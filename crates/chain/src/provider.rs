@@ -33,34 +33,18 @@ impl ChainProvider {
 
     pub async fn bootstrap_configured_pools(&self, settings: &Settings) -> Result<Vec<PoolState>> {
         let now = Utc::now();
-        let usdc = settings.usdc_address;
-        let weth = settings.weth_address;
         let mut out = Vec::new();
 
         if let Some(pool) = settings.aerodrome_usdc_weth_pool {
-            let (reserve0, reserve1) = self.fetch_aerodrome_reserves(pool).await.with_context(|| {
-                format!(
-                    "failed to initialize AERODROME_USDC_WETH_POOL {pool:#x}; expected a volatile pair supporting getReserves()"
-                )
-            })?;
-            out.push(PoolState {
-                pool_id: PoolId {
-                    chain_id: self.chain_id,
-                    address: pool,
-                },
-                dex: DexKind::Aerodrome,
-                variant: PoolVariant::AerodromeVolatile,
-                token0: usdc,
-                token1: weth,
-                fee_bps: 30,
-                reserve0: Some(reserve0),
-                reserve1: Some(reserve1),
-                sqrt_price_x96: None,
-                liquidity: None,
-                tick: None,
-                block_number: self.get_block_number().await?,
-                updated_at: now,
-            });
+            let state = self
+                .fetch_aerodrome_state(pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to initialize AERODROME_USDC_WETH_POOL {pool:#x}; expected either volatile getReserves() or Slipstream slot0()/liquidity()"
+                    )
+                })?;
+            out.push(state);
         }
 
         for (pool, fee_bps) in [
@@ -68,6 +52,9 @@ impl ChainProvider {
             (settings.uniswap_v3_usdc_weth_3000_pool, 30u32),
         ] {
             if let Some(pool) = pool {
+                let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
+                    format!("failed to read token0/token1 for Uniswap V3 pool {pool:#x}")
+                })?;
                 let (sqrt_price_x96, tick, liquidity) =
                     self.fetch_uniswap_v3_state(pool).await.with_context(|| {
                         format!(
@@ -81,8 +68,8 @@ impl ChainProvider {
                     },
                     dex: DexKind::UniswapV3,
                     variant: PoolVariant::UniswapV3,
-                    token0: weth,
-                    token1: usdc,
+                    token0,
+                    token1,
                     fee_bps,
                     reserve0: None,
                     reserve1: None,
@@ -160,6 +147,74 @@ impl ChainProvider {
         Ok(out)
     }
 
+    async fn fetch_aerodrome_state(&self, pool: Address) -> Result<PoolState> {
+        let block_number = self.get_block_number().await?;
+        let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
+            format!("failed to read token0/token1 for Aerodrome pool {pool:#x}")
+        })?;
+
+        match self.fetch_aerodrome_reserves(pool).await {
+            Ok((reserve0, reserve1)) => Ok(PoolState {
+                pool_id: PoolId {
+                    chain_id: self.chain_id,
+                    address: pool,
+                },
+                dex: DexKind::Aerodrome,
+                variant: PoolVariant::AerodromeVolatile,
+                token0,
+                token1,
+                fee_bps: 30,
+                reserve0: Some(reserve0),
+                reserve1: Some(reserve1),
+                sqrt_price_x96: None,
+                liquidity: None,
+                tick: None,
+                block_number,
+                updated_at: Utc::now(),
+            }),
+            Err(reserve_err) => {
+                let (sqrt_price_x96, tick, liquidity) = self
+                    .fetch_aerodrome_slipstream_state(pool)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "volatile getReserves() failed first: {reserve_err}; Slipstream fallback also failed"
+                        )
+                    })?;
+
+                Ok(PoolState {
+                    pool_id: PoolId {
+                        chain_id: self.chain_id,
+                        address: pool,
+                    },
+                    dex: DexKind::Aerodrome,
+                    variant: PoolVariant::AerodromeSlipstream,
+                    token0,
+                    token1,
+                    fee_bps: 30,
+                    reserve0: None,
+                    reserve1: None,
+                    sqrt_price_x96: Some(sqrt_price_x96),
+                    liquidity: Some(liquidity),
+                    tick: Some(tick),
+                    block_number,
+                    updated_at: Utc::now(),
+                })
+            }
+        }
+    }
+
+    async fn fetch_pool_tokens(&self, pool: Address) -> Result<(Address, Address)> {
+        let token0_raw = self.eth_call(pool, "0x0dfe1681", "token0()").await?;
+        let token1_raw = self.eth_call(pool, "0xd21220a7", "token1()").await?;
+        let token0_words = decode_32byte_words(&token0_raw)?;
+        let token1_words = decode_32byte_words(&token1_raw)?;
+        Ok((
+            parse_word_address(&token0_words[0])?,
+            parse_word_address(&token1_words[0])?,
+        ))
+    }
+
     async fn fetch_aerodrome_reserves(&self, pool: Address) -> Result<(U256, U256)> {
         let data = self
             .eth_call(pool, "0x0902f1ac", "Aerodrome getReserves()")
@@ -168,6 +223,23 @@ impl ChainProvider {
         let reserve0 = parse_word_u256(&words[0])?;
         let reserve1 = parse_word_u256(&words[1])?;
         Ok((reserve0, reserve1))
+    }
+
+    async fn fetch_aerodrome_slipstream_state(&self, pool: Address) -> Result<(U256, i32, U256)> {
+        let slot0 = self
+            .eth_call(pool, "0x3850c7bd", "Aerodrome Slipstream slot0()")
+            .await?;
+        let slot0_words = decode_32byte_words(&slot0)?;
+        let sqrt_price_x96 = parse_word_u256(&slot0_words[0])?;
+        let tick = parse_word_i24(&slot0_words[1])?;
+
+        let liquidity = self
+            .eth_call(pool, "0x1a686502", "Aerodrome Slipstream liquidity()")
+            .await?;
+        let liquidity_words = decode_32byte_words(&liquidity)?;
+        let liquidity = parse_word_u256(&liquidity_words[0])?;
+
+        Ok((sqrt_price_x96, tick, liquidity))
     }
 
     async fn fetch_uniswap_v3_state(&self, pool: Address) -> Result<(U256, i32, U256)> {
@@ -289,6 +361,18 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
             "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
         ) => "Swap",
         (
+            DexKind::Aerodrome,
+            "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+        ) => "Swap",
+        (
+            DexKind::Aerodrome,
+            "0x7a53080ba414158be7ec69b987b5fb7d07dee1015d1c6ee733b3f419f0e3c2d2",
+        ) => "Mint",
+        (
+            DexKind::Aerodrome,
+            "0x0c396cd989a39f4459b5fa1aed6a9a8e9d0dc76f0f6d4c1d3c2f3f6721e5d2fb",
+        ) => "Burn",
+        (
             DexKind::UniswapV3,
             "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
         ) => "Swap",
@@ -329,6 +413,14 @@ fn decode_32byte_words(data: &str) -> Result<Vec<String>> {
 
 fn parse_word_u256(word: &str) -> Result<U256> {
     Ok(U256::from_str_radix(word, 16)?)
+}
+
+fn parse_word_address(word: &str) -> Result<Address> {
+    let address_start = word
+        .len()
+        .checked_sub(40)
+        .ok_or_else(|| anyhow::anyhow!("abi word too short for address"))?;
+    Ok(format!("0x{}", &word[address_start..]).parse()?)
 }
 
 fn parse_word_i24(word: &str) -> Result<i32> {

@@ -25,6 +25,7 @@ pub enum DexKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PoolVariant {
     AerodromeVolatile,
+    AerodromeSlipstream,
     UniswapV3,
 }
 
