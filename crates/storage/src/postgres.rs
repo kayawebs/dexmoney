@@ -110,11 +110,9 @@ impl PostgresStore {
 }
 
 pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
-        CREATE TABLE IF NOT EXISTS token_pairs (
+    for statement in [
+        r#"CREATE EXTENSION IF NOT EXISTS "uuid-ossp""#,
+        r#"CREATE TABLE IF NOT EXISTS token_pairs (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,
             token0 TEXT NOT NULL,
@@ -124,12 +122,10 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (chain_id, token0, token1)
-        );
-
-        CREATE INDEX IF NOT EXISTS token_pairs_enabled_idx
-            ON token_pairs (enabled, updated_at DESC);
-
-        CREATE TABLE IF NOT EXISTS pools (
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS token_pairs_enabled_idx
+            ON token_pairs (enabled, updated_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS pools (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             token_pair_id UUID REFERENCES token_pairs(id),
             chain_id BIGINT NOT NULL,
@@ -146,16 +142,14 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (chain_id, pool_address)
-        );
-
-        CREATE INDEX IF NOT EXISTS pools_enabled_idx
-            ON pools (enabled, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS pools_pair_idx
-            ON pools (token_pair_id, enabled);
-        "#,
-    )
-    .execute(pool)
-    .await?;
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pools_enabled_idx
+            ON pools (enabled, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pools_pair_idx
+            ON pools (token_pair_id, enabled)"#,
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
     Ok(())
 }
 
