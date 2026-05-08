@@ -96,9 +96,9 @@ impl ChainProvider {
         parse_hex_u64(value.as_str().unwrap_or("0x0"))
     }
 
-    pub async fn fetch_relevant_events(
+    pub async fn fetch_relevant_events_for_pools(
         &self,
-        settings: &Settings,
+        pools: &[PoolState],
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<DexEvent>> {
@@ -106,16 +106,10 @@ impl ChainProvider {
             return Ok(Vec::new());
         }
 
-        let mut addresses = Vec::new();
-        if let Some(pool) = settings.aerodrome_usdc_weth_pool {
-            addresses.push(format!("{pool:#x}"));
-        }
-        if let Some(pool) = settings.uniswap_v3_usdc_weth_500_pool {
-            addresses.push(format!("{pool:#x}"));
-        }
-        if let Some(pool) = settings.uniswap_v3_usdc_weth_3000_pool {
-            addresses.push(format!("{pool:#x}"));
-        }
+        let addresses = pools
+            .iter()
+            .map(|pool| format!("{:#x}", pool.pool_id.address))
+            .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
@@ -132,7 +126,7 @@ impl ChainProvider {
         for log in logs {
             let raw_data_json = serde_json::to_value(&log)?;
             let pool_address: Address = log.address.parse()?;
-            let dex = dex_for_pool(settings, pool_address);
+            let dex = dex_for_pool(pools, pool_address);
             let event_type = decode_event_type(dex, log.topics.first().map(String::as_str));
             out.push(DexEvent {
                 block_number: parse_hex_u64(&log.block_number)?,
@@ -394,12 +388,12 @@ struct RpcError {
     data: Option<Value>,
 }
 
-fn dex_for_pool(settings: &Settings, pool: Address) -> DexKind {
-    if settings.aerodrome_usdc_weth_pool == Some(pool) {
-        DexKind::Aerodrome
-    } else {
-        DexKind::UniswapV3
-    }
+fn dex_for_pool(pools: &[PoolState], pool: Address) -> DexKind {
+    pools
+        .iter()
+        .find(|state| state.pool_id.address == pool)
+        .map(|state| state.dex)
+        .unwrap_or(DexKind::UniswapV3)
 }
 
 fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {

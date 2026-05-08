@@ -20,14 +20,20 @@ where
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
 
-        let initial_states = self
+        let mut monitored_states = self
             .provider
             .bootstrap_configured_pools(&self.settings)
             .await?;
-        for state in initial_states {
+        for state in &monitored_states {
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder.record_pool_state(state.clone()).await?;
-            super::state_updater::log_pool_state_update(&state);
+            super::state_updater::log_pool_state_update(state);
+            info!(
+                pool = %state.pool_id.address,
+                dex = ?state.dex,
+                variant = ?state.variant,
+                "monitoring pool logs"
+            );
         }
 
         let mut last_seen_block = self.provider.get_block_number().await?;
@@ -45,7 +51,11 @@ where
 
             let events = self
                 .provider
-                .fetch_relevant_events(&self.settings, last_seen_block + 1, latest_block)
+                .fetch_relevant_events_for_pools(
+                    &monitored_states,
+                    last_seen_block + 1,
+                    latest_block,
+                )
                 .await?;
 
             for event in &events {
@@ -59,14 +69,20 @@ where
             }
 
             if !events.is_empty() {
-                let refreshed_states = self
+                monitored_states = self
                     .provider
                     .bootstrap_configured_pools(&self.settings)
                     .await?;
-                for state in refreshed_states {
+                for state in &monitored_states {
                     self.pool_store.set_pool_state(state.clone()).await?;
                     self.recorder.record_pool_state(state.clone()).await?;
-                    super::state_updater::log_pool_state_update(&state);
+                    super::state_updater::log_pool_state_update(state);
+                    info!(
+                        pool = %state.pool_id.address,
+                        dex = ?state.dex,
+                        variant = ?state.variant,
+                        "monitoring pool logs"
+                    );
                 }
             }
 
