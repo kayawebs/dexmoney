@@ -47,25 +47,54 @@ base-arb-bot/
 
 ## Quick Start
 
-1. Copy `.env.example` to `.env` and fill Base / DB / Redis / contract addresses.
-2. Create the Postgres database and run `migrations/0001_init.sql`.
-3. Start local services:
+1. Copy `.env.example` to `.env`.
+2. Start local Postgres and Redis:
    - Base node with HTTP + WS
-   - Postgres
-   - Redis
-4. Build:
+   - Postgres on `localhost:5632`
+   - Redis on `localhost:6779`
+
+```bash
+cp .env.example .env
+docker compose up -d postgres redis
+```
+
+3. Build:
 
 ```bash
 cargo build
 ```
 
-5. Run processes in separate terminals:
+4. Run each process in its own terminal:
 
 ```bash
 cargo run -p market-data
 cargo run -p searcher
 cargo run -p execution-manager
 ```
+
+5. Optional health checks:
+
+```bash
+docker compose ps
+cargo test --workspace
+```
+
+## Docker
+
+Build a specific process image with `APP_BIN`:
+
+```bash
+docker build --build-arg APP_BIN=market-data -t base-arb-market-data .
+docker build --build-arg APP_BIN=searcher -t base-arb-searcher .
+docker build --build-arg APP_BIN=execution-manager -t base-arb-execution-manager .
+```
+
+The compose file in this repo currently provisions only Postgres and Redis. The Base node is expected to run separately.
+
+## Notes
+
+- The current `.env.example` is prefilled so the current scaffold can boot without manual editing.
+- `AERODROME_USDC_WETH_POOL` is set to an Aerodrome WETH/USDC-related contract address so the current bootstrap/search path has a concrete address to use before full onchain discovery is implemented.
 
 ## Current Status
 
@@ -79,4 +108,3 @@ This initialization provides:
 - Foundry contract skeleton and baseline tests
 
 It does not yet provide production-ready chain integration, router calldata encoding, or full Uniswap V3 local tick simulation.
-
