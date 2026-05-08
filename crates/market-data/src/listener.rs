@@ -23,6 +23,7 @@ where
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
 
+        self.sync_env_bootstrap_pools().await?;
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states).await?;
 
@@ -146,6 +147,15 @@ where
                 "monitoring pool logs"
             );
         }
+        Ok(())
+    }
+
+    async fn sync_env_bootstrap_pools(&self) -> Result<()> {
+        let states = self
+            .provider
+            .bootstrap_configured_pools(&self.settings)
+            .await?;
+        self.seed_registry_from_states(&states).await?;
         Ok(())
     }
 

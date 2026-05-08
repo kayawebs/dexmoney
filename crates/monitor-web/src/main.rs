@@ -423,6 +423,7 @@ async fn fetch_dex_events(pool: &PgPool) -> Result<Vec<DexEventRow>> {
         r#"
         SELECT created_at, block_number, dex, event_type, pool_address, tx_hash
         FROM dex_events
+        WHERE event_type <> 'Unknown'
         ORDER BY created_at DESC
         LIMIT 25
         "#,
