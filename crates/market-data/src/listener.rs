@@ -20,7 +20,10 @@ where
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
 
-        let initial_states = self.provider.bootstrap_configured_pools(&self.settings).await?;
+        let initial_states = self
+            .provider
+            .bootstrap_configured_pools(&self.settings)
+            .await?;
         for state in initial_states {
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder.record_pool_state(state.clone()).await?;
@@ -31,12 +34,9 @@ where
             block_number: 1,
             tx_hash: "0xdemo".into(),
             log_index: 0,
-            pool_address: self
-                .settings
-                .aerodrome_usdc_weth_pool
-                .unwrap_or(alloy_primitives::address!(
-                    "1111111111111111111111111111111111111111"
-                )),
+            pool_address: self.settings.aerodrome_usdc_weth_pool.unwrap_or(
+                alloy_primitives::address!("1111111111111111111111111111111111111111"),
+            ),
             dex: base_arb_common::types::DexKind::Aerodrome,
             event_type: "Sync".into(),
             raw_data_json: serde_json::json!({

@@ -70,6 +70,7 @@ cargo build
 cargo run -p market-data
 cargo run -p searcher
 cargo run -p execution-manager
+cargo run -p monitor-web
 ```
 
 5. Optional health checks:
@@ -77,6 +78,13 @@ cargo run -p execution-manager
 ```bash
 docker compose ps
 cargo test --workspace
+curl -sS http://127.0.0.1:8085/healthz
+```
+
+6. Open the monitor:
+
+```bash
+open http://127.0.0.1:8085
 ```
 
 ## Docker
@@ -95,6 +103,7 @@ The compose file in this repo currently provisions only Postgres and Redis. The 
 
 - The current `.env.example` is prefilled so the current scaffold can boot without manual editing.
 - `AERODROME_USDC_WETH_POOL` is set to an Aerodrome WETH/USDC-related contract address so the current bootstrap/search path has a concrete address to use before full onchain discovery is implemented.
+- `monitor-web` is a read-only Postgres dashboard on `http://127.0.0.1:8085`.
 
 ## Current Status
 
