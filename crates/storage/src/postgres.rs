@@ -33,6 +33,7 @@ impl RecorderStore for PostgresStore {
             ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING
             "#,
         )
+        // $1..$10 map exactly to the non-id/created_at insert columns above.
         .bind(8453_i64)
         .bind(i64::try_from(event.block_number)?)
         .bind(event.tx_hash)
@@ -40,7 +41,6 @@ impl RecorderStore for PostgresStore {
         .bind(address_to_string(event.pool_address))
         .bind(dex_to_string(event.dex))
         .bind(event.event_type)
-        .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind(sqlx::types::Json(event.raw_data_json))
