@@ -148,6 +148,29 @@ impl ChainProvider {
     }
 
     async fn fetch_aerodrome_state(&self, pool: Address) -> Result<PoolState> {
+        match self.fetch_aerodrome_pool_state(pool).await {
+            Ok(state) => Ok(state),
+            Err(pool_err) => {
+                let resolved_pool = self.resolve_aerodrome_gauge_pool(pool).await.with_context(|| {
+                    format!("configured address {pool:#x} is not readable as an Aerodrome pool, and gauge pool resolution failed; direct pool read error: {pool_err}")
+                })?;
+                info!(
+                    configured_address = %pool,
+                    resolved_pool = %resolved_pool,
+                    "resolved Aerodrome gauge to pool"
+                );
+                self.fetch_aerodrome_pool_state(resolved_pool)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolved Aerodrome gauge {pool:#x} to pool {resolved_pool:#x}, but resolved pool state read failed"
+                        )
+                    })
+            }
+        }
+    }
+
+    async fn fetch_aerodrome_pool_state(&self, pool: Address) -> Result<PoolState> {
         let block_number = self.get_block_number().await?;
         let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
             format!("failed to read token0/token1 for Aerodrome pool {pool:#x}")
@@ -202,6 +225,35 @@ impl ChainProvider {
                 })
             }
         }
+    }
+
+    async fn resolve_aerodrome_gauge_pool(&self, gauge: Address) -> Result<Address> {
+        for (selector, label) in [
+            ("0x16f0115b", "pool()"),
+            ("0x72f702f3", "stakingToken()"),
+            ("0xcc7a262e", "stakedToken()"),
+        ] {
+            match self.eth_call(gauge, selector, label).await {
+                Ok(raw) => {
+                    let words = decode_32byte_words(&raw)?;
+                    let candidate = parse_word_address(&words[0])?;
+                    if candidate != Address::ZERO {
+                        return Ok(candidate);
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        gauge = %gauge,
+                        selector,
+                        label,
+                        error = %err,
+                        "Aerodrome gauge pool resolver probe failed"
+                    );
+                }
+            }
+        }
+
+        anyhow::bail!("could not resolve Aerodrome gauge {gauge:#x} to an underlying pool")
     }
 
     async fn fetch_pool_tokens(&self, pool: Address) -> Result<(Address, Address)> {
