@@ -1,0 +1,14 @@
+[package]
+name = "base-arb-dex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base-arb-common = { path = "../common" }
+serde.workspace = true
+tracing.workspace = true
+

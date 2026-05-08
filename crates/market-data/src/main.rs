@@ -1,0 +1,33 @@
+mod listener;
+mod state_updater;
+
+use anyhow::Result;
+use base_arb_chain::provider::ChainProvider;
+use base_arb_common::config::Settings;
+use base_arb_storage::{postgres::PostgresStore, redis::RedisStore};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let settings = Settings::load()?;
+    let provider = ChainProvider::from_settings(&settings);
+    provider.healthcheck().await?;
+
+    let postgres = PostgresStore::connect(&settings.postgres_url).await?;
+    let redis = RedisStore::connect(&settings.redis_url).await?;
+
+    info!("market-data initialized");
+    let service = listener::MarketDataService {
+        settings: settings.clone(),
+        provider,
+        pool_store: redis,
+        recorder: postgres,
+    };
+    listener::run(&service).await?;
+    Ok(())
+}

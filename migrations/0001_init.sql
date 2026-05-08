@@ -1,0 +1,92 @@
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE IF NOT EXISTS dex_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    chain_id BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    log_index BIGINT NOT NULL,
+    pool_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    token0 TEXT,
+    token1 TEXT,
+    raw_data_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS dex_events_chain_tx_log_idx
+    ON dex_events (chain_id, tx_hash, log_index);
+CREATE INDEX IF NOT EXISTS dex_events_pool_block_idx
+    ON dex_events (pool_address, block_number DESC);
+
+CREATE TABLE IF NOT EXISTS pool_states (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    pool_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    token0 TEXT NOT NULL,
+    token1 TEXT NOT NULL,
+    fee BIGINT,
+    reserve0 TEXT,
+    reserve1 TEXT,
+    sqrt_price_x96 TEXT,
+    liquidity TEXT,
+    tick BIGINT,
+    block_number BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS pool_states_pool_updated_idx
+    ON pool_states (pool_address, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS opportunities (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    block_number BIGINT NOT NULL,
+    strategy TEXT NOT NULL,
+    token_in TEXT NOT NULL,
+    amount_in TEXT NOT NULL,
+    expected_amount_out TEXT NOT NULL,
+    expected_profit TEXT NOT NULL,
+    min_profit TEXT NOT NULL,
+    path_json JSONB NOT NULL,
+    status TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS opportunities_created_idx
+    ON opportunities (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS simulations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    opportunity_id UUID NOT NULL REFERENCES opportunities(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    success BOOLEAN NOT NULL,
+    simulated_profit TEXT,
+    gas_estimate TEXT,
+    revert_reason TEXT,
+    calldata TEXT,
+    raw_result JSONB
+);
+
+CREATE INDEX IF NOT EXISTS simulations_opportunity_idx
+    ON simulations (opportunity_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    opportunity_id UUID REFERENCES opportunities(id),
+    simulation_id UUID REFERENCES simulations(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    eoa TEXT NOT NULL,
+    tx_hash TEXT,
+    nonce BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    gas_used TEXT,
+    effective_gas_price TEXT,
+    realized_profit TEXT,
+    revert_reason TEXT,
+    receipt_json JSONB
+);
+
+CREATE INDEX IF NOT EXISTS transactions_eoa_created_idx
+    ON transactions (eoa, created_at DESC);
+
