@@ -29,6 +29,7 @@ pub struct ChainProvider {
     pub http_url: String,
     pub ws_url: String,
     pub chain_id: u64,
+    pub filter_relevant_event_topics: bool,
     client: reqwest::Client,
 }
 
@@ -38,6 +39,7 @@ impl ChainProvider {
             http_url: settings.base_rpc_http.clone(),
             ws_url: settings.base_rpc_ws.clone(),
             chain_id: settings.chain_id,
+            filter_relevant_event_topics: settings.filter_relevant_event_topics,
             client: reqwest::Client::new(),
         }
     }
@@ -373,12 +375,15 @@ impl ChainProvider {
             return Ok(Vec::new());
         }
 
-        let params = json!([{
+        let mut filter = json!({
             "fromBlock": format!("0x{from_block:x}"),
             "toBlock": format!("0x{to_block:x}"),
             "address": addresses,
-            "topics": [RELEVANT_EVENT_TOPICS],
-        }]);
+        });
+        if self.filter_relevant_event_topics {
+            filter["topics"] = json!([RELEVANT_EVENT_TOPICS]);
+        }
+        let params = json!([filter]);
         let value = self.rpc("eth_getLogs", params).await?;
         let logs: Vec<RpcLog> = serde_json::from_value(value)?;
 

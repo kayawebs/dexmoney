@@ -37,6 +37,15 @@ struct DexEventRow {
 }
 
 #[derive(Debug, FromRow)]
+struct UnknownTopicRow {
+    last_seen: DateTime<Utc>,
+    dex: String,
+    pool_address: String,
+    topic0: Option<String>,
+    event_count: i64,
+}
+
+#[derive(Debug, FromRow)]
 struct PoolStateRow {
     updated_at: DateTime<Utc>,
     block_number: i64,
@@ -216,6 +225,9 @@ async fn activity_page(
     let events = fetch_dex_events(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let unknown_topics = fetch_unknown_topics(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let pool_states = fetch_pool_states(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -227,11 +239,16 @@ async fn activity_page(
           <div class="card-body">{}</div>
         </section>
         <section class="card">
+          <h2>Unknown Topics</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
           <h2>Pool States</h2>
           <div class="card-body">{}</div>
         </section>
         "#,
         render_events_table(&events),
+        render_unknown_topics_table(&unknown_topics),
         render_pool_states_table(&pool_states),
     );
 
@@ -486,6 +503,26 @@ async fn fetch_dex_events(pool: &PgPool) -> Result<Vec<DexEventRow>> {
         WHERE event_type <> 'Unknown'
         ORDER BY created_at DESC
         LIMIT 25
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_unknown_topics(pool: &PgPool) -> Result<Vec<UnknownTopicRow>> {
+    Ok(sqlx::query_as::<_, UnknownTopicRow>(
+        r#"
+        SELECT
+            MAX(created_at) AS last_seen,
+            dex,
+            pool_address,
+            raw_data_json->'topics'->>0 AS topic0,
+            COUNT(*)::BIGINT AS event_count
+        FROM dex_events
+        WHERE event_type = 'Unknown'
+        GROUP BY dex, pool_address, topic0
+        ORDER BY event_count DESC, last_seen DESC
+        LIMIT 50
         "#,
     )
     .fetch_all(pool)
@@ -807,6 +844,30 @@ fn render_events_table(rows: &[DexEventRow]) -> String {
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
+    }
+    html.push_str("</tbody></table></div>");
+    html
+}
+
+fn render_unknown_topics_table(rows: &[UnknownTopicRow]) -> String {
+    let mut html = String::from(
+        "<div class=\"table-scroll\"><table><thead><tr><th>Last Seen</th><th>Count</th><th>DEX</th><th>Pool</th><th>Topic 0</th></tr></thead><tbody>",
+    );
+    for row in rows {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            fmt_ts(row.last_seen),
+            row.event_count,
+            escape(&row.dex),
+            copyable(&row.pool_address),
+            row.topic0
+                .as_deref()
+                .map(copyable)
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+    if rows.is_empty() {
+        html.push_str("<tr><td colspan=\"5\">No unknown topics recorded.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
