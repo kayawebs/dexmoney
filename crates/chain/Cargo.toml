@@ -9,6 +9,7 @@ alloy-primitives.workspace = true
 anyhow.workspace = true
 base-arb-common = { path = "../common" }
 chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

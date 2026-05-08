@@ -1,5 +1,4 @@
 use anyhow::Result;
-use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::{PoolStateStore, RecorderStore};
@@ -31,33 +30,47 @@ where
             super::state_updater::log_pool_state_update(&state);
         }
 
-        let mut ticker = interval(Duration::from_secs(15));
+        let mut last_seen_block = self.provider.get_block_number().await?;
+        info!(last_seen_block, "market-data synchronized at startup");
+
+        let mut ticker = interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             ticker.tick().await;
+            let latest_block = self.provider.get_block_number().await?;
+            if latest_block <= last_seen_block {
+                continue;
+            }
 
-            let event = DexEvent {
-                block_number: 1,
-                tx_hash: "0xdemo".into(),
-                log_index: 0,
-                pool_address: self.settings.aerodrome_usdc_weth_pool.unwrap_or(
-                    alloy_primitives::address!("1111111111111111111111111111111111111111"),
-                ),
-                dex: base_arb_common::types::DexKind::Aerodrome,
-                event_type: "Sync".into(),
-                raw_data_json: serde_json::json!({
-                    "reserve0": "200000000000",
-                    "reserve1": "100000000000000000000"
-                }),
-            };
+            let events = self
+                .provider
+                .fetch_relevant_events(&self.settings, last_seen_block + 1, latest_block)
+                .await?;
 
-            info!(
-                pool = %event.pool_address,
-                event_type = %event.event_type,
-                "event received"
-            );
-            self.recorder.record_dex_event(event).await?;
+            for event in &events {
+                info!(
+                    pool = %event.pool_address,
+                    block_number = event.block_number,
+                    event_type = %event.event_type,
+                    "event received"
+                );
+                self.recorder.record_dex_event(event.clone()).await?;
+            }
+
+            if !events.is_empty() {
+                let refreshed_states = self
+                    .provider
+                    .bootstrap_configured_pools(&self.settings)
+                    .await?;
+                for state in refreshed_states {
+                    self.pool_store.set_pool_state(state.clone()).await?;
+                    self.recorder.record_pool_state(state.clone()).await?;
+                    super::state_updater::log_pool_state_update(&state);
+                }
+            }
+
+            last_seen_block = latest_block;
         }
     }
 }
