@@ -132,6 +132,9 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/registry", get(registry_page))
+        .route("/activity", get(activity_page))
+        .route("/execution", get(execution_page))
         .route("/pairs", post(add_pair))
         .route("/healthz", get(healthz))
         .with_state(state);
@@ -154,18 +157,95 @@ async fn index(
         return Ok(Html(render_login()));
     }
 
-    let token_pairs = fetch_token_pairs(&state.pool)
+    let pool_states = fetch_pool_states(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let registry_pools = fetch_registry_pools(&state.pool)
+    let opportunities = fetch_opportunities(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let content = format!(
+        r#"
+        <section class="card">
+          <h2>Pool States</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
+          <h2>Opportunities</h2>
+          <div class="card-body">{}</div>
+        </section>
+        "#,
+        render_pool_states_table(&pool_states),
+        render_opportunities_table(&opportunities),
+    );
+
+    Ok(Html(render_page(
+        "Overview",
+        "Current monitored pools and recent opportunities.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn registry_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+
+    render_registry_response(&state.pool, auth.password.as_deref(), None).await
+}
+
+async fn activity_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+
     let events = fetch_dex_events(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let pool_states = fetch_pool_states(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let content = format!(
+        r#"
+        <section class="card">
+          <h2>DEX Events</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
+          <h2>Pool States</h2>
+          <div class="card-body">{}</div>
+        </section>
+        "#,
+        render_events_table(&events),
+        render_pool_states_table(&pool_states),
+    );
+
+    Ok(Html(render_page(
+        "Activity",
+        "Recent chain events and state snapshots.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn execution_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+
     let opportunities = fetch_opportunities(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -176,15 +256,32 @@ async fn index(
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Html(render_dashboard(
+    let content = format!(
+        r#"
+        <section class="card">
+          <h2>Opportunities</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
+          <h2>Simulations</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
+          <h2>Transactions</h2>
+          <div class="card-body">{}</div>
+        </section>
+        "#,
+        render_opportunities_table(&opportunities),
+        render_simulations_table(&simulations),
+        render_transactions_table(&transactions),
+    );
+
+    Ok(Html(render_page(
+        "Execution",
+        "Searcher, simulation, and transaction records.",
+        auth.password.as_deref(),
         None,
-        &token_pairs,
-        &registry_pools,
-        &events,
-        &pool_states,
-        &opportunities,
-        &simulations,
-        &transactions,
+        &content,
     )))
 }
 
@@ -193,8 +290,9 @@ async fn add_pair(
     Form(form): Form<AddPairForm>,
 ) -> Result<Html<String>, StatusCode> {
     if !password_matches(state.admin_password.as_deref(), &form.password) {
-        return render_dashboard_response(
+        return render_registry_response(
             &state.pool,
+            None,
             Some("unauthorized: invalid monitor password"),
         )
         .await;
@@ -218,7 +316,8 @@ async fn add_pair(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     if discovered.is_empty() {
-        return render_dashboard_response(&state.pool, Some("no pools found for this pair")).await;
+        return render_registry_response(&state.pool, None, Some("no pools found for this pair"))
+            .await;
     }
 
     let store = PostgresStore {
@@ -236,11 +335,12 @@ async fn add_pair(
     }
 
     let message = format!("added pair {symbol}; discovered {} pools", discovered.len());
-    render_dashboard_response(&state.pool, Some(&message)).await
+    render_registry_response(&state.pool, None, Some(&message)).await
 }
 
-async fn render_dashboard_response(
+async fn render_registry_response(
     pool: &PgPool,
+    auth_password: Option<&str>,
     flash: Option<&str>,
 ) -> Result<Html<String>, StatusCode> {
     let token_pairs = fetch_token_pairs(pool)
@@ -249,31 +349,45 @@ async fn render_dashboard_response(
     let registry_pools = fetch_registry_pools(pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let events = fetch_dex_events(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let pool_states = fetch_pool_states(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let opportunities = fetch_opportunities(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let simulations = fetch_simulations(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let transactions = fetch_transactions(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Html(render_dashboard(
+    let content = format!(
+        r#"
+        <section class="admin">
+          <form method="post" action="/pairs">
+            <label>Password
+              <input name="password" type="password" autocomplete="current-password" required>
+            </label>
+            <label>Symbol
+              <input name="symbol" placeholder="USDC/WETH" required>
+            </label>
+            <label>Token 0
+              <input name="token0" placeholder="0x..." required>
+            </label>
+            <label>Token 1
+              <input name="token1" placeholder="0x..." required>
+            </label>
+            <button type="submit">Discover Pools</button>
+          </form>
+        </section>
+        <section class="card">
+          <h2>Token Pairs</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
+          <h2>Pool Registry</h2>
+          <div class="card-body">{}</div>
+        </section>
+        "#,
+        render_token_pairs_table(&token_pairs),
+        render_registry_pools_table(&registry_pools),
+    );
+
+    Ok(Html(render_page(
+        "Registry",
+        "Add token pairs and inspect discovered pools.",
+        auth_password,
         flash,
-        &token_pairs,
-        &registry_pools,
-        &events,
-        &pool_states,
-        &opportunities,
-        &simulations,
-        &transactions,
+        &content,
     )))
 }
 
@@ -370,15 +484,12 @@ async fn fetch_transactions(pool: &PgPool) -> Result<Vec<TransactionRow>> {
     .await?)
 }
 
-fn render_dashboard(
+fn render_page(
+    title: &str,
+    subtitle: &str,
+    auth_password: Option<&str>,
     flash: Option<&str>,
-    token_pairs: &[TokenPairRow],
-    registry_pools: &[PoolRegistryRow],
-    events: &[DexEventRow],
-    pool_states: &[PoolStateRow],
-    opportunities: &[OpportunityRow],
-    simulations: &[SimulationRow],
-    transactions: &[TransactionRow],
+    content: &str,
 ) -> String {
     format!(
         r#"<!doctype html>
@@ -386,7 +497,7 @@ fn render_dashboard(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Base Arb Monitor</title>
+  <title>Base Arb Monitor - {title}</title>
   <style>
     :root {{
       --bg: #0d1117;
@@ -409,10 +520,28 @@ fn render_dashboard(
     }}
     h1 {{ margin: 0 0 8px; font-size: 28px; }}
     p {{ margin: 0 0 18px; color: var(--muted); }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    nav {{
+      display: flex;
+      flex-wrap: wrap;
       gap: 16px;
+      margin: 18px 0;
+    }}
+    nav a {{
+      color: var(--text);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: rgba(255,255,255,0.03);
+    }}
+    nav a:hover {{
+      border-color: var(--accent);
+      color: var(--accent);
+    }}
+    .stack {{
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
     }}
     .admin {{
       margin: 18px 0;
@@ -538,66 +667,28 @@ fn render_dashboard(
   </script>
 </head>
 <body>
-  <h1>Base Arb Monitor</h1>
-  <p>Postgres dashboard and lightweight pool registry admin.</p>
+  <h1>{title}</h1>
+  <p>{subtitle}</p>
+  <nav>
+    <a href="{overview_href}">Overview</a>
+    <a href="{registry_href}">Registry</a>
+    <a href="{activity_href}">Activity</a>
+    <a href="{execution_href}">Execution</a>
+  </nav>
   {flash}
-  <section class="admin">
-    <form method="post" action="/pairs">
-      <label>Password
-        <input name="password" type="password" autocomplete="current-password" required>
-      </label>
-      <label>Symbol
-        <input name="symbol" placeholder="USDC/WETH" required>
-      </label>
-      <label>Token 0
-        <input name="token0" placeholder="0x..." required>
-      </label>
-      <label>Token 1
-        <input name="token1" placeholder="0x..." required>
-      </label>
-      <button type="submit">Discover Pools</button>
-    </form>
-  </section>
-  <div class="grid">
-    <section class="card">
-      <h2>Token Pairs</h2>
-      <div class="card-body">{token_pairs}</div>
-    </section>
-    <section class="card">
-      <h2>Pool Registry</h2>
-      <div class="card-body">{registry_pools}</div>
-    </section>
-    <section class="card">
-      <h2>DEX Events</h2>
-      <div class="card-body">{events}</div>
-    </section>
-    <section class="card">
-      <h2>Pool States</h2>
-      <div class="card-body">{pool_states}</div>
-    </section>
-    <section class="card">
-      <h2>Opportunities</h2>
-      <div class="card-body">{opportunities}</div>
-    </section>
-    <section class="card">
-      <h2>Simulations</h2>
-      <div class="card-body">{simulations}</div>
-    </section>
-    <section class="card">
-      <h2>Transactions</h2>
-      <div class="card-body">{transactions}</div>
-    </section>
+  <div class="stack">
+    {content}
   </div>
 </body>
 </html>"#,
+        subtitle = escape(subtitle),
+        title = escape(title),
+        overview_href = nav_href("/", auth_password),
+        registry_href = nav_href("/registry", auth_password),
+        activity_href = nav_href("/activity", auth_password),
+        execution_href = nav_href("/execution", auth_password),
         flash = render_flash(flash),
-        token_pairs = render_token_pairs_table(token_pairs),
-        registry_pools = render_registry_pools_table(registry_pools),
-        events = render_events_table(events),
-        pool_states = render_pool_states_table(pool_states),
-        opportunities = render_opportunities_table(opportunities),
-        simulations = render_simulations_table(simulations),
-        transactions = render_transactions_table(transactions),
+        content = content,
     )
 }
 
@@ -660,6 +751,15 @@ fn render_flash(value: Option<&str>) -> String {
     value
         .map(|message| format!("<div class=\"flash\">{}</div>", escape(message)))
         .unwrap_or_default()
+}
+
+fn nav_href(path: &str, auth_password: Option<&str>) -> String {
+    match auth_password {
+        Some(password) if !password.is_empty() => {
+            format!("{}?password={}", path, url_query_escape(password))
+        }
+        _ => path.to_string(),
+    }
 }
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
@@ -815,6 +915,18 @@ fn escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn url_query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn copyable(value: &str) -> String {
