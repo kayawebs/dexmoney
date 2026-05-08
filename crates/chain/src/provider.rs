@@ -1,12 +1,12 @@
+use crate::events::DexEvent;
 use alloy_primitives::{address, Address, U256};
 use anyhow::Result;
-use crate::events::DexEvent;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct ChainProvider {
@@ -38,25 +38,35 @@ impl ChainProvider {
         let mut out = Vec::new();
 
         if let Some(pool) = settings.aerodrome_usdc_weth_pool {
-            let (reserve0, reserve1) = self.fetch_aerodrome_reserves(pool).await?;
-            out.push(PoolState {
-                pool_id: PoolId {
-                    chain_id: self.chain_id,
-                    address: pool,
-                },
-                dex: DexKind::Aerodrome,
-                variant: PoolVariant::AerodromeVolatile,
-                token0: usdc,
-                token1: weth,
-                fee_bps: 30,
-                reserve0: Some(reserve0),
-                reserve1: Some(reserve1),
-                sqrt_price_x96: None,
-                liquidity: None,
-                tick: None,
-                block_number: self.get_block_number().await?,
-                updated_at: now,
-            });
+            match self.fetch_aerodrome_reserves(pool).await {
+                Ok((reserve0, reserve1)) => {
+                    out.push(PoolState {
+                        pool_id: PoolId {
+                            chain_id: self.chain_id,
+                            address: pool,
+                        },
+                        dex: DexKind::Aerodrome,
+                        variant: PoolVariant::AerodromeVolatile,
+                        token0: usdc,
+                        token1: weth,
+                        fee_bps: 30,
+                        reserve0: Some(reserve0),
+                        reserve1: Some(reserve1),
+                        sqrt_price_x96: None,
+                        liquidity: None,
+                        tick: None,
+                        block_number: self.get_block_number().await?,
+                        updated_at: now,
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        pool = %pool,
+                        error = %err,
+                        "failed to fetch Aerodrome pool reserves; skipping pool"
+                    );
+                }
+            }
         }
 
         for (pool, fee_bps) in [
@@ -64,25 +74,36 @@ impl ChainProvider {
             (settings.uniswap_v3_usdc_weth_3000_pool, 30u32),
         ] {
             if let Some(pool) = pool {
-                let (sqrt_price_x96, tick, liquidity) = self.fetch_uniswap_v3_state(pool).await?;
-                out.push(PoolState {
-                    pool_id: PoolId {
-                        chain_id: self.chain_id,
-                        address: pool,
-                    },
-                    dex: DexKind::UniswapV3,
-                    variant: PoolVariant::UniswapV3,
-                    token0: weth,
-                    token1: usdc,
-                    fee_bps,
-                    reserve0: None,
-                    reserve1: None,
-                    sqrt_price_x96: Some(sqrt_price_x96),
-                    liquidity: Some(liquidity),
-                    tick: Some(tick),
-                    block_number: self.get_block_number().await?,
-                    updated_at: now,
-                });
+                match self.fetch_uniswap_v3_state(pool).await {
+                    Ok((sqrt_price_x96, tick, liquidity)) => {
+                        out.push(PoolState {
+                            pool_id: PoolId {
+                                chain_id: self.chain_id,
+                                address: pool,
+                            },
+                            dex: DexKind::UniswapV3,
+                            variant: PoolVariant::UniswapV3,
+                            token0: weth,
+                            token1: usdc,
+                            fee_bps,
+                            reserve0: None,
+                            reserve1: None,
+                            sqrt_price_x96: Some(sqrt_price_x96),
+                            liquidity: Some(liquidity),
+                            tick: Some(tick),
+                            block_number: self.get_block_number().await?,
+                            updated_at: now,
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            pool = %pool,
+                            fee_bps,
+                            error = %err,
+                            "failed to fetch Uniswap V3 pool state; skipping pool"
+                        );
+                    }
+                }
             }
         }
 
@@ -167,7 +188,9 @@ impl ChainProvider {
     }
 
     async fn fetch_aerodrome_reserves(&self, pool: Address) -> Result<(U256, U256)> {
-        let data = self.eth_call(pool, "0x0902f1ac").await?;
+        let data = self
+            .eth_call(pool, "0x0902f1ac", "Aerodrome getReserves()")
+            .await?;
         let words = decode_32byte_words(&data)?;
         let reserve0 = parse_word_u256(&words[0])?;
         let reserve1 = parse_word_u256(&words[1])?;
@@ -175,19 +198,23 @@ impl ChainProvider {
     }
 
     async fn fetch_uniswap_v3_state(&self, pool: Address) -> Result<(U256, i32, U256)> {
-        let slot0 = self.eth_call(pool, "0x3850c7bd").await?;
+        let slot0 = self
+            .eth_call(pool, "0x3850c7bd", "UniswapV3 slot0()")
+            .await?;
         let slot0_words = decode_32byte_words(&slot0)?;
         let sqrt_price_x96 = parse_word_u256(&slot0_words[0])?;
         let tick = parse_word_i24(&slot0_words[1])?;
 
-        let liquidity = self.eth_call(pool, "0x1a686502").await?;
+        let liquidity = self
+            .eth_call(pool, "0x1a686502", "UniswapV3 liquidity()")
+            .await?;
         let liquidity_words = decode_32byte_words(&liquidity)?;
         let liquidity = parse_word_u256(&liquidity_words[0])?;
 
         Ok((sqrt_price_x96, tick, liquidity))
     }
 
-    async fn eth_call(&self, to: Address, data: &str) -> Result<String> {
+    async fn eth_call(&self, to: Address, data: &str, label: &str) -> Result<String> {
         let value = self
             .rpc(
                 "eth_call",
@@ -200,7 +227,11 @@ impl ChainProvider {
                 ]),
             )
             .await?;
-        Ok(value.as_str().unwrap_or("0x").to_string())
+        let result = value.as_str().unwrap_or("0x").to_string();
+        if result == "0x" {
+            anyhow::bail!("{label} returned empty result for pool {to:#x}");
+        }
+        Ok(result)
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {

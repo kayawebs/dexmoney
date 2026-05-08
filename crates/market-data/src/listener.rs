@@ -3,7 +3,7 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::{PoolStateStore, RecorderStore};
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct MarketDataService<P, R> {
     pub settings: Settings,
@@ -24,6 +24,9 @@ where
             .provider
             .bootstrap_configured_pools(&self.settings)
             .await?;
+        if initial_states.is_empty() {
+            warn!("no configured pools could be initialized successfully");
+        }
         for state in initial_states {
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder.record_pool_state(state.clone()).await?;
