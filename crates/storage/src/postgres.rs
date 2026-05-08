@@ -39,6 +39,7 @@ impl RecorderStore for PostgresStore {
         .bind(i64::try_from(event.log_index)?)
         .bind(address_to_string(event.pool_address))
         .bind(dex_to_string(event.dex))
+        .bind(event.event_type)
         .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind(Option::<String>::None)

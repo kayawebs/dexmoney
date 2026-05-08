@@ -3,6 +3,7 @@ use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::{PoolStateStore, RecorderStore};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::info;
 
 pub struct MarketDataService<P, R> {
@@ -30,28 +31,34 @@ where
             super::state_updater::log_pool_state_update(&state);
         }
 
-        let event = DexEvent {
-            block_number: 1,
-            tx_hash: "0xdemo".into(),
-            log_index: 0,
-            pool_address: self.settings.aerodrome_usdc_weth_pool.unwrap_or(
-                alloy_primitives::address!("1111111111111111111111111111111111111111"),
-            ),
-            dex: base_arb_common::types::DexKind::Aerodrome,
-            event_type: "Sync".into(),
-            raw_data_json: serde_json::json!({
-                "reserve0": "200000000000",
-                "reserve1": "100000000000000000000"
-            }),
-        };
+        let mut ticker = interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        info!(
-            pool = %event.pool_address,
-            event_type = %event.event_type,
-            "event received"
-        );
-        self.recorder.record_dex_event(event).await?;
-        Ok(())
+        loop {
+            ticker.tick().await;
+
+            let event = DexEvent {
+                block_number: 1,
+                tx_hash: "0xdemo".into(),
+                log_index: 0,
+                pool_address: self.settings.aerodrome_usdc_weth_pool.unwrap_or(
+                    alloy_primitives::address!("1111111111111111111111111111111111111111"),
+                ),
+                dex: base_arb_common::types::DexKind::Aerodrome,
+                event_type: "Sync".into(),
+                raw_data_json: serde_json::json!({
+                    "reserve0": "200000000000",
+                    "reserve1": "100000000000000000000"
+                }),
+            };
+
+            info!(
+                pool = %event.pool_address,
+                event_type = %event.event_type,
+                "event received"
+            );
+            self.recorder.record_dex_event(event).await?;
+        }
     }
 }
 

@@ -7,6 +7,7 @@ use base_arb_common::config::Settings;
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PoolStateStore, RecorderStore,
 };
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -21,17 +22,22 @@ async fn main() -> Result<()> {
     let redis = RedisStore::connect(&settings.redis_url).await?;
 
     info!("searcher initialized");
-    run_search_cycle(
-        &redis,
-        &redis,
-        &postgres,
-        &settings,
-        settings.candidate_ttl_ms,
-        settings.max_price_impact_bps,
-        settings.min_expected_profit_usdc,
-    )
-    .await?;
-    Ok(())
+    let mut ticker = interval(Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        run_search_cycle(
+            &redis,
+            &redis,
+            &postgres,
+            &settings,
+            settings.candidate_ttl_ms,
+            settings.max_price_impact_bps,
+            settings.min_expected_profit_usdc,
+        )
+        .await?;
+    }
 }
 
 async fn run_search_cycle<P, C, R>(
@@ -55,6 +61,10 @@ where
         strategy::usdc_to_units(min_expected_profit_usdc),
     )?;
     let pool_states = pool_store.all_pool_states().await?;
+    if pool_states.is_empty() {
+        info!("no pool states available in redis");
+        return Ok(());
+    }
     let candidates = engine.search(&pool_states)?;
 
     for candidate in candidates {
