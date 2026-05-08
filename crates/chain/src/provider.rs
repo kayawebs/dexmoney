@@ -1,12 +1,12 @@
 use crate::events::DexEvent;
-use alloy_primitives::{address, Address, U256};
-use anyhow::Result;
+use alloy_primitives::{Address, U256};
+use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
 use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct ChainProvider {
@@ -38,35 +38,29 @@ impl ChainProvider {
         let mut out = Vec::new();
 
         if let Some(pool) = settings.aerodrome_usdc_weth_pool {
-            match self.fetch_aerodrome_reserves(pool).await {
-                Ok((reserve0, reserve1)) => {
-                    out.push(PoolState {
-                        pool_id: PoolId {
-                            chain_id: self.chain_id,
-                            address: pool,
-                        },
-                        dex: DexKind::Aerodrome,
-                        variant: PoolVariant::AerodromeVolatile,
-                        token0: usdc,
-                        token1: weth,
-                        fee_bps: 30,
-                        reserve0: Some(reserve0),
-                        reserve1: Some(reserve1),
-                        sqrt_price_x96: None,
-                        liquidity: None,
-                        tick: None,
-                        block_number: self.get_block_number().await?,
-                        updated_at: now,
-                    });
-                }
-                Err(err) => {
-                    warn!(
-                        pool = %pool,
-                        error = %err,
-                        "failed to fetch Aerodrome pool reserves; skipping pool"
-                    );
-                }
-            }
+            let (reserve0, reserve1) = self.fetch_aerodrome_reserves(pool).await.with_context(|| {
+                format!(
+                    "failed to initialize AERODROME_USDC_WETH_POOL {pool:#x}; expected a volatile pair supporting getReserves()"
+                )
+            })?;
+            out.push(PoolState {
+                pool_id: PoolId {
+                    chain_id: self.chain_id,
+                    address: pool,
+                },
+                dex: DexKind::Aerodrome,
+                variant: PoolVariant::AerodromeVolatile,
+                token0: usdc,
+                token1: weth,
+                fee_bps: 30,
+                reserve0: Some(reserve0),
+                reserve1: Some(reserve1),
+                sqrt_price_x96: None,
+                liquidity: None,
+                tick: None,
+                block_number: self.get_block_number().await?,
+                updated_at: now,
+            });
         }
 
         for (pool, fee_bps) in [
@@ -74,58 +68,37 @@ impl ChainProvider {
             (settings.uniswap_v3_usdc_weth_3000_pool, 30u32),
         ] {
             if let Some(pool) = pool {
-                match self.fetch_uniswap_v3_state(pool).await {
-                    Ok((sqrt_price_x96, tick, liquidity)) => {
-                        out.push(PoolState {
-                            pool_id: PoolId {
-                                chain_id: self.chain_id,
-                                address: pool,
-                            },
-                            dex: DexKind::UniswapV3,
-                            variant: PoolVariant::UniswapV3,
-                            token0: weth,
-                            token1: usdc,
-                            fee_bps,
-                            reserve0: None,
-                            reserve1: None,
-                            sqrt_price_x96: Some(sqrt_price_x96),
-                            liquidity: Some(liquidity),
-                            tick: Some(tick),
-                            block_number: self.get_block_number().await?,
-                            updated_at: now,
-                        });
-                    }
-                    Err(err) => {
-                        warn!(
-                            pool = %pool,
-                            fee_bps,
-                            error = %err,
-                            "failed to fetch Uniswap V3 pool state; skipping pool"
-                        );
-                    }
-                }
+                let (sqrt_price_x96, tick, liquidity) =
+                    self.fetch_uniswap_v3_state(pool).await.with_context(|| {
+                        format!(
+                            "failed to initialize Uniswap V3 USDC/WETH pool {pool:#x} fee_bps={fee_bps}; expected a V3 pool supporting slot0() and liquidity()"
+                        )
+                    })?;
+                out.push(PoolState {
+                    pool_id: PoolId {
+                        chain_id: self.chain_id,
+                        address: pool,
+                    },
+                    dex: DexKind::UniswapV3,
+                    variant: PoolVariant::UniswapV3,
+                    token0: weth,
+                    token1: usdc,
+                    fee_bps,
+                    reserve0: None,
+                    reserve1: None,
+                    sqrt_price_x96: Some(sqrt_price_x96),
+                    liquidity: Some(liquidity),
+                    tick: Some(tick),
+                    block_number: self.get_block_number().await?,
+                    updated_at: now,
+                });
             }
         }
 
         if out.is_empty() {
-            out.push(PoolState {
-                pool_id: PoolId {
-                    chain_id: self.chain_id,
-                    address: address!("1111111111111111111111111111111111111111"),
-                },
-                dex: DexKind::Aerodrome,
-                variant: PoolVariant::AerodromeVolatile,
-                token0: usdc,
-                token1: weth,
-                fee_bps: 30,
-                reserve0: Some(U256::from(200_000_000_000u64)),
-                reserve1: Some(U256::from(100_000_000_000_000_000_000u128)),
-                sqrt_price_x96: None,
-                liquidity: None,
-                tick: None,
-                block_number: self.get_block_number().await?,
-                updated_at: now,
-            });
+            anyhow::bail!(
+                "no configured pools found; set AERODROME_USDC_WETH_POOL and at least one Uniswap V3 USDC/WETH pool in .env"
+            );
         }
 
         Ok(out)
@@ -226,7 +199,8 @@ impl ChainProvider {
                     "latest"
                 ]),
             )
-            .await?;
+            .await
+            .with_context(|| format!("eth_call {label} to={to:#x} data={data}"))?;
         let result = value.as_str().unwrap_or("0x").to_string();
         if result == "0x" {
             anyhow::bail!("{label} returned empty result for pool {to:#x}");
@@ -250,7 +224,18 @@ impl ChainProvider {
             .await?;
 
         if let Some(error) = response.error {
-            anyhow::bail!("rpc {method} failed: {}", error.message);
+            anyhow::bail!(
+                "rpc {method} failed: code={} message={} data={}",
+                error
+                    .code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                error.message,
+                error
+                    .data
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
         }
 
         response
@@ -280,7 +265,9 @@ struct RpcResponse {
 
 #[derive(Debug, Deserialize)]
 struct RpcError {
+    code: Option<i64>,
     message: String,
+    data: Option<Value>,
 }
 
 fn dex_for_pool(settings: &Settings, pool: Address) -> DexKind {
