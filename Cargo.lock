@@ -1960,9 +1960,12 @@ dependencies = [
 name = "monitor-web"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "axum",
+ "base-arb-chain",
  "base-arb-common",
+ "base-arb-storage",
  "chrono",
  "serde",
  "sqlx",

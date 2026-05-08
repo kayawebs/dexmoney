@@ -46,6 +46,27 @@ pub struct PoolState {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolRegistryEntry {
+    pub pool_address: Address,
+    pub dex: DexKind,
+    pub variant: PoolVariant,
+    pub token0: Address,
+    pub token1: Address,
+    pub fee_bps: u32,
+    pub tick_spacing: Option<i32>,
+    pub stable: Option<bool>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredPool {
+    pub state: PoolState,
+    pub tick_spacing: Option<i32>,
+    pub stable: Option<bool>,
+    pub source: String,
+}
+
 impl PoolState {
     pub fn is_stale(&self, now: DateTime<Utc>, max_age_ms: i64) -> bool {
         now.signed_duration_since(self.updated_at)

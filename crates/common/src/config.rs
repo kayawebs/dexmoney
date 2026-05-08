@@ -14,7 +14,10 @@ pub struct Settings {
     pub usdc_address: Address,
     pub weth_address: Address,
     pub aerodrome_router: Option<Address>,
+    pub aerodrome_pool_factory: Option<Address>,
+    pub aerodrome_slipstream_factory: Option<Address>,
     pub aerodrome_usdc_weth_pool: Option<Address>,
+    pub uniswap_v3_factory: Option<Address>,
     pub uniswap_v3_router: Option<Address>,
     pub uniswap_v3_quoter: Option<Address>,
     pub uniswap_v3_usdc_weth_500_pool: Option<Address>,
@@ -25,6 +28,7 @@ pub struct Settings {
     pub min_simulated_profit_usdc: f64,
     pub candidate_ttl_ms: i64,
     pub max_price_impact_bps: u64,
+    pub monitor_web_password: Option<String>,
 }
 
 impl Settings {

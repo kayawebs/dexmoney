@@ -2,11 +2,20 @@ use crate::events::DexEvent;
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
-use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
+use base_arb_common::types::{
+    DexKind, DiscoveredPool, PoolId, PoolRegistryEntry, PoolState, PoolVariant,
+};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tracing::info;
+
+const AERODROME_POOL_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
+const AERODROME_SLIPSTREAM_FACTORY: &str = "0xeC8E5342B19977B4eF8892e02D8DAEcfa1315831";
+const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
+const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
+const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 5] = [1, 50, 100, 200, 2000];
 
 #[derive(Debug, Clone)]
 pub struct ChainProvider {
@@ -91,9 +100,252 @@ impl ChainProvider {
         Ok(out)
     }
 
+    pub async fn fetch_pool_state_from_registry(
+        &self,
+        entry: &PoolRegistryEntry,
+    ) -> Result<PoolState> {
+        match entry.dex {
+            DexKind::Aerodrome => self.fetch_aerodrome_pool_state(entry.pool_address).await,
+            DexKind::UniswapV3 => {
+                let (token0, token1) = self
+                    .fetch_pool_tokens(entry.pool_address)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to read token0/token1 for Uniswap V3 registry pool {:#x}",
+                            entry.pool_address
+                        )
+                    })?;
+                let (sqrt_price_x96, tick, liquidity) = self
+                    .fetch_uniswap_v3_state(entry.pool_address)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to read state for Uniswap V3 registry pool {:#x}",
+                            entry.pool_address
+                        )
+                    })?;
+                Ok(PoolState {
+                    pool_id: PoolId {
+                        chain_id: self.chain_id,
+                        address: entry.pool_address,
+                    },
+                    dex: DexKind::UniswapV3,
+                    variant: PoolVariant::UniswapV3,
+                    token0,
+                    token1,
+                    fee_bps: entry.fee_bps,
+                    reserve0: None,
+                    reserve1: None,
+                    sqrt_price_x96: Some(sqrt_price_x96),
+                    liquidity: Some(liquidity),
+                    tick: Some(tick),
+                    block_number: self.get_block_number().await?,
+                    updated_at: Utc::now(),
+                })
+            }
+        }
+    }
+
+    pub async fn discover_pools_for_pair(
+        &self,
+        settings: &Settings,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<Vec<DiscoveredPool>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        self.discover_aerodrome_classic(settings, token_a, token_b, &mut seen, &mut out)
+            .await?;
+        self.discover_aerodrome_slipstream(settings, token_a, token_b, &mut seen, &mut out)
+            .await?;
+        self.discover_uniswap_v3(settings, token_a, token_b, &mut seen, &mut out)
+            .await?;
+
+        Ok(out)
+    }
+
     pub async fn get_block_number(&self) -> Result<u64> {
         let value = self.rpc("eth_blockNumber", json!([])).await?;
         parse_hex_u64(value.as_str().unwrap_or("0x0"))
+    }
+
+    async fn discover_aerodrome_classic(
+        &self,
+        settings: &Settings,
+        token_a: Address,
+        token_b: Address,
+        seen: &mut HashSet<Address>,
+        out: &mut Vec<DiscoveredPool>,
+    ) -> Result<()> {
+        let factory = settings
+            .aerodrome_pool_factory
+            .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
+
+        for stable in [false, true] {
+            let data = encode_get_pool_bool(token_a, token_b, stable);
+            match self
+                .eth_call(
+                    factory,
+                    &data,
+                    "Aerodrome factory getPool(address,address,bool)",
+                )
+                .await
+            {
+                Ok(raw) => {
+                    let pool = decode_single_address(&raw)?;
+                    if pool == Address::ZERO || !seen.insert(pool) {
+                        continue;
+                    }
+                    let state = self
+                        .fetch_aerodrome_pool_state(pool)
+                        .await
+                        .with_context(|| {
+                            format!("Aerodrome classic discovered pool {pool:#x} is not readable")
+                        })?;
+                    out.push(DiscoveredPool {
+                        state,
+                        tick_spacing: None,
+                        stable: Some(stable),
+                        source: "aerodrome_classic_factory".to_string(),
+                    });
+                }
+                Err(err) => {
+                    info!(factory = %factory, stable, error = %err, "Aerodrome classic discovery probe failed")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn discover_aerodrome_slipstream(
+        &self,
+        settings: &Settings,
+        token_a: Address,
+        token_b: Address,
+        seen: &mut HashSet<Address>,
+        out: &mut Vec<DiscoveredPool>,
+    ) -> Result<()> {
+        let factory = settings
+            .aerodrome_slipstream_factory
+            .unwrap_or(AERODROME_SLIPSTREAM_FACTORY.parse()?);
+        let tick_spacings = self
+            .fetch_slipstream_tick_spacings(factory)
+            .await
+            .unwrap_or_else(|err| {
+                info!(factory = %factory, error = %err, "Aerodrome Slipstream tickSpacings() failed; using fallback tick spacings");
+                FALLBACK_SLIPSTREAM_TICK_SPACINGS.to_vec()
+            });
+
+        for tick_spacing in tick_spacings {
+            let data = encode_get_pool_int24(token_a, token_b, tick_spacing);
+            match self
+                .eth_call(
+                    factory,
+                    &data,
+                    "Aerodrome Slipstream getPool(address,address,int24)",
+                )
+                .await
+            {
+                Ok(raw) => {
+                    let pool = decode_single_address(&raw)?;
+                    if pool == Address::ZERO || !seen.insert(pool) {
+                        continue;
+                    }
+                    let state = self
+                        .fetch_aerodrome_pool_state(pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Aerodrome Slipstream discovered pool {pool:#x} is not readable"
+                            )
+                        })?;
+                    out.push(DiscoveredPool {
+                        state,
+                        tick_spacing: Some(tick_spacing),
+                        stable: None,
+                        source: "aerodrome_slipstream_factory".to_string(),
+                    });
+                }
+                Err(err) => {
+                    info!(factory = %factory, tick_spacing, error = %err, "Aerodrome Slipstream discovery probe failed")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn discover_uniswap_v3(
+        &self,
+        settings: &Settings,
+        token_a: Address,
+        token_b: Address,
+        seen: &mut HashSet<Address>,
+        out: &mut Vec<DiscoveredPool>,
+    ) -> Result<()> {
+        let factory = settings
+            .uniswap_v3_factory
+            .unwrap_or(UNISWAP_V3_FACTORY.parse()?);
+
+        for fee in UNISWAP_V3_FEE_TIERS {
+            let data = encode_get_pool_uint24(token_a, token_b, fee);
+            match self
+                .eth_call(
+                    factory,
+                    &data,
+                    "Uniswap V3 factory getPool(address,address,uint24)",
+                )
+                .await
+            {
+                Ok(raw) => {
+                    let pool = decode_single_address(&raw)?;
+                    if pool == Address::ZERO || !seen.insert(pool) {
+                        continue;
+                    }
+                    let (token0, token1) = self.fetch_pool_tokens(pool).await?;
+                    let (sqrt_price_x96, tick, liquidity) =
+                        self.fetch_uniswap_v3_state(pool).await?;
+                    out.push(DiscoveredPool {
+                        state: PoolState {
+                            pool_id: PoolId {
+                                chain_id: self.chain_id,
+                                address: pool,
+                            },
+                            dex: DexKind::UniswapV3,
+                            variant: PoolVariant::UniswapV3,
+                            token0,
+                            token1,
+                            fee_bps: fee / 100,
+                            reserve0: None,
+                            reserve1: None,
+                            sqrt_price_x96: Some(sqrt_price_x96),
+                            liquidity: Some(liquidity),
+                            tick: Some(tick),
+                            block_number: self.get_block_number().await?,
+                            updated_at: Utc::now(),
+                        },
+                        tick_spacing: None,
+                        stable: None,
+                        source: format!("uniswap_v3_factory_fee_{fee}"),
+                    });
+                }
+                Err(err) => {
+                    info!(factory = %factory, fee, error = %err, "Uniswap V3 discovery probe failed")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_slipstream_tick_spacings(&self, factory: Address) -> Result<Vec<i32>> {
+        let raw = self
+            .eth_call(factory, "0x9cbbbe86", "Aerodrome Slipstream tickSpacings()")
+            .await?;
+        decode_int24_array(&raw)
     }
 
     pub async fn fetch_relevant_events_for_pools(
@@ -477,4 +729,75 @@ fn parse_word_i24(word: &str) -> Result<i32> {
         low as i32
     };
     Ok(signed)
+}
+
+fn decode_single_address(data: &str) -> Result<Address> {
+    let words = decode_32byte_words(data)?;
+    parse_word_address(&words[0])
+}
+
+fn decode_int24_array(data: &str) -> Result<Vec<i32>> {
+    let words = decode_32byte_words(data)?;
+    if words.len() < 2 {
+        anyhow::bail!("dynamic int24 array response is too short");
+    }
+    let len = parse_word_u256(&words[1])?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("tickSpacings() length does not fit usize"))?;
+    let values = words
+        .iter()
+        .skip(2)
+        .take(len)
+        .map(|word| parse_word_i24(word))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(values)
+}
+
+fn encode_get_pool_bool(token_a: Address, token_b: Address, stable: bool) -> String {
+    format!(
+        "0x79bc57d5{}{}{}",
+        encode_address_word(token_a),
+        encode_address_word(token_b),
+        encode_bool_word(stable),
+    )
+}
+
+fn encode_get_pool_uint24(token_a: Address, token_b: Address, fee: u32) -> String {
+    format!(
+        "0x1698ee82{}{}{}",
+        encode_address_word(token_a),
+        encode_address_word(token_b),
+        encode_u32_word(fee),
+    )
+}
+
+fn encode_get_pool_int24(token_a: Address, token_b: Address, tick_spacing: i32) -> String {
+    format!(
+        "0x28af8d0b{}{}{}",
+        encode_address_word(token_a),
+        encode_address_word(token_b),
+        encode_i24_word(tick_spacing),
+    )
+}
+
+fn encode_address_word(address: Address) -> String {
+    let clean = format!("{address:#x}").trim_start_matches("0x").to_string();
+    format!("{clean:0>64}")
+}
+
+fn encode_bool_word(value: bool) -> String {
+    encode_u32_word(u32::from(value))
+}
+
+fn encode_u32_word(value: u32) -> String {
+    format!("{value:064x}")
+}
+
+fn encode_i24_word(value: i32) -> String {
+    if value >= 0 {
+        format!("{value:064x}")
+    } else {
+        let low24 = ((1_i32 << 24) + value) as u32;
+        format!("{}{:06x}", "f".repeat(58), low24)
+    }
 }

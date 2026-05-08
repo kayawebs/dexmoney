@@ -1,42 +1,33 @@
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_storage::{PoolStateStore, RecorderStore};
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use base_arb_common::types::PoolState;
+use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore};
+use std::collections::HashSet;
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::info;
 
-pub struct MarketDataService<P, R> {
+const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
+
+pub struct MarketDataService<P> {
     pub settings: Settings,
     pub provider: ChainProvider,
     pub pool_store: P,
-    pub recorder: R,
+    pub recorder: PostgresStore,
 }
 
-impl<P, R> MarketDataService<P, R>
+impl<P> MarketDataService<P>
 where
     P: PoolStateStore,
-    R: RecorderStore,
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
 
-        let mut monitored_states = self
-            .provider
-            .bootstrap_configured_pools(&self.settings)
-            .await?;
-        for state in &monitored_states {
-            self.pool_store.set_pool_state(state.clone()).await?;
-            self.recorder.record_pool_state(state.clone()).await?;
-            super::state_updater::log_pool_state_update(state);
-            info!(
-                pool = %state.pool_id.address,
-                dex = ?state.dex,
-                variant = ?state.variant,
-                "monitoring pool logs"
-            );
-        }
+        let mut monitored_states = self.load_monitored_states().await?;
+        self.publish_monitored_states(&monitored_states).await?;
 
         let mut last_seen_block = self.provider.get_block_number().await?;
+        let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         info!(last_seen_block, "market-data synchronized at startup");
 
         let mut ticker = interval(Duration::from_secs(3));
@@ -46,7 +37,16 @@ where
             ticker.tick().await;
             let latest_block = self.provider.get_block_number().await?;
             if latest_block <= last_seen_block {
+                if Instant::now() >= next_registry_reload {
+                    monitored_states = self.reload_if_changed(monitored_states).await?;
+                    next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
+                }
                 continue;
+            }
+
+            if Instant::now() >= next_registry_reload {
+                monitored_states = self.reload_if_changed(monitored_states).await?;
+                next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
             }
 
             let events = self
@@ -69,33 +69,96 @@ where
             }
 
             if !events.is_empty() {
-                monitored_states = self
-                    .provider
-                    .bootstrap_configured_pools(&self.settings)
-                    .await?;
-                for state in &monitored_states {
-                    self.pool_store.set_pool_state(state.clone()).await?;
-                    self.recorder.record_pool_state(state.clone()).await?;
-                    super::state_updater::log_pool_state_update(state);
-                    info!(
-                        pool = %state.pool_id.address,
-                        dex = ?state.dex,
-                        variant = ?state.variant,
-                        "monitoring pool logs"
-                    );
-                }
+                monitored_states = self.refresh_current_states(&monitored_states).await?;
+                self.publish_monitored_states(&monitored_states).await?;
             }
 
             last_seen_block = latest_block;
         }
     }
+
+    async fn load_monitored_states(&self) -> Result<Vec<PoolState>> {
+        let registry_pools = self.recorder.enabled_registry_pools().await?;
+        if registry_pools.is_empty() {
+            info!("pool registry is empty; falling back to .env configured pools");
+            return self
+                .provider
+                .bootstrap_configured_pools(&self.settings)
+                .await;
+        }
+
+        let mut out = Vec::with_capacity(registry_pools.len());
+        for entry in &registry_pools {
+            out.push(self.provider.fetch_pool_state_from_registry(entry).await?);
+        }
+        Ok(out)
+    }
+
+    async fn reload_if_changed(&self, current: Vec<PoolState>) -> Result<Vec<PoolState>> {
+        let next = self.load_monitored_states().await?;
+        let current_addresses = address_set(&current);
+        let next_addresses = address_set(&next);
+        if current_addresses != next_addresses {
+            info!(
+                previous = current_addresses.len(),
+                next = next_addresses.len(),
+                "pool registry changed; reloading monitored pools"
+            );
+            self.publish_monitored_states(&next).await?;
+        }
+        Ok(next)
+    }
+
+    async fn refresh_current_states(&self, states: &[PoolState]) -> Result<Vec<PoolState>> {
+        let registry_entries = states
+            .iter()
+            .map(|state| base_arb_common::types::PoolRegistryEntry {
+                pool_address: state.pool_id.address,
+                dex: state.dex,
+                variant: state.variant,
+                token0: state.token0,
+                token1: state.token1,
+                fee_bps: state.fee_bps,
+                tick_spacing: None,
+                stable: None,
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+
+        let mut out = Vec::with_capacity(registry_entries.len());
+        for entry in &registry_entries {
+            out.push(self.provider.fetch_pool_state_from_registry(entry).await?);
+        }
+        Ok(out)
+    }
+
+    async fn publish_monitored_states(&self, states: &[PoolState]) -> Result<()> {
+        for state in states {
+            self.pool_store.set_pool_state(state.clone()).await?;
+            self.recorder.record_pool_state(state.clone()).await?;
+            super::state_updater::log_pool_state_update(state);
+            info!(
+                pool = %state.pool_id.address,
+                dex = ?state.dex,
+                variant = ?state.variant,
+                "monitoring pool logs"
+            );
+        }
+        Ok(())
+    }
 }
 
-pub async fn run<P, R>(service: &MarketDataService<P, R>) -> Result<()>
+pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
 where
     P: PoolStateStore,
-    R: RecorderStore,
 {
     service.run().await?;
     Ok(())
+}
+
+fn address_set(states: &[PoolState]) -> HashSet<String> {
+    states
+        .iter()
+        .map(|state| format!("{:#x}", state.pool_id.address))
+        .collect()
 }

@@ -6,7 +6,10 @@ use tracing::info;
 
 use crate::RecorderStore;
 use base_arb_chain::events::DexEvent;
-use base_arb_common::types::{Candidate, DexKind, PoolState, SimulationResult, TxResult};
+use base_arb_common::types::{
+    Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolVariant,
+    SimulationResult, TxResult,
+};
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -16,8 +19,174 @@ pub struct PostgresStore {
 impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPool::connect(url).await?;
+        ensure_registry_schema(&pool).await?;
         info!("connected to postgres");
         Ok(Self { pool })
+    }
+
+    pub async fn upsert_token_pair(
+        &self,
+        chain_id: u64,
+        token0: Address,
+        token1: Address,
+        symbol: &str,
+    ) -> Result<uuid::Uuid> {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO token_pairs (id, chain_id, token0, token1, symbol, enabled, created_at, updated_at)
+            VALUES (uuid_generate_v4(), $1, $2, $3, $4, TRUE, NOW(), NOW())
+            ON CONFLICT (chain_id, token0, token1)
+            DO UPDATE SET symbol = EXCLUDED.symbol, enabled = TRUE, updated_at = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(token0))
+        .bind(address_to_string(token1))
+        .bind(symbol)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    pub async fn upsert_discovered_pool(
+        &self,
+        token_pair_id: uuid::Uuid,
+        discovered: &DiscoveredPool,
+    ) -> Result<()> {
+        let state = &discovered.state;
+        sqlx::query(
+            r#"
+            INSERT INTO pools (
+                id, token_pair_id, chain_id, pool_address, dex, variant, token0, token1,
+                fee_bps, tick_spacing, stable, enabled, source, created_at, updated_at
+            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,$11,NOW(),NOW())
+            ON CONFLICT (chain_id, pool_address)
+            DO UPDATE SET
+                token_pair_id = EXCLUDED.token_pair_id,
+                dex = EXCLUDED.dex,
+                variant = EXCLUDED.variant,
+                token0 = EXCLUDED.token0,
+                token1 = EXCLUDED.token1,
+                fee_bps = EXCLUDED.fee_bps,
+                tick_spacing = EXCLUDED.tick_spacing,
+                stable = EXCLUDED.stable,
+                enabled = TRUE,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(token_pair_id)
+        .bind(i64::try_from(state.pool_id.chain_id)?)
+        .bind(address_to_string(state.pool_id.address))
+        .bind(dex_to_string(state.dex))
+        .bind(variant_to_string(state.variant))
+        .bind(address_to_string(state.token0))
+        .bind(address_to_string(state.token1))
+        .bind(i64::from(state.fee_bps))
+        .bind(discovered.tick_spacing.map(i64::from))
+        .bind(discovered.stable)
+        .bind(&discovered.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn enabled_registry_pools(&self) -> Result<Vec<PoolRegistryEntry>> {
+        let rows = sqlx::query_as::<_, PoolRegistryRow>(
+            r#"
+            SELECT pool_address, dex, variant, token0, token1, fee_bps, tick_spacing, stable, enabled
+            FROM pools
+            WHERE enabled = TRUE
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(PoolRegistryEntry::try_from).collect()
+    }
+}
+
+pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+        CREATE TABLE IF NOT EXISTS token_pairs (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            token0 TEXT NOT NULL,
+            token1 TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, token0, token1)
+        );
+
+        CREATE INDEX IF NOT EXISTS token_pairs_enabled_idx
+            ON token_pairs (enabled, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS pools (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            token_pair_id UUID REFERENCES token_pairs(id),
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            token0 TEXT NOT NULL,
+            token1 TEXT NOT NULL,
+            fee_bps BIGINT,
+            tick_spacing BIGINT,
+            stable BOOLEAN,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            source TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, pool_address)
+        );
+
+        CREATE INDEX IF NOT EXISTS pools_enabled_idx
+            ON pools (enabled, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS pools_pair_idx
+            ON pools (token_pair_id, enabled);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct PoolRegistryRow {
+    pool_address: String,
+    dex: String,
+    variant: String,
+    token0: String,
+    token1: String,
+    fee_bps: Option<i64>,
+    tick_spacing: Option<i64>,
+    stable: Option<bool>,
+    enabled: bool,
+}
+
+impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(row: PoolRegistryRow) -> Result<Self> {
+        Ok(Self {
+            pool_address: row.pool_address.parse()?,
+            dex: parse_dex(&row.dex)?,
+            variant: parse_variant(&row.variant)?,
+            token0: row.token0.parse()?,
+            token1: row.token1.parse()?,
+            fee_bps: u32::try_from(row.fee_bps.unwrap_or_default())?,
+            tick_spacing: row.tick_spacing.map(i32::try_from).transpose()?,
+            stable: row.stable,
+            enabled: row.enabled,
+        })
     }
 }
 
@@ -163,5 +332,30 @@ fn dex_to_string(dex: DexKind) -> &'static str {
     match dex {
         DexKind::Aerodrome => "Aerodrome",
         DexKind::UniswapV3 => "UniswapV3",
+    }
+}
+
+fn variant_to_string(variant: PoolVariant) -> &'static str {
+    match variant {
+        PoolVariant::AerodromeVolatile => "AerodromeVolatile",
+        PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
+        PoolVariant::UniswapV3 => "UniswapV3",
+    }
+}
+
+fn parse_dex(value: &str) -> Result<DexKind> {
+    match value {
+        "Aerodrome" => Ok(DexKind::Aerodrome),
+        "UniswapV3" => Ok(DexKind::UniswapV3),
+        _ => anyhow::bail!("unknown dex kind {value}"),
+    }
+}
+
+fn parse_variant(value: &str) -> Result<PoolVariant> {
+    match value {
+        "AerodromeVolatile" => Ok(PoolVariant::AerodromeVolatile),
+        "AerodromeSlipstream" => Ok(PoolVariant::AerodromeSlipstream),
+        "UniswapV3" => Ok(PoolVariant::UniswapV3),
+        _ => anyhow::bail!("unknown pool variant {value}"),
     }
 }

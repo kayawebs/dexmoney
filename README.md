@@ -41,9 +41,10 @@ base-arb-bot/
 - `storage`: Postgres / Redis access skeleton and schema notes
 - `dex`: DEX adapters, pool state models, quoters
 - `recorder`: replay/debug record models
-- `market-data`: WS listener and state updater skeleton
+- `market-data`: RPC log poller and pool state updater
 - `searcher`: opportunity generation and risk gate skeleton
 - `execution-manager`: candidate execution, simulation, lane state skeleton
+- `monitor-web`: lightweight Postgres dashboard and pool registry admin
 
 ## Quick Start
 
@@ -87,6 +88,11 @@ curl -sS http://127.0.0.1:8085/healthz
 open http://127.0.0.1:8085
 ```
 
+The monitor includes a protected form for adding token pairs. Set `MONITOR_WEB_PASSWORD`
+in `.env`, then submit two token addresses. The app discovers Aerodrome Classic,
+Aerodrome Slipstream, and Uniswap V3 pools, writes them into `pools`, and
+`market-data` reloads enabled pools from Postgres every 30 seconds.
+
 ## Docker
 
 Build a specific process image with `APP_BIN`:
@@ -102,8 +108,8 @@ The compose file in this repo currently provisions only Postgres and Redis. The 
 ## Notes
 
 - The current `.env.example` is prefilled so the current scaffold can boot without manual editing.
-- `AERODROME_USDC_WETH_POOL` is set to an Aerodrome WETH/USDC-related contract address so the current bootstrap/search path has a concrete address to use before full onchain discovery is implemented.
-- `monitor-web` is a read-only Postgres dashboard on `http://127.0.0.1:8085`.
+- `AERODROME_USDC_WETH_POOL` is still supported as a fallback bootstrap address when the `pools` registry is empty.
+- `monitor-web` runs on `http://127.0.0.1:8085`.
 
 ## Current Status
 
@@ -114,6 +120,7 @@ This initialization provides:
 - Aerodrome volatile pool quote math
 - searcher / execution skeletons
 - Postgres migration and Redis key conventions
+- token pair and pool registry with web-driven discovery
 - Foundry contract skeleton and baseline tests
 
-It does not yet provide production-ready chain integration, router calldata encoding, or full Uniswap V3 local tick simulation.
+It does not yet provide production-ready router calldata encoding or full Uniswap V3 local tick simulation.
