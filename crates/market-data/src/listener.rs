@@ -1,7 +1,7 @@
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::types::{DiscoveredPool, PoolState};
+use base_arb_common::types::PoolState;
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore};
 use std::collections::HashSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
@@ -23,7 +23,6 @@ where
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
 
-        self.sync_env_bootstrap_pools().await?;
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states).await?;
 
@@ -82,12 +81,10 @@ where
         let registry_pools = self.recorder.enabled_registry_pools().await?;
         if registry_pools.is_empty() {
             info!("pool registry is empty; falling back to .env configured pools");
-            let states = self
+            return self
                 .provider
                 .bootstrap_configured_pools(&self.settings)
-                .await?;
-            self.seed_registry_from_states(&states).await?;
-            return Ok(states);
+                .await;
         }
 
         let mut out = Vec::with_capacity(registry_pools.len());
@@ -149,42 +146,6 @@ where
         }
         Ok(())
     }
-
-    async fn sync_env_bootstrap_pools(&self) -> Result<()> {
-        let states = self
-            .provider
-            .bootstrap_configured_pools(&self.settings)
-            .await?;
-        self.seed_registry_from_states(&states).await?;
-        Ok(())
-    }
-
-    async fn seed_registry_from_states(&self, states: &[PoolState]) -> Result<()> {
-        for state in states {
-            let symbol = short_pair_symbol(state);
-            let pair_id = self
-                .recorder
-                .upsert_token_pair(state.pool_id.chain_id, state.token0, state.token1, &symbol)
-                .await?;
-            self.recorder
-                .upsert_discovered_pool(
-                    pair_id,
-                    &DiscoveredPool {
-                        state: state.clone(),
-                        tick_spacing: None,
-                        stable: None,
-                        source: "env_bootstrap".to_string(),
-                    },
-                )
-                .await?;
-            info!(
-                pool = %state.pool_id.address,
-                symbol,
-                "seeded .env bootstrap pool into registry"
-            );
-        }
-        Ok(())
-    }
 }
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
@@ -200,17 +161,4 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
         .iter()
         .map(|state| format!("{:#x}", state.pool_id.address))
         .collect()
-}
-
-fn short_pair_symbol(state: &PoolState) -> String {
-    format!(
-        "{}/{}",
-        short_address(state.token0),
-        short_address(state.token1)
-    )
-}
-
-fn short_address(address: alloy_primitives::Address) -> String {
-    let value = format!("{address:#x}");
-    value.chars().take(8).collect()
 }

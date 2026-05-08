@@ -111,6 +111,11 @@ struct AddPairForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct FallbackForm {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
 }
@@ -136,6 +141,7 @@ async fn main() -> Result<()> {
         .route("/activity", get(activity_page))
         .route("/execution", get(execution_page))
         .route("/pairs", post(add_pair))
+        .route("/registry/fallback", post(add_fallback_pools))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -338,6 +344,54 @@ async fn add_pair(
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
+async fn add_fallback_pools(
+    State(state): State<AppState>,
+    Form(form): Form<FallbackForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let states = state
+        .provider
+        .bootstrap_configured_pools(&state.settings)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+
+    let mut inserted = 0usize;
+    for state in states {
+        let symbol = short_pair_symbol(&state);
+        let pair_id = store
+            .upsert_token_pair(state.pool_id.chain_id, state.token0, state.token1, &symbol)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .upsert_discovered_pool(
+                pair_id,
+                &base_arb_common::types::DiscoveredPool {
+                    state,
+                    tick_spacing: None,
+                    stable: None,
+                    source: "env_fallback_button".to_string(),
+                },
+            )
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        inserted += 1;
+    }
+
+    let message = format!("loaded {inserted} .env fallback pools into registry");
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
 async fn render_registry_response(
     pool: &PgPool,
     auth_password: Option<&str>,
@@ -367,6 +421,12 @@ async fn render_registry_response(
               <input name="token1" placeholder="0x..." required>
             </label>
             <button type="submit">Discover Pools</button>
+          </form>
+          <form method="post" action="/registry/fallback" class="fallback-form">
+            <label>Password
+              <input name="password" type="password" autocomplete="current-password" required>
+            </label>
+            <button type="submit">Load .env Fallback Pools</button>
           </form>
         </section>
         <section class="card">
@@ -550,6 +610,10 @@ fn render_page(
       border: 1px solid var(--line);
       border-radius: 14px;
       background: rgba(22,27,34,0.82);
+    }}
+    .admin {{
+      display: grid;
+      gap: 14px;
     }}
     .admin form {{
       display: grid;
@@ -962,4 +1026,17 @@ fn normalized_symbol(symbol: &str, token0: &str, token1: &str) -> String {
         &token0[..token0.len().min(6)],
         &token1[..token1.len().min(6)]
     )
+}
+
+fn short_pair_symbol(state: &base_arb_common::types::PoolState) -> String {
+    format!(
+        "{}/{}",
+        short_address(state.token0),
+        short_address(state.token1)
+    )
+}
+
+fn short_address(address: Address) -> String {
+    let value = format!("{address:#x}");
+    value.chars().take(8).collect()
 }
