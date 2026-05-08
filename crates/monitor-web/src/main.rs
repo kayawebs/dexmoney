@@ -469,6 +469,19 @@ fn render_dashboard(
       text-transform: uppercase;
       border-bottom: 1px solid var(--line);
     }}
+    .card-body {{
+      max-height: 450px;
+      overflow-y: auto;
+    }}
+    .table-scroll {{
+      width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+    }}
+    .table-scroll table {{
+      min-width: max-content;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -486,13 +499,43 @@ fn render_dashboard(
     .warn {{ color: var(--warn); }}
     .bad {{ color: var(--bad); }}
     .mono {{
-      max-width: 180px;
+      max-width: 150px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       display: inline-block;
+      vertical-align: middle;
+    }}
+    .copyable {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 220px;
+    }}
+    .copy-btn {{
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 4px 7px;
+      color: var(--text);
+      background: rgba(255,255,255,0.04);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1;
     }}
   </style>
+  <script>
+    async function copyValue(button) {{
+      const value = button.dataset.copy;
+      try {{
+        await navigator.clipboard.writeText(value);
+        const label = button.textContent;
+        button.textContent = "copied";
+        window.setTimeout(() => button.textContent = label, 900);
+      }} catch (_) {{
+        window.prompt("Copy value", value);
+      }}
+    }}
+  </script>
 </head>
 <body>
   <h1>Base Arb Monitor</h1>
@@ -518,31 +561,31 @@ fn render_dashboard(
   <div class="grid">
     <section class="card">
       <h2>Token Pairs</h2>
-      {token_pairs}
+      <div class="card-body">{token_pairs}</div>
     </section>
     <section class="card">
       <h2>Pool Registry</h2>
-      {registry_pools}
+      <div class="card-body">{registry_pools}</div>
     </section>
     <section class="card">
       <h2>DEX Events</h2>
-      {events}
+      <div class="card-body">{events}</div>
     </section>
     <section class="card">
       <h2>Pool States</h2>
-      {pool_states}
+      <div class="card-body">{pool_states}</div>
     </section>
     <section class="card">
       <h2>Opportunities</h2>
-      {opportunities}
+      <div class="card-body">{opportunities}</div>
     </section>
     <section class="card">
       <h2>Simulations</h2>
-      {simulations}
+      <div class="card-body">{simulations}</div>
     </section>
     <section class="card">
       <h2>Transactions</h2>
-      {transactions}
+      <div class="card-body">{transactions}</div>
     </section>
   </div>
 </body>
@@ -593,23 +636,23 @@ fn render_login() -> String {
 
 fn render_events_table(rows: &[DexEventRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Time</th><th>Block</th><th>DEX</th><th>Event</th><th>Pool</th><th>Tx</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>DEX</th><th>Event</th><th>Pool</th><th>Tx</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><span class=\"mono\">{}</span></td><td><span class=\"mono\">{}</span></td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.block_number,
             escape(&row.dex),
             escape(&row.event_type),
-            escape(&row.pool_address),
-            escape(&row.tx_hash),
+            copyable(&row.pool_address),
+            copyable(&row.tx_hash),
         ));
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
@@ -621,39 +664,39 @@ fn render_flash(value: Option<&str>) -> String {
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Enabled</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Enabled</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td><span class=\"mono\">{}</span></td><td><span class=\"mono\">{}</span></td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.chain_id,
             escape(&row.symbol),
-            escape(&row.token0),
-            escape(&row.token1),
+            copyable(&row.token0),
+            copyable(&row.token1),
             row.enabled,
         ));
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Created</th><th>DEX</th><th>Variant</th><th>Pool</th><th>Pair</th><th>Fee</th><th>Tick</th><th>Stable</th><th>Enabled</th><th>Source</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>DEX</th><th>Variant</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Tick</th><th>Stable</th><th>Enabled</th><th>Source</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td><span class=\"mono\">{}</span></td><td><span class=\"mono\">{}/{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             escape(&row.dex),
             escape(&row.variant),
-            escape(&row.pool_address),
-            escape(&row.token0),
-            escape(&row.token1),
+            copyable(&row.pool_address),
+            copyable(&row.token0),
+            copyable(&row.token1),
             row.fee_bps.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             row.tick_spacing.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             row.stable.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
@@ -662,39 +705,38 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"10\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Pool</th><th>Pair</th><th>Fee</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td><span class=\"mono\">{}</span></td><td><span class=\"mono\">{}/{}\
-            </span></td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.updated_at),
             row.block_number,
             escape(&row.dex),
-            escape(&row.pool_address),
-            escape(&row.token0),
-            escape(&row.token1),
+            copyable(&row.pool_address),
+            copyable(&row.token0),
+            copyable(&row.token1),
             row.fee.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Time</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Status</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Status</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
@@ -710,13 +752,13 @@ fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_simulations_table(rows: &[SimulationRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Time</th><th>Success</th><th>Profit</th><th>Gas</th><th>Revert</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Success</th><th>Profit</th><th>Gas</th><th>Revert</th></tr></thead><tbody>",
     );
     for row in rows {
         let class = if row.success { "ok" } else { "bad" };
@@ -733,20 +775,23 @@ fn render_simulations_table(rows: &[SimulationRow]) -> String {
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"5\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_transactions_table(rows: &[TransactionRow]) -> String {
     let mut html = String::from(
-        "<table><thead><tr><th>Time</th><th>EOA</th><th>Tx Hash</th><th>Nonce</th><th>Status</th><th>Profit</th><th>Revert</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>EOA</th><th>Tx Hash</th><th>Nonce</th><th>Status</th><th>Profit</th><th>Revert</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td><span class=\"mono\">{}</span></td><td><span class=\"mono\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
-            escape(&row.eoa),
-            escape(row.tx_hash.as_deref().unwrap_or("-")),
+            copyable(&row.eoa),
+            row.tx_hash
+                .as_deref()
+                .map(copyable)
+                .unwrap_or_else(|| "-".to_string()),
             row.nonce,
             escape(&row.status),
             escape(row.realized_profit.as_deref().unwrap_or("-")),
@@ -756,7 +801,7 @@ fn render_transactions_table(rows: &[TransactionRow]) -> String {
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
     }
-    html.push_str("</tbody></table>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
@@ -770,6 +815,14 @@ fn escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn copyable(value: &str) -> String {
+    let escaped = escape(value);
+    format!(
+        "<span class=\"copyable\"><span class=\"mono\" title=\"{0}\">{0}</span><button class=\"copy-btn\" type=\"button\" data-copy=\"{0}\" onclick=\"copyValue(this)\">copy</button></span>",
+        escaped
+    )
 }
 
 fn password_matches(expected: Option<&str>, actual: &str) -> bool {
