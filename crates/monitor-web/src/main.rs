@@ -12,7 +12,7 @@ use axum::{
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::postgres::{ensure_registry_schema, PostgresStore};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sqlx::{FromRow, PgPool};
 use tracing::info;
@@ -118,6 +118,7 @@ struct TokenPairRow {
 #[derive(Debug, FromRow)]
 struct PoolRegistryRow {
     created_at: DateTime<Utc>,
+    last_update_time: Option<DateTime<Utc>>,
     dex: String,
     variant: String,
     pair_symbol: Option<String>,
@@ -547,6 +548,7 @@ async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
         r#"
         SELECT
             p.created_at,
+            GREATEST(events.last_event_at, states.last_state_at) AS last_update_time,
             p.dex,
             p.variant,
             tp.symbol AS pair_symbol,
@@ -561,6 +563,16 @@ async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
             p.source
         FROM pools p
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        LEFT JOIN (
+            SELECT lower(pool_address) AS pool_address, MAX(created_at) AS last_event_at
+            FROM dex_events
+            GROUP BY lower(pool_address)
+        ) events ON events.pool_address = lower(p.pool_address)
+        LEFT JOIN (
+            SELECT lower(pool_address) AS pool_address, MAX(updated_at) AS last_state_at
+            FROM pool_states
+            GROUP BY lower(pool_address)
+        ) states ON states.pool_address = lower(p.pool_address)
         ORDER BY p.created_at DESC
         LIMIT 100
         "#,
@@ -1108,12 +1120,16 @@ fn render_delete_pair_form(row: &TokenPairRow) -> String {
 
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Last Update Time</th><th>Activity</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
+            row.last_update_time
+                .map(fmt_ts)
+                .unwrap_or_else(|| "-".into()),
+            activity_status(row.last_update_time),
             escape(&row.dex),
             escape(&row.variant),
             row.pair_symbol
@@ -1130,7 +1146,7 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"13\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1323,6 +1339,20 @@ fn monitoring_status(enabled: bool) -> String {
         "<span class=\"ok\">enabled</span>".into()
     } else {
         "<span class=\"bad\">disabled</span>".into()
+    }
+}
+
+fn activity_status(last_update_time: Option<DateTime<Utc>>) -> String {
+    let Some(last_update_time) = last_update_time else {
+        return "<span class=\"bad\">never seen</span>".into();
+    };
+    let age = Utc::now().signed_duration_since(last_update_time);
+    if age <= Duration::minutes(10) {
+        "<span class=\"ok\">active</span>".into()
+    } else if age <= Duration::minutes(30) {
+        "<span class=\"warn\">stale</span>".into()
+    } else {
+        "<span class=\"bad\">inactive</span>".into()
     }
 }
 
