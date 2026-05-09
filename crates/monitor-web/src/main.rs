@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
         .route("/pairs", post(add_pair))
         .route("/pairs/rediscover", post(rediscover_pair))
         .route("/pairs/delete", post(delete_pair))
+        .route("/pairs/remove", post(remove_pair))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -424,6 +425,43 @@ async fn delete_pair(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     render_registry_response(&state.pool, None, Some("token pair disabled")).await
+}
+
+async fn remove_pair(
+    State(state): State<AppState>,
+    Form(form): Form<DeletePairForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let token0: Address = form
+        .token0
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1: Address = form
+        .token1
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (token0, token1) = canonical_pair(token0, token1);
+
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    let pools_deleted = store
+        .delete_token_pair(state.settings.chain_id, token0, token1)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let message = format!("token pair deleted; removed {pools_deleted} associated pools");
+    render_registry_response(&state.pool, None, Some(&message)).await
 }
 
 struct PairDiscoveryResult {
@@ -782,6 +820,11 @@ fn render_page(
       background: var(--bad);
       color: #190704;
     }}
+    .danger-btn {{
+      border: 1px solid var(--bad);
+      background: rgba(255,109,84,0.14);
+      color: var(--bad);
+    }}
     .password-wrap {{
       display: flex;
       align-items: stretch;
@@ -1084,9 +1127,10 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
 
 fn render_pair_actions(row: &TokenPairRow) -> String {
     format!(
-        "{}{}",
+        "{}{}{}",
         render_rediscover_form(row),
-        render_delete_pair_form(row)
+        render_delete_pair_form(row),
+        render_remove_pair_form(row)
     )
 }
 
@@ -1111,6 +1155,20 @@ fn render_delete_pair_form(row: &TokenPairRow) -> String {
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button class="delete-btn" type="submit">Disable Pair</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
+        token0 = escape(&row.token0),
+        token1 = escape(&row.token1),
+    )
+}
+
+fn render_remove_pair_form(row: &TokenPairRow) -> String {
+    format!(
+        r#"<form method="post" action="/pairs/remove" class="inline-form" onsubmit="return confirm('Delete this token pair and associated pool registry rows? Historical events and state snapshots will be kept.');">
+  {password_input}
+  <input name="token0" type="hidden" value="{token0}">
+  <input name="token1" type="hidden" value="{token1}">
+  <button class="danger-btn" type="submit">Delete Pair</button>
 </form>"#,
         password_input = password_input(Some("password"), false),
         token0 = escape(&row.token0),

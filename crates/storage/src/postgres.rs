@@ -129,6 +129,56 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn delete_token_pair(
+        &self,
+        chain_id: u64,
+        token0: Address,
+        token1: Address,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let token_pair_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM token_pairs
+            WHERE chain_id = $1 AND token0 = $2 AND token1 = $3
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(token0))
+        .bind(address_to_string(token1))
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(token_pair_id) = token_pair_id else {
+            tx.commit().await?;
+            return Ok(0);
+        };
+
+        let pools_deleted = sqlx::query(
+            r#"
+            DELETE FROM pools
+            WHERE token_pair_id = $1
+            "#,
+        )
+        .bind(token_pair_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        sqlx::query(
+            r#"
+            DELETE FROM token_pairs
+            WHERE id = $1
+            "#,
+        )
+        .bind(token_pair_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(pools_deleted)
+    }
+
     pub async fn enabled_registry_pools(&self) -> Result<Vec<PoolRegistryEntry>> {
         let rows = sqlx::query_as::<_, PoolRegistryRow>(
             r#"
