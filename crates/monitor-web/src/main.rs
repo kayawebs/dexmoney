@@ -126,6 +126,13 @@ struct RediscoverPairForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeletePairForm {
+    password: String,
+    token0: String,
+    token1: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
 }
@@ -152,6 +159,7 @@ async fn main() -> Result<()> {
         .route("/execution", get(execution_page))
         .route("/pairs", post(add_pair))
         .route("/pairs/rediscover", post(rediscover_pair))
+        .route("/pairs/delete", post(delete_pair))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -352,6 +360,42 @@ async fn rediscover_pair(
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
+async fn delete_pair(
+    State(state): State<AppState>,
+    Form(form): Form<DeletePairForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let token0: Address = form
+        .token0
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1: Address = form
+        .token1
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (token0, token1) = canonical_pair(token0, token1);
+
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    store
+        .disable_token_pair(state.settings.chain_id, token0, token1)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    render_registry_response(&state.pool, None, Some("token pair disabled")).await
+}
+
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
@@ -422,7 +466,7 @@ async fn render_registry_response(
         <section class="admin">
           <form method="post" action="/pairs">
             <label>Password
-              <input name="password" type="password" autocomplete="current-password" required>
+              {password_input}
             </label>
             <label>Token A
               <input name="token0" placeholder="0x..." required>
@@ -444,6 +488,7 @@ async fn render_registry_response(
         "#,
         render_token_pairs_table(&token_pairs),
         render_registry_pools_table(&registry_pools),
+        password_input = password_input(None, true),
     );
 
     Ok(Html(render_page(
@@ -649,15 +694,34 @@ fn render_page(
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      min-width: 260px;
+      min-width: 430px;
+      margin-right: 8px;
     }}
-    .inline-form input[type="password"] {{
-      width: 140px;
-      padding: 7px 9px;
+    .inline-form .password-wrap {{
+      width: 180px;
     }}
     .inline-form button {{
       padding: 8px 10px;
       white-space: nowrap;
+    }}
+    .delete-btn {{
+      background: var(--bad);
+      color: #190704;
+    }}
+    .password-wrap {{
+      display: flex;
+      align-items: stretch;
+      gap: 6px;
+    }}
+    .password-wrap input {{
+      min-width: 0;
+    }}
+    .toggle-password {{
+      flex: 0 0 auto;
+      padding: 8px 9px;
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--line);
     }}
     label {{ display: grid; gap: 6px; color: var(--muted); font-size: 12px; }}
     input {{
@@ -767,6 +831,12 @@ fn render_page(
         window.prompt("Copy value", value);
       }}
     }}
+    function togglePassword(button) {{
+      const input = button.parentElement.querySelector("input");
+      const visible = input.type === "text";
+      input.type = visible ? "password" : "text";
+      button.textContent = visible ? "show" : "hide";
+    }}
   </script>
 </head>
 <body>
@@ -812,20 +882,31 @@ fn render_login() -> String {
     label { display: grid; gap: 8px; color: var(--muted); font-size: 12px; }
     input { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: #0d1117; color: var(--text); padding: 11px 12px; font: inherit; }
     button { width: 100%; margin-top: 14px; border: 0; border-radius: 10px; padding: 12px 14px; color: #07110c; background: var(--accent); font-weight: 700; cursor: pointer; }
+    .password-wrap { display: flex; align-items: stretch; gap: 6px; }
+    .password-wrap input { min-width: 0; }
+    .toggle-password { width: auto; margin-top: 0; padding: 10px 11px; color: var(--text); background: rgba(255,255,255,0.06); border: 1px solid var(--line); }
   </style>
+  <script>
+    function togglePassword(button) {
+      const input = button.parentElement.querySelector("input");
+      const visible = input.type === "text";
+      input.type = visible ? "password" : "text";
+      button.textContent = visible ? "show" : "hide";
+    }
+  </script>
 </head>
 <body>
   <form method="get" action="/">
     <h1>Base Arb Monitor</h1>
     <p>Enter `MONITOR_WEB_PASSWORD` from `.env`.</p>
     <label>Password
-      <input name="password" type="password" autocomplete="current-password" required autofocus>
+      __PASSWORD_INPUT__
     </label>
     <button type="submit">Open Monitor</button>
   </form>
 </body>
 </html>"#
-        .to_string()
+        .replace("__PASSWORD_INPUT__", &password_input(Some(""), true))
 }
 
 fn render_events_table(rows: &[DexEventRow]) -> String {
@@ -902,7 +983,7 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
             copyable(&row.token0),
             copyable(&row.token1),
             row.enabled,
-            render_rediscover_form(row),
+            render_pair_actions(row),
         ));
     }
     if rows.is_empty() {
@@ -912,14 +993,37 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     html
 }
 
+fn render_pair_actions(row: &TokenPairRow) -> String {
+    format!(
+        "{}{}",
+        render_rediscover_form(row),
+        render_delete_pair_form(row)
+    )
+}
+
 fn render_rediscover_form(row: &TokenPairRow) -> String {
     format!(
         r#"<form method="post" action="/pairs/rediscover" class="inline-form">
-  <input name="password" type="password" placeholder="password" autocomplete="current-password" required>
+  {password_input}
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button type="submit">Discover Pools</button>
 </form>"#,
+        password_input = password_input(Some("password"), false),
+        token0 = escape(&row.token0),
+        token1 = escape(&row.token1),
+    )
+}
+
+fn render_delete_pair_form(row: &TokenPairRow) -> String {
+    format!(
+        r#"<form method="post" action="/pairs/delete" class="inline-form">
+  {password_input}
+  <input name="token0" type="hidden" value="{token0}">
+  <input name="token1" type="hidden" value="{token1}">
+  <button class="delete-btn" type="submit">Disable Pair</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
     )
@@ -1075,6 +1179,16 @@ fn copyable(value: &str) -> String {
     format!(
         "<span class=\"copyable\"><span class=\"mono\" title=\"{0}\">{0}</span><button class=\"copy-btn\" type=\"button\" data-copy=\"{0}\" onclick=\"copyValue(this)\">copy</button></span>",
         escaped
+    )
+}
+
+fn password_input(placeholder: Option<&str>, autofocus: bool) -> String {
+    format!(
+        r#"<span class="password-wrap"><input name="password" type="password" {placeholder} autocomplete="current-password" required {autofocus}><button class="toggle-password" type="button" onclick="togglePassword(this)">show</button></span>"#,
+        placeholder = placeholder
+            .map(|value| format!(r#"placeholder="{}""#, escape(value)))
+            .unwrap_or_default(),
+        autofocus = if autofocus { "autofocus" } else { "" },
     )
 }
 

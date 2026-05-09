@@ -93,6 +93,42 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn disable_token_pair(
+        &self,
+        chain_id: u64,
+        token0: Address,
+        token1: Address,
+    ) -> Result<()> {
+        let token_pair_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE token_pairs
+            SET enabled = FALSE, updated_at = NOW()
+            WHERE chain_id = $1 AND token0 = $2 AND token1 = $3
+            RETURNING id
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(token0))
+        .bind(address_to_string(token1))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(token_pair_id) = token_pair_id {
+            sqlx::query(
+                r#"
+                UPDATE pools
+                SET enabled = FALSE, updated_at = NOW()
+                WHERE token_pair_id = $1
+                "#,
+            )
+            .bind(token_pair_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn enabled_registry_pools(&self) -> Result<Vec<PoolRegistryEntry>> {
         let rows = sqlx::query_as::<_, PoolRegistryRow>(
             r#"
