@@ -664,7 +664,7 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
             ps.fee, ps.reserve0, ps.reserve1,
             ps.sqrt_price_x96, ps.liquidity, ps.tick
         FROM pool_states ps
-        LEFT JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
+        INNER JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         ORDER BY ps.pool_address, ps.updated_at DESC
         LIMIT 25
