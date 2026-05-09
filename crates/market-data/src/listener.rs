@@ -159,7 +159,7 @@ where
         let mut corrected = false;
 
         for state in &mut states {
-            if state.dex != DexKind::Aerodrome || state.variant != PoolVariant::AerodromeVolatile {
+            if !should_calibrate(state) {
                 continue;
             }
 
@@ -188,13 +188,13 @@ where
                 continue;
             }
 
-            let drift_bps = reserve_drift_bps(state, &onchain);
+            let drift_bps = state_drift_bps(state, &onchain);
             if drift_bps > 0 {
-                let message = format!(
-                    "local Aerodrome volatile reserves drifted from onchain state by {drift_bps} bps"
-                );
+                let message = calibration_message(state, drift_bps);
                 warn!(
                     pool = %state.pool_id.address,
+                    dex = ?state.dex,
+                    variant = ?state.variant,
                     local_block = state.block_number,
                     onchain_block = onchain.block_number,
                     drift_bps,
@@ -241,10 +241,58 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
         .collect()
 }
 
+fn should_calibrate(state: &PoolState) -> bool {
+    matches!(
+        (state.dex, state.variant),
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
+            | (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+            | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+    )
+}
+
+fn calibration_message(state: &PoolState, drift_bps: u64) -> String {
+    match (state.dex, state.variant) {
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => {
+            format!(
+                "local Aerodrome volatile reserves drifted from onchain state by {drift_bps} bps"
+            )
+        }
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+        | (DexKind::UniswapV3, PoolVariant::UniswapV3) => {
+            format!("local V3-style state drifted from onchain slot0/liquidity by {drift_bps} bps")
+        }
+        _ => format!("local pool state drifted from onchain state by {drift_bps} bps"),
+    }
+}
+
+fn state_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
+    match (local.dex, local.variant) {
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => reserve_drift_bps(local, onchain),
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+        | (DexKind::UniswapV3, PoolVariant::UniswapV3) => v3_state_drift_bps(local, onchain),
+        _ => u64::MAX,
+    }
+}
+
 fn reserve_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
     let reserve0 = value_drift_bps(local.reserve0, onchain.reserve0);
     let reserve1 = value_drift_bps(local.reserve1, onchain.reserve1);
     reserve0.max(reserve1)
+}
+
+fn v3_state_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
+    let sqrt_price = value_drift_bps(local.sqrt_price_x96, onchain.sqrt_price_x96);
+    let liquidity = value_drift_bps(local.liquidity, onchain.liquidity);
+    let tick = tick_drift(local.tick, onchain.tick);
+    sqrt_price.max(liquidity).max(tick)
+}
+
+fn tick_drift(local: Option<i32>, onchain: Option<i32>) -> u64 {
+    match (local, onchain) {
+        (Some(local), Some(onchain)) if local == onchain => 0,
+        (Some(local), Some(onchain)) => local.abs_diff(onchain).max(1) as u64,
+        _ => u64::MAX,
+    }
 }
 
 fn value_drift_bps(local: Option<U256>, onchain: Option<U256>) -> u64 {
