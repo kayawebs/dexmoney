@@ -49,6 +49,7 @@ struct UnknownTopicRow {
 struct PoolStateRow {
     updated_at: DateTime<Utc>,
     block_number: i64,
+    source: String,
     dex: String,
     variant: Option<String>,
     pool_address: String,
@@ -657,7 +658,13 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
     Ok(sqlx::query_as::<_, PoolStateRow>(
         r#"
         SELECT DISTINCT ON (ps.pool_address)
-            ps.updated_at, ps.block_number, ps.dex, p.variant, ps.pool_address,
+            ps.updated_at,
+            ps.block_number,
+            CASE
+                WHEN source_event.pool_address IS NULL THEN 'onchain init/calibration'
+                ELSE 'local event'
+            END AS source,
+            ps.dex, p.variant, ps.pool_address,
             ps.token0, ps.token1,
             split_part(tp.symbol, '/', 1) AS token0_symbol,
             split_part(tp.symbol, '/', 2) AS token1_symbol,
@@ -666,6 +673,17 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
         FROM pool_states ps
         INNER JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        LEFT JOIN LATERAL (
+            SELECT lower(de.pool_address) AS pool_address
+            FROM dex_events de
+            WHERE lower(de.pool_address) = lower(ps.pool_address)
+                AND de.block_number = ps.block_number
+                AND (
+                    (p.variant = 'AerodromeVolatile' AND de.event_type = 'Sync')
+                    OR (p.variant IN ('AerodromeSlipstream', 'UniswapV3') AND de.event_type = 'Swap')
+                )
+            LIMIT 1
+        ) source_event ON TRUE
         ORDER BY ps.pool_address, ps.updated_at DESC
         LIMIT 25
         "#,
@@ -1212,13 +1230,14 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
 
 fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Variant</th><th>Tick</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>Source</th><th>DEX</th><th>Variant</th><th>Tick</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"state-number\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"state-number\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.updated_at),
             row.block_number,
+            state_source_label(&row.source),
             escape(&row.dex),
             row.variant
                 .as_deref()
@@ -1236,7 +1255,7 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"13\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
+        html.push_str("<tr><td colspan=\"14\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1259,7 +1278,7 @@ fn render_pool_state_warnings_table(rows: &[PoolStateWarningRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"7\">No state warnings.</td></tr>");
+        html.push_str("<tr><td colspan=\"7\">No state warnings. This means calibration has not detected local-vs-onchain drift yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1397,6 +1416,14 @@ fn monitoring_status(enabled: bool) -> String {
         "<span class=\"ok\">enabled</span>".into()
     } else {
         "<span class=\"bad\">disabled</span>".into()
+    }
+}
+
+fn state_source_label(source: &str) -> String {
+    match source {
+        "local event" => "<span class=\"ok\">local event</span>".into(),
+        "onchain init/calibration" => "<span class=\"warn\">onchain init/calibration</span>".into(),
+        value => escape(value),
     }
 }
 
