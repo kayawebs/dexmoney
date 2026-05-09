@@ -29,7 +29,6 @@ pub struct Settings {
     pub candidate_ttl_ms: i64,
     pub max_price_impact_bps: u64,
     pub monitor_web_password: Option<String>,
-    pub filter_relevant_event_topics: bool,
 }
 
 impl Settings {
@@ -38,7 +37,6 @@ impl Settings {
 
         Config::builder()
             .set_default("candidate_ttl_ms", DEFAULT_CANDIDATE_TTL_MS)?
-            .set_default("filter_relevant_event_topics", false)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

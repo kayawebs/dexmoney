@@ -16,22 +16,12 @@ const AERODROME_SLIPSTREAM_FACTORY: &str = "0xeC8E5342B19977B4eF8892e02D8DAEcfa1
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
 const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 5] = [1, 50, 100, 200, 2000];
-const RELEVANT_EVENT_TOPICS: [&str; 7] = [
-    "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1",
-    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
-    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
-    "0x7a53080ba414158be7ec69b987b5fb7d07dee1015d1c6ee733b3f419f0e3c2d2",
-    "0x0c396cd989a39f4459b5fa1aed6a9a8e9d0dc76f0f6d4c1d3c2f3f6721e5d2fb",
-    "0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f",
-    "0x5d624aa9c148153ab3446c1b154f660ee7701e549fe9b62dab7171b1c80e6fa2",
-];
 
 #[derive(Debug, Clone)]
 pub struct ChainProvider {
     pub http_url: String,
     pub ws_url: String,
     pub chain_id: u64,
-    pub filter_relevant_event_topics: bool,
     client: reqwest::Client,
 }
 
@@ -41,7 +31,6 @@ impl ChainProvider {
             http_url: settings.base_rpc_http.clone(),
             ws_url: settings.base_rpc_ws.clone(),
             chain_id: settings.chain_id,
-            filter_relevant_event_topics: settings.filter_relevant_event_topics,
             client: reqwest::Client::new(),
         }
     }
@@ -377,15 +366,11 @@ impl ChainProvider {
             return Ok(Vec::new());
         }
 
-        let mut filter = json!({
+        let params = json!([{
             "fromBlock": format!("0x{from_block:x}"),
             "toBlock": format!("0x{to_block:x}"),
             "address": addresses,
-        });
-        if self.filter_relevant_event_topics {
-            filter["topics"] = json!([RELEVANT_EVENT_TOPICS]);
-        }
-        let params = json!([filter]);
+        }]);
         let value = self.rpc("eth_getLogs", params).await?;
         let logs: Vec<RpcLog> = serde_json::from_value(value)?;
 
