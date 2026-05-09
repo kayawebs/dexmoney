@@ -54,6 +54,8 @@ struct PoolStateRow {
     pool_address: String,
     token0: String,
     token1: String,
+    token0_symbol: Option<String>,
+    token1_symbol: Option<String>,
     fee: Option<i64>,
     reserve0: Option<String>,
     reserve1: Option<String>,
@@ -118,11 +120,13 @@ struct PoolRegistryRow {
     created_at: DateTime<Utc>,
     dex: String,
     variant: String,
+    pair_symbol: Option<String>,
     pool_address: String,
     token0: String,
     token1: String,
+    token0_symbol: Option<String>,
+    token1_symbol: Option<String>,
     fee_bps: Option<i64>,
-    tick_spacing: Option<i64>,
     stable: Option<bool>,
     enabled: bool,
     source: String,
@@ -541,10 +545,23 @@ async fn fetch_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
 async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
     Ok(sqlx::query_as::<_, PoolRegistryRow>(
         r#"
-        SELECT created_at, dex, variant, pool_address, token0, token1, fee_bps,
-            tick_spacing, stable, enabled, source
-        FROM pools
-        ORDER BY created_at DESC
+        SELECT
+            p.created_at,
+            p.dex,
+            p.variant,
+            tp.symbol AS pair_symbol,
+            p.pool_address,
+            p.token0,
+            p.token1,
+            split_part(tp.symbol, '/', 1) AS token0_symbol,
+            split_part(tp.symbol, '/', 2) AS token1_symbol,
+            p.fee_bps,
+            p.stable,
+            p.enabled,
+            p.source
+        FROM pools p
+        LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        ORDER BY p.created_at DESC
         LIMIT 100
         "#,
     )
@@ -591,10 +608,14 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
         r#"
         SELECT DISTINCT ON (ps.pool_address)
             ps.updated_at, ps.block_number, ps.dex, p.variant, ps.pool_address,
-            ps.token0, ps.token1, ps.fee, ps.reserve0, ps.reserve1,
+            ps.token0, ps.token1,
+            split_part(tp.symbol, '/', 1) AS token0_symbol,
+            split_part(tp.symbol, '/', 2) AS token1_symbol,
+            ps.fee, ps.reserve0, ps.reserve1,
             ps.sqrt_price_x96, ps.liquidity, ps.tick
         FROM pool_states ps
         LEFT JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
+        LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         ORDER BY ps.pool_address, ps.updated_at DESC
         LIMIT 25
         "#,
@@ -864,6 +885,16 @@ fn render_page(
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }}
+    .token-label {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }}
+    .token-label strong {{
+      color: var(--text);
+      font-weight: 800;
+    }}
   </style>
   <script>
     async function copyValue(button) {{
@@ -1077,7 +1108,7 @@ fn render_delete_pair_form(row: &TokenPairRow) -> String {
 
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>DEX</th><th>Variant</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Tick</th><th>Stable</th><th>Enabled</th><th>Source</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
@@ -1085,13 +1116,16 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
             fmt_ts(row.created_at),
             escape(&row.dex),
             escape(&row.variant),
+            row.pair_symbol
+                .as_deref()
+                .map(escape)
+                .unwrap_or_else(|| "-".into()),
             copyable(&row.pool_address),
-            copyable(&row.token0),
-            copyable(&row.token1),
+            token_label(row.token0_symbol.as_deref(), &row.token0),
+            token_label(row.token1_symbol.as_deref(), &row.token1),
             row.fee_bps.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            row.tick_spacing.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            row.stable.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            row.enabled,
+            pool_mode(row.stable),
+            monitoring_status(row.enabled),
             escape(&row.source),
         ));
     }
@@ -1118,8 +1152,8 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
                 .unwrap_or_else(|| "-".into()),
             row.tick.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             copyable(&row.pool_address),
-            copyable(&row.token0),
-            copyable(&row.token1),
+            token_label(row.token0_symbol.as_deref(), &row.token0),
+            token_label(row.token1_symbol.as_deref(), &row.token1),
             row.fee.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             copyable_optional(row.reserve0.as_deref()),
             copyable_optional(row.reserve1.as_deref()),
@@ -1262,6 +1296,34 @@ fn copyable(value: &str) -> String {
 
 fn copyable_optional(value: Option<&str>) -> String {
     value.map(copyable).unwrap_or_else(|| "-".into())
+}
+
+fn token_label(symbol: Option<&str>, address: &str) -> String {
+    let symbol = symbol
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let escaped_symbol = escape(symbol);
+    let escaped_address = escape(address);
+    format!(
+        "<span class=\"token-label\" title=\"{escaped_address}\"><strong>{escaped_symbol}</strong><button class=\"copy-btn\" type=\"button\" data-copy=\"{escaped_address}\" onclick=\"copyValue(this)\">copy addr</button></span>"
+    )
+}
+
+fn pool_mode(stable: Option<bool>) -> String {
+    match stable {
+        Some(true) => "stable".into(),
+        Some(false) => "volatile".into(),
+        None => "-".into(),
+    }
+}
+
+fn monitoring_status(enabled: bool) -> String {
+    if enabled {
+        "<span class=\"ok\">enabled</span>".into()
+    } else {
+        "<span class=\"bad\">disabled</span>".into()
+    }
 }
 
 fn password_input(placeholder: Option<&str>, autofocus: bool) -> String {
