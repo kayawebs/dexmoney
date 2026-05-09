@@ -50,6 +50,7 @@ struct PoolStateRow {
     updated_at: DateTime<Utc>,
     block_number: i64,
     dex: String,
+    variant: Option<String>,
     pool_address: String,
     token0: String,
     token1: String,
@@ -588,11 +589,13 @@ async fn fetch_unknown_topics(pool: &PgPool) -> Result<Vec<UnknownTopicRow>> {
 async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
     Ok(sqlx::query_as::<_, PoolStateRow>(
         r#"
-        SELECT DISTINCT ON (pool_address)
-            updated_at, block_number, dex, pool_address, token0, token1, fee,
-            reserve0, reserve1, sqrt_price_x96, liquidity, tick
-        FROM pool_states
-        ORDER BY pool_address, updated_at DESC
+        SELECT DISTINCT ON (ps.pool_address)
+            ps.updated_at, ps.block_number, ps.dex, p.variant, ps.pool_address,
+            ps.token0, ps.token1, ps.fee, ps.reserve0, ps.reserve1,
+            ps.sqrt_price_x96, ps.liquidity, ps.tick
+        FROM pool_states ps
+        LEFT JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
+        ORDER BY ps.pool_address, ps.updated_at DESC
         LIMIT 25
         "#,
     )
@@ -856,6 +859,11 @@ fn render_page(
       font-weight: 600;
       line-height: 1;
     }}
+    .state-number {{
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
   </style>
   <script>
     async function copyValue(button) {{
@@ -1096,14 +1104,19 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
 
 fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th><th>Tick</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Variant</th><th>Tick</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"state-number\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.updated_at),
             row.block_number,
             escape(&row.dex),
+            row.variant
+                .as_deref()
+                .map(escape)
+                .unwrap_or_else(|| "-".into()),
+            row.tick.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             copyable(&row.pool_address),
             copyable(&row.token0),
             copyable(&row.token1),
@@ -1112,11 +1125,10 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
             copyable_optional(row.reserve1.as_deref()),
             copyable_optional(row.sqrt_price_x96.as_deref()),
             copyable_optional(row.liquidity.as_deref()),
-            row.tick.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"12\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
+        html.push_str("<tr><td colspan=\"13\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
