@@ -166,6 +166,11 @@ impl ChainProvider {
         Ok(out)
     }
 
+    pub async fn fetch_erc20_symbol(&self, token: Address) -> Result<String> {
+        let raw = self.eth_call(token, "0x95d89b41", "ERC20 symbol()").await?;
+        decode_abi_string_or_bytes32(&raw)
+    }
+
     pub async fn get_block_number(&self) -> Result<u64> {
         let value = self.rpc("eth_blockNumber", json!([])).await?;
         parse_hex_u64(value.as_str().unwrap_or("0x0"))
@@ -823,6 +828,52 @@ fn decode_int24_array(data: &str) -> Result<Vec<i32>> {
         .map(|word| parse_word_i24(word))
         .collect::<Result<Vec<_>>>()?;
     Ok(values)
+}
+
+fn decode_abi_string_or_bytes32(data: &str) -> Result<String> {
+    let clean = data.trim_start_matches("0x");
+    if clean.len() == 64 {
+        let bytes = hex_to_bytes(clean)?;
+        return Ok(trim_null_utf8(&bytes));
+    }
+
+    let words = decode_32byte_words(data)?;
+    if words.len() < 2 {
+        anyhow::bail!("dynamic string response is too short");
+    }
+    let len: usize = parse_word_u256(&words[1])?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("symbol() length does not fit usize"))?;
+    let encoded = clean
+        .get(128..)
+        .ok_or_else(|| anyhow::anyhow!("dynamic string response missing data"))?;
+    let byte_len = len
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("symbol() length overflow"))?;
+    let symbol_hex = encoded
+        .get(..byte_len)
+        .ok_or_else(|| anyhow::anyhow!("dynamic string response truncated"))?;
+    let bytes = hex_to_bytes(symbol_hex)?;
+    Ok(trim_null_utf8(&bytes))
+}
+
+fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        anyhow::bail!("hex string has odd length");
+    }
+
+    (0..value.len())
+        .step_by(2)
+        .map(|index| Ok(u8::from_str_radix(&value[index..index + 2], 16)?))
+        .collect()
+}
+
+fn trim_null_utf8(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
 }
 
 fn encode_get_pool_bool(token_a: Address, token_b: Address, stable: bool) -> String {

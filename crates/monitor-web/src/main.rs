@@ -114,7 +114,6 @@ struct PoolRegistryRow {
 #[derive(Debug, Deserialize)]
 struct AddPairForm {
     password: String,
-    symbol: String,
     token0: String,
     token1: String,
 }
@@ -122,7 +121,6 @@ struct AddPairForm {
 #[derive(Debug, Deserialize)]
 struct RediscoverPairForm {
     password: String,
-    symbol: String,
     token0: String,
     token1: String,
 }
@@ -324,43 +322,11 @@ async fn add_pair(
         .await;
     }
 
-    let token0: Address = form
-        .token0
-        .trim()
-        .parse()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token1: Address = form
-        .token1
-        .trim()
-        .parse()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let symbol = normalized_symbol(&form.symbol, &form.token0, &form.token1);
-
-    let discovered = state
-        .provider
-        .discover_pools_for_pair(&state.settings, token0, token1)
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if discovered.is_empty() {
-        return render_registry_response(&state.pool, None, Some("no pools found for this pair"))
-            .await;
-    }
-
-    let store = PostgresStore {
-        pool: (*state.pool).clone(),
-    };
-    let pair_id = store
-        .upsert_token_pair(state.settings.chain_id, token0, token1, &symbol)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    for pool in &discovered {
-        store
-            .upsert_discovered_pool(pair_id, pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-
-    let message = format!("added pair {symbol}; discovered {} pools", discovered.len());
+    let result = discover_and_upsert_pair(&state, &form.token0, &form.token1).await?;
+    let message = format!(
+        "added pair {}; discovered {} pools",
+        result.symbol, result.discovered_count
+    );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
@@ -377,30 +343,46 @@ async fn rediscover_pair(
         .await;
     }
 
-    let token0: Address = form
-        .token0
-        .trim()
-        .parse()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let token1: Address = form
-        .token1
-        .trim()
-        .parse()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let symbol = normalized_symbol(&form.symbol, &form.token0, &form.token1);
+    let result = discover_and_upsert_pair(&state, &form.token0, &form.token1).await?;
+    let message = format!(
+        "rediscovered pair {symbol}; discovered {} pools",
+        result.discovered_count,
+        symbol = result.symbol,
+    );
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
 
+struct PairDiscoveryResult {
+    symbol: String,
+    discovered_count: usize,
+}
+
+async fn discover_and_upsert_pair(
+    state: &AppState,
+    token_a: &str,
+    token_b: &str,
+) -> Result<PairDiscoveryResult, StatusCode> {
+    let token_a: Address = token_a
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token_b: Address = token_b
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (token0, token1) = canonical_pair(token_a, token_b);
+    if token0 == token1 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let symbol = pair_symbol(&state.provider, token0, token1).await;
     let discovered = state
         .provider
         .discover_pools_for_pair(&state.settings, token0, token1)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     if discovered.is_empty() {
-        return render_registry_response(
-            &state.pool,
-            None,
-            Some("no new pools found for this pair"),
-        )
-        .await;
+        return Err(StatusCode::NOT_FOUND);
     }
 
     let store = PostgresStore {
@@ -417,11 +399,10 @@ async fn rediscover_pair(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
-    let message = format!(
-        "rediscovered pair {symbol}; discovered {} pools",
-        discovered.len()
-    );
-    render_registry_response(&state.pool, None, Some(&message)).await
+    Ok(PairDiscoveryResult {
+        symbol,
+        discovered_count: discovered.len(),
+    })
 }
 
 async fn render_registry_response(
@@ -443,13 +424,10 @@ async fn render_registry_response(
             <label>Password
               <input name="password" type="password" autocomplete="current-password" required>
             </label>
-            <label>Symbol
-              <input name="symbol" placeholder="USDC/WETH" required>
-            </label>
-            <label>Token 0
+            <label>Token A
               <input name="token0" placeholder="0x..." required>
             </label>
-            <label>Token 1
+            <label>Token B
               <input name="token1" placeholder="0x..." required>
             </label>
             <button type="submit">Discover Pools</button>
@@ -938,12 +916,10 @@ fn render_rediscover_form(row: &TokenPairRow) -> String {
     format!(
         r#"<form method="post" action="/pairs/rediscover" class="inline-form">
   <input name="password" type="password" placeholder="password" autocomplete="current-password" required>
-  <input name="symbol" type="hidden" value="{symbol}">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button type="submit">Discover Pools</button>
 </form>"#,
-        symbol = escape(&row.symbol),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
     )
@@ -1116,14 +1092,29 @@ fn password_matches_query(expected: Option<&str>, actual: Option<&str>) -> bool 
     actual.map(str::trim).is_some_and(|value| value == expected)
 }
 
-fn normalized_symbol(symbol: &str, token0: &str, token1: &str) -> String {
-    let symbol = symbol.trim();
-    if !symbol.is_empty() {
-        return symbol.to_string();
+fn canonical_pair(token_a: Address, token_b: Address) -> (Address, Address) {
+    let token_a_key = format!("{token_a:#x}");
+    let token_b_key = format!("{token_b:#x}");
+    if token_a_key <= token_b_key {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
     }
-    format!(
-        "{}/{}",
-        &token0[..token0.len().min(6)],
-        &token1[..token1.len().min(6)]
-    )
+}
+
+async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address) -> String {
+    let symbol0 = provider
+        .fetch_erc20_symbol(token0)
+        .await
+        .unwrap_or_else(|_| short_address(token0));
+    let symbol1 = provider
+        .fetch_erc20_symbol(token1)
+        .await
+        .unwrap_or_else(|_| short_address(token1));
+    format!("{symbol0}/{symbol1}")
+}
+
+fn short_address(address: Address) -> String {
+    let value = format!("{address:#x}");
+    value.chars().take(8).collect()
 }
