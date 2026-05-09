@@ -7,8 +7,8 @@ use tracing::info;
 use crate::RecorderStore;
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
-    Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolVariant,
-    SimulationResult, TxResult,
+    Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateWarning,
+    PoolVariant, SimulationResult, TxResult,
 };
 
 #[derive(Clone)]
@@ -143,6 +143,29 @@ impl PostgresStore {
 
         rows.into_iter().map(PoolRegistryEntry::try_from).collect()
     }
+
+    pub async fn record_pool_state_warning(&self, warning: PoolStateWarning) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pool_state_warnings (
+                id, pool_address, dex, variant, block_number, local_state_json,
+                onchain_state_json, drift_bps, message, created_at
+            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9)
+            "#,
+        )
+        .bind(address_to_string(warning.pool_address))
+        .bind(dex_to_string(warning.dex))
+        .bind(variant_to_string(warning.variant))
+        .bind(i64::try_from(warning.block_number)?)
+        .bind(sqlx::types::Json(warning.local_state))
+        .bind(sqlx::types::Json(warning.onchain_state))
+        .bind(i64::try_from(warning.drift_bps)?)
+        .bind(warning.message)
+        .bind(warning.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
@@ -183,6 +206,22 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pools (enabled, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pools_pair_idx
             ON pools (token_pair_id, enabled)"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_state_warnings (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            pool_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            block_number BIGINT NOT NULL,
+            local_state_json JSONB NOT NULL,
+            onchain_state_json JSONB NOT NULL,
+            drift_bps BIGINT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_state_warnings_created_idx
+            ON pool_state_warnings (created_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_state_warnings_pool_created_idx
+            ON pool_state_warnings (pool_address, created_at DESC)"#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
