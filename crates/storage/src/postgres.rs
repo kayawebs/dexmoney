@@ -256,6 +256,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pools (enabled, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pools_pair_idx
             ON pools (token_pair_id, enabled)"#,
+        r#"CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
+            ON dex_events (pool_address, block_number DESC, event_type)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_state_warnings (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             pool_address TEXT NOT NULL,

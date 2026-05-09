@@ -657,7 +657,7 @@ async fn fetch_unknown_topics(pool: &PgPool) -> Result<Vec<UnknownTopicRow>> {
 async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
     Ok(sqlx::query_as::<_, PoolStateRow>(
         r#"
-        SELECT DISTINCT ON (ps.pool_address)
+        SELECT
             ps.updated_at,
             ps.block_number,
             CASE
@@ -670,13 +670,21 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
             split_part(tp.symbol, '/', 2) AS token1_symbol,
             ps.fee, ps.reserve0, ps.reserve1,
             ps.sqrt_price_x96, ps.liquidity, ps.tick
-        FROM pool_states ps
-        INNER JOIN pools p ON lower(p.pool_address) = lower(ps.pool_address)
+        FROM pools p
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        INNER JOIN LATERAL (
+            SELECT
+                updated_at, block_number, dex, pool_address, token0, token1, fee,
+                reserve0, reserve1, sqrt_price_x96, liquidity, tick
+            FROM pool_states
+            WHERE pool_address = p.pool_address
+            ORDER BY updated_at DESC
+            LIMIT 1
+        ) ps ON TRUE
         LEFT JOIN LATERAL (
-            SELECT lower(de.pool_address) AS pool_address
+            SELECT de.pool_address
             FROM dex_events de
-            WHERE lower(de.pool_address) = lower(ps.pool_address)
+            WHERE de.pool_address = p.pool_address
                 AND de.block_number = ps.block_number
                 AND (
                     (p.variant = 'AerodromeVolatile' AND de.event_type = 'Sync')
@@ -684,7 +692,8 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
                 )
             LIMIT 1
         ) source_event ON TRUE
-        ORDER BY ps.pool_address, ps.updated_at DESC
+        WHERE p.enabled = TRUE
+        ORDER BY ps.updated_at DESC
         LIMIT 25
         "#,
     )

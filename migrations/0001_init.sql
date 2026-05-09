@@ -19,6 +19,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS dex_events_chain_tx_log_idx
     ON dex_events (chain_id, tx_hash, log_index);
 CREATE INDEX IF NOT EXISTS dex_events_pool_block_idx
     ON dex_events (pool_address, block_number DESC);
+CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
+    ON dex_events (pool_address, block_number DESC, event_type);
 
 CREATE TABLE IF NOT EXISTS pool_states (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
