@@ -54,6 +54,11 @@ struct PoolStateRow {
     token0: String,
     token1: String,
     fee: Option<i64>,
+    reserve0: Option<String>,
+    reserve1: Option<String>,
+    sqrt_price_x96: Option<String>,
+    liquidity: Option<String>,
+    tick: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -584,7 +589,8 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
     Ok(sqlx::query_as::<_, PoolStateRow>(
         r#"
         SELECT DISTINCT ON (pool_address)
-            updated_at, block_number, dex, pool_address, token0, token1, fee
+            updated_at, block_number, dex, pool_address, token0, token1, fee,
+            reserve0, reserve1, sqrt_price_x96, liquidity, tick
         FROM pool_states
         ORDER BY pool_address, updated_at DESC
         LIMIT 25
@@ -1090,11 +1096,11 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
 
 fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>DEX</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th><th>Tick</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.updated_at),
             row.block_number,
             escape(&row.dex),
@@ -1102,10 +1108,15 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
             copyable(&row.token0),
             copyable(&row.token1),
             row.fee.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            copyable_optional(row.reserve0.as_deref()),
+            copyable_optional(row.reserve1.as_deref()),
+            copyable_optional(row.sqrt_price_x96.as_deref()),
+            copyable_optional(row.liquidity.as_deref()),
+            row.tick.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"12\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1235,6 +1246,10 @@ fn copyable(value: &str) -> String {
         "<span class=\"copyable\"><span class=\"mono\" title=\"{0}\">{0}</span><button class=\"copy-btn\" type=\"button\" data-copy=\"{0}\" onclick=\"copyValue(this)\">copy</button></span>",
         escaped
     )
+}
+
+fn copyable_optional(value: Option<&str>) -> String {
+    value.map(copyable).unwrap_or_else(|| "-".into())
 }
 
 fn password_input(placeholder: Option<&str>, autofocus: bool) -> String {
