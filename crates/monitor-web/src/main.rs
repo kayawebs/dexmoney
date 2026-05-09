@@ -120,8 +120,11 @@ struct AddPairForm {
 }
 
 #[derive(Debug, Deserialize)]
-struct FallbackForm {
+struct RediscoverPairForm {
     password: String,
+    symbol: String,
+    token0: String,
+    token1: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +153,7 @@ async fn main() -> Result<()> {
         .route("/activity", get(activity_page))
         .route("/execution", get(execution_page))
         .route("/pairs", post(add_pair))
-        .route("/registry/fallback", post(add_fallback_pools))
+        .route("/pairs/rediscover", post(rediscover_pair))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -361,9 +364,9 @@ async fn add_pair(
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
-async fn add_fallback_pools(
+async fn rediscover_pair(
     State(state): State<AppState>,
-    Form(form): Form<FallbackForm>,
+    Form(form): Form<RediscoverPairForm>,
 ) -> Result<Html<String>, StatusCode> {
     if !password_matches(state.admin_password.as_deref(), &form.password) {
         return render_registry_response(
@@ -374,38 +377,50 @@ async fn add_fallback_pools(
         .await;
     }
 
-    let states = state
+    let token0: Address = form
+        .token0
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1: Address = form
+        .token1
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let symbol = normalized_symbol(&form.symbol, &form.token0, &form.token1);
+
+    let discovered = state
         .provider
-        .bootstrap_configured_pools(&state.settings)
+        .discover_pools_for_pair(&state.settings, token0, token1)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if discovered.is_empty() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("no new pools found for this pair"),
+        )
+        .await;
+    }
+
     let store = PostgresStore {
         pool: (*state.pool).clone(),
     };
-
-    let mut inserted = 0usize;
-    for state in states {
-        let symbol = short_pair_symbol(&state);
-        let pair_id = store
-            .upsert_token_pair(state.pool_id.chain_id, state.token0, state.token1, &symbol)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pair_id = store
+        .upsert_token_pair(state.settings.chain_id, token0, token1, &symbol)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for pool in &discovered {
         store
-            .upsert_discovered_pool(
-                pair_id,
-                &base_arb_common::types::DiscoveredPool {
-                    state,
-                    tick_spacing: None,
-                    stable: None,
-                    source: "env_fallback_button".to_string(),
-                },
-            )
+            .upsert_discovered_pool(pair_id, pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        inserted += 1;
     }
 
-    let message = format!("loaded {inserted} .env fallback pools into registry");
+    let message = format!(
+        "rediscovered pair {symbol}; discovered {} pools",
+        discovered.len()
+    );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
@@ -438,12 +453,6 @@ async fn render_registry_response(
               <input name="token1" placeholder="0x..." required>
             </label>
             <button type="submit">Discover Pools</button>
-          </form>
-          <form method="post" action="/registry/fallback" class="fallback-form">
-            <label>Password
-              <input name="password" type="password" autocomplete="current-password" required>
-            </label>
-            <button type="submit">Load .env Fallback Pools</button>
           </form>
         </section>
         <section class="card">
@@ -657,6 +666,20 @@ fn render_page(
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 10px;
       align-items: end;
+    }}
+    .inline-form {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 260px;
+    }}
+    .inline-form input[type="password"] {{
+      width: 140px;
+      padding: 7px 9px;
+    }}
+    .inline-form button {{
+      padding: 8px 10px;
+      white-space: nowrap;
     }}
     label {{ display: grid; gap: 6px; color: var(--muted); font-size: 12px; }}
     input {{
@@ -890,24 +913,40 @@ fn nav_href(path: &str, auth_password: Option<&str>) -> String {
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Enabled</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.chain_id,
             escape(&row.symbol),
             copyable(&row.token0),
             copyable(&row.token1),
             row.enabled,
+            render_rediscover_form(row),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
+}
+
+fn render_rediscover_form(row: &TokenPairRow) -> String {
+    format!(
+        r#"<form method="post" action="/pairs/rediscover" class="inline-form">
+  <input name="password" type="password" placeholder="password" autocomplete="current-password" required>
+  <input name="symbol" type="hidden" value="{symbol}">
+  <input name="token0" type="hidden" value="{token0}">
+  <input name="token1" type="hidden" value="{token1}">
+  <button type="submit">Discover Pools</button>
+</form>"#,
+        symbol = escape(&row.symbol),
+        token0 = escape(&row.token0),
+        token1 = escape(&row.token1),
+    )
 }
 
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
@@ -1087,17 +1126,4 @@ fn normalized_symbol(symbol: &str, token0: &str, token1: &str) -> String {
         &token0[..token0.len().min(6)],
         &token1[..token1.len().min(6)]
     )
-}
-
-fn short_pair_symbol(state: &base_arb_common::types::PoolState) -> String {
-    format!(
-        "{}/{}",
-        short_address(state.token0),
-        short_address(state.token1)
-    )
-}
-
-fn short_address(address: Address) -> String {
-    let value = format!("{address:#x}");
-    value.chars().take(8).collect()
 }
