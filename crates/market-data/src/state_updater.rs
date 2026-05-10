@@ -7,6 +7,8 @@ use tracing::info;
 
 const SYNC_TOPIC: &str = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const V3_MINT_TOPIC: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
+const V3_BURN_TOPIC: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
 pub fn log_pool_state_update(pool_state: &PoolState) {
     info!(
@@ -28,6 +30,11 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     else {
         return Ok(false);
     };
+    let topics = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.as_array())
+        .context("pool event missing topics")?;
     let data = event
         .raw_data_json
         .get("data")
@@ -46,6 +53,11 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         state.sqrt_price_x96 = Some(sqrt_price_x96);
         state.liquidity = Some(liquidity);
         state.tick = Some(tick);
+    } else if is_v3_style(state) && (topic0 == V3_MINT_TOPIC || topic0 == V3_BURN_TOPIC) {
+        let Some(next_liquidity) = apply_v3_liquidity_delta(state, topic0, topics, data)? else {
+            return Ok(false);
+        };
+        state.liquidity = Some(next_liquidity);
     } else {
         return Ok(false);
     }
@@ -82,6 +94,54 @@ fn decode_v3_swap_state(data: &str) -> Result<(U256, U256, i32)> {
     let liquidity = U256::from_str_radix(&clean[192..256], 16)?;
     let tick = decode_i24_word(&clean[256..320])?;
     Ok((sqrt_price_x96, liquidity, tick))
+}
+
+fn apply_v3_liquidity_delta(
+    state: &PoolState,
+    topic0: &str,
+    topics: &[serde_json::Value],
+    data: &str,
+) -> Result<Option<U256>> {
+    let Some(current_tick) = state.tick else {
+        return Ok(None);
+    };
+    let Some(current_liquidity) = state.liquidity else {
+        return Ok(None);
+    };
+    if topics.len() < 4 {
+        anyhow::bail!("V3 Mint/Burn event missing indexed tick topics");
+    }
+
+    let tick_lower = decode_i24_topic(&topics[2])?;
+    let tick_upper = decode_i24_topic(&topics[3])?;
+    if current_tick < tick_lower || current_tick >= tick_upper {
+        return Ok(None);
+    }
+
+    let amount = decode_v3_liquidity_amount(data, topic0 == V3_MINT_TOPIC)?;
+    if topic0 == V3_MINT_TOPIC {
+        Ok(Some(current_liquidity.saturating_add(amount)))
+    } else {
+        Ok(Some(current_liquidity.saturating_sub(amount)))
+    }
+}
+
+fn decode_v3_liquidity_amount(data: &str, is_mint: bool) -> Result<U256> {
+    let clean = data.trim_start_matches("0x");
+    let amount_start = if is_mint { 64 } else { 0 };
+    let amount_end = amount_start + 64;
+    if clean.len() < amount_end {
+        anyhow::bail!("V3 Mint/Burn data too short");
+    }
+    U256::from_str_radix(&clean[amount_start..amount_end], 16).map_err(Into::into)
+}
+
+fn decode_i24_topic(topic: &serde_json::Value) -> Result<i32> {
+    let value = topic
+        .as_str()
+        .context("V3 indexed tick topic is not a string")?
+        .trim_start_matches("0x");
+    decode_i24_word(value)
 }
 
 fn decode_i24_word(word: &str) -> Result<i32> {
@@ -247,5 +307,132 @@ mod tests {
         assert_eq!(state.liquidity, Some(U256::from(555u64)));
         assert_eq!(state.tick, Some(42));
         assert_eq!(state.block_number, 11);
+    }
+
+    #[test]
+    fn applies_v3_mint_liquidity_inside_active_range() {
+        let pool = address!("4444444444444444444444444444444444444444");
+        let mut state = v3_state(pool, Some(42), Some(U256::from(100u64)));
+        let event = DexEvent {
+            block_number: 12,
+            tx_hash: "0xjkl".into(),
+            log_index: 0,
+            pool_address: pool,
+            dex: DexKind::UniswapV3,
+            event_type: "Mint".into(),
+            raw_data_json: json!({
+                "topics": [
+                    super::V3_MINT_TOPIC,
+                    "0x0000000000000000000000001111111111111111111111111111111111111111",
+                    "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "0x0000000000000000000000000000000000000000000000000000000000000064"
+                ],
+                "data": concat!(
+                    "0x",
+                    "0000000000000000000000002222222222222222222222222222222222222222",
+                    "000000000000000000000000000000000000000000000000000000000000000a",
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000002"
+                )
+            }),
+        };
+
+        let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
+
+        assert!(changed);
+        assert_eq!(state.liquidity, Some(U256::from(110u64)));
+        assert_eq!(state.block_number, 12);
+    }
+
+    #[test]
+    fn applies_v3_burn_liquidity_inside_active_range() {
+        let pool = address!("5555555555555555555555555555555555555555");
+        let mut state = v3_state(pool, Some(42), Some(U256::from(100u64)));
+        let event = DexEvent {
+            block_number: 13,
+            tx_hash: "0xmno".into(),
+            log_index: 0,
+            pool_address: pool,
+            dex: DexKind::UniswapV3,
+            event_type: "Burn".into(),
+            raw_data_json: json!({
+                "topics": [
+                    super::V3_BURN_TOPIC,
+                    "0x0000000000000000000000001111111111111111111111111111111111111111",
+                    "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "0x0000000000000000000000000000000000000000000000000000000000000064"
+                ],
+                "data": concat!(
+                    "0x",
+                    "0000000000000000000000000000000000000000000000000000000000000007",
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000002"
+                )
+            }),
+        };
+
+        let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
+
+        assert!(changed);
+        assert_eq!(state.liquidity, Some(U256::from(93u64)));
+        assert_eq!(state.block_number, 13);
+    }
+
+    #[test]
+    fn ignores_v3_liquidity_change_outside_active_range() {
+        let pool = address!("6666666666666666666666666666666666666666");
+        let mut state = v3_state(pool, Some(150), Some(U256::from(100u64)));
+        let event = DexEvent {
+            block_number: 14,
+            tx_hash: "0xpqr".into(),
+            log_index: 0,
+            pool_address: pool,
+            dex: DexKind::UniswapV3,
+            event_type: "Mint".into(),
+            raw_data_json: json!({
+                "topics": [
+                    super::V3_MINT_TOPIC,
+                    "0x0000000000000000000000001111111111111111111111111111111111111111",
+                    "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "0x0000000000000000000000000000000000000000000000000000000000000064"
+                ],
+                "data": concat!(
+                    "0x",
+                    "0000000000000000000000002222222222222222222222222222222222222222",
+                    "000000000000000000000000000000000000000000000000000000000000000a"
+                )
+            }),
+        };
+
+        let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
+
+        assert!(!changed);
+        assert_eq!(state.liquidity, Some(U256::from(100u64)));
+        assert_eq!(state.block_number, 1);
+    }
+
+    fn v3_state(
+        pool: alloy_primitives::Address,
+        tick: Option<i32>,
+        liquidity: Option<U256>,
+    ) -> PoolState {
+        PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: pool,
+            },
+            dex: DexKind::UniswapV3,
+            variant: PoolVariant::UniswapV3,
+            token0: address!("4200000000000000000000000000000000000006"),
+            token1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            fee_bps: 5,
+            reserve0: None,
+            reserve1: None,
+            sqrt_price_x96: Some(U256::from(1u64)),
+            liquidity,
+            tick,
+            block_number: 1,
+            updated_at: Utc::now(),
+        }
     }
 }

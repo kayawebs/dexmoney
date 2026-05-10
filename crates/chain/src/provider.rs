@@ -669,11 +669,11 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
         ) => "Swap",
         (
             DexKind::Aerodrome,
-            "0x7a53080ba414158be7ec69b987b5fb7d07dee1015d1c6ee733b3f419f0e3c2d2",
+            "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde",
         ) => "Mint",
         (
             DexKind::Aerodrome,
-            "0x0c396cd989a39f4459b5fa1aed6a9a8e9d0dc76f0f6d4c1d3c2f3f6721e5d2fb",
+            "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c",
         ) => "Burn",
         (
             DexKind::Aerodrome,
@@ -733,11 +733,11 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
         ) => "Swap",
         (
             DexKind::UniswapV3,
-            "0x7a53080ba414158be7ec69b987b5fb7d07dee1015d1c6ee733b3f419f0e3c2d2",
+            "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde",
         ) => "Mint",
         (
             DexKind::UniswapV3,
-            "0x0c396cd989a39f4459b5fa1aed6a9a8e9d0dc76f0f6d4c1d3c2f3f6721e5d2fb",
+            "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c",
         ) => "Burn",
         (
             DexKind::UniswapV3,
