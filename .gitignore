@@ -1,3 +1,5 @@
 target/
 .env
 .DS_Store
+contracts/cache/
+contracts/out/

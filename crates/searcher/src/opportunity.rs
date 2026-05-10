@@ -51,6 +51,7 @@ mod tests {
             name: "test".into(),
             steps: vec![SwapStep {
                 dex: DexKind::Aerodrome,
+                variant: None,
                 pool: token,
                 token_in: token,
                 token_out: token,

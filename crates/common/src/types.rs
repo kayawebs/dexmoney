@@ -101,6 +101,8 @@ impl PoolState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwapStep {
     pub dex: DexKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<PoolVariant>,
     pub pool: Address,
     pub token_in: Address,
     pub token_out: Address,

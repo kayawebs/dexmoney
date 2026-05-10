@@ -2,7 +2,7 @@ use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::types::{Candidate, DexKind, SimulationResult};
+use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
 
 const EXECUTOR_DEADLINE_SECS: i64 = 30;
@@ -85,7 +85,7 @@ pub fn build_execute_calldata(
     settings: &Settings,
 ) -> Result<Vec<u8>> {
     let selector = &keccak256(
-        b"executeWithOwnFunds(address,uint256,(uint8,address,address,address,address,uint24,bytes)[],uint256,uint256)",
+        b"executeWithOwnFunds(address,uint256,(uint8,address,address,address,address,uint24,bool,address)[],uint256,uint256)",
     )[..4];
     let mut out = Vec::new();
     out.extend_from_slice(selector);
@@ -102,32 +102,59 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend(encode_u256(U256::from(candidate.path.steps.len())));
 
-    let heads_len = candidate
-        .path
-        .steps
-        .len()
-        .checked_mul(7 * 32)
-        .context("steps head length overflow")?;
-    let mut tails = Vec::new();
-
     for step in &candidate.path.steps {
         let router = router_for_step(step.dex, settings)
             .with_context(|| format!("router missing for {:?}", step.dex))?;
-        out.extend(encode_u256(U256::from(match step.dex {
-            DexKind::Aerodrome => 0u8,
-            DexKind::UniswapV3 => 1u8,
-        })));
+        out.extend(encode_u256(U256::from(executor_dex_kind(
+            step.dex,
+            step.variant,
+        )?)));
         out.extend(encode_address(router));
         out.extend(encode_address(step.pool));
         out.extend(encode_address(step.token_in));
         out.extend(encode_address(step.token_out));
         out.extend(encode_u256(U256::from(step.fee_bps.unwrap_or_default())));
-        out.extend(encode_u256(U256::from(heads_len + tails.len())));
-        tails.extend(encode_bytes(&[]));
+        out.extend(encode_bool(classic_stable_flag(step.variant)));
+        out.extend(encode_address(factory_for_step(
+            step.dex,
+            step.variant,
+            settings,
+        )?));
     }
 
-    out.extend(tails);
     Ok(out)
+}
+
+fn executor_dex_kind(dex: DexKind, variant: Option<PoolVariant>) -> Result<u8> {
+    match (dex, variant) {
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
+            Ok(0)
+        }
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => Ok(1),
+        (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => Ok(2),
+        _ => anyhow::bail!("dex and pool variant mismatch"),
+    }
+}
+
+fn classic_stable_flag(_variant: Option<PoolVariant>) -> bool {
+    false
+}
+
+fn factory_for_step(
+    dex: DexKind,
+    variant: Option<PoolVariant>,
+    settings: &Settings,
+) -> Result<Address> {
+    if matches!(
+        (dex, variant),
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
+    ) {
+        settings
+            .aerodrome_pool_factory
+            .context("AERODROME_POOL_FACTORY is required for Aerodrome Classic execution")
+    } else {
+        Ok(Address::ZERO)
+    }
 }
 
 fn router_for_step(dex: DexKind, settings: &Settings) -> Option<Address> {
@@ -155,13 +182,8 @@ fn encode_u256(value: U256) -> Vec<u8> {
     out.to_vec()
 }
 
-fn encode_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend(encode_u256(U256::from(bytes.len())));
-    out.extend_from_slice(bytes);
-    let padding = (32 - (bytes.len() % 32)) % 32;
-    out.extend(vec![0u8; padding]);
-    out
+fn encode_bool(value: bool) -> Vec<u8> {
+    encode_u256(U256::from(u8::from(value)))
 }
 
 fn decode_uint256_result(raw: &str) -> Option<U256> {
@@ -229,6 +251,7 @@ mod tests {
                 name: "demo".into(),
                 steps: vec![SwapStep {
                     dex: base_arb_common::types::DexKind::UniswapV3,
+                    variant: Some(base_arb_common::types::PoolVariant::UniswapV3),
                     pool: address!("5555555555555555555555555555555555555555"),
                     token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     token_out: address!("4200000000000000000000000000000000000006"),

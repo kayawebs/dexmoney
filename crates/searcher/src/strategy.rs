@@ -51,6 +51,7 @@ impl SearchEngine {
                     steps: vec![
                         SwapStep {
                             dex: DexKind::Aerodrome,
+                            variant: Some(PoolVariant::AerodromeVolatile),
                             pool: aero_pool,
                             token_in: usdc,
                             token_out: weth,
@@ -58,6 +59,7 @@ impl SearchEngine {
                         },
                         SwapStep {
                             dex: DexKind::UniswapV3,
+                            variant: Some(PoolVariant::UniswapV3),
                             pool: uni_pool,
                             token_in: weth,
                             token_out: usdc,
@@ -71,6 +73,7 @@ impl SearchEngine {
                     steps: vec![
                         SwapStep {
                             dex: DexKind::UniswapV3,
+                            variant: Some(PoolVariant::UniswapV3),
                             pool: uni_pool,
                             token_in: usdc,
                             token_out: weth,
@@ -78,6 +81,7 @@ impl SearchEngine {
                         },
                         SwapStep {
                             dex: DexKind::Aerodrome,
+                            variant: Some(PoolVariant::AerodromeVolatile),
                             pool: aero_pool,
                             token_in: weth,
                             token_out: usdc,
@@ -174,6 +178,7 @@ impl SearchEngine {
                     steps: vec![
                         SwapStep {
                             dex: first.dex,
+                            variant: Some(first.variant),
                             pool: first.pool_id.address,
                             token_in: self.usdc,
                             token_out: self.weth,
@@ -181,6 +186,7 @@ impl SearchEngine {
                         },
                         SwapStep {
                             dex: second.dex,
+                            variant: Some(second.variant),
                             pool: second.pool_id.address,
                             token_in: self.weth,
                             token_out: self.usdc,
