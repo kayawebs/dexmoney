@@ -11,6 +11,13 @@ const Q96_BITS: usize = 96;
 #[derive(Debug, Clone, Default)]
 pub struct UniswapV3CurrentTickQuoter;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V3QuoteDiagnostics {
+    pub ticks_used: u32,
+    pub crossed_ticks: u32,
+    pub tick_range_exhausted: bool,
+}
+
 #[async_trait]
 impl DexQuoter for UniswapV3CurrentTickQuoter {
     async fn quote_exact_in(
@@ -86,6 +93,17 @@ pub fn quote_exact_in_with_ticks(
     token_in: Address,
     amount_in: U256,
 ) -> Result<QuoteResult> {
+    let (quote, _) =
+        quote_exact_in_with_ticks_diagnostics(pool_state, initialized_ticks, token_in, amount_in)?;
+    Ok(quote)
+}
+
+pub fn quote_exact_in_with_ticks_diagnostics(
+    pool_state: &PoolState,
+    initialized_ticks: &[TickState],
+    token_in: Address,
+    amount_in: U256,
+) -> Result<(QuoteResult, V3QuoteDiagnostics)> {
     if initialized_ticks.is_empty() {
         return Err(ArbBotError::Quote("missing initialized ticks".into()));
     }
@@ -102,7 +120,7 @@ pub fn quote_exact_in_with_ticks(
         .tick
         .ok_or_else(|| ArbBotError::Quote("missing tick".into()))?;
     let amount_remaining = apply_fee(amount_in, pool_state.fee_bps)?;
-    let amount_out = if token_in == pool_state.token0 {
+    let (amount_out, diagnostics) = if token_in == pool_state.token0 {
         simulate_zero_for_one(
             amount_remaining,
             sqrt_price_x96,
@@ -120,11 +138,14 @@ pub fn quote_exact_in_with_ticks(
         )?
     };
 
-    Ok(QuoteResult {
-        amount_in,
-        amount_out,
-        gas_estimate: None,
-    })
+    Ok((
+        QuoteResult {
+            amount_in,
+            amount_out,
+            gas_estimate: None,
+        },
+        diagnostics,
+    ))
 }
 
 fn simulate_zero_for_one(
@@ -133,8 +154,9 @@ fn simulate_zero_for_one(
     mut liquidity: U256,
     current_tick: i32,
     initialized_ticks: &[TickState],
-) -> Result<U256> {
+) -> Result<(U256, V3QuoteDiagnostics)> {
     let mut amount_out = U256::ZERO;
+    let mut diagnostics = V3QuoteDiagnostics::default();
     let mut ticks = initialized_ticks
         .iter()
         .filter(|tick| tick.tick < current_tick)
@@ -145,10 +167,12 @@ fn simulate_zero_for_one(
         if amount_remaining.is_zero() || liquidity.is_zero() {
             break;
         }
+        diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
         let amount_to_target = amount0_delta(liquidity, target_sqrt, sqrt_price, true)?;
         if amount_remaining >= amount_to_target {
             amount_remaining = amount_remaining.saturating_sub(amount_to_target);
+            diagnostics.crossed_ticks += 1;
             amount_out = amount_out
                 .checked_add(amount1_delta(liquidity, target_sqrt, sqrt_price, false)?)
                 .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
@@ -160,17 +184,18 @@ fn simulate_zero_for_one(
             amount_out = amount_out
                 .checked_add(amount1_delta(liquidity, next_sqrt, sqrt_price, false)?)
                 .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
-            return Ok(amount_out);
+            return Ok((amount_out, diagnostics));
         }
     }
 
     if !amount_remaining.is_zero() && !liquidity.is_zero() {
+        diagnostics.tick_range_exhausted = true;
         let next_sqrt = next_sqrt_price_from_amount0_in(sqrt_price, liquidity, amount_remaining)?;
         amount_out = amount_out
             .checked_add(amount1_delta(liquidity, next_sqrt, sqrt_price, false)?)
             .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
     }
-    Ok(amount_out)
+    Ok((amount_out, diagnostics))
 }
 
 fn simulate_one_for_zero(
@@ -179,8 +204,9 @@ fn simulate_one_for_zero(
     mut liquidity: U256,
     current_tick: i32,
     initialized_ticks: &[TickState],
-) -> Result<U256> {
+) -> Result<(U256, V3QuoteDiagnostics)> {
     let mut amount_out = U256::ZERO;
+    let mut diagnostics = V3QuoteDiagnostics::default();
     let mut ticks = initialized_ticks
         .iter()
         .filter(|tick| tick.tick > current_tick)
@@ -191,10 +217,12 @@ fn simulate_one_for_zero(
         if amount_remaining.is_zero() || liquidity.is_zero() {
             break;
         }
+        diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
         let amount_to_target = amount1_delta(liquidity, sqrt_price, target_sqrt, true)?;
         if amount_remaining >= amount_to_target {
             amount_remaining = amount_remaining.saturating_sub(amount_to_target);
+            diagnostics.crossed_ticks += 1;
             amount_out = amount_out
                 .checked_add(amount0_delta(liquidity, sqrt_price, target_sqrt, false)?)
                 .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
@@ -206,17 +234,18 @@ fn simulate_one_for_zero(
             amount_out = amount_out
                 .checked_add(amount0_delta(liquidity, sqrt_price, next_sqrt, false)?)
                 .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
-            return Ok(amount_out);
+            return Ok((amount_out, diagnostics));
         }
     }
 
     if !amount_remaining.is_zero() && !liquidity.is_zero() {
+        diagnostics.tick_range_exhausted = true;
         let next_sqrt = next_sqrt_price_from_amount1_in(sqrt_price, liquidity, amount_remaining)?;
         amount_out = amount_out
             .checked_add(amount0_delta(liquidity, sqrt_price, next_sqrt, false)?)
             .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
     }
-    Ok(amount_out)
+    Ok((amount_out, diagnostics))
 }
 
 fn apply_fee(amount_in: U256, fee_bps: u32) -> Result<U256> {
@@ -438,11 +467,13 @@ mod tests {
     use alloy_primitives::{address, U256};
     use chrono::Utc;
 
-    use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
+    use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant, TickState};
 
     use crate::quoter::DexQuoter;
 
-    use super::{spot_quote_exact_in, UniswapV3CurrentTickQuoter};
+    use super::{
+        quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
+    };
 
     #[tokio::test]
     async fn quotes_current_tick_in_both_directions() {
@@ -480,5 +511,46 @@ mod tests {
         assert!(zero_for_one.amount_out > U256::ZERO);
         assert!(one_for_zero.amount_out > U256::ZERO);
         assert!(spot_quote_exact_in(&state, token0, U256::from(1_000u64)).unwrap() > U256::ZERO);
+    }
+
+    #[test]
+    fn quote_diagnostics_mark_exhausted_tick_range() {
+        let token0 = address!("4200000000000000000000000000000000000006");
+        let token1 = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let pool_id = PoolId {
+            chain_id: 8453,
+            address: address!("1111111111111111111111111111111111111111"),
+        };
+        let state = PoolState {
+            pool_id: pool_id.clone(),
+            dex: DexKind::UniswapV3,
+            variant: PoolVariant::UniswapV3,
+            token0,
+            token1,
+            fee_bps: 30,
+            reserve0: None,
+            reserve1: None,
+            sqrt_price_x96: Some(U256::from(1u64) << 96),
+            liquidity: Some(U256::from(1_000_000_000_000u64)),
+            tick: Some(0),
+            block_number: 1,
+            updated_at: Utc::now(),
+        };
+        let ticks = vec![TickState {
+            pool_id,
+            tick: 100,
+            liquidity_net: 1_000,
+            liquidity_gross: U256::from(1_000u64),
+            block_number: 1,
+            updated_at: Utc::now(),
+        }];
+
+        let (_, diagnostics) =
+            quote_exact_in_with_ticks_diagnostics(&state, &ticks, token0, U256::from(1_000u64))
+                .unwrap();
+
+        assert_eq!(diagnostics.ticks_used, 0);
+        assert_eq!(diagnostics.crossed_ticks, 0);
+        assert!(diagnostics.tick_range_exhausted);
     }
 }

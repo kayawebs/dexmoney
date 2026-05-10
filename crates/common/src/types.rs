@@ -111,6 +111,17 @@ pub struct SwapStep {
 pub struct ArbPath {
     pub name: String,
     pub steps: Vec<SwapStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<QuoteDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuoteDiagnostics {
+    pub modes: Vec<String>,
+    pub ticks_used: u32,
+    pub crossed_ticks: u32,
+    pub tick_range_exhausted: bool,
+    pub v3_pools_without_ticks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -234,6 +234,7 @@ mod tests {
                     token_out: address!("4200000000000000000000000000000000000006"),
                     fee_bps: Some(5),
                 }],
+                diagnostics: None,
             },
             status: OpportunityStatus::Created,
         };

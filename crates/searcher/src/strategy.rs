@@ -3,12 +3,13 @@ use chrono::Utc;
 
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    ArbPath, Candidate, DexKind, PoolId, PoolState, PoolVariant, QuoteResult, SwapStep, TickState,
+    ArbPath, Candidate, DexKind, PoolId, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult,
+    SwapStep, TickState,
 };
 use base_arb_dex::aerodrome::AerodromeVolatileQuoter;
 use base_arb_dex::quoter::DexQuoter;
 use base_arb_dex::uniswap_v3::{
-    quote_exact_in_with_ticks, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
+    quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
 };
 
 use crate::opportunity::build_candidate;
@@ -63,6 +64,7 @@ impl SearchEngine {
                             fee_bps: Some(30),
                         },
                     ],
+                    diagnostics: None,
                 },
                 ArbPath {
                     name: name2.clone(),
@@ -82,6 +84,7 @@ impl SearchEngine {
                             fee_bps: Some(30),
                         },
                     ],
+                    diagnostics: None,
                 },
             ],
             min_expected_profit,
@@ -103,7 +106,7 @@ impl SearchEngine {
 
         for path in &paths {
             for amount_in in &self.amount_sizes {
-                if let Some((expected_amount_out, price_impact_bps)) =
+                if let Some((expected_amount_out, price_impact_bps, diagnostics)) =
                     quote_path(pool_states, tick_states, path, *amount_in).await?
                 {
                     if price_impact_bps > self.max_price_impact_bps {
@@ -130,7 +133,7 @@ impl SearchEngine {
                         expected_profit,
                         self.min_expected_profit,
                         price_impact_bps,
-                        path.clone(),
+                        path_with_diagnostics(path, diagnostics),
                         self.candidate_ttl_ms,
                     );
                     out.push(candidate);
@@ -184,6 +187,7 @@ impl SearchEngine {
                             fee_bps: Some(second.fee_bps),
                         },
                     ],
+                    diagnostics: None,
                 });
             }
         }
@@ -270,11 +274,18 @@ async fn quote_path(
     tick_states: &[TickState],
     path: &ArbPath,
     amount_in: U256,
-) -> anyhow::Result<Option<(U256, u64)>> {
+) -> anyhow::Result<Option<(U256, u64, QuoteDiagnostics)>> {
     let aero = AerodromeVolatileQuoter;
     let uni = UniswapV3CurrentTickQuoter;
     let mut amount = amount_in;
     let mut max_impact = 0u64;
+    let mut diagnostics = QuoteDiagnostics {
+        modes: Vec::new(),
+        ticks_used: 0,
+        crossed_ticks: 0,
+        tick_range_exhausted: false,
+        v3_pools_without_ticks: 0,
+    };
 
     for step in &path.steps {
         let pool_state = match pool_states
@@ -289,6 +300,10 @@ async fn quote_path(
             PoolVariant::AerodromeVolatile => aero
                 .quote_exact_in(pool_state, step.token_in, amount)
                 .await
+                .map(|quote| {
+                    diagnostics.modes.push("classic_reserve".into());
+                    quote
+                })
                 .map_err(anyhow::Error::from)?,
             PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => {
                 let pool_ticks = tick_states
@@ -297,12 +312,24 @@ async fn quote_path(
                     .cloned()
                     .collect::<Vec<_>>();
                 if pool_ticks.is_empty() {
+                    diagnostics.modes.push("v3_current_tick_fallback".into());
+                    diagnostics.v3_pools_without_ticks += 1;
                     uni.quote_exact_in(pool_state, step.token_in, amount)
                         .await
                         .map_err(anyhow::Error::from)?
                 } else {
-                    quote_exact_in_with_ticks(pool_state, &pool_ticks, step.token_in, amount)
-                        .map_err(anyhow::Error::from)?
+                    let (quote, v3_diagnostics) = quote_exact_in_with_ticks_diagnostics(
+                        pool_state,
+                        &pool_ticks,
+                        step.token_in,
+                        amount,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    diagnostics.modes.push("v3_cross_tick".into());
+                    diagnostics.ticks_used += v3_diagnostics.ticks_used;
+                    diagnostics.crossed_ticks += v3_diagnostics.crossed_ticks;
+                    diagnostics.tick_range_exhausted |= v3_diagnostics.tick_range_exhausted;
+                    quote
                 }
             }
         };
@@ -311,7 +338,13 @@ async fn quote_path(
         max_impact = max_impact.max(estimate_price_impact_bps(pool_state, step.token_in, &quote));
     }
 
-    Ok(Some((amount, max_impact)))
+    Ok(Some((amount, max_impact, diagnostics)))
+}
+
+fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPath {
+    let mut path = path.clone();
+    path.diagnostics = Some(diagnostics);
+    path
 }
 
 fn estimate_price_impact_bps(

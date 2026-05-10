@@ -83,6 +83,11 @@ struct OpportunityRow {
     strategy: String,
     amount_in: String,
     expected_profit: String,
+    quote_modes: Option<String>,
+    ticks_used: Option<i64>,
+    crossed_ticks: Option<i64>,
+    tick_range_exhausted: Option<bool>,
+    v3_pools_without_ticks: Option<i64>,
     status: String,
 }
 
@@ -703,7 +708,18 @@ async fn fetch_pool_state_warnings(pool: &PgPool) -> Result<Vec<PoolStateWarning
 async fn fetch_opportunities(pool: &PgPool) -> Result<Vec<OpportunityRow>> {
     Ok(sqlx::query_as::<_, OpportunityRow>(
         r#"
-        SELECT created_at, block_number, strategy, amount_in, expected_profit, status
+        SELECT
+            created_at,
+            block_number,
+            strategy,
+            amount_in,
+            expected_profit,
+            path_json->'diagnostics'->>'modes' AS quote_modes,
+            (path_json->'diagnostics'->>'ticks_used')::BIGINT AS ticks_used,
+            (path_json->'diagnostics'->>'crossed_ticks')::BIGINT AS crossed_ticks,
+            (path_json->'diagnostics'->>'tick_range_exhausted')::BOOLEAN AS tick_range_exhausted,
+            (path_json->'diagnostics'->>'v3_pools_without_ticks')::BIGINT AS v3_pools_without_ticks,
+            status
         FROM opportunities
         ORDER BY created_at DESC
         LIMIT 25
@@ -1281,24 +1297,48 @@ fn render_pool_state_warnings_table(rows: &[PoolStateWarningRow]) -> String {
 
 fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Status</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Quote Modes</th><th>Ticks Used</th><th>Crossed</th><th>Range Exhausted</th><th>Missing Ticks</th><th>Status</th></tr></thead><tbody>",
     );
     for row in rows {
+        let range_exhausted = match row.tick_range_exhausted {
+            Some(true) => "<span class=\"warn\">true</span>".to_string(),
+            Some(false) => "false".to_string(),
+            None => "-".to_string(),
+        };
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.block_number,
             escape(&row.strategy),
             escape(&row.amount_in),
             escape(&row.expected_profit),
+            escape(row.quote_modes.as_deref().unwrap_or("-")),
+            fmt_optional_i64(row.ticks_used),
+            fmt_optional_i64(row.crossed_ticks),
+            range_exhausted,
+            fmt_warn_i64(row.v3_pools_without_ticks),
             escape(&row.status),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"6\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
+}
+
+fn fmt_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn fmt_warn_i64(value: Option<i64>) -> String {
+    match value {
+        Some(value) if value > 0 => format!("<span class=\"warn\">{value}</span>"),
+        Some(value) => value.to_string(),
+        None => "-".to_string(),
+    }
 }
 
 fn render_simulations_table(rows: &[SimulationRow]) -> String {

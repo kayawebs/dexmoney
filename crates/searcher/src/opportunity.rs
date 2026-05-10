@@ -56,6 +56,7 @@ mod tests {
                 token_out: token,
                 fee_bps: Some(30),
             }],
+            diagnostics: None,
         };
 
         let candidate = build_candidate(
