@@ -82,7 +82,25 @@ cargo test --workspace
 curl -sS http://127.0.0.1:8085/healthz
 ```
 
-6. Open the monitor:
+6. Deploy and initialize the Executor contract when you are ready to run `eth_call` simulation:
+
+```bash
+set -a
+source .env
+set +a
+
+forge script contracts/script/DeployExecutor.s.sol:DeployExecutor \
+  --root contracts \
+  --rpc-url "$BASE_RPC_HTTP" \
+  --broadcast
+```
+
+After deployment, set `EXECUTOR_CONTRACT` in `.env` to the deployed address. The
+deployment script configures `EXECUTOR_OPERATOR`, USDC/WETH, configured routers,
+factories, and pool whitelist slots. It also grants max token approvals from the
+Executor to the configured Aerodrome and Uniswap V3 routers.
+
+7. Open the monitor:
 
 ```bash
 open http://127.0.0.1:8085
@@ -121,6 +139,7 @@ This initialization provides:
 - searcher / execution skeletons
 - Postgres migration and Redis key conventions
 - token pair and pool registry with web-driven discovery
-- Foundry contract skeleton and baseline tests
+- Executor contract with own-funds two-hop simulation support for Aerodrome Classic and Uniswap V3
+- execution-manager `eth_call` calldata for the Executor
 
-It does not yet provide production-ready router calldata encoding or full Uniswap V3 local tick simulation.
+It does not yet submit real transactions or execute Aerodrome Slipstream swaps in the Executor.
