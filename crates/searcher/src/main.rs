@@ -6,6 +6,7 @@ use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PoolStateStore, RecorderStore,
+    TickStateStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::info;
@@ -51,7 +52,7 @@ async fn run_search_cycle<P, C, R>(
     min_expected_profit_usdc: f64,
 ) -> Result<()>
 where
-    P: PoolStateStore,
+    P: PoolStateStore + TickStateStore,
     C: CandidateStore,
     R: RecorderStore,
 {
@@ -66,7 +67,17 @@ where
         info!("no pool states available in redis");
         return Ok(());
     }
-    let candidates = engine.search(&pool_states).await?;
+    let mut tick_states = Vec::new();
+    for state in &pool_states {
+        if matches!(
+            state.variant,
+            base_arb_common::types::PoolVariant::AerodromeSlipstream
+                | base_arb_common::types::PoolVariant::UniswapV3
+        ) {
+            tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
+        }
+    }
+    let candidates = engine.search(&pool_states, &tick_states).await?;
 
     for candidate in candidates {
         info!(candidate_id = %candidate.id, "quote generated");

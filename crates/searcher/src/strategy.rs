@@ -3,11 +3,13 @@ use chrono::Utc;
 
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    ArbPath, Candidate, DexKind, PoolId, PoolState, PoolVariant, QuoteResult, SwapStep,
+    ArbPath, Candidate, DexKind, PoolId, PoolState, PoolVariant, QuoteResult, SwapStep, TickState,
 };
 use base_arb_dex::aerodrome::AerodromeVolatileQuoter;
 use base_arb_dex::quoter::DexQuoter;
-use base_arb_dex::uniswap_v3::{spot_quote_exact_in, UniswapV3CurrentTickQuoter};
+use base_arb_dex::uniswap_v3::{
+    quote_exact_in_with_ticks, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
+};
 
 use crate::opportunity::build_candidate;
 
@@ -91,14 +93,18 @@ impl SearchEngine {
         }
     }
 
-    pub async fn search(&self, pool_states: &[PoolState]) -> anyhow::Result<Vec<Candidate>> {
+    pub async fn search(
+        &self,
+        pool_states: &[PoolState],
+        tick_states: &[TickState],
+    ) -> anyhow::Result<Vec<Candidate>> {
         let paths = self.paths_for_pool_states(pool_states);
         let mut out = Vec::new();
 
         for path in &paths {
             for amount_in in &self.amount_sizes {
                 if let Some((expected_amount_out, price_impact_bps)) =
-                    quote_path(pool_states, path, *amount_in).await?
+                    quote_path(pool_states, tick_states, path, *amount_in).await?
                 {
                     if price_impact_bps > self.max_price_impact_bps {
                         continue;
@@ -261,6 +267,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
 
 async fn quote_path(
     pool_states: &[PoolState],
+    tick_states: &[TickState],
     path: &ArbPath,
     amount_in: U256,
 ) -> anyhow::Result<Option<(U256, u64)>> {
@@ -283,10 +290,21 @@ async fn quote_path(
                 .quote_exact_in(pool_state, step.token_in, amount)
                 .await
                 .map_err(anyhow::Error::from)?,
-            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => uni
-                .quote_exact_in(pool_state, step.token_in, amount)
-                .await
-                .map_err(anyhow::Error::from)?,
+            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => {
+                let pool_ticks = tick_states
+                    .iter()
+                    .filter(|tick| tick.pool_id.address == pool_state.pool_id.address)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if pool_ticks.is_empty() {
+                    uni.quote_exact_in(pool_state, step.token_in, amount)
+                        .await
+                        .map_err(anyhow::Error::from)?
+                } else {
+                    quote_exact_in_with_ticks(pool_state, &pool_ticks, step.token_in, amount)
+                        .map_err(anyhow::Error::from)?
+                }
+            }
         };
 
         amount = quote.amount_out;
@@ -372,9 +390,10 @@ mod tests {
     async fn search_engine_emits_candidates_for_demo_state() {
         let engine = SearchEngine::new(500, 10_000, U256::from(1u64));
         let candidates = engine
-            .search(&demo_pool_states(address!(
-                "833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-            )))
+            .search(
+                &demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")),
+                &[],
+            )
             .await
             .unwrap();
 
