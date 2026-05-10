@@ -10,6 +10,13 @@ const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed
 const V3_MINT_TOPIC: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
 const V3_BURN_TOPIC: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickDelta {
+    pub tick: i32,
+    pub liquidity_gross_delta: i128,
+    pub liquidity_net_delta: i128,
+}
+
 pub fn log_pool_state_update(pool_state: &PoolState) {
     info!(
         pool = %pool_state.pool_id.address,
@@ -65,6 +72,70 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     state.block_number = event.block_number;
     state.updated_at = Utc::now();
     Ok(true)
+}
+
+pub fn v3_tick_deltas_from_event(state: &PoolState, event: &DexEvent) -> Result<Vec<TickDelta>> {
+    if state.pool_id.address != event.pool_address || !is_v3_style(state) {
+        return Ok(Vec::new());
+    }
+    let Some(topic0) = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.get(0))
+        .and_then(|topic| topic.as_str())
+    else {
+        return Ok(Vec::new());
+    };
+    if topic0 != V3_MINT_TOPIC && topic0 != V3_BURN_TOPIC {
+        return Ok(Vec::new());
+    }
+    let topics = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.as_array())
+        .context("pool event missing topics")?;
+    if topics.len() < 4 {
+        anyhow::bail!("V3 Mint/Burn event missing indexed tick topics");
+    }
+    let data = event
+        .raw_data_json
+        .get("data")
+        .and_then(|data| data.as_str())
+        .context("pool event missing data")?;
+    let tick_lower = decode_i24_topic(&topics[2])?;
+    let tick_upper = decode_i24_topic(&topics[3])?;
+    let amount = decode_v3_liquidity_amount(data, topic0 == V3_MINT_TOPIC)?;
+    let amount: i128 = amount
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("liquidity amount does not fit i128"))?;
+
+    if topic0 == V3_MINT_TOPIC {
+        Ok(vec![
+            TickDelta {
+                tick: tick_lower,
+                liquidity_gross_delta: amount,
+                liquidity_net_delta: amount,
+            },
+            TickDelta {
+                tick: tick_upper,
+                liquidity_gross_delta: amount,
+                liquidity_net_delta: -amount,
+            },
+        ])
+    } else {
+        Ok(vec![
+            TickDelta {
+                tick: tick_lower,
+                liquidity_gross_delta: -amount,
+                liquidity_net_delta: -amount,
+            },
+            TickDelta {
+                tick: tick_upper,
+                liquidity_gross_delta: -amount,
+                liquidity_net_delta: amount,
+            },
+        ])
+    }
 }
 
 fn is_v3_style(state: &PoolState) -> bool {

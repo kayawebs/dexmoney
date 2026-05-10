@@ -10,13 +10,22 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use base_arb_chain::events::DexEvent;
-use base_arb_common::types::{Candidate, EoaLaneState, PoolState, SimulationResult, TxResult};
+use base_arb_common::types::{
+    Candidate, EoaLaneState, PoolState, SimulationResult, TickState, TxResult,
+};
 
 #[async_trait]
 pub trait PoolStateStore: Send + Sync {
     async fn set_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()>;
     async fn get_pool_state(&self, address: Address) -> anyhow::Result<Option<PoolState>>;
     async fn all_pool_states(&self) -> anyhow::Result<Vec<PoolState>>;
+}
+
+#[async_trait]
+pub trait TickStateStore: Send + Sync {
+    async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()>;
+    async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()>;
+    async fn get_pool_ticks(&self, pool: Address) -> anyhow::Result<Vec<TickState>>;
 }
 
 #[async_trait]
@@ -58,6 +67,7 @@ pub struct InMemoryStores {
     lanes: Arc<Mutex<BTreeMap<Address, EoaLaneState>>>,
     events: Arc<Mutex<Vec<DexEvent>>>,
     pool_snapshots: Arc<Mutex<Vec<PoolState>>>,
+    ticks: Arc<Mutex<BTreeMap<(Address, i32), TickState>>>,
 }
 
 impl InMemoryStores {
@@ -82,6 +92,36 @@ impl PoolStateStore for InMemoryStores {
 
     async fn all_pool_states(&self) -> anyhow::Result<Vec<PoolState>> {
         Ok(self.pool_states.lock().await.values().cloned().collect())
+    }
+}
+
+#[async_trait]
+impl TickStateStore for InMemoryStores {
+    async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()> {
+        self.ticks
+            .lock()
+            .await
+            .insert((tick_state.pool_id.address, tick_state.tick), tick_state);
+        Ok(())
+    }
+
+    async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()> {
+        let mut ticks = self.ticks.lock().await;
+        for tick_state in tick_states {
+            ticks.insert((tick_state.pool_id.address, tick_state.tick), tick_state);
+        }
+        Ok(())
+    }
+
+    async fn get_pool_ticks(&self, pool: Address) -> anyhow::Result<Vec<TickState>> {
+        Ok(self
+            .ticks
+            .lock()
+            .await
+            .values()
+            .filter(|tick| tick.pool_id.address == pool)
+            .cloned()
+            .collect())
     }
 }
 

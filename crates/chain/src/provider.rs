@@ -3,7 +3,7 @@ use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    DexKind, DiscoveredPool, PoolId, PoolRegistryEntry, PoolState, PoolVariant,
+    DexKind, DiscoveredPool, PoolId, PoolRegistryEntry, PoolState, PoolVariant, TickState,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -562,6 +562,82 @@ impl ChainProvider {
         Ok((sqrt_price_x96, tick, liquidity))
     }
 
+    pub async fn fetch_initialized_ticks_around_state(
+        &self,
+        pool_state: &PoolState,
+        word_radius: i32,
+    ) -> Result<Vec<TickState>> {
+        let Some(current_tick) = pool_state.tick else {
+            return Ok(Vec::new());
+        };
+        if pool_state.variant == PoolVariant::AerodromeVolatile {
+            return Ok(Vec::new());
+        }
+
+        let tick_spacing = self.fetch_tick_spacing(pool_state.pool_id.address).await?;
+        if tick_spacing <= 0 {
+            anyhow::bail!("invalid tick spacing {tick_spacing}");
+        }
+
+        let current_word = word_position(current_tick, tick_spacing);
+        let block_number = self.get_block_number().await?;
+        let mut ticks = Vec::new();
+
+        for word in (current_word - word_radius)..=(current_word + word_radius) {
+            let bitmap = self
+                .fetch_tick_bitmap_word(pool_state.pool_id.address, word as i16)
+                .await?;
+            for bit in 0..256usize {
+                if ((bitmap >> bit) & U256::from(1u64)).is_zero() {
+                    continue;
+                }
+                let compressed = word
+                    .checked_mul(256)
+                    .and_then(|value| value.checked_add(bit as i32))
+                    .ok_or_else(|| anyhow::anyhow!("compressed tick overflow"))?;
+                let tick = compressed
+                    .checked_mul(tick_spacing)
+                    .ok_or_else(|| anyhow::anyhow!("tick overflow"))?;
+                let (liquidity_gross, liquidity_net) = self
+                    .fetch_tick_info(pool_state.pool_id.address, tick)
+                    .await?;
+                ticks.push(TickState {
+                    pool_id: pool_state.pool_id.clone(),
+                    tick,
+                    liquidity_net,
+                    liquidity_gross,
+                    block_number,
+                    updated_at: Utc::now(),
+                });
+            }
+        }
+
+        Ok(ticks)
+    }
+
+    async fn fetch_tick_spacing(&self, pool: Address) -> Result<i32> {
+        let raw = self.eth_call(pool, "0xd0c93a7c", "tickSpacing()").await?;
+        let words = decode_32byte_words(&raw)?;
+        parse_word_i24(&words[0])
+    }
+
+    async fn fetch_tick_bitmap_word(&self, pool: Address, word_position: i16) -> Result<U256> {
+        let data = format!("0x5339c296{}", encode_signed_word(word_position as i128));
+        let raw = self.eth_call(pool, &data, "tickBitmap(int16)").await?;
+        let words = decode_32byte_words(&raw)?;
+        parse_word_u256(&words[0])
+    }
+
+    async fn fetch_tick_info(&self, pool: Address, tick: i32) -> Result<(U256, i128)> {
+        let data = format!("0xf30dba93{}", encode_signed_word(tick as i128));
+        let raw = self.eth_call(pool, &data, "ticks(int24)").await?;
+        let words = decode_32byte_words(&raw)?;
+        if words.len() < 2 {
+            anyhow::bail!("ticks(int24) response too short");
+        }
+        Ok((parse_word_u256(&words[0])?, parse_word_i128(&words[1])?))
+    }
+
     async fn eth_call(&self, to: Address, data: &str, label: &str) -> Result<String> {
         let value = self
             .rpc(
@@ -806,6 +882,24 @@ fn parse_word_i24(word: &str) -> Result<i32> {
         low as i32
     };
     Ok(signed)
+}
+
+fn parse_word_i128(word: &str) -> Result<i128> {
+    let low = u128::from_str_radix(&word[word.len() - 32..], 16)?;
+    Ok(low as i128)
+}
+
+fn encode_signed_word(value: i128) -> String {
+    let encoded = if value >= 0 {
+        U256::from(value as u128)
+    } else {
+        U256::MAX - U256::from((-value - 1) as u128)
+    };
+    format!("{encoded:064x}")
+}
+
+fn word_position(tick: i32, tick_spacing: i32) -> i32 {
+    tick.div_euclid(tick_spacing) >> 8
 }
 
 fn decode_single_address(data: &str) -> Result<Address> {

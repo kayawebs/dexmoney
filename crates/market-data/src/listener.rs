@@ -2,14 +2,17 @@ use alloy_primitives::U256;
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::types::{DexKind, PoolState, PoolStateWarning, PoolVariant};
-use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore};
+use base_arb_common::types::{
+    DexKind, PoolId, PoolState, PoolStateWarning, PoolVariant, TickState,
+};
+use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
 use std::collections::HashSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
+const TICK_BITMAP_WORD_RADIUS: i32 = 2;
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -20,7 +23,7 @@ pub struct MarketDataService<P> {
 
 impl<P> MarketDataService<P>
 where
-    P: PoolStateStore,
+    P: PoolStateStore + TickStateStore,
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
@@ -28,6 +31,7 @@ where
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states, "onchain_init")
             .await?;
+        self.publish_initialized_ticks(&monitored_states).await?;
 
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
@@ -78,6 +82,15 @@ where
                 );
                 self.recorder.record_dex_event(event.clone()).await?;
                 for state in &mut monitored_states {
+                    if state.pool_id.address != event.pool_address {
+                        continue;
+                    }
+                    let tick_deltas =
+                        super::state_updater::v3_tick_deltas_from_event(state, event)?;
+                    if !tick_deltas.is_empty() {
+                        self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
+                            .await?;
+                    }
                     if super::state_updater::apply_event_to_pool_state(state, event)? {
                         state_changed = true;
                         info!(
@@ -85,8 +98,8 @@ where
                             block_number = state.block_number,
                             "pool state locally updated from event"
                         );
-                        break;
                     }
+                    break;
                 }
             }
 
@@ -135,6 +148,7 @@ where
             );
             self.publish_monitored_states(&next, "registry_reload")
                 .await?;
+            self.publish_initialized_ticks(&next).await?;
         }
         Ok(next)
     }
@@ -154,6 +168,67 @@ where
                 "monitoring pool logs"
             );
         }
+        Ok(())
+    }
+
+    async fn publish_initialized_ticks(&self, states: &[PoolState]) -> Result<()> {
+        for state in states {
+            if !is_v3_style_state(state) {
+                continue;
+            }
+            let ticks = self
+                .provider
+                .fetch_initialized_ticks_around_state(state, TICK_BITMAP_WORD_RADIUS)
+                .await?;
+            if ticks.is_empty() {
+                continue;
+            }
+            let count = ticks.len();
+            self.pool_store.set_tick_states(ticks).await?;
+            info!(
+                pool = %state.pool_id.address,
+                count,
+                "initialized ticks loaded"
+            );
+        }
+        Ok(())
+    }
+
+    async fn apply_tick_deltas(
+        &self,
+        pool_id: &PoolId,
+        deltas: &[super::state_updater::TickDelta],
+        block_number: u64,
+    ) -> Result<()> {
+        let mut ticks = self.pool_store.get_pool_ticks(pool_id.address).await?;
+        let mut updates = Vec::with_capacity(deltas.len());
+
+        for delta in deltas {
+            let existing = ticks
+                .iter_mut()
+                .find(|tick| tick.tick == delta.tick)
+                .cloned();
+            let mut tick_state = existing.unwrap_or_else(|| TickState {
+                pool_id: pool_id.clone(),
+                tick: delta.tick,
+                liquidity_net: 0,
+                liquidity_gross: U256::ZERO,
+                block_number,
+                updated_at: chrono::Utc::now(),
+            });
+
+            tick_state.liquidity_net = tick_state
+                .liquidity_net
+                .checked_add(delta.liquidity_net_delta)
+                .ok_or_else(|| anyhow::anyhow!("liquidity_net overflow"))?;
+            tick_state.liquidity_gross =
+                apply_signed_u256_delta(tick_state.liquidity_gross, delta.liquidity_gross_delta)?;
+            tick_state.block_number = block_number;
+            tick_state.updated_at = chrono::Utc::now();
+            updates.push(tick_state);
+        }
+
+        self.pool_store.set_tick_states(updates).await?;
         Ok(())
     }
 
@@ -235,10 +310,29 @@ where
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
 where
-    P: PoolStateStore,
+    P: PoolStateStore + TickStateStore,
 {
     service.run().await?;
     Ok(())
+}
+
+fn is_v3_style_state(state: &PoolState) -> bool {
+    matches!(
+        (state.dex, state.variant),
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+            | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+    )
+}
+
+fn apply_signed_u256_delta(value: U256, delta: i128) -> Result<U256> {
+    if delta >= 0 {
+        value
+            .checked_add(U256::from(delta as u128))
+            .ok_or_else(|| anyhow::anyhow!("liquidity_gross overflow"))
+    } else {
+        let abs = U256::from((-delta) as u128);
+        Ok(value.saturating_sub(abs))
+    }
 }
 
 fn address_set(states: &[PoolState]) -> HashSet<String> {

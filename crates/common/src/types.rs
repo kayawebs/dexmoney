@@ -47,6 +47,16 @@ pub struct PoolState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TickState {
+    pub pool_id: PoolId,
+    pub tick: i32,
+    pub liquidity_net: i128,
+    pub liquidity_gross: U256,
+    pub block_number: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolRegistryEntry {
     pub pool_address: Address,
     pub dex: DexKind,
