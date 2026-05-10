@@ -11,6 +11,8 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+const MAX_POOL_STATE_AGE_MS: i64 = 300_000;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -64,14 +66,14 @@ where
         info!("no pool states available in redis");
         return Ok(());
     }
-    let candidates = engine.search(&pool_states)?;
+    let candidates = engine.search(&pool_states).await?;
 
     for candidate in candidates {
         info!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
             &pool_states,
-            candidate_ttl_ms,
+            MAX_POOL_STATE_AGE_MS,
             engine.min_expected_profit,
             max_price_impact_bps,
             &engine.whitelist_paths,

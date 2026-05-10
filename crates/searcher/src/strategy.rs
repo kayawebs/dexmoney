@@ -7,7 +7,7 @@ use base_arb_common::types::{
 };
 use base_arb_dex::aerodrome::AerodromeVolatileQuoter;
 use base_arb_dex::quoter::DexQuoter;
-use base_arb_dex::uniswap_v3::UniswapV3ChainQuoter;
+use base_arb_dex::uniswap_v3::{spot_quote_exact_in, UniswapV3CurrentTickQuoter};
 
 use crate::opportunity::build_candidate;
 
@@ -18,6 +18,8 @@ pub struct SearchEngine {
     pub max_price_impact_bps: u64,
     pub whitelist_paths: Vec<String>,
     pub candidate_ttl_ms: i64,
+    pub usdc: Address,
+    pub weth: Address,
 }
 
 impl SearchEngine {
@@ -84,26 +86,39 @@ impl SearchEngine {
             max_price_impact_bps,
             whitelist_paths: vec![name1, name2],
             candidate_ttl_ms,
+            usdc,
+            weth,
         }
     }
 
-    pub fn search(&self, pool_states: &[PoolState]) -> anyhow::Result<Vec<Candidate>> {
-        let usdc = self.paths[0].steps[0].token_in;
+    pub async fn search(&self, pool_states: &[PoolState]) -> anyhow::Result<Vec<Candidate>> {
+        let paths = self.paths_for_pool_states(pool_states);
         let mut out = Vec::new();
 
-        for path in &self.paths {
+        for path in &paths {
             for amount_in in &self.amount_sizes {
                 if let Some((expected_amount_out, price_impact_bps)) =
-                    quote_path(pool_states, path, *amount_in)?
+                    quote_path(pool_states, path, *amount_in).await?
                 {
                     if price_impact_bps > self.max_price_impact_bps {
                         continue;
                     }
                     let expected_profit = expected_amount_out.saturating_sub(*amount_in);
+                    let block_number = path
+                        .steps
+                        .iter()
+                        .filter_map(|step| {
+                            pool_states
+                                .iter()
+                                .find(|state| state.pool_id.address == step.pool)
+                                .map(|state| state.block_number)
+                        })
+                        .max()
+                        .unwrap_or(0);
                     let candidate = build_candidate(
-                        1,
+                        block_number,
                         "mvp-usdc-weth-usdc".into(),
-                        usdc,
+                        self.usdc,
                         *amount_in,
                         expected_amount_out,
                         expected_profit,
@@ -119,6 +134,56 @@ impl SearchEngine {
 
         Ok(out)
     }
+
+    fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<ArbPath> {
+        if !self.paths.is_empty() {
+            return self.paths.clone();
+        }
+
+        let pools = pool_states
+            .iter()
+            .filter(|state| is_supported_usdc_weth_pool(state, self.usdc, self.weth))
+            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+
+        for first in &pools {
+            for second in &pools {
+                if first.pool_id.address == second.pool_id.address {
+                    continue;
+                }
+                if first.dex == second.dex && first.variant == second.variant {
+                    continue;
+                }
+
+                let name = format!(
+                    "usdc-weth-usdc-{}-{}",
+                    pool_label(first),
+                    pool_label(second)
+                );
+                paths.push(ArbPath {
+                    name,
+                    steps: vec![
+                        SwapStep {
+                            dex: first.dex,
+                            pool: first.pool_id.address,
+                            token_in: self.usdc,
+                            token_out: self.weth,
+                            fee_bps: Some(first.fee_bps),
+                        },
+                        SwapStep {
+                            dex: second.dex,
+                            pool: second.pool_id.address,
+                            token_in: self.weth,
+                            token_out: self.usdc,
+                            fee_bps: Some(second.fee_bps),
+                        },
+                    ],
+                });
+            }
+        }
+
+        paths
+    }
 }
 
 pub fn usdc_to_units(usdc: f64) -> U256 {
@@ -131,74 +196,6 @@ pub fn engine_from_settings(
     max_price_impact_bps: u64,
     min_expected_profit: U256,
 ) -> anyhow::Result<SearchEngine> {
-    let Some(aero_pool) = settings.aerodrome_usdc_weth_pool else {
-        anyhow::bail!("AERODROME_USDC_WETH_POOL is required");
-    };
-
-    let mut paths = Vec::new();
-    let mut whitelist_paths = Vec::new();
-
-    for (pool, label, fee_bps) in [
-        (settings.uniswap_v3_usdc_weth_500_pool, "uni500", 5u32),
-        (settings.uniswap_v3_usdc_weth_3000_pool, "uni3000", 30u32),
-    ] {
-        let Some(uni_pool) = pool else {
-            continue;
-        };
-
-        let forward_name = format!("usdc-weth-usdc-aero-{label}");
-        let reverse_name = format!("usdc-weth-usdc-{label}-aero");
-
-        whitelist_paths.push(forward_name.clone());
-        whitelist_paths.push(reverse_name.clone());
-
-        paths.push(ArbPath {
-            name: forward_name,
-            steps: vec![
-                SwapStep {
-                    dex: DexKind::Aerodrome,
-                    pool: aero_pool,
-                    token_in: settings.usdc_address,
-                    token_out: settings.weth_address,
-                    fee_bps: Some(30),
-                },
-                SwapStep {
-                    dex: DexKind::UniswapV3,
-                    pool: uni_pool,
-                    token_in: settings.weth_address,
-                    token_out: settings.usdc_address,
-                    fee_bps: Some(fee_bps),
-                },
-            ],
-        });
-
-        paths.push(ArbPath {
-            name: reverse_name,
-            steps: vec![
-                SwapStep {
-                    dex: DexKind::UniswapV3,
-                    pool: uni_pool,
-                    token_in: settings.usdc_address,
-                    token_out: settings.weth_address,
-                    fee_bps: Some(fee_bps),
-                },
-                SwapStep {
-                    dex: DexKind::Aerodrome,
-                    pool: aero_pool,
-                    token_in: settings.weth_address,
-                    token_out: settings.usdc_address,
-                    fee_bps: Some(30),
-                },
-            ],
-        });
-    }
-
-    if paths.is_empty() {
-        anyhow::bail!(
-            "at least one of UNISWAP_V3_USDC_WETH_500_POOL or UNISWAP_V3_USDC_WETH_3000_POOL is required"
-        );
-    }
-
     Ok(SearchEngine {
         amount_sizes: vec![
             U256::from(10_000_000u64),
@@ -206,11 +203,13 @@ pub fn engine_from_settings(
             U256::from(50_000_000u64),
             U256::from(100_000_000u64),
         ],
-        paths,
+        paths: Vec::new(),
         min_expected_profit,
         max_price_impact_bps,
-        whitelist_paths,
+        whitelist_paths: Vec::new(),
         candidate_ttl_ms,
+        usdc: settings.usdc_address,
+        weth: settings.weth_address,
     })
 }
 
@@ -260,13 +259,13 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
     ]
 }
 
-fn quote_path(
+async fn quote_path(
     pool_states: &[PoolState],
     path: &ArbPath,
     amount_in: U256,
 ) -> anyhow::Result<Option<(U256, u64)>> {
     let aero = AerodromeVolatileQuoter;
-    let uni = UniswapV3ChainQuoter;
+    let uni = UniswapV3CurrentTickQuoter;
     let mut amount = amount_in;
     let mut max_impact = 0u64;
 
@@ -279,45 +278,88 @@ fn quote_path(
             None => return Ok(None),
         };
 
-        let quote = match step.dex {
-            DexKind::Aerodrome => {
-                futures::executor::block_on(aero.quote_exact_in(pool_state, step.token_in, amount))
-                    .map_err(anyhow::Error::from)?
-            }
-            DexKind::UniswapV3 => {
-                futures::executor::block_on(uni.quote_exact_in(pool_state, step.token_in, amount))
-                    .map_err(anyhow::Error::from)?
-            }
+        let quote = match pool_state.variant {
+            PoolVariant::AerodromeVolatile => aero
+                .quote_exact_in(pool_state, step.token_in, amount)
+                .await
+                .map_err(anyhow::Error::from)?,
+            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => uni
+                .quote_exact_in(pool_state, step.token_in, amount)
+                .await
+                .map_err(anyhow::Error::from)?,
         };
 
         amount = quote.amount_out;
-        max_impact = max_impact.max(estimate_price_impact_bps(pool_state, &quote));
+        max_impact = max_impact.max(estimate_price_impact_bps(pool_state, step.token_in, &quote));
     }
 
     Ok(Some((amount, max_impact)))
 }
 
-fn estimate_price_impact_bps(pool_state: &PoolState, quote: &QuoteResult) -> u64 {
+fn estimate_price_impact_bps(
+    pool_state: &PoolState,
+    token_in: Address,
+    quote: &QuoteResult,
+) -> u64 {
     if let (Some(reserve0), Some(reserve1)) = (pool_state.reserve0, pool_state.reserve1) {
-        let reserve_in = reserve0.max(U256::from(1u64));
-        let reserve_out = reserve1.max(U256::from(1u64));
+        let (reserve_in, reserve_out) = if token_in == pool_state.token0 {
+            (reserve0, reserve1)
+        } else if token_in == pool_state.token1 {
+            (reserve1, reserve0)
+        } else {
+            return u64::MAX;
+        };
         let spot_out = quote
             .amount_in
-            .saturating_mul(reserve_out)
-            .checked_div(reserve_in)
+            .saturating_mul(reserve_out.max(U256::from(1u64)))
+            .checked_div(reserve_in.max(U256::from(1u64)))
             .unwrap_or(U256::ZERO);
-        if spot_out.is_zero() {
-            return 0;
-        }
-        let slippage = spot_out.saturating_sub(quote.amount_out);
-        let bps = slippage
-            .saturating_mul(U256::from(10_000u64))
-            .checked_div(spot_out)
-            .unwrap_or(U256::ZERO);
-        return u64::try_from(bps).unwrap_or(u64::MAX);
+        return impact_from_spot(spot_out, quote.amount_out);
     }
 
-    5
+    let Ok(spot_out) = spot_quote_exact_in(pool_state, token_in, quote.amount_in) else {
+        return u64::MAX;
+    };
+    impact_from_spot(spot_out, quote.amount_out)
+}
+
+fn impact_from_spot(spot_out: U256, actual_out: U256) -> u64 {
+    if spot_out.is_zero() {
+        return 0;
+    }
+    let slippage = spot_out.saturating_sub(actual_out);
+    let bps = slippage
+        .saturating_mul(U256::from(10_000u64))
+        .checked_div(spot_out)
+        .unwrap_or(U256::ZERO);
+    u64::try_from(bps).unwrap_or(u64::MAX)
+}
+
+fn is_supported_usdc_weth_pool(state: &PoolState, usdc: Address, weth: Address) -> bool {
+    let has_pair = (state.token0 == usdc && state.token1 == weth)
+        || (state.token0 == weth && state.token1 == usdc);
+    if !has_pair {
+        return false;
+    }
+    match state.variant {
+        PoolVariant::AerodromeVolatile => state.reserve0.is_some() && state.reserve1.is_some(),
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => {
+            state.sqrt_price_x96.is_some() && state.liquidity.is_some() && state.tick.is_some()
+        }
+    }
+}
+
+fn pool_label(state: &PoolState) -> String {
+    let suffix = format!("{:#x}", state.pool_id.address);
+    let suffix = &suffix[suffix.len().saturating_sub(6)..];
+    match (state.dex, state.variant) {
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => format!("aero-classic-{suffix}"),
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream) => {
+            format!("aero-slipstream-{suffix}")
+        }
+        (DexKind::UniswapV3, PoolVariant::UniswapV3) => format!("uni-v3-{suffix}"),
+        _ => format!("pool-{suffix}"),
+    }
 }
 
 #[cfg(test)]
@@ -326,13 +368,14 @@ mod tests {
 
     use super::{demo_pool_states, SearchEngine};
 
-    #[test]
-    fn search_engine_emits_candidates_for_demo_state() {
-        let engine = SearchEngine::new(500, 50, U256::from(1u64));
+    #[tokio::test]
+    async fn search_engine_emits_candidates_for_demo_state() {
+        let engine = SearchEngine::new(500, 10_000, U256::from(1u64));
         let candidates = engine
             .search(&demo_pool_states(address!(
                 "833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
             )))
+            .await
             .unwrap();
 
         assert!(!candidates.is_empty());

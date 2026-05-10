@@ -12,3 +12,6 @@ base-arb-common = { path = "../common" }
 serde.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+chrono.workspace = true
+tokio.workspace = true

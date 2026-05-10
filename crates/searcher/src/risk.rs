@@ -19,15 +19,20 @@ pub fn validate_candidate(
     if candidate.price_impact_bps > max_price_impact_bps {
         return Err(ArbBotError::RiskGate("price impact too high".into()));
     }
-    if !whitelist_paths.contains(&candidate.path.name) {
+    if !whitelist_paths.is_empty() && !whitelist_paths.contains(&candidate.path.name) {
         return Err(ArbBotError::RiskGate("path not whitelisted".into()));
     }
 
     let now = Utc::now();
-    if pool_states
-        .iter()
-        .any(|state| state.is_stale(now, max_pool_age_ms))
-    {
+    if candidate.path.steps.iter().any(|step| {
+        match pool_states
+            .iter()
+            .find(|state| state.pool_id.address == step.pool)
+        {
+            Some(state) => state.is_stale(now, max_pool_age_ms),
+            None => true,
+        }
+    }) {
         return Err(ArbBotError::RiskGate("pool state stale".into()));
     }
 

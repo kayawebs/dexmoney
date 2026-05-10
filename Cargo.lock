@@ -432,7 +432,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base-arb-common",
+ "chrono",
  "serde",
+ "tokio",
  "tracing",
 ]
 
@@ -2866,7 +2868,6 @@ dependencies = [
  "base-arb-dex",
  "base-arb-storage",
  "chrono",
- "futures",
  "tokio",
  "tracing",
  "tracing-subscriber",
