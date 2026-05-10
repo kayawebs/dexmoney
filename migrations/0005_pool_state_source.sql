@@ -1,0 +1,2 @@
+ALTER TABLE pool_states
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown';

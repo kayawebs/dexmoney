@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS pool_states (
     liquidity TEXT,
     tick BIGINT,
     block_number BIGINT NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source TEXT NOT NULL DEFAULT 'unknown'
 );
 
 CREATE INDEX IF NOT EXISTS pool_states_pool_updated_idx

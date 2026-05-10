@@ -26,7 +26,8 @@ where
         info!("event listener started");
 
         let mut monitored_states = self.load_monitored_states().await?;
-        self.publish_monitored_states(&monitored_states).await?;
+        self.publish_monitored_states(&monitored_states, "onchain_init")
+            .await?;
 
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
@@ -90,7 +91,8 @@ where
             }
 
             if state_changed {
-                self.publish_monitored_states(&monitored_states).await?;
+                self.publish_monitored_states(&monitored_states, "local_event")
+                    .await?;
             }
 
             if Instant::now() >= next_calibration {
@@ -131,20 +133,24 @@ where
                 next = next_addresses.len(),
                 "pool registry changed; reloading monitored pools"
             );
-            self.publish_monitored_states(&next).await?;
+            self.publish_monitored_states(&next, "registry_reload")
+                .await?;
         }
         Ok(next)
     }
 
-    async fn publish_monitored_states(&self, states: &[PoolState]) -> Result<()> {
+    async fn publish_monitored_states(&self, states: &[PoolState], source: &str) -> Result<()> {
         for state in states {
             self.pool_store.set_pool_state(state.clone()).await?;
-            self.recorder.record_pool_state(state.clone()).await?;
+            self.recorder
+                .record_pool_state_with_source(state.clone(), source)
+                .await?;
             super::state_updater::log_pool_state_update(state);
             info!(
                 pool = %state.pool_id.address,
                 dex = ?state.dex,
                 variant = ?state.variant,
+                source,
                 "monitoring pool logs"
             );
         }
@@ -219,7 +225,8 @@ where
         }
 
         if corrected {
-            self.publish_monitored_states(&states).await?;
+            self.publish_monitored_states(&states, "calibration_correction")
+                .await?;
         }
 
         Ok(states)

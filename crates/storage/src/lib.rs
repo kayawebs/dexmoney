@@ -29,6 +29,14 @@ pub trait CandidateStore: Send + Sync {
 pub trait RecorderStore: Send + Sync {
     async fn record_dex_event(&self, event: DexEvent) -> anyhow::Result<()>;
     async fn record_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()>;
+    async fn record_pool_state_with_source(
+        &self,
+        pool_state: PoolState,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        let _ = source;
+        self.record_pool_state(pool_state).await
+    }
     async fn record_opportunity(&self, candidate: Candidate) -> anyhow::Result<()>;
     async fn record_simulation(&self, simulation: SimulationResult) -> anyhow::Result<()>;
     async fn record_transaction(&self, tx: TxResult) -> anyhow::Result<()>;

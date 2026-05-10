@@ -660,10 +660,7 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
         SELECT
             ps.updated_at,
             ps.block_number,
-            CASE
-                WHEN source_event.pool_address IS NULL THEN 'onchain init/calibration'
-                ELSE 'local event'
-            END AS source,
+            ps.source,
             ps.dex, p.variant, ps.pool_address,
             ps.token0, ps.token1,
             split_part(tp.symbol, '/', 1) AS token0_symbol,
@@ -675,23 +672,12 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
         INNER JOIN LATERAL (
             SELECT
                 updated_at, block_number, dex, pool_address, token0, token1, fee,
-                reserve0, reserve1, sqrt_price_x96, liquidity, tick
+                reserve0, reserve1, sqrt_price_x96, liquidity, tick, source
             FROM pool_states
             WHERE pool_address = p.pool_address
             ORDER BY updated_at DESC
             LIMIT 1
         ) ps ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT de.pool_address
-            FROM dex_events de
-            WHERE de.pool_address = p.pool_address
-                AND de.block_number = ps.block_number
-                AND (
-                    (p.variant = 'AerodromeVolatile' AND de.event_type = 'Sync')
-                    OR (p.variant IN ('AerodromeSlipstream', 'UniswapV3') AND de.event_type = 'Swap')
-                )
-            LIMIT 1
-        ) source_event ON TRUE
         WHERE p.enabled = TRUE
         ORDER BY ps.updated_at DESC
         LIMIT 25
@@ -1430,8 +1416,11 @@ fn monitoring_status(enabled: bool) -> String {
 
 fn state_source_label(source: &str) -> String {
     match source {
-        "local event" => "<span class=\"ok\">local event</span>".into(),
-        "onchain init/calibration" => "<span class=\"warn\">onchain init/calibration</span>".into(),
+        "local_event" => "<span class=\"ok\">local_event</span>".into(),
+        "onchain_init" | "registry_reload" => {
+            format!("<span class=\"warn\">{}</span>", escape(source))
+        }
+        "calibration_correction" => "<span class=\"bad\">calibration_correction</span>".into(),
         value => escape(value),
     }
 }

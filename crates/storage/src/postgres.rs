@@ -258,6 +258,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pools (token_pair_id, enabled)"#,
         r#"CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
             ON dex_events (pool_address, block_number DESC, event_type)"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown'"#,
         r#"CREATE TABLE IF NOT EXISTS pool_state_warnings (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             pool_address TEXT NOT NULL,
@@ -340,12 +342,21 @@ impl RecorderStore for PostgresStore {
     }
 
     async fn record_pool_state(&self, pool_state: PoolState) -> Result<()> {
+        self.record_pool_state_with_source(pool_state, "unknown")
+            .await
+    }
+
+    async fn record_pool_state_with_source(
+        &self,
+        pool_state: PoolState,
+        source: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO pool_states (
                 id, pool_address, dex, token0, token1, fee, reserve0, reserve1,
-                sqrt_price_x96, liquidity, tick, block_number, updated_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                sqrt_price_x96, liquidity, tick, block_number, updated_at, source
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -361,6 +372,7 @@ impl RecorderStore for PostgresStore {
         .bind(pool_state.tick.map(i64::from))
         .bind(i64::try_from(pool_state.block_number)?)
         .bind(pool_state.updated_at)
+        .bind(source)
         .execute(&self.pool)
         .await?;
         Ok(())
