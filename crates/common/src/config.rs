@@ -23,6 +23,7 @@ pub struct Settings {
     pub uniswap_v3_usdc_weth_500_pool: Option<Address>,
     pub uniswap_v3_usdc_weth_3000_pool: Option<Address>,
     pub executor_contract: Option<Address>,
+    pub eoa_address_1: Option<Address>,
     pub eoa_private_key_1: Option<String>,
     pub min_expected_profit_usdc: f64,
     pub min_simulated_profit_usdc: f64,

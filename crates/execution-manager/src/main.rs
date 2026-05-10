@@ -1,9 +1,9 @@
 mod eoa_lane;
 mod simulator;
-mod tx_manager;
 
 use alloy_primitives::address;
 use anyhow::Result;
+use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, RecorderStore,
@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
     let settings = Settings::load()?;
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
+    let provider = ChainProvider::from_settings(&settings);
 
     info!("execution-manager initialized");
     let mut ticker = interval(Duration::from_millis(500));
@@ -31,6 +32,8 @@ async fn main() -> Result<()> {
             &redis,
             &redis,
             &postgres,
+            &provider,
+            &settings,
             settings.min_simulated_profit_usdc,
         )
         .await?;
@@ -41,6 +44,8 @@ async fn run_execution_cycle<C, E, R>(
     candidate_store: &C,
     eoa_store: &E,
     recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
     min_simulated_profit_usdc: f64,
 ) -> Result<()>
 where
@@ -48,8 +53,10 @@ where
     E: EoaStateStore,
     R: RecorderStore,
 {
-    let lane_address = address!("4200000000000000000000000000000000000006");
-    let mut lane = eoa_lane::EoaLane::new(lane_address);
+    let lane_address = settings
+        .eoa_address_1
+        .unwrap_or_else(|| address!("0000000000000000000000000000000000000000"));
+    let lane = eoa_lane::EoaLane::new(lane_address);
     eoa_store.set_lane_state(lane.state.clone()).await?;
     info!(lane = ?lane.state, "eoa lane ready");
 
@@ -58,21 +65,16 @@ where
         return Ok(());
     };
 
-    let simulation = simulator::simulate(&candidate, min_simulated_profit_usdc);
+    let simulation =
+        simulator::simulate(provider, settings, &candidate, min_simulated_profit_usdc).await;
     recorder.record_simulation(simulation.clone()).await?;
     info!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
 
     if simulation.success {
-        let pending = tx_manager::build_pending_tx(&candidate, lane.state.local_nonce);
-        let tx_hash = tx_manager::synthetic_tx_hash(&candidate, lane.state.local_nonce);
-        lane.mark_submitted(tx_hash);
-        eoa_store.set_lane_state(lane.state.clone()).await?;
-        recorder.record_transaction(pending.clone()).await?;
-        info!(candidate_id = %candidate.id, nonce = pending.nonce, "tx submitted");
-
-        lane.mark_confirmed(lane.state.local_nonce);
-        eoa_store.set_lane_state(lane.state.clone()).await?;
-        info!(candidate_id = %candidate.id, "tx confirmed/reverted");
+        info!(
+            candidate_id = %candidate.id,
+            "eth_call simulation passed; raw transaction signing/submission is not enabled yet"
+        );
     }
 
     Ok(())

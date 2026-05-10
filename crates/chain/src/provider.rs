@@ -639,17 +639,25 @@ impl ChainProvider {
     }
 
     async fn eth_call(&self, to: Address, data: &str, label: &str) -> Result<String> {
+        self.eth_call_from(None, to, data, label).await
+    }
+
+    pub async fn eth_call_from(
+        &self,
+        from: Option<Address>,
+        to: Address,
+        data: &str,
+        label: &str,
+    ) -> Result<String> {
+        let mut call = json!({
+            "to": format!("{to:#x}"),
+            "data": data,
+        });
+        if let Some(from) = from {
+            call["from"] = json!(format!("{from:#x}"));
+        }
         let value = self
-            .rpc(
-                "eth_call",
-                json!([
-                    {
-                        "to": format!("{to:#x}"),
-                        "data": data,
-                    },
-                    "latest"
-                ]),
-            )
+            .rpc("eth_call", json!([call, "latest"]))
             .await
             .with_context(|| format!("eth_call {label} to={to:#x} data={data}"))?;
         let result = value.as_str().unwrap_or("0x").to_string();
