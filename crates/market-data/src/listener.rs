@@ -101,7 +101,14 @@ where
                         self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
                             .await?;
                     }
+                    let v3_liquidity_update =
+                        super::state_updater::v3_liquidity_update_from_event(state, event)?;
                     if super::state_updater::apply_event_to_pool_state(state, event)? {
+                        if let Some(update) = v3_liquidity_update {
+                            self.recorder
+                                .record_v3_liquidity_update(event, state, &update)
+                                .await?;
+                        }
                         changed_pools.insert(state.pool_id.address);
                         info!(
                             pool = %state.pool_id.address,

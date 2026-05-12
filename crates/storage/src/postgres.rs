@@ -8,7 +8,7 @@ use crate::RecorderStore;
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
     Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateWarning,
-    PoolVariant, SimulationResult, TxResult,
+    PoolVariant, SimulationResult, TxResult, V3LiquidityUpdate,
 };
 
 #[derive(Clone)]
@@ -217,6 +217,40 @@ impl PostgresStore {
         .await?;
         Ok(())
     }
+
+    pub async fn record_v3_liquidity_update(
+        &self,
+        event: &DexEvent,
+        state: &PoolState,
+        update: &V3LiquidityUpdate,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO v3_liquidity_updates (
+                id, pool_address, dex, variant, block_number, tx_hash, log_index,
+                event_type, current_tick, tick_lower, tick_upper, amount,
+                previous_liquidity, next_liquidity, created_at
+            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+            ON CONFLICT (pool_address, tx_hash, log_index) DO NOTHING
+            "#,
+        )
+        .bind(address_to_string(event.pool_address))
+        .bind(dex_to_string(state.dex))
+        .bind(variant_to_string(state.variant))
+        .bind(i64::try_from(event.block_number)?)
+        .bind(&event.tx_hash)
+        .bind(i64::try_from(event.log_index)?)
+        .bind(&event.event_type)
+        .bind(i64::from(update.current_tick))
+        .bind(i64::from(update.tick_lower))
+        .bind(i64::from(update.tick_upper))
+        .bind(update.amount.to_string())
+        .bind(update.previous_liquidity.to_string())
+        .bind(update.next_liquidity.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
@@ -277,6 +311,26 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pool_state_warnings (created_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pool_state_warnings_pool_created_idx
             ON pool_state_warnings (pool_address, created_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS v3_liquidity_updates (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            pool_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            block_number BIGINT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            log_index BIGINT NOT NULL,
+            event_type TEXT NOT NULL,
+            current_tick BIGINT NOT NULL,
+            tick_lower BIGINT NOT NULL,
+            tick_upper BIGINT NOT NULL,
+            amount TEXT NOT NULL,
+            previous_liquidity TEXT NOT NULL,
+            next_liquidity TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (pool_address, tx_hash, log_index)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS v3_liquidity_updates_pool_block_idx
+            ON v3_liquidity_updates (pool_address, block_number DESC, log_index DESC)"#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }

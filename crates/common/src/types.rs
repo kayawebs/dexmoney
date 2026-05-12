@@ -57,6 +57,16 @@ pub struct TickState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct V3LiquidityUpdate {
+    pub current_tick: i32,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub amount: U256,
+    pub previous_liquidity: U256,
+    pub next_liquidity: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolRegistryEntry {
     pub pool_address: Address,
     pub dex: DexKind,

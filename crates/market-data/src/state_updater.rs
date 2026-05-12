@@ -1,7 +1,7 @@
 use alloy_primitives::U256;
 use anyhow::{Context, Result};
 use base_arb_chain::events::DexEvent;
-use base_arb_common::types::{DexKind, PoolState, PoolVariant};
+use base_arb_common::types::{DexKind, PoolState, PoolVariant, V3LiquidityUpdate};
 use chrono::Utc;
 use tracing::info;
 
@@ -151,6 +151,38 @@ pub fn v3_tick_deltas_from_event(state: &PoolState, event: &DexEvent) -> Result<
     }
 }
 
+pub fn v3_liquidity_update_from_event(
+    state: &PoolState,
+    event: &DexEvent,
+) -> Result<Option<V3LiquidityUpdate>> {
+    if state.pool_id.address != event.pool_address || !is_v3_style(state) {
+        return Ok(None);
+    }
+    let Some(topic0) = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.get(0))
+        .and_then(|topic| topic.as_str())
+    else {
+        return Ok(None);
+    };
+    if topic0 != V3_MINT_TOPIC && topic0 != V3_BURN_TOPIC {
+        return Ok(None);
+    }
+    let topics = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.as_array())
+        .context("pool event missing topics")?;
+    let data = event
+        .raw_data_json
+        .get("data")
+        .and_then(|data| data.as_str())
+        .context("pool event missing data")?;
+
+    apply_v3_liquidity_delta(state, topic0, topics, data)
+}
+
 fn is_v3_style(state: &PoolState) -> bool {
     matches!(
         (state.dex, state.variant),
@@ -185,7 +217,7 @@ fn apply_v3_liquidity_delta(
     topic0: &str,
     topics: &[serde_json::Value],
     data: &str,
-) -> Result<Option<LiquidityUpdate>> {
+) -> Result<Option<V3LiquidityUpdate>> {
     let Some(current_tick) = state.tick else {
         return Ok(None);
     };
@@ -208,7 +240,7 @@ fn apply_v3_liquidity_delta(
     } else {
         current_liquidity.saturating_sub(amount)
     };
-    Ok(Some(LiquidityUpdate {
+    Ok(Some(V3LiquidityUpdate {
         current_tick,
         tick_lower,
         tick_upper,
@@ -246,15 +278,6 @@ fn decode_i24_word(word: &str) -> Result<i32> {
     } else {
         Ok(low as i32)
     }
-}
-
-struct LiquidityUpdate {
-    current_tick: i32,
-    tick_lower: i32,
-    tick_upper: i32,
-    amount: U256,
-    previous_liquidity: U256,
-    next_liquidity: U256,
 }
 
 #[cfg(test)]
