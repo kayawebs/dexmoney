@@ -18,6 +18,24 @@ use sqlx::{FromRow, PgPool};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Dexmoney logo">
+  <defs>
+    <linearGradient id="g" x1="10" y1="8" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4ad295"/>
+      <stop offset="0.52" stop-color="#22a7f2"/>
+      <stop offset="1" stop-color="#ffb347"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#0d1117"/>
+  <path d="M17 37.5c2.4 8.1 11.3 12.5 19.2 9.5 5.2-2 8.6-6.5 9.5-11.6" fill="none" stroke="url(#g)" stroke-width="5.6" stroke-linecap="round"/>
+  <path d="M47.5 25.7c-2.9-7.2-11.3-11-18.8-8.1-4.8 1.8-8.1 5.9-9.2 10.7" fill="none" stroke="url(#g)" stroke-width="5.6" stroke-linecap="round"/>
+  <path d="M46.5 35.3l7.7 1.4-5.3 5.7-2.4-7.1Z" fill="#ffb347"/>
+  <path d="M18.2 28.7l-7.7-1.5 5.4-5.6 2.3 7.1Z" fill="#4ad295"/>
+  <circle cx="32" cy="32" r="8.8" fill="#101923" stroke="#e6edf3" stroke-width="2.2"/>
+  <path d="M28 32h8" stroke="#4ad295" stroke-width="3" stroke-linecap="round"/>
+  <path d="M32 28v8" stroke="#22a7f2" stroke-width="3" stroke-linecap="round"/>
+</svg>"##;
+
 #[derive(Clone)]
 struct AppState {
     pool: Arc<PgPool>,
@@ -189,6 +207,8 @@ async fn main() -> Result<()> {
         .route("/pairs/rediscover", post(rediscover_pair))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
+        .route("/favicon.ico", get(favicon))
+        .route("/favicon.svg", get(favicon))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -200,6 +220,10 @@ async fn main() -> Result<()> {
 
 async fn healthz() -> impl IntoResponse {
     "ok"
+}
+
+async fn favicon() -> impl IntoResponse {
+    ([("content-type", "image/svg+xml; charset=utf-8")], LOGO_SVG)
 }
 
 async fn index(
@@ -768,6 +792,8 @@ fn render_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="shortcut icon" href="/favicon.ico">
   <title>Base Arb Monitor - {title}</title>
   <style>
     :root {{
@@ -789,8 +815,20 @@ fn render_page(
       background: radial-gradient(circle at top, #142033 0%, var(--bg) 42%);
       color: var(--text);
     }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
+    h1 {{ margin: 0; font-size: 28px; }}
     p {{ margin: 0 0 18px; color: var(--muted); }}
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }}
+    .brand-logo {{
+      width: 42px;
+      height: 42px;
+      flex: 0 0 auto;
+      filter: drop-shadow(0 8px 18px rgba(74,210,149,0.18));
+    }}
     nav {{
       display: flex;
       flex-wrap: wrap;
@@ -1001,7 +1039,10 @@ fn render_page(
   </script>
 </head>
 <body>
-  <h1>{title}</h1>
+  <div class="brand">
+    <span class="brand-logo">{logo}</span>
+    <h1>{title}</h1>
+  </div>
   <p>{subtitle}</p>
   <nav>
     <a href="{overview_href}">Overview</a>
@@ -1017,6 +1058,7 @@ fn render_page(
 </html>"#,
         subtitle = escape(subtitle),
         title = escape(title),
+        logo = LOGO_SVG,
         overview_href = nav_href("/", auth_password),
         registry_href = nav_href("/registry", auth_password),
         activity_href = nav_href("/activity", auth_password),
@@ -1032,14 +1074,18 @@ fn render_login() -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="shortcut icon" href="/favicon.ico">
   <title>Base Arb Monitor Login</title>
   <style>
     :root { --bg: #0d1117; --panel: #161b22; --text: #e6edf3; --muted: #93a1b2; --line: #2d3742; --accent: #4ad295; }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background: radial-gradient(circle at top, #142033 0%, var(--bg) 48%); color: var(--text); }
     form { width: min(420px, calc(100vw - 32px)); padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); box-shadow: 0 18px 50px rgba(0,0,0,0.26); }
-    h1 { margin: 0 0 8px; font-size: 22px; }
+    h1 { margin: 0; font-size: 22px; }
     p { margin: 0 0 18px; color: var(--muted); }
+    .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .brand-logo { width: 38px; height: 38px; flex: 0 0 auto; filter: drop-shadow(0 8px 18px rgba(74,210,149,0.18)); }
     label { display: grid; gap: 8px; color: var(--muted); font-size: 12px; }
     input { width: 100%; border: 1px solid var(--line); border-radius: 10px; background: #0d1117; color: var(--text); padding: 11px 12px; font: inherit; }
     button { width: 100%; margin-top: 14px; border: 0; border-radius: 10px; padding: 12px 14px; color: #07110c; background: var(--accent); font-weight: 700; cursor: pointer; }
@@ -1058,7 +1104,10 @@ fn render_login() -> String {
 </head>
 <body>
   <form method="get" action="/">
-    <h1>Base Arb Monitor</h1>
+    <div class="brand">
+      <span class="brand-logo">__LOGO__</span>
+      <h1>Base Arb Monitor</h1>
+    </div>
     <p>Enter `MONITOR_WEB_PASSWORD` from `.env`.</p>
     <label>Password
       __PASSWORD_INPUT__
@@ -1067,6 +1116,7 @@ fn render_login() -> String {
   </form>
 </body>
 </html>"#
+        .replace("__LOGO__", LOGO_SVG)
         .replace("__PASSWORD_INPUT__", &password_input(Some(""), true))
 }
 
