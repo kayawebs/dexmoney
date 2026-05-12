@@ -6,7 +6,7 @@ use base_arb_common::types::{
     DexKind, PoolId, PoolState, PoolStateWarning, PoolVariant, TickState,
 };
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -36,6 +36,7 @@ where
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+        let mut recent_logs = RecentLogCache::new(20_000);
         info!(last_seen_block, "market-data synchronized at startup");
 
         let mut ticker = interval(Duration::from_secs(3));
@@ -74,6 +75,15 @@ where
 
             let mut changed_pools = HashSet::new();
             for event in &events {
+                if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
+                    warn!(
+                        tx_hash = %event.tx_hash,
+                        log_index = event.log_index,
+                        pool = %event.pool_address,
+                        "duplicate event skipped before local state update"
+                    );
+                    continue;
+                }
                 info!(
                     pool = %event.pool_address,
                     block_number = event.block_number,
@@ -453,4 +463,34 @@ fn value_drift_bps(local: Option<U256>, onchain: Option<U256>) -> u64 {
         .checked_div(onchain)
         .unwrap_or(U256::MAX);
     u64::try_from(bps).unwrap_or(u64::MAX)
+}
+
+struct RecentLogCache {
+    limit: usize,
+    order: VecDeque<(String, u64)>,
+    set: HashSet<(String, u64)>,
+}
+
+impl RecentLogCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            order: VecDeque::with_capacity(limit),
+            set: HashSet::with_capacity(limit),
+        }
+    }
+
+    fn insert(&mut self, tx_hash: String, log_index: u64) -> bool {
+        let key = (tx_hash, log_index);
+        if !self.set.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.limit {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
 }
