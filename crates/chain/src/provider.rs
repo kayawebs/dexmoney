@@ -107,8 +107,20 @@ impl ChainProvider {
         &self,
         entry: &PoolRegistryEntry,
     ) -> Result<PoolState> {
+        self.fetch_pool_state_from_registry_at_block(entry, None)
+            .await
+    }
+
+    pub async fn fetch_pool_state_from_registry_at_block(
+        &self,
+        entry: &PoolRegistryEntry,
+        block_number: Option<u64>,
+    ) -> Result<PoolState> {
         match entry.dex {
-            DexKind::Aerodrome => self.fetch_aerodrome_pool_state(entry.pool_address).await,
+            DexKind::Aerodrome => {
+                self.fetch_aerodrome_pool_state_at_block(entry.pool_address, block_number)
+                    .await
+            }
             DexKind::UniswapV3 => {
                 let (token0, token1) = self
                     .fetch_pool_tokens(entry.pool_address)
@@ -120,7 +132,7 @@ impl ChainProvider {
                         )
                     })?;
                 let (sqrt_price_x96, tick, liquidity) = self
-                    .fetch_uniswap_v3_state(entry.pool_address)
+                    .fetch_uniswap_v3_state_at_block(entry.pool_address, block_number)
                     .await
                     .with_context(|| {
                         format!(
@@ -143,7 +155,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
-                    block_number: self.get_block_number().await?,
+                    block_number: block_number.unwrap_or(self.get_block_number().await?),
                     updated_at: Utc::now(),
                 })
             }
@@ -458,12 +470,23 @@ impl ChainProvider {
     }
 
     async fn fetch_aerodrome_pool_state(&self, pool: Address) -> Result<PoolState> {
-        let block_number = self.get_block_number().await?;
+        self.fetch_aerodrome_pool_state_at_block(pool, None).await
+    }
+
+    async fn fetch_aerodrome_pool_state_at_block(
+        &self,
+        pool: Address,
+        block_number: Option<u64>,
+    ) -> Result<PoolState> {
+        let block_number = block_number.unwrap_or(self.get_block_number().await?);
         let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
             format!("failed to read token0/token1 for Aerodrome pool {pool:#x}")
         })?;
 
-        match self.fetch_aerodrome_reserves(pool).await {
+        match self
+            .fetch_aerodrome_reserves_at_block(pool, Some(block_number))
+            .await
+        {
             Ok((reserve0, reserve1)) => Ok(PoolState {
                 pool_id: PoolId {
                     chain_id: self.chain_id,
@@ -484,7 +507,7 @@ impl ChainProvider {
             }),
             Err(reserve_err) => {
                 let (sqrt_price_x96, tick, liquidity) = self
-                    .fetch_aerodrome_slipstream_state(pool)
+                    .fetch_aerodrome_slipstream_state_at_block(pool, Some(block_number))
                     .await
                     .with_context(|| {
                         format!(
@@ -554,9 +577,13 @@ impl ChainProvider {
         ))
     }
 
-    async fn fetch_aerodrome_reserves(&self, pool: Address) -> Result<(U256, U256)> {
+    async fn fetch_aerodrome_reserves_at_block(
+        &self,
+        pool: Address,
+        block_number: Option<u64>,
+    ) -> Result<(U256, U256)> {
         let data = self
-            .eth_call(pool, "0x0902f1ac", "Aerodrome getReserves()")
+            .eth_call_at_block(pool, "0x0902f1ac", "Aerodrome getReserves()", block_number)
             .await?;
         let words = decode_32byte_words(&data)?;
         let reserve0 = parse_word_u256(&words[0])?;
@@ -564,16 +591,30 @@ impl ChainProvider {
         Ok((reserve0, reserve1))
     }
 
-    async fn fetch_aerodrome_slipstream_state(&self, pool: Address) -> Result<(U256, i32, U256)> {
+    async fn fetch_aerodrome_slipstream_state_at_block(
+        &self,
+        pool: Address,
+        block_number: Option<u64>,
+    ) -> Result<(U256, i32, U256)> {
         let slot0 = self
-            .eth_call(pool, "0x3850c7bd", "Aerodrome Slipstream slot0()")
+            .eth_call_at_block(
+                pool,
+                "0x3850c7bd",
+                "Aerodrome Slipstream slot0()",
+                block_number,
+            )
             .await?;
         let slot0_words = decode_32byte_words(&slot0)?;
         let sqrt_price_x96 = parse_word_u256(&slot0_words[0])?;
         let tick = parse_word_i24(&slot0_words[1])?;
 
         let liquidity = self
-            .eth_call(pool, "0x1a686502", "Aerodrome Slipstream liquidity()")
+            .eth_call_at_block(
+                pool,
+                "0x1a686502",
+                "Aerodrome Slipstream liquidity()",
+                block_number,
+            )
             .await?;
         let liquidity_words = decode_32byte_words(&liquidity)?;
         let liquidity = parse_word_u256(&liquidity_words[0])?;
@@ -582,15 +623,23 @@ impl ChainProvider {
     }
 
     async fn fetch_uniswap_v3_state(&self, pool: Address) -> Result<(U256, i32, U256)> {
+        self.fetch_uniswap_v3_state_at_block(pool, None).await
+    }
+
+    async fn fetch_uniswap_v3_state_at_block(
+        &self,
+        pool: Address,
+        block_number: Option<u64>,
+    ) -> Result<(U256, i32, U256)> {
         let slot0 = self
-            .eth_call(pool, "0x3850c7bd", "UniswapV3 slot0()")
+            .eth_call_at_block(pool, "0x3850c7bd", "UniswapV3 slot0()", block_number)
             .await?;
         let slot0_words = decode_32byte_words(&slot0)?;
         let sqrt_price_x96 = parse_word_u256(&slot0_words[0])?;
         let tick = parse_word_i24(&slot0_words[1])?;
 
         let liquidity = self
-            .eth_call(pool, "0x1a686502", "UniswapV3 liquidity()")
+            .eth_call_at_block(pool, "0x1a686502", "UniswapV3 liquidity()", block_number)
             .await?;
         let liquidity_words = decode_32byte_words(&liquidity)?;
         let liquidity = parse_word_u256(&liquidity_words[0])?;
@@ -675,7 +724,19 @@ impl ChainProvider {
     }
 
     async fn eth_call(&self, to: Address, data: &str, label: &str) -> Result<String> {
-        self.eth_call_from(None, to, data, label).await
+        self.eth_call_from_at_block(None, to, data, label, None)
+            .await
+    }
+
+    async fn eth_call_at_block(
+        &self,
+        to: Address,
+        data: &str,
+        label: &str,
+        block_number: Option<u64>,
+    ) -> Result<String> {
+        self.eth_call_from_at_block(None, to, data, label, block_number)
+            .await
     }
 
     pub async fn eth_call_from(
@@ -685,6 +746,18 @@ impl ChainProvider {
         data: &str,
         label: &str,
     ) -> Result<String> {
+        self.eth_call_from_at_block(from, to, data, label, None)
+            .await
+    }
+
+    pub async fn eth_call_from_at_block(
+        &self,
+        from: Option<Address>,
+        to: Address,
+        data: &str,
+        label: &str,
+        block_number: Option<u64>,
+    ) -> Result<String> {
         let mut call = json!({
             "to": format!("{to:#x}"),
             "data": data,
@@ -692,8 +765,11 @@ impl ChainProvider {
         if let Some(from) = from {
             call["from"] = json!(format!("{from:#x}"));
         }
+        let block_tag = block_number
+            .map(|block| format!("0x{block:x}"))
+            .unwrap_or_else(|| "latest".to_string());
         let value = self
-            .rpc("eth_call", json!([call, "latest"]))
+            .rpc("eth_call", json!([call, block_tag]))
             .await
             .with_context(|| format!("eth_call {label} to={to:#x} data={data}"))?;
         let result = value.as_str().unwrap_or("0x").to_string();

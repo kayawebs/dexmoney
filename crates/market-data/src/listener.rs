@@ -12,7 +12,6 @@ use tracing::{debug, info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
-const CALIBRATION_RECENT_BLOCK_GRACE: u64 = 2;
 const TICK_BITMAP_WORD_RADIUS: i32 = 2;
 
 pub struct MarketDataService<P> {
@@ -52,9 +51,7 @@ where
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
                 }
                 if Instant::now() >= next_calibration {
-                    monitored_states = self
-                        .calibrate_states(monitored_states, last_seen_block)
-                        .await?;
+                    monitored_states = self.calibrate_states(monitored_states).await?;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                 }
                 continue;
@@ -127,9 +124,7 @@ where
             }
 
             if Instant::now() >= next_calibration {
-                monitored_states = self
-                    .calibrate_states(monitored_states, latest_block)
-                    .await?;
+                monitored_states = self.calibrate_states(monitored_states).await?;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
             }
 
@@ -284,11 +279,7 @@ where
         Ok(())
     }
 
-    async fn calibrate_states(
-        &self,
-        mut states: Vec<PoolState>,
-        max_processed_block: u64,
-    ) -> Result<Vec<PoolState>> {
+    async fn calibrate_states(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
         let mut corrected_pools = HashSet::new();
 
         for state in &mut states {
@@ -298,41 +289,21 @@ where
 
             let onchain = self
                 .provider
-                .fetch_pool_state_from_registry(&base_arb_common::types::PoolRegistryEntry {
-                    pool_address: state.pool_id.address,
-                    dex: state.dex,
-                    variant: state.variant,
-                    token0: state.token0,
-                    token1: state.token1,
-                    fee_bps: state.fee_bps,
-                    tick_spacing: None,
-                    stable: None,
-                    enabled: true,
-                })
+                .fetch_pool_state_from_registry_at_block(
+                    &base_arb_common::types::PoolRegistryEntry {
+                        pool_address: state.pool_id.address,
+                        dex: state.dex,
+                        variant: state.variant,
+                        token0: state.token0,
+                        token1: state.token1,
+                        fee_bps: state.fee_bps,
+                        tick_spacing: None,
+                        stable: None,
+                        enabled: true,
+                    },
+                    Some(state.block_number),
+                )
                 .await?;
-
-            if onchain.block_number > max_processed_block {
-                debug!(
-                    pool = %state.pool_id.address,
-                    onchain_block = onchain.block_number,
-                    max_processed_block,
-                    "skipping calibration for block newer than processed events"
-                );
-                continue;
-            }
-
-            if let Some(block_delta) = onchain.block_number.checked_sub(state.block_number) {
-                if block_delta > 0 && block_delta <= CALIBRATION_RECENT_BLOCK_GRACE {
-                    debug!(
-                        pool = %state.pool_id.address,
-                        local_block = state.block_number,
-                        onchain_block = onchain.block_number,
-                        block_delta,
-                        "skipping calibration for very recent onchain state"
-                    );
-                    continue;
-                }
-            }
 
             let drift_bps = state_drift_bps(state, &onchain);
             if drift_bps > 0 {
