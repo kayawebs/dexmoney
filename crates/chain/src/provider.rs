@@ -363,9 +363,13 @@ impl ChainProvider {
             return Ok(Vec::new());
         }
 
+        let mut seen_addresses = HashSet::new();
         let addresses = pools
             .iter()
-            .map(|pool| format!("{:#x}", pool.pool_id.address))
+            .filter_map(|pool| {
+                let address = format!("{:#x}", pool.pool_id.address);
+                seen_addresses.insert(address.clone()).then_some(address)
+            })
             .collect::<Vec<_>>();
         if addresses.is_empty() {
             return Ok(Vec::new());
@@ -380,7 +384,12 @@ impl ChainProvider {
         let logs: Vec<RpcLog> = serde_json::from_value(value)?;
 
         let mut out = Vec::with_capacity(logs.len());
+        let mut seen_logs = HashSet::new();
         for log in logs {
+            let log_index = parse_hex_u64(&log.log_index)?;
+            if !seen_logs.insert((log.transaction_hash.clone(), log_index)) {
+                continue;
+            }
             let raw_data_json = serde_json::to_value(&log)?;
             let pool_address: Address = log.address.parse()?;
             let dex = dex_for_pool(pools, pool_address);
@@ -388,7 +397,7 @@ impl ChainProvider {
             out.push(DexEvent {
                 block_number: parse_hex_u64(&log.block_number)?,
                 tx_hash: log.transaction_hash,
-                log_index: parse_hex_u64(&log.log_index)?,
+                log_index,
                 pool_address,
                 dex,
                 event_type,

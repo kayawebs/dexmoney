@@ -129,8 +129,16 @@ where
                 .await;
         }
 
+        let mut seen = HashSet::new();
         let mut out = Vec::with_capacity(registry_pools.len());
         for entry in &registry_pools {
+            if !seen.insert(entry.pool_address) {
+                info!(
+                    pool = %entry.pool_address,
+                    "duplicate registry pool ignored for market-data monitoring"
+                );
+                continue;
+            }
             out.push(self.provider.fetch_pool_state_from_registry(entry).await?);
         }
         Ok(out)
