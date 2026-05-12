@@ -391,7 +391,17 @@ async fn add_pair(
         .await;
     }
 
-    let result = discover_and_upsert_pair(&state, &form.token0, &form.token1).await?;
+    let result = match discover_and_upsert_pair(&state, &form.token0, &form.token1).await {
+        Ok(result) => result,
+        Err(status) => {
+            return render_registry_response(
+                &state.pool,
+                None,
+                Some(discovery_error_message(status)),
+            )
+            .await;
+        }
+    };
     let message = format!(
         "added pair {}; discovered {} pools",
         result.symbol, result.discovered_count
@@ -412,7 +422,17 @@ async fn rediscover_pair(
         .await;
     }
 
-    let result = discover_and_upsert_pair(&state, &form.token0, &form.token1).await?;
+    let result = match discover_and_upsert_pair(&state, &form.token0, &form.token1).await {
+        Ok(result) => result,
+        Err(status) => {
+            return render_registry_response(
+                &state.pool,
+                None,
+                Some(discovery_error_message(status)),
+            )
+            .await;
+        }
+    };
     let message = format!(
         "rediscovered pair {symbol}; discovered {} pools",
         result.discovered_count,
@@ -497,6 +517,18 @@ async fn remove_pair(
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
+}
+
+fn discovery_error_message(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid token pair input",
+        StatusCode::NOT_FOUND => {
+            "no supported Aerodrome Classic, Aerodrome Slipstream, or Uniswap V3 pools found for this pair"
+        }
+        StatusCode::BAD_GATEWAY => "pool discovery RPC failed; check monitor-web logs",
+        StatusCode::INTERNAL_SERVER_ERROR => "pool registry database write failed",
+        _ => "token pair discovery failed",
+    }
 }
 
 async fn discover_and_upsert_pair(

@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use tracing::info;
+use tracing::{debug, info};
 
 const AERODROME_POOL_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
 const AERODROME_SLIPSTREAM_FACTORY: &str = "0xeC8E5342B19977B4eF8892e02D8DAEcfa1315831";
@@ -203,12 +203,15 @@ impl ChainProvider {
                     if pool == Address::ZERO || !seen.insert(pool) {
                         continue;
                     }
-                    let state = self
-                        .fetch_aerodrome_pool_state(pool)
-                        .await
-                        .with_context(|| {
-                            format!("Aerodrome classic discovered pool {pool:#x} is not readable")
-                        })?;
+                    let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
+                        || format!("Aerodrome classic discovered pool {pool:#x} is not readable"),
+                    ) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Aerodrome classic discovered pool skipped");
+                            continue;
+                        }
+                    };
                     out.push(DiscoveredPool {
                         state,
                         tick_spacing: None,
@@ -217,7 +220,7 @@ impl ChainProvider {
                     });
                 }
                 Err(err) => {
-                    info!(factory = %factory, stable, error = %err, "Aerodrome classic discovery probe failed")
+                    debug!(factory = %factory, stable, error = %err, "Aerodrome classic discovery probe failed")
                 }
             }
         }
@@ -259,14 +262,19 @@ impl ChainProvider {
                     if pool == Address::ZERO || !seen.insert(pool) {
                         continue;
                     }
-                    let state = self
-                        .fetch_aerodrome_pool_state(pool)
-                        .await
-                        .with_context(|| {
+                    let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
+                        || {
                             format!(
                                 "Aerodrome Slipstream discovered pool {pool:#x} is not readable"
                             )
-                        })?;
+                        },
+                    ) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Aerodrome Slipstream discovered pool skipped");
+                            continue;
+                        }
+                    };
                     out.push(DiscoveredPool {
                         state,
                         tick_spacing: Some(tick_spacing),
@@ -275,7 +283,7 @@ impl ChainProvider {
                     });
                 }
                 Err(err) => {
-                    info!(factory = %factory, tick_spacing, error = %err, "Aerodrome Slipstream discovery probe failed")
+                    debug!(factory = %factory, tick_spacing, error = %err, "Aerodrome Slipstream discovery probe failed")
                 }
             }
         }
@@ -310,9 +318,23 @@ impl ChainProvider {
                     if pool == Address::ZERO || !seen.insert(pool) {
                         continue;
                     }
-                    let (token0, token1) = self.fetch_pool_tokens(pool).await?;
-                    let (sqrt_price_x96, tick, liquidity) =
-                        self.fetch_uniswap_v3_state(pool).await?;
+                    let (token0, token1) = match self.fetch_pool_tokens(pool).await {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Uniswap V3 discovered pool token read failed; skipping");
+                            continue;
+                        }
+                    };
+                    let (sqrt_price_x96, tick, liquidity) = match self
+                        .fetch_uniswap_v3_state(pool)
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Uniswap V3 discovered pool state read failed; skipping");
+                            continue;
+                        }
+                    };
                     out.push(DiscoveredPool {
                         state: PoolState {
                             pool_id: PoolId {
@@ -338,7 +360,7 @@ impl ChainProvider {
                     });
                 }
                 Err(err) => {
-                    info!(factory = %factory, fee, error = %err, "Uniswap V3 discovery probe failed")
+                    debug!(factory = %factory, fee, error = %err, "Uniswap V3 discovery probe failed")
                 }
             }
         }
