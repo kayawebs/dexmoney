@@ -8,10 +8,11 @@ use base_arb_common::types::{
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
 use std::collections::{HashSet, VecDeque};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
+const CALIBRATION_RECENT_BLOCK_GRACE: u64 = 2;
 const TICK_BITMAP_WORD_RADIUS: i32 = 2;
 
 pub struct MarketDataService<P> {
@@ -84,7 +85,7 @@ where
                     );
                     continue;
                 }
-                info!(
+                debug!(
                     pool = %event.pool_address,
                     block_number = event.block_number,
                     event_type = %event.event_type,
@@ -110,7 +111,7 @@ where
                                 .await?;
                         }
                         changed_pools.insert(state.pool_id.address);
-                        info!(
+                        debug!(
                             pool = %state.pool_id.address,
                             block_number = state.block_number,
                             "pool state locally updated from event"
@@ -150,7 +151,7 @@ where
         let mut out = Vec::with_capacity(registry_pools.len());
         for entry in &registry_pools {
             if !seen.insert(entry.pool_address) {
-                info!(
+                debug!(
                     pool = %entry.pool_address,
                     "duplicate registry pool ignored for market-data monitoring"
                 );
@@ -211,10 +212,10 @@ where
                 .record_pool_state_with_source(state.clone(), source)
                 .await?;
             super::state_updater::log_pool_state_update(state);
-            info!(
-                pool = %state.pool_id.address,
-                dex = ?state.dex,
-                variant = ?state.variant,
+            debug!(
+                    pool = %state.pool_id.address,
+                    dex = ?state.dex,
+                    variant = ?state.variant,
                 source,
                 "monitoring pool logs"
             );
@@ -236,7 +237,7 @@ where
             }
             let count = ticks.len();
             self.pool_store.set_tick_states(ticks).await?;
-            info!(
+            debug!(
                 pool = %state.pool_id.address,
                 count,
                 "initialized ticks loaded"
@@ -311,13 +312,26 @@ where
                 .await?;
 
             if onchain.block_number > max_processed_block {
-                info!(
+                debug!(
                     pool = %state.pool_id.address,
                     onchain_block = onchain.block_number,
                     max_processed_block,
                     "skipping calibration for block newer than processed events"
                 );
                 continue;
+            }
+
+            if let Some(block_delta) = onchain.block_number.checked_sub(state.block_number) {
+                if block_delta > 0 && block_delta <= CALIBRATION_RECENT_BLOCK_GRACE {
+                    debug!(
+                        pool = %state.pool_id.address,
+                        local_block = state.block_number,
+                        onchain_block = onchain.block_number,
+                        block_delta,
+                        "skipping calibration for very recent onchain state"
+                    );
+                    continue;
+                }
             }
 
             let drift_bps = state_drift_bps(state, &onchain);

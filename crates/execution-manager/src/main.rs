@@ -9,7 +9,7 @@ use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, RecorderStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -58,20 +58,20 @@ where
         .unwrap_or_else(|| address!("0000000000000000000000000000000000000000"));
     let lane = eoa_lane::EoaLane::new(lane_address);
     eoa_store.set_lane_state(lane.state.clone()).await?;
-    info!(lane = ?lane.state, "eoa lane ready");
+    debug!(lane = ?lane.state, "eoa lane ready");
 
     let Some(candidate) = candidate_store.pop_candidate().await? else {
-        info!("no candidate available");
+        debug!("no candidate available");
         return Ok(());
     };
 
     let simulation =
         simulator::simulate(provider, settings, &candidate, min_simulated_profit_usdc).await;
     recorder.record_simulation(simulation.clone()).await?;
-    info!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
+    debug!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
 
     if simulation.success {
-        info!(
+        debug!(
             candidate_id = %candidate.id,
             "eth_call simulation passed; raw transaction signing/submission is not enabled yet"
         );

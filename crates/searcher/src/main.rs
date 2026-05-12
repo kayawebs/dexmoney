@@ -9,7 +9,7 @@ use base_arb_storage::{
     TickStateStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 const MAX_POOL_STATE_AGE_MS: i64 = 300_000;
@@ -64,7 +64,7 @@ where
     )?;
     let pool_states = pool_store.all_pool_states().await?;
     if pool_states.is_empty() {
-        info!("no pool states available in redis");
+        debug!("no pool states available in redis");
         return Ok(());
     }
     let mut tick_states = Vec::new();
@@ -80,7 +80,7 @@ where
     let candidates = engine.search(&pool_states, &tick_states).await?;
 
     for candidate in candidates {
-        info!(candidate_id = %candidate.id, "quote generated");
+        debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
             &pool_states,
@@ -92,9 +92,9 @@ where
             Ok(()) => {
                 recorder.record_opportunity(candidate.clone()).await?;
                 candidate_store.push_candidate(candidate.clone()).await?;
-                info!(candidate_id = %candidate.id, "candidate created");
+                debug!(candidate_id = %candidate.id, "candidate created");
             }
-            Err(err) => info!(candidate_id = %candidate.id, reason = %err, "candidate rejected"),
+            Err(err) => debug!(candidate_id = %candidate.id, reason = %err, "candidate rejected"),
         }
     }
 

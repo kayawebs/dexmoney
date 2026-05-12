@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{DexKind, PoolState, PoolVariant, V3LiquidityUpdate};
 use chrono::Utc;
-use tracing::info;
+use tracing::debug;
 
 const SYNC_TOPIC: &str = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
@@ -18,7 +18,7 @@ pub struct TickDelta {
 }
 
 pub fn log_pool_state_update(pool_state: &PoolState) {
-    info!(
+    debug!(
         pool = %pool_state.pool_id.address,
         block_number = pool_state.block_number,
         "pool state updated"
@@ -64,7 +64,7 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         let Some(update) = apply_v3_liquidity_delta(state, topic0, topics, data)? else {
             return Ok(false);
         };
-        info!(
+        debug!(
             pool = %state.pool_id.address,
             event_type = event.event_type,
             tx_hash = %event.tx_hash,
