@@ -4,14 +4,12 @@ mod strategy;
 
 use anyhow::Result;
 use base_arb_common::config::Settings;
-use base_arb_common::types::OpportunityStatus;
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PoolStateStore, RecorderStore,
     TickStateStore,
 };
-use std::collections::BTreeMap;
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const MAX_POOL_STATE_AGE_MS: i64 = 300_000;
@@ -80,12 +78,9 @@ where
         }
     }
     let candidates = engine.search(&pool_states, &tick_states).await?;
-    let mut created_count = 0usize;
-    let mut rejected_count = 0usize;
-    let mut rejected_reasons = BTreeMap::<String, usize>::new();
 
     for candidate in candidates {
-        debug!(candidate_id = %candidate.id, "quote generated");
+        info!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
             &pool_states,
@@ -97,28 +92,10 @@ where
             Ok(()) => {
                 recorder.record_opportunity(candidate.clone()).await?;
                 candidate_store.push_candidate(candidate.clone()).await?;
-                created_count += 1;
                 info!(candidate_id = %candidate.id, "candidate created");
             }
-            Err(err) => {
-                let reason = err.to_string();
-                let mut rejected = candidate.clone();
-                rejected.status = OpportunityStatus::Rejected;
-                recorder.record_opportunity(rejected).await?;
-                rejected_count += 1;
-                *rejected_reasons.entry(reason.clone()).or_default() += 1;
-                debug!(candidate_id = %candidate.id, reason = %reason, "candidate rejected");
-            }
+            Err(err) => info!(candidate_id = %candidate.id, reason = %err, "candidate rejected"),
         }
-    }
-
-    if created_count > 0 || rejected_count > 0 {
-        info!(
-            created_count,
-            rejected_count,
-            rejected_reasons = ?rejected_reasons,
-            "search cycle completed"
-        );
     }
 
     Ok(())
