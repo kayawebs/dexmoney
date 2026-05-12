@@ -1,4 +1,4 @@
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -72,7 +72,7 @@ where
                 )
                 .await?;
 
-            let mut state_changed = false;
+            let mut changed_pools = HashSet::new();
             for event in &events {
                 info!(
                     pool = %event.pool_address,
@@ -92,7 +92,7 @@ where
                             .await?;
                     }
                     if super::state_updater::apply_event_to_pool_state(state, event)? {
-                        state_changed = true;
+                        changed_pools.insert(state.pool_id.address);
                         info!(
                             pool = %state.pool_id.address,
                             block_number = state.block_number,
@@ -103,8 +103,8 @@ where
                 }
             }
 
-            if state_changed {
-                self.publish_monitored_states(&monitored_states, "local_event")
+            if !changed_pools.is_empty() {
+                self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
                     .await?;
             }
 
@@ -162,7 +162,33 @@ where
     }
 
     async fn publish_monitored_states(&self, states: &[PoolState], source: &str) -> Result<()> {
+        let selected = states
+            .iter()
+            .map(|state| state.pool_id.address)
+            .collect::<HashSet<_>>();
+        self.publish_selected_states(states, &selected, source)
+            .await
+    }
+
+    async fn publish_selected_states(
+        &self,
+        states: &[PoolState],
+        selected: &HashSet<Address>,
+        source: &str,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
         for state in states {
+            if !selected.contains(&state.pool_id.address) {
+                continue;
+            }
+            if !seen.insert(state.pool_id.address) {
+                warn!(
+                    pool = %state.pool_id.address,
+                    source,
+                    "duplicate monitored pool skipped while publishing state"
+                );
+                continue;
+            }
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder
                 .record_pool_state_with_source(state.clone(), source)
@@ -245,7 +271,7 @@ where
         mut states: Vec<PoolState>,
         max_processed_block: u64,
     ) -> Result<Vec<PoolState>> {
-        let mut corrected = false;
+        let mut corrected_pools = HashSet::new();
 
         for state in &mut states {
             if !should_calibrate(state) {
@@ -303,12 +329,12 @@ where
                     })
                     .await?;
                 *state = onchain;
-                corrected = true;
+                corrected_pools.insert(state.pool_id.address);
             }
         }
 
-        if corrected {
-            self.publish_monitored_states(&states, "calibration_correction")
+        if !corrected_pools.is_empty() {
+            self.publish_selected_states(&states, &corrected_pools, "calibration_correction")
                 .await?;
         }
 

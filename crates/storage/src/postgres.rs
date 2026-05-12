@@ -182,10 +182,11 @@ impl PostgresStore {
     pub async fn enabled_registry_pools(&self) -> Result<Vec<PoolRegistryEntry>> {
         let rows = sqlx::query_as::<_, PoolRegistryRow>(
             r#"
-            SELECT pool_address, dex, variant, token0, token1, fee_bps, tick_spacing, stable, enabled
+            SELECT DISTINCT ON (lower(pool_address))
+                pool_address, dex, variant, token0, token1, fee_bps, tick_spacing, stable, enabled
             FROM pools
             WHERE enabled = TRUE
-            ORDER BY updated_at DESC
+            ORDER BY lower(pool_address), updated_at DESC
             "#,
         )
         .fetch_all(&self.pool)
