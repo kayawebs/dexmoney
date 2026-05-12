@@ -12,7 +12,10 @@ use std::collections::HashSet;
 use tracing::{debug, info};
 
 const AERODROME_POOL_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
-const AERODROME_SLIPSTREAM_FACTORY: &str = "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a";
+const AERODROME_SLIPSTREAM_FACTORIES: [&str; 2] = [
+    "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A",
+    "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a",
+];
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
 const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 7] = [1, 10, 50, 100, 200, 500, 2000];
@@ -236,54 +239,55 @@ impl ChainProvider {
         seen: &mut HashSet<Address>,
         out: &mut Vec<DiscoveredPool>,
     ) -> Result<()> {
-        let factory = settings
-            .aerodrome_slipstream_factory
-            .unwrap_or(AERODROME_SLIPSTREAM_FACTORY.parse()?);
-        let tick_spacings = self
-            .fetch_slipstream_tick_spacings(factory)
-            .await
-            .unwrap_or_else(|err| {
-                info!(factory = %factory, error = %err, "Aerodrome Slipstream tickSpacings() failed; using fallback tick spacings");
-                FALLBACK_SLIPSTREAM_TICK_SPACINGS.to_vec()
-            });
+        let factories = slipstream_factories(settings)?;
 
-        for tick_spacing in tick_spacings {
-            let data = encode_get_pool_int24(token_a, token_b, tick_spacing);
-            match self
-                .eth_call(
-                    factory,
-                    &data,
-                    "Aerodrome Slipstream getPool(address,address,int24)",
-                )
+        for factory in factories {
+            let tick_spacings = self
+                .fetch_slipstream_tick_spacings(factory)
                 .await
-            {
-                Ok(raw) => {
-                    let pool = decode_single_address(&raw)?;
-                    if pool == Address::ZERO || !seen.insert(pool) {
-                        continue;
-                    }
-                    let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
-                        || {
-                            format!(
-                                "Aerodrome Slipstream discovered pool {pool:#x} is not readable"
-                            )
-                        },
-                    ) {
-                        Ok(state) => state,
-                        Err(err) => {
-                            debug!(pool = %pool, error = %err, "Aerodrome Slipstream discovered pool skipped");
+                .unwrap_or_else(|err| {
+                    info!(factory = %factory, error = %err, "Aerodrome Slipstream tickSpacings() failed; using fallback tick spacings");
+                    FALLBACK_SLIPSTREAM_TICK_SPACINGS.to_vec()
+                });
+
+            for tick_spacing in tick_spacings {
+                let data = encode_get_pool_int24(token_a, token_b, tick_spacing);
+                match self
+                    .eth_call(
+                        factory,
+                        &data,
+                        "Aerodrome Slipstream getPool(address,address,int24)",
+                    )
+                    .await
+                {
+                    Ok(raw) => {
+                        let pool = decode_single_address(&raw)?;
+                        if pool == Address::ZERO || !seen.insert(pool) {
                             continue;
                         }
-                    };
-                    out.push(DiscoveredPool {
-                        state,
-                        tick_spacing: Some(tick_spacing),
-                        stable: None,
-                        source: "aerodrome_slipstream_factory".to_string(),
-                    });
-                }
-                Err(err) => {
-                    debug!(factory = %factory, tick_spacing, error = %err, "Aerodrome Slipstream discovery probe failed")
+                        let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
+                            || {
+                                format!(
+                                    "Aerodrome Slipstream discovered pool {pool:#x} is not readable"
+                                )
+                            },
+                        ) {
+                            Ok(state) => state,
+                            Err(err) => {
+                                debug!(pool = %pool, error = %err, "Aerodrome Slipstream discovered pool skipped");
+                                continue;
+                            }
+                        };
+                        out.push(DiscoveredPool {
+                            state,
+                            tick_spacing: Some(tick_spacing),
+                            stable: None,
+                            source: "aerodrome_slipstream_factory".to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        debug!(factory = %factory, tick_spacing, error = %err, "Aerodrome Slipstream discovery probe failed")
+                    }
                 }
             }
         }
@@ -732,6 +736,23 @@ impl ChainProvider {
             .result
             .ok_or_else(|| anyhow::anyhow!("rpc {method} returned no result"))
     }
+}
+
+fn slipstream_factories(settings: &Settings) -> Result<Vec<Address>> {
+    let mut factories = Vec::with_capacity(AERODROME_SLIPSTREAM_FACTORIES.len() + 1);
+
+    if let Some(factory) = settings.aerodrome_slipstream_factory {
+        factories.push(factory);
+    }
+
+    for factory in AERODROME_SLIPSTREAM_FACTORIES {
+        let factory = factory.parse()?;
+        if !factories.contains(&factory) {
+            factories.push(factory);
+        }
+    }
+
+    Ok(factories)
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
