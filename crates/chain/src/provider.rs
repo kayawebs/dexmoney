@@ -430,6 +430,7 @@ impl ChainProvider {
                 raw_data_json,
             });
         }
+        out.sort_by_key(|event| (event.block_number, event.log_index));
         Ok(out)
     }
 

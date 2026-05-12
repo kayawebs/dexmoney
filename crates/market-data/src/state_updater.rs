@@ -61,10 +61,23 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         state.liquidity = Some(liquidity);
         state.tick = Some(tick);
     } else if is_v3_style(state) && (topic0 == V3_MINT_TOPIC || topic0 == V3_BURN_TOPIC) {
-        let Some(next_liquidity) = apply_v3_liquidity_delta(state, topic0, topics, data)? else {
+        let Some(update) = apply_v3_liquidity_delta(state, topic0, topics, data)? else {
             return Ok(false);
         };
-        state.liquidity = Some(next_liquidity);
+        info!(
+            pool = %state.pool_id.address,
+            event_type = event.event_type,
+            tx_hash = %event.tx_hash,
+            log_index = event.log_index,
+            current_tick = update.current_tick,
+            tick_lower = update.tick_lower,
+            tick_upper = update.tick_upper,
+            amount = %update.amount,
+            previous_liquidity = %update.previous_liquidity,
+            next_liquidity = %update.next_liquidity,
+            "V3 active liquidity locally updated"
+        );
+        state.liquidity = Some(update.next_liquidity);
     } else {
         return Ok(false);
     }
@@ -172,7 +185,7 @@ fn apply_v3_liquidity_delta(
     topic0: &str,
     topics: &[serde_json::Value],
     data: &str,
-) -> Result<Option<U256>> {
+) -> Result<Option<LiquidityUpdate>> {
     let Some(current_tick) = state.tick else {
         return Ok(None);
     };
@@ -190,11 +203,19 @@ fn apply_v3_liquidity_delta(
     }
 
     let amount = decode_v3_liquidity_amount(data, topic0 == V3_MINT_TOPIC)?;
-    if topic0 == V3_MINT_TOPIC {
-        Ok(Some(current_liquidity.saturating_add(amount)))
+    let next_liquidity = if topic0 == V3_MINT_TOPIC {
+        current_liquidity.saturating_add(amount)
     } else {
-        Ok(Some(current_liquidity.saturating_sub(amount)))
-    }
+        current_liquidity.saturating_sub(amount)
+    };
+    Ok(Some(LiquidityUpdate {
+        current_tick,
+        tick_lower,
+        tick_upper,
+        amount,
+        previous_liquidity: current_liquidity,
+        next_liquidity,
+    }))
 }
 
 fn decode_v3_liquidity_amount(data: &str, is_mint: bool) -> Result<U256> {
@@ -225,6 +246,15 @@ fn decode_i24_word(word: &str) -> Result<i32> {
     } else {
         Ok(low as i32)
     }
+}
+
+struct LiquidityUpdate {
+    current_tick: i32,
+    tick_lower: i32,
+    tick_upper: i32,
+    amount: U256,
+    previous_liquidity: U256,
+    next_liquidity: U256,
 }
 
 #[cfg(test)]
