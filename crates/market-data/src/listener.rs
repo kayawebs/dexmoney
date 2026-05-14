@@ -287,9 +287,22 @@ where
                 continue;
             }
 
+            let block_hash = match self.provider.get_block_hash(state.block_number).await {
+                Ok(block_hash) => block_hash,
+                Err(err) => {
+                    warn!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        error = %err,
+                        "skipping calibration because block hash lookup failed"
+                    );
+                    continue;
+                }
+            };
+
             let onchain = self
                 .provider
-                .fetch_pool_state_from_registry_at_block(
+                .fetch_pool_state_from_registry_at_block_hash(
                     &base_arb_common::types::PoolRegistryEntry {
                         pool_address: state.pool_id.address,
                         dex: state.dex,
@@ -301,9 +314,22 @@ where
                         stable: None,
                         enabled: true,
                     },
-                    Some(state.block_number),
+                    &block_hash,
+                    state.block_number,
                 )
-                .await?;
+                .await;
+            let onchain = match onchain {
+                Ok(onchain) => onchain,
+                Err(err) => {
+                    warn!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        error = %err,
+                        "skipping calibration because block-hash pinned eth_call failed"
+                    );
+                    continue;
+                }
+            };
 
             let drift_bps = state_drift_bps(state, &onchain);
             if drift_bps > 0 {
