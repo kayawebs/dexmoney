@@ -251,6 +251,37 @@ impl PostgresStore {
         .await?;
         Ok(())
     }
+
+    pub async fn pool_block_has_any_event_types(
+        &self,
+        pool_address: Address,
+        block_number: u64,
+        event_types: &[&str],
+    ) -> Result<bool> {
+        if event_types.is_empty() {
+            return Ok(false);
+        }
+
+        let event_types = event_types.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM dex_events
+                WHERE lower(pool_address) = lower($1)
+                  AND block_number = $2
+                  AND event_type = ANY($3)
+            )
+            "#,
+        )
+        .bind(address_to_string(pool_address))
+        .bind(i64::try_from(block_number)?)
+        .bind(event_types)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists)
+    }
 }
 
 pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {

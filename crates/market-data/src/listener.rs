@@ -287,6 +287,24 @@ where
                 continue;
             }
 
+            if is_v3_style_state(state)
+                && self
+                    .recorder
+                    .pool_block_has_any_event_types(
+                        state.pool_id.address,
+                        state.block_number,
+                        &["Mint", "Burn"],
+                    )
+                    .await?
+            {
+                debug!(
+                    pool = %state.pool_id.address,
+                    block_number = state.block_number,
+                    "skipping V3 calibration on block with Mint/Burn events"
+                );
+                continue;
+            }
+
             let block_hash = match self.provider.get_block_hash(state.block_number).await {
                 Ok(block_hash) => block_hash,
                 Err(err) => {
