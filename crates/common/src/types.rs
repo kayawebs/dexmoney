@@ -100,6 +100,21 @@ pub struct PoolStateWarning {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoolStateValidation {
+    pub pool_address: Address,
+    pub dex: DexKind,
+    pub variant: PoolVariant,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub local_state: PoolState,
+    pub onchain_state: PoolState,
+    pub drift_bps: u64,
+    pub passed: bool,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+}
+
 impl PoolState {
     pub fn is_stale(&self, now: DateTime<Utc>, max_age_ms: i64) -> bool {
         now.signed_duration_since(self.updated_at)

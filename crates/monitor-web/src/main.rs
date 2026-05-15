@@ -95,6 +95,18 @@ struct PoolStateWarningRow {
 }
 
 #[derive(Debug, FromRow)]
+struct PoolStateValidationRow {
+    created_at: DateTime<Utc>,
+    pool_address: String,
+    dex: String,
+    variant: String,
+    block_number: i64,
+    drift_bps: i64,
+    passed: bool,
+    message: String,
+}
+
+#[derive(Debug, FromRow)]
 struct OpportunityRow {
     created_at: DateTime<Utc>,
     block_number: i64,
@@ -240,12 +252,19 @@ async fn index(
     let warnings = fetch_pool_state_warnings(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let validations = fetch_pool_state_validations(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let opportunities = fetch_opportunities(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let content = format!(
         r#"
+        <section class="card">
+          <h2>Block Validations</h2>
+          <div class="card-body">{}</div>
+        </section>
         <section class="card">
           <h2>State Warnings</h2>
           <div class="card-body">{}</div>
@@ -259,6 +278,7 @@ async fn index(
           <div class="card-body">{}</div>
         </section>
         "#,
+        render_pool_state_validations_table(&validations),
         render_pool_state_warnings_table(&warnings),
         render_pool_states_table(&pool_states),
         render_opportunities_table(&opportunities),
@@ -753,6 +773,19 @@ async fn fetch_pool_state_warnings(pool: &PgPool) -> Result<Vec<PoolStateWarning
         r#"
         SELECT created_at, pool_address, dex, variant, block_number, drift_bps, message
         FROM pool_state_warnings
+        ORDER BY created_at DESC
+        LIMIT 25
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_pool_state_validations(pool: &PgPool) -> Result<Vec<PoolStateValidationRow>> {
+    Ok(sqlx::query_as::<_, PoolStateValidationRow>(
+        r#"
+        SELECT created_at, pool_address, dex, variant, block_number, drift_bps, passed, message
+        FROM pool_state_validations
         ORDER BY created_at DESC
         LIMIT 25
         "#,
@@ -1372,6 +1405,40 @@ fn render_pool_state_warnings_table(rows: &[PoolStateWarningRow]) -> String {
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"7\">No state warnings. This means calibration has not detected local-vs-onchain drift yet.</td></tr>");
+    }
+    html.push_str("</tbody></table></div>");
+    html
+}
+
+fn render_pool_state_validations_table(rows: &[PoolStateValidationRow]) -> String {
+    let mut html = String::from(
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Pool</th><th>DEX</th><th>Variant</th><th>Block</th><th>Result</th><th>Drift BPS</th><th>Message</th></tr></thead><tbody>",
+    );
+    for row in rows {
+        let result = if row.passed {
+            "<span class=\"ok\">pass</span>"
+        } else {
+            "<span class=\"bad\">fail</span>"
+        };
+        let drift = if row.passed {
+            row.drift_bps.to_string()
+        } else {
+            format!("<span class=\"warn\">{}</span>", row.drift_bps)
+        };
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            fmt_ts(row.created_at),
+            copyable(&row.pool_address),
+            escape(&row.dex),
+            escape(&row.variant),
+            row.block_number,
+            result,
+            drift,
+            escape(&row.message),
+        ));
+    }
+    if rows.is_empty() {
+        html.push_str("<tr><td colspan=\"8\">No delayed block validations yet. Start market-data and wait for local events plus the validation delay.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html

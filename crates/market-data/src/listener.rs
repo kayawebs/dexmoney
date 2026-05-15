@@ -3,15 +3,17 @@ use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    DexKind, PoolId, PoolState, PoolStateWarning, PoolVariant, TickState,
+    DexKind, PoolId, PoolState, PoolStateValidation, PoolStateWarning, PoolVariant, TickState,
 };
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
+const VALIDATION_DELAY_BLOCKS: u64 = 2;
+const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const TICK_BITMAP_WORD_RADIUS: i32 = 2;
 
 pub struct MarketDataService<P> {
@@ -37,6 +39,7 @@ where
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
         let mut recent_logs = RecentLogCache::new(20_000);
+        let mut pending_validations = VecDeque::new();
         info!(last_seen_block, "market-data synchronized at startup");
 
         let mut ticker = interval(Duration::from_secs(3));
@@ -54,6 +57,8 @@ where
                     monitored_states = self.calibrate_states(monitored_states).await?;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                 }
+                self.validate_due_snapshots(&mut pending_validations, latest_block)
+                    .await?;
                 continue;
             }
 
@@ -72,6 +77,7 @@ where
                 .await?;
 
             let mut changed_pools = HashSet::new();
+            let mut validation_snapshots = BTreeMap::new();
             for event in &events {
                 if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
                     warn!(
@@ -108,6 +114,8 @@ where
                                 .await?;
                         }
                         changed_pools.insert(state.pool_id.address);
+                        validation_snapshots
+                            .insert((state.block_number, state.pool_id.address), state.clone());
                         debug!(
                             pool = %state.pool_id.address,
                             block_number = state.block_number,
@@ -122,6 +130,10 @@ where
                 self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
                     .await?;
             }
+
+            enqueue_validation_snapshots(&mut pending_validations, validation_snapshots);
+            self.validate_due_snapshots(&mut pending_validations, latest_block)
+                .await?;
 
             if Instant::now() >= next_calibration {
                 monitored_states = self.calibrate_states(monitored_states).await?;
@@ -287,24 +299,6 @@ where
                 continue;
             }
 
-            if is_v3_style_state(state)
-                && self
-                    .recorder
-                    .pool_block_has_any_event_types(
-                        state.pool_id.address,
-                        state.block_number,
-                        &["Mint", "Burn"],
-                    )
-                    .await?
-            {
-                debug!(
-                    pool = %state.pool_id.address,
-                    block_number = state.block_number,
-                    "skipping V3 calibration on block with Mint/Burn events"
-                );
-                continue;
-            }
-
             let block_hash = match self.provider.get_block_hash(state.block_number).await {
                 Ok(block_hash) => block_hash,
                 Err(err) => {
@@ -386,6 +380,113 @@ where
 
         Ok(states)
     }
+
+    async fn validate_due_snapshots(
+        &self,
+        pending: &mut VecDeque<PendingValidation>,
+        latest_block: u64,
+    ) -> Result<()> {
+        while matches!(
+            pending.front(),
+            Some(item) if item.state.block_number + VALIDATION_DELAY_BLOCKS <= latest_block
+        ) {
+            let Some(item) = pending.pop_front() else {
+                break;
+            };
+            let state = item.state;
+            let block_hash = match self.provider.get_block_hash(state.block_number).await {
+                Ok(block_hash) => block_hash,
+                Err(err) => {
+                    warn!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        error = %err,
+                        "skipping delayed block validation because block hash lookup failed"
+                    );
+                    continue;
+                }
+            };
+            let onchain = self
+                .provider
+                .fetch_pool_state_from_registry_at_block_hash(
+                    &base_arb_common::types::PoolRegistryEntry {
+                        pool_address: state.pool_id.address,
+                        dex: state.dex,
+                        variant: state.variant,
+                        token0: state.token0,
+                        token1: state.token1,
+                        fee_bps: state.fee_bps,
+                        tick_spacing: None,
+                        stable: None,
+                        enabled: true,
+                    },
+                    &block_hash,
+                    state.block_number,
+                )
+                .await;
+            let onchain = match onchain {
+                Ok(onchain) => onchain,
+                Err(err) => {
+                    warn!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        error = %err,
+                        "skipping delayed block validation because block-hash pinned eth_call failed"
+                    );
+                    continue;
+                }
+            };
+
+            let drift_bps = state_drift_bps(&state, &onchain);
+            let passed = drift_bps == 0;
+            let message = if passed {
+                "delayed block validation passed".to_string()
+            } else {
+                format!("delayed block validation drifted by {drift_bps} bps")
+            };
+            if passed {
+                debug!(
+                    pool = %state.pool_id.address,
+                    block_number = state.block_number,
+                    "delayed block validation passed"
+                );
+            } else if drift_bps >= 50 {
+                warn!(
+                    pool = %state.pool_id.address,
+                    dex = ?state.dex,
+                    variant = ?state.variant,
+                    block_number = state.block_number,
+                    drift_bps,
+                    "delayed block validation mismatch"
+                );
+            } else {
+                debug!(
+                    pool = %state.pool_id.address,
+                    block_number = state.block_number,
+                    drift_bps,
+                    "minor delayed block validation mismatch"
+                );
+            }
+
+            self.recorder
+                .record_pool_state_validation(PoolStateValidation {
+                    pool_address: state.pool_id.address,
+                    dex: state.dex,
+                    variant: state.variant,
+                    block_number: state.block_number,
+                    block_hash,
+                    local_state: state,
+                    onchain_state: onchain,
+                    drift_bps,
+                    passed,
+                    message,
+                    created_at: chrono::Utc::now(),
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
@@ -426,8 +527,6 @@ fn should_calibrate(state: &PoolState) -> bool {
     matches!(
         (state.dex, state.variant),
         (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
-            | (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-            | (DexKind::UniswapV3, PoolVariant::UniswapV3)
     )
 }
 
@@ -499,6 +598,23 @@ fn value_drift_bps(local: Option<U256>, onchain: Option<U256>) -> u64 {
         .checked_div(onchain)
         .unwrap_or(U256::MAX);
     u64::try_from(bps).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone)]
+struct PendingValidation {
+    state: PoolState,
+}
+
+fn enqueue_validation_snapshots(
+    pending: &mut VecDeque<PendingValidation>,
+    snapshots: BTreeMap<(u64, Address), PoolState>,
+) {
+    for state in snapshots.into_values() {
+        pending.push_back(PendingValidation { state });
+    }
+    while pending.len() > MAX_PENDING_VALIDATIONS {
+        pending.pop_front();
+    }
 }
 
 struct RecentLogCache {

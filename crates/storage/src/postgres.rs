@@ -7,8 +7,8 @@ use tracing::info;
 use crate::RecorderStore;
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
-    Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateWarning,
-    PoolVariant, SimulationResult, TxResult, V3LiquidityUpdate,
+    Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateValidation,
+    PoolStateWarning, PoolVariant, SimulationResult, TxResult, V3LiquidityUpdate,
 };
 
 #[derive(Clone)]
@@ -218,6 +218,43 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn record_pool_state_validation(
+        &self,
+        validation: PoolStateValidation,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pool_state_validations (
+                id, pool_address, dex, variant, block_number, block_hash,
+                local_state_json, onchain_state_json, drift_bps, passed, message, created_at
+            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (pool_address, block_number)
+            DO UPDATE SET
+                block_hash = EXCLUDED.block_hash,
+                local_state_json = EXCLUDED.local_state_json,
+                onchain_state_json = EXCLUDED.onchain_state_json,
+                drift_bps = EXCLUDED.drift_bps,
+                passed = EXCLUDED.passed,
+                message = EXCLUDED.message,
+                created_at = EXCLUDED.created_at
+            "#,
+        )
+        .bind(address_to_string(validation.pool_address))
+        .bind(dex_to_string(validation.dex))
+        .bind(variant_to_string(validation.variant))
+        .bind(i64::try_from(validation.block_number)?)
+        .bind(validation.block_hash)
+        .bind(sqlx::types::Json(validation.local_state))
+        .bind(sqlx::types::Json(validation.onchain_state))
+        .bind(i64::try_from(validation.drift_bps)?)
+        .bind(validation.passed)
+        .bind(validation.message)
+        .bind(validation.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn record_v3_liquidity_update(
         &self,
         event: &DexEvent,
@@ -262,7 +299,10 @@ impl PostgresStore {
             return Ok(false);
         }
 
-        let event_types = event_types.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        let event_types = event_types
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
         let exists: bool = sqlx::query_scalar(
             r#"
             SELECT EXISTS (
@@ -342,6 +382,25 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pool_state_warnings (created_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pool_state_warnings_pool_created_idx
             ON pool_state_warnings (pool_address, created_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_state_validations (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            pool_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            block_number BIGINT NOT NULL,
+            block_hash TEXT NOT NULL,
+            local_state_json JSONB NOT NULL,
+            onchain_state_json JSONB NOT NULL,
+            drift_bps BIGINT NOT NULL,
+            passed BOOLEAN NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (pool_address, block_number)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_state_validations_created_idx
+            ON pool_state_validations (created_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_state_validations_pool_block_idx
+            ON pool_state_validations (pool_address, block_number DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS v3_liquidity_updates (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             pool_address TEXT NOT NULL,
