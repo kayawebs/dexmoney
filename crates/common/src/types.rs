@@ -214,6 +214,7 @@ pub enum TxStatus {
 pub struct TxResult {
     pub opportunity_id: Uuid,
     pub simulation_id: Option<Uuid>,
+    pub eoa: Address,
     pub tx_hash: Option<B256>,
     pub nonce: u64,
     pub status: TxStatus,
@@ -221,6 +222,8 @@ pub struct TxResult {
     pub gas_used: Option<U256>,
     pub effective_gas_price: Option<U256>,
     pub revert_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +240,10 @@ pub struct EoaLaneState {
     pub local_nonce: u64,
     pub confirmed_nonce: u64,
     pub pending_tx: Option<B256>,
+    #[serde(default)]
+    pub pending_opportunity_id: Option<Uuid>,
+    #[serde(default)]
+    pub pending_nonce: Option<u64>,
     pub eth_balance: U256,
     pub status: EoaLaneStatus,
 }

@@ -1,15 +1,16 @@
 mod eoa_lane;
 mod simulator;
+mod tx_manager;
 
-use alloy_primitives::address;
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
+use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, RecorderStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -53,27 +54,177 @@ where
     E: EoaStateStore,
     R: RecorderStore,
 {
-    let lane_address = settings
-        .eoa_address_1
-        .unwrap_or_else(|| address!("0000000000000000000000000000000000000000"));
-    let lane = eoa_lane::EoaLane::new(lane_address);
+    let private_key = settings
+        .eoa_private_key_1
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("EOA_PRIVATE_KEY_1 is required"))?;
+    let wallet = tx_manager::ExecutionWallet::from_private_key(private_key, settings.chain_id)?;
+    if let Some(configured) = settings.eoa_address_1 {
+        if configured != wallet.address() {
+            warn!(
+                configured = %configured,
+                derived = %wallet.address(),
+                "EOA_ADDRESS_1 does not match EOA_PRIVATE_KEY_1 derived address"
+            );
+        }
+    }
+
+    let mut lane = eoa_store
+        .get_lane_state(wallet.address())
+        .await?
+        .map(|state| eoa_lane::EoaLane { state })
+        .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
+
+    if lane.state.status == EoaLaneStatus::Pending {
+        handle_pending_lane(&mut lane, eoa_store, recorder, provider).await?;
+        return Ok(());
+    }
+
+    sync_idle_lane(&mut lane, provider).await?;
     eoa_store.set_lane_state(lane.state.clone()).await?;
-    debug!(lane = ?lane.state, "eoa lane ready");
 
     let Some(candidate) = candidate_store.pop_candidate().await? else {
         debug!("no candidate available");
         return Ok(());
     };
 
-    let simulation =
-        simulator::simulate(provider, settings, &candidate, min_simulated_profit_usdc).await;
+    let simulation = simulator::simulate(
+        provider,
+        settings,
+        wallet.address(),
+        &candidate,
+        min_simulated_profit_usdc,
+    )
+    .await;
     recorder.record_simulation(simulation.clone()).await?;
     debug!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
 
-    if simulation.success {
-        debug!(
-            candidate_id = %candidate.id,
-            "eth_call simulation passed; raw transaction signing/submission is not enabled yet"
+    if !simulation.success {
+        return Ok(());
+    }
+
+    let nonce = lane.state.local_nonce;
+    match tx_manager::submit_candidate(provider, &wallet, settings, &candidate, &simulation, nonce)
+        .await
+    {
+        Ok(submission) => {
+            lane.mark_submitted(candidate.id, submission.tx_hash, submission.nonce);
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            recorder
+                .record_transaction(tx_manager::pending_tx_result(
+                    &candidate,
+                    wallet.address(),
+                    &submission,
+                ))
+                .await?;
+        }
+        Err(err) => {
+            warn!(
+                candidate_id = %candidate.id,
+                nonce,
+                error = %err,
+                "tx submission failed"
+            );
+            lane.mark_cooldown();
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            recorder
+                .record_transaction(TxResult {
+                    opportunity_id: candidate.id,
+                    simulation_id: None,
+                    eoa: wallet.address(),
+                    tx_hash: None,
+                    nonce,
+                    status: TxStatus::Dropped,
+                    realized_profit: None,
+                    gas_used: None,
+                    effective_gas_price: None,
+                    revert_reason: Some(err.to_string()),
+                    receipt_json: None,
+                })
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn sync_idle_lane(lane: &mut eoa_lane::EoaLane, provider: &ChainProvider) -> Result<()> {
+    let confirmed_nonce = provider
+        .get_transaction_count(lane.state.address, false)
+        .await?;
+    let pending_nonce = provider
+        .get_transaction_count(lane.state.address, true)
+        .await?;
+    lane.state.confirmed_nonce = confirmed_nonce;
+    lane.state.local_nonce = pending_nonce;
+    lane.state.eth_balance = provider.get_balance(lane.state.address).await?;
+    lane.state.status = EoaLaneStatus::Idle;
+    Ok(())
+}
+
+async fn handle_pending_lane<E, R>(
+    lane: &mut eoa_lane::EoaLane,
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore,
+{
+    let Some(tx_hash) = lane.state.pending_tx else {
+        lane.mark_blocked();
+        eoa_store.set_lane_state(lane.state.clone()).await?;
+        return Ok(());
+    };
+    let Some(opportunity_id) = lane.state.pending_opportunity_id else {
+        warn!(tx_hash = %tx_hash, "pending lane is missing opportunity id");
+        lane.mark_blocked();
+        eoa_store.set_lane_state(lane.state.clone()).await?;
+        return Ok(());
+    };
+    let Some(nonce) = lane.state.pending_nonce else {
+        warn!(tx_hash = %tx_hash, "pending lane is missing nonce");
+        lane.mark_blocked();
+        eoa_store.set_lane_state(lane.state.clone()).await?;
+        return Ok(());
+    };
+
+    let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+        debug!(tx_hash = %tx_hash, "pending tx has no receipt yet");
+        return Ok(());
+    };
+
+    recorder
+        .record_transaction(tx_manager::receipt_tx_result(
+            opportunity_id,
+            lane.state.address,
+            nonce,
+            &receipt,
+        ))
+        .await?;
+    let confirmed_nonce = provider
+        .get_transaction_count(lane.state.address, false)
+        .await?;
+    lane.mark_confirmed(confirmed_nonce);
+    lane.state.local_nonce = provider
+        .get_transaction_count(lane.state.address, true)
+        .await?;
+    lane.state.eth_balance = provider.get_balance(lane.state.address).await?;
+    eoa_store.set_lane_state(lane.state.clone()).await?;
+
+    if receipt.success {
+        info!(
+            candidate_id = %opportunity_id,
+            tx_hash = %tx_hash,
+            block_number = ?receipt.block_number,
+            "tx confirmed"
+        );
+    } else {
+        warn!(
+            tx_hash = %tx_hash,
+            block_number = ?receipt.block_number,
+            "tx reverted"
         );
     }
 

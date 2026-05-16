@@ -587,7 +587,7 @@ impl RecorderStore for PostgresStore {
         .bind(uuid::Uuid::new_v4())
         .bind(tx.opportunity_id)
         .bind(tx.simulation_id)
-        .bind("0x0000000000000000000000000000000000000000")
+        .bind(address_to_string(tx.eoa))
         .bind(tx.tx_hash.map(|v| format!("{v:#x}")))
         .bind(i64::try_from(tx.nonce)?)
         .bind(format!("{:?}", tx.status))
@@ -595,7 +595,9 @@ impl RecorderStore for PostgresStore {
         .bind(tx.effective_gas_price.map(|v| v.to_string()))
         .bind(tx.realized_profit.map(|v| v.to_string()))
         .bind(tx.revert_reason)
-        .bind(sqlx::types::Json(serde_json::json!({})))
+        .bind(sqlx::types::Json(
+            tx.receipt_json.unwrap_or_else(|| serde_json::json!({})),
+        ))
         .execute(&self.pool)
         .await?;
         Ok(())

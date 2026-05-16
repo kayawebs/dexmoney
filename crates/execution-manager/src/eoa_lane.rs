@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
+use uuid::Uuid;
 
 use base_arb_common::types::{EoaLaneState, EoaLaneStatus};
 
@@ -15,21 +16,27 @@ impl EoaLane {
                 local_nonce: 0,
                 confirmed_nonce: 0,
                 pending_tx: None,
+                pending_opportunity_id: None,
+                pending_nonce: None,
                 eth_balance: U256::ZERO,
                 status: EoaLaneStatus::Idle,
             },
         }
     }
 
-    pub fn mark_submitted(&mut self, tx_hash: B256) {
+    pub fn mark_submitted(&mut self, opportunity_id: Uuid, tx_hash: B256, nonce: u64) {
         self.state.pending_tx = Some(tx_hash);
-        self.state.local_nonce += 1;
+        self.state.pending_opportunity_id = Some(opportunity_id);
+        self.state.pending_nonce = Some(nonce);
+        self.state.local_nonce = nonce.saturating_add(1);
         self.state.status = EoaLaneStatus::Pending;
     }
 
     pub fn mark_confirmed(&mut self, confirmed_nonce: u64) {
         self.state.confirmed_nonce = confirmed_nonce;
         self.state.pending_tx = None;
+        self.state.pending_opportunity_id = None;
+        self.state.pending_nonce = None;
         self.state.status = EoaLaneStatus::Idle;
     }
 
@@ -57,16 +64,21 @@ mod tests {
 
         assert_eq!(lane.state.status, EoaLaneStatus::Idle);
 
-        lane.mark_submitted(b256!(
-            "0101010101010101010101010101010101010101010101010101010101010101"
-        ));
+        lane.mark_submitted(
+            uuid::Uuid::new_v4(),
+            b256!("0101010101010101010101010101010101010101010101010101010101010101"),
+            7,
+        );
         assert_eq!(lane.state.status, EoaLaneStatus::Pending);
-        assert_eq!(lane.state.local_nonce, 1);
+        assert_eq!(lane.state.local_nonce, 8);
+        assert_eq!(lane.state.pending_nonce, Some(7));
 
         lane.mark_confirmed(1);
         assert_eq!(lane.state.status, EoaLaneStatus::Idle);
         assert_eq!(lane.state.confirmed_nonce, 1);
         assert!(lane.state.pending_tx.is_none());
+        assert!(lane.state.pending_opportunity_id.is_none());
+        assert!(lane.state.pending_nonce.is_none());
 
         lane.mark_blocked();
         assert_eq!(lane.state.status, EoaLaneStatus::Blocked);

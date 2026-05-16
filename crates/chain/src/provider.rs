@@ -1,5 +1,5 @@
 use crate::events::DexEvent;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
@@ -259,6 +259,106 @@ impl ChainProvider {
             .and_then(Value::as_str)
             .context("eth_getBlockByNumber returned no hash")?;
         Ok(hash.to_string())
+    }
+
+    pub async fn get_transaction_count(&self, address: Address, pending: bool) -> Result<u64> {
+        let tag = if pending { "pending" } else { "latest" };
+        let value = self
+            .rpc(
+                "eth_getTransactionCount",
+                json!([format!("{address:#x}"), tag]),
+            )
+            .await?;
+        parse_hex_u64(value.as_str().unwrap_or("0x0"))
+    }
+
+    pub async fn get_balance(&self, address: Address) -> Result<U256> {
+        let value = self
+            .rpc("eth_getBalance", json!([format!("{address:#x}"), "latest"]))
+            .await?;
+        parse_hex_u256(value.as_str().unwrap_or("0x0"))
+    }
+
+    pub async fn estimate_gas(&self, from: Address, to: Address, data: &str) -> Result<U256> {
+        let call = json!({
+            "from": format!("{from:#x}"),
+            "to": format!("{to:#x}"),
+            "data": data,
+        });
+        let value = self.rpc("eth_estimateGas", json!([call])).await?;
+        parse_hex_u256(value.as_str().unwrap_or("0x0"))
+    }
+
+    pub async fn suggested_eip1559_fees(&self) -> Result<(U256, U256)> {
+        let priority = match self.rpc("eth_maxPriorityFeePerGas", json!([])).await {
+            Ok(value) => parse_hex_u256(value.as_str().unwrap_or("0x0"))?,
+            Err(_) => U256::from(1_000_000u64),
+        };
+        let latest = self
+            .rpc("eth_getBlockByNumber", json!(["latest", false]))
+            .await?;
+        let base_fee = latest
+            .get("baseFeePerGas")
+            .and_then(Value::as_str)
+            .map(parse_hex_u256)
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let max_fee = base_fee
+            .saturating_mul(U256::from(2u64))
+            .saturating_add(priority);
+        Ok((max_fee, priority))
+    }
+
+    pub async fn send_raw_transaction(&self, raw_tx: &str) -> Result<B256> {
+        let value = self.rpc("eth_sendRawTransaction", json!([raw_tx])).await?;
+        value
+            .as_str()
+            .context("eth_sendRawTransaction returned non-string tx hash")?
+            .parse()
+            .context("failed to parse tx hash")
+    }
+
+    pub async fn get_transaction_receipt(&self, tx_hash: B256) -> Result<Option<TxReceipt>> {
+        let value = self
+            .rpc(
+                "eth_getTransactionReceipt",
+                json!([format!("{tx_hash:#x}")]),
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(parse_hex_u64)
+            .transpose()?
+            .unwrap_or_default();
+        let gas_used = value
+            .get("gasUsed")
+            .and_then(Value::as_str)
+            .map(parse_hex_u256)
+            .transpose()?;
+        let effective_gas_price = value
+            .get("effectiveGasPrice")
+            .and_then(Value::as_str)
+            .map(parse_hex_u256)
+            .transpose()?;
+        let block_number = value
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .map(parse_hex_u64)
+            .transpose()?;
+
+        Ok(Some(TxReceipt {
+            tx_hash,
+            success: status == 1,
+            gas_used,
+            effective_gas_price,
+            block_number,
+            raw: value,
+        }))
     }
 
     async fn discover_aerodrome_classic(
@@ -1094,6 +1194,16 @@ struct RpcResponse {
     error: Option<RpcError>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TxReceipt {
+    pub tx_hash: B256,
+    pub success: bool,
+    pub gas_used: Option<U256>,
+    pub effective_gas_price: Option<U256>,
+    pub block_number: Option<u64>,
+    pub raw: Value,
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcError {
     code: Option<i64>,
@@ -1226,6 +1336,14 @@ fn parse_hex_u64(value: &str) -> Result<u64> {
         return Ok(0);
     }
     Ok(u64::from_str_radix(clean, 16)?)
+}
+
+fn parse_hex_u256(value: &str) -> Result<U256> {
+    let clean = value.trim_start_matches("0x");
+    if clean.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    Ok(U256::from_str_radix(clean, 16)?)
 }
 
 fn decode_32byte_words(data: &str) -> Result<Vec<String>> {

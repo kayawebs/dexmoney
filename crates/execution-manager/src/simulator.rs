@@ -10,10 +10,19 @@ const EXECUTOR_DEADLINE_SECS: i64 = 30;
 pub async fn simulate(
     provider: &ChainProvider,
     settings: &Settings,
+    operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
 ) -> SimulationResult {
-    match simulate_inner(provider, settings, candidate, min_simulated_profit_usdc).await {
+    match simulate_inner(
+        provider,
+        settings,
+        operator,
+        candidate,
+        min_simulated_profit_usdc,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => SimulationResult {
             opportunity_id: candidate.id,
@@ -29,6 +38,7 @@ pub async fn simulate(
 async fn simulate_inner(
     provider: &ChainProvider,
     settings: &Settings,
+    operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
 ) -> Result<SimulationResult> {
@@ -45,11 +55,6 @@ async fn simulate_inner(
         .executor_contract
         .filter(|address| *address != Address::ZERO)
         .context("EXECUTOR_CONTRACT is not configured")?;
-    let operator = settings
-        .eoa_address_1
-        .filter(|address| *address != Address::ZERO)
-        .context("EOA_ADDRESS_1 is required for eth_call operator simulation")?;
-
     let deadline = U256::from((Utc::now().timestamp() + EXECUTOR_DEADLINE_SECS) as u64);
     let calldata = build_execute_calldata(candidate, min_profit_units, deadline, settings)?;
     let data = format!("0x{}", hex::encode(&calldata));
