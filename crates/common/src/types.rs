@@ -194,6 +194,7 @@ pub struct QuoteResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SimulationResult {
+    pub id: Uuid,
     pub opportunity_id: Uuid,
     pub success: bool,
     pub simulated_profit: U256,
@@ -242,6 +243,8 @@ pub struct EoaLaneState {
     pub pending_tx: Option<B256>,
     #[serde(default)]
     pub pending_opportunity_id: Option<Uuid>,
+    #[serde(default)]
+    pub pending_simulation_id: Option<Uuid>,
     #[serde(default)]
     pub pending_nonce: Option<u64>,
     pub eth_balance: U256,

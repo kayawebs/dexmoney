@@ -23,8 +23,11 @@ pub struct Settings {
     pub uniswap_v3_usdc_weth_500_pool: Option<Address>,
     pub uniswap_v3_usdc_weth_3000_pool: Option<Address>,
     pub executor_contract: Option<Address>,
+    pub executor_owner_private_key: Option<String>,
+    pub deployer_private_key: Option<String>,
     pub eoa_address_1: Option<Address>,
     pub eoa_private_key_1: Option<String>,
+    pub search_amount_usdc: Option<String>,
     pub min_expected_profit_usdc: f64,
     pub min_simulated_profit_usdc: f64,
     pub candidate_ttl_ms: i64,
@@ -38,6 +41,7 @@ impl Settings {
 
         Config::builder()
             .set_default("candidate_ttl_ms", DEFAULT_CANDIDATE_TTL_MS)?
+            .set_default("search_amount_usdc", "10,30,50,100")?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

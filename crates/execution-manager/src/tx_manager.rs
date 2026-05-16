@@ -9,6 +9,8 @@ use ethers_core::types::{
 use ethers_signers::{LocalWallet, Signer};
 
 const GAS_LIMIT_MULTIPLIER_BPS: u64 = 12_000;
+const EXECUTED_EVENT_TOPIC: &str =
+    "0xe953ae62f4f69be1c6d943cb68d93d288f23ffae7332b84196d46e9e778b23b2";
 
 #[derive(Debug, Clone)]
 pub struct ExecutionWallet {
@@ -20,6 +22,7 @@ pub struct ExecutionWallet {
 pub struct Submission {
     pub tx_hash: B256,
     pub nonce: u64,
+    pub simulation_id: uuid::Uuid,
 }
 
 impl ExecutionWallet {
@@ -85,13 +88,17 @@ pub async fn submit_candidate(
         "tx submitted"
     );
 
-    Ok(Submission { tx_hash, nonce })
+    Ok(Submission {
+        tx_hash,
+        nonce,
+        simulation_id: simulation.id,
+    })
 }
 
 pub fn pending_tx_result(candidate: &Candidate, eoa: Address, submission: &Submission) -> TxResult {
     TxResult {
         opportunity_id: candidate.id,
-        simulation_id: None,
+        simulation_id: Some(submission.simulation_id),
         eoa,
         tx_hash: Some(submission.tx_hash),
         nonce: submission.nonce,
@@ -106,13 +113,19 @@ pub fn pending_tx_result(candidate: &Candidate, eoa: Address, submission: &Submi
 
 pub fn receipt_tx_result(
     opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
     eoa: Address,
     nonce: u64,
     receipt: &TxReceipt,
 ) -> TxResult {
+    let realized_profit = if receipt.success {
+        extract_executed_profit(&receipt.raw)
+    } else {
+        None
+    };
     TxResult {
         opportunity_id,
-        simulation_id: None,
+        simulation_id,
         eoa,
         tx_hash: Some(receipt.tx_hash),
         nonce,
@@ -121,7 +134,7 @@ pub fn receipt_tx_result(
         } else {
             TxStatus::Reverted
         },
-        realized_profit: None,
+        realized_profit,
         gas_used: receipt.gas_used,
         effective_gas_price: receipt.effective_gas_price,
         revert_reason: if receipt.success {
@@ -131,6 +144,29 @@ pub fn receipt_tx_result(
         },
         receipt_json: Some(receipt.raw.clone()),
     }
+}
+
+fn extract_executed_profit(receipt: &serde_json::Value) -> Option<U256> {
+    let logs = receipt.get("logs")?.as_array()?;
+    for log in logs {
+        let topic0 = log
+            .get("topics")?
+            .as_array()?
+            .first()?
+            .as_str()?
+            .to_ascii_lowercase();
+        if topic0 != EXECUTED_EVENT_TOPIC {
+            continue;
+        }
+        let data = log.get("data")?.as_str()?.trim_start_matches("0x");
+        if data.len() < 128 {
+            continue;
+        }
+        if let Ok(profit) = U256::from_str_radix(&data[64..128], 16) {
+            return Some(profit);
+        }
+    }
+    None
 }
 
 fn bump_gas_limit(value: U256) -> U256 {

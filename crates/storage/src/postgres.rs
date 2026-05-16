@@ -421,6 +421,17 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS v3_liquidity_updates_pool_block_idx
             ON v3_liquidity_updates (pool_address, block_number DESC, log_index DESC)"#,
+        r#"DELETE FROM transactions old
+            USING transactions newer
+            WHERE old.tx_hash IS NOT NULL
+              AND old.tx_hash = newer.tx_hash
+              AND (
+                old.created_at < newer.created_at
+                OR (old.created_at = newer.created_at AND old.id::text < newer.id::text)
+              )"#,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS transactions_tx_hash_unique_idx
+            ON transactions (tx_hash)
+            WHERE tx_hash IS NOT NULL"#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
@@ -559,7 +570,7 @@ impl RecorderStore for PostgresStore {
             ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8)
             "#,
         )
-        .bind(uuid::Uuid::new_v4())
+        .bind(simulation.id)
         .bind(simulation.opportunity_id)
         .bind(simulation.success)
         .bind(simulation.simulated_profit.to_string())
@@ -576,30 +587,71 @@ impl RecorderStore for PostgresStore {
     }
 
     async fn record_transaction(&self, tx: TxResult) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO transactions (
-                id, opportunity_id, simulation_id, created_at, eoa, tx_hash, nonce, status,
-                gas_used, effective_gas_price, realized_profit, revert_reason, receipt_json
-            ) VALUES ($1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10,$11,$12)
-            "#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(tx.opportunity_id)
-        .bind(tx.simulation_id)
-        .bind(address_to_string(tx.eoa))
-        .bind(tx.tx_hash.map(|v| format!("{v:#x}")))
-        .bind(i64::try_from(tx.nonce)?)
-        .bind(format!("{:?}", tx.status))
-        .bind(tx.gas_used.map(|v| v.to_string()))
-        .bind(tx.effective_gas_price.map(|v| v.to_string()))
-        .bind(tx.realized_profit.map(|v| v.to_string()))
-        .bind(tx.revert_reason)
-        .bind(sqlx::types::Json(
-            tx.receipt_json.unwrap_or_else(|| serde_json::json!({})),
-        ))
-        .execute(&self.pool)
-        .await?;
+        let tx_hash = tx.tx_hash.map(|v| format!("{v:#x}"));
+        if tx_hash.is_some() {
+            sqlx::query(
+                r#"
+                INSERT INTO transactions (
+                    id, opportunity_id, simulation_id, created_at, eoa, tx_hash, nonce, status,
+                    gas_used, effective_gas_price, realized_profit, revert_reason, receipt_json
+                ) VALUES ($1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (tx_hash) WHERE tx_hash IS NOT NULL
+                DO UPDATE SET
+                    opportunity_id = EXCLUDED.opportunity_id,
+                    simulation_id = COALESCE(EXCLUDED.simulation_id, transactions.simulation_id),
+                    eoa = EXCLUDED.eoa,
+                    nonce = EXCLUDED.nonce,
+                    status = EXCLUDED.status,
+                    gas_used = EXCLUDED.gas_used,
+                    effective_gas_price = EXCLUDED.effective_gas_price,
+                    realized_profit = EXCLUDED.realized_profit,
+                    revert_reason = EXCLUDED.revert_reason,
+                    receipt_json = EXCLUDED.receipt_json,
+                    created_at = EXCLUDED.created_at
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(tx.opportunity_id)
+            .bind(tx.simulation_id)
+            .bind(address_to_string(tx.eoa))
+            .bind(tx_hash)
+            .bind(i64::try_from(tx.nonce)?)
+            .bind(format!("{:?}", tx.status))
+            .bind(tx.gas_used.map(|v| v.to_string()))
+            .bind(tx.effective_gas_price.map(|v| v.to_string()))
+            .bind(tx.realized_profit.map(|v| v.to_string()))
+            .bind(tx.revert_reason)
+            .bind(sqlx::types::Json(
+                tx.receipt_json.unwrap_or_else(|| serde_json::json!({})),
+            ))
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO transactions (
+                    id, opportunity_id, simulation_id, created_at, eoa, tx_hash, nonce, status,
+                    gas_used, effective_gas_price, realized_profit, revert_reason, receipt_json
+                ) VALUES ($1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(tx.opportunity_id)
+            .bind(tx.simulation_id)
+            .bind(address_to_string(tx.eoa))
+            .bind(tx_hash)
+            .bind(i64::try_from(tx.nonce)?)
+            .bind(format!("{:?}", tx.status))
+            .bind(tx.gas_used.map(|v| v.to_string()))
+            .bind(tx.effective_gas_price.map(|v| v.to_string()))
+            .bind(tx.realized_profit.map(|v| v.to_string()))
+            .bind(tx.revert_reason)
+            .bind(sqlx::types::Json(
+                tx.receipt_json.unwrap_or_else(|| serde_json::json!({})),
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 }

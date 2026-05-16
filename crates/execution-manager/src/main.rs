@@ -108,7 +108,12 @@ where
         .await
     {
         Ok(submission) => {
-            lane.mark_submitted(candidate.id, submission.tx_hash, submission.nonce);
+            lane.mark_submitted(
+                candidate.id,
+                submission.simulation_id,
+                submission.tx_hash,
+                submission.nonce,
+            );
             eoa_store.set_lane_state(lane.state.clone()).await?;
             recorder
                 .record_transaction(tx_manager::pending_tx_result(
@@ -130,7 +135,7 @@ where
             recorder
                 .record_transaction(TxResult {
                     opportunity_id: candidate.id,
-                    simulation_id: None,
+                    simulation_id: Some(simulation.id),
                     eoa: wallet.address(),
                     tx_hash: None,
                     nonce,
@@ -189,6 +194,7 @@ where
         eoa_store.set_lane_state(lane.state.clone()).await?;
         return Ok(());
     };
+    let simulation_id = lane.state.pending_simulation_id;
 
     let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
         debug!(tx_hash = %tx_hash, "pending tx has no receipt yet");
@@ -198,6 +204,7 @@ where
     recorder
         .record_transaction(tx_manager::receipt_tx_result(
             opportunity_id,
+            simulation_id,
             lane.state.address,
             nonce,
             &receipt,

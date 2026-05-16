@@ -25,6 +25,7 @@ pub async fn simulate(
     {
         Ok(result) => result,
         Err(err) => SimulationResult {
+            id: uuid::Uuid::new_v4(),
             opportunity_id: candidate.id,
             success: false,
             simulated_profit: U256::ZERO,
@@ -70,6 +71,7 @@ async fn simulate_inner(
     let simulated_profit = decode_uint256_result(&raw_result).unwrap_or(candidate.expected_profit);
 
     Ok(SimulationResult {
+        id: uuid::Uuid::new_v4(),
         opportunity_id: candidate.id,
         success: simulated_profit >= min_profit_units,
         simulated_profit,
@@ -228,8 +230,11 @@ mod tests {
             uniswap_v3_usdc_weth_500_pool: None,
             uniswap_v3_usdc_weth_3000_pool: None,
             executor_contract: Some(address!("3333333333333333333333333333333333333333")),
+            executor_owner_private_key: None,
+            deployer_private_key: None,
             eoa_address_1: Some(address!("4444444444444444444444444444444444444444")),
             eoa_private_key_1: None,
+            search_amount_usdc: Some("10,30,50,100".into()),
             min_expected_profit_usdc: 0.01,
             min_simulated_profit_usdc: 0.005,
             candidate_ttl_ms: 500,

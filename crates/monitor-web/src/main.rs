@@ -1,3 +1,5 @@
+mod executor_admin;
+
 use std::sync::Arc;
 
 use alloy_primitives::Address;
@@ -423,8 +425,8 @@ async fn add_pair(
         }
     };
     let message = format!(
-        "added pair {}; discovered {} pools",
-        result.symbol, result.discovered_count
+        "added pair {}; discovered {} pools; {}",
+        result.symbol, result.discovered_count, result.executor_report
     );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
@@ -454,8 +456,9 @@ async fn rediscover_pair(
         }
     };
     let message = format!(
-        "rediscovered pair {symbol}; discovered {} pools",
+        "rediscovered pair {symbol}; discovered {} pools; {}",
         result.discovered_count,
+        result.executor_report,
         symbol = result.symbol,
     );
     render_registry_response(&state.pool, None, Some(&message)).await
@@ -537,6 +540,7 @@ async fn remove_pair(
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
+    executor_report: String,
 }
 
 fn discovery_error_message(status: StatusCode) -> &'static str {
@@ -592,10 +596,18 @@ async fn discover_and_upsert_pair(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
+    let executor_report =
+        match executor_admin::configure_executor_for_pair(&state.provider, &state.settings, &discovered, token0, token1)
+            .await
+        {
+            Ok(report) => report.summary(),
+            Err(err) => format!("executor auto-config failed after registry update: {err}"),
+        };
 
     Ok(PairDiscoveryResult {
         symbol,
         discovered_count: discovered.len(),
+        executor_report,
     })
 }
 

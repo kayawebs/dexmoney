@@ -17,6 +17,7 @@ impl EoaLane {
                 confirmed_nonce: 0,
                 pending_tx: None,
                 pending_opportunity_id: None,
+                pending_simulation_id: None,
                 pending_nonce: None,
                 eth_balance: U256::ZERO,
                 status: EoaLaneStatus::Idle,
@@ -24,9 +25,16 @@ impl EoaLane {
         }
     }
 
-    pub fn mark_submitted(&mut self, opportunity_id: Uuid, tx_hash: B256, nonce: u64) {
+    pub fn mark_submitted(
+        &mut self,
+        opportunity_id: Uuid,
+        simulation_id: Uuid,
+        tx_hash: B256,
+        nonce: u64,
+    ) {
         self.state.pending_tx = Some(tx_hash);
         self.state.pending_opportunity_id = Some(opportunity_id);
+        self.state.pending_simulation_id = Some(simulation_id);
         self.state.pending_nonce = Some(nonce);
         self.state.local_nonce = nonce.saturating_add(1);
         self.state.status = EoaLaneStatus::Pending;
@@ -36,6 +44,7 @@ impl EoaLane {
         self.state.confirmed_nonce = confirmed_nonce;
         self.state.pending_tx = None;
         self.state.pending_opportunity_id = None;
+        self.state.pending_simulation_id = None;
         self.state.pending_nonce = None;
         self.state.status = EoaLaneStatus::Idle;
     }
@@ -66,6 +75,7 @@ mod tests {
 
         lane.mark_submitted(
             uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
             b256!("0101010101010101010101010101010101010101010101010101010101010101"),
             7,
         );
@@ -78,6 +88,7 @@ mod tests {
         assert_eq!(lane.state.confirmed_nonce, 1);
         assert!(lane.state.pending_tx.is_none());
         assert!(lane.state.pending_opportunity_id.is_none());
+        assert!(lane.state.pending_simulation_id.is_none());
         assert!(lane.state.pending_nonce.is_none());
 
         lane.mark_blocked();

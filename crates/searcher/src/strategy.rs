@@ -213,12 +213,7 @@ pub fn engine_from_settings(
     min_expected_profit: U256,
 ) -> anyhow::Result<SearchEngine> {
     Ok(SearchEngine {
-        amount_sizes: vec![
-            U256::from(10_000_000u64),
-            U256::from(30_000_000u64),
-            U256::from(50_000_000u64),
-            U256::from(100_000_000u64),
-        ],
+        amount_sizes: parse_search_amounts(settings.search_amount_usdc.as_deref())?,
         paths: Vec::new(),
         min_expected_profit,
         max_price_impact_bps,
@@ -227,6 +222,28 @@ pub fn engine_from_settings(
         usdc: settings.usdc_address,
         weth: settings.weth_address,
     })
+}
+
+fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
+    let raw = raw.unwrap_or("10,30,50,100");
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: f64 = trimmed
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid SEARCH_AMOUNT_USDC value: {trimmed}"))?;
+        if !value.is_finite() || value <= 0.0 {
+            anyhow::bail!("SEARCH_AMOUNT_USDC values must be positive: {trimmed}");
+        }
+        out.push(usdc_to_units(value));
+    }
+    if out.is_empty() {
+        anyhow::bail!("SEARCH_AMOUNT_USDC must contain at least one amount");
+    }
+    Ok(out)
 }
 
 pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
