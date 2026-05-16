@@ -105,14 +105,20 @@ where
                         self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
                             .await?;
                     }
-                    let v3_liquidity_update =
-                        super::state_updater::v3_liquidity_update_from_event(state, event)?;
-                    if super::state_updater::apply_event_to_pool_state(state, event)? {
-                        if let Some(update) = v3_liquidity_update {
-                            self.recorder
-                                .record_v3_liquidity_update(event, state, &update)
-                                .await?;
+                    if super::state_updater::is_v3_liquidity_event(state, event)? {
+                        if self.refresh_v3_state_at_block(state, event.block_number).await? {
+                            changed_pools.insert(state.pool_id.address);
+                            validation_snapshots.insert(
+                                (state.block_number, state.pool_id.address),
+                                state.clone(),
+                            );
+                            debug!(
+                                pool = %state.pool_id.address,
+                                block_number = state.block_number,
+                                "V3 pool state refreshed from block-pinned onchain liquidity event"
+                            );
                         }
+                    } else if super::state_updater::apply_event_to_pool_state(state, event)? {
                         changed_pools.insert(state.pool_id.address);
                         validation_snapshots
                             .insert((state.block_number, state.pool_id.address), state.clone());
@@ -228,6 +234,58 @@ where
             );
         }
         Ok(())
+    }
+
+    async fn refresh_v3_state_at_block(
+        &self,
+        state: &mut PoolState,
+        block_number: u64,
+    ) -> Result<bool> {
+        let block_hash = match self.provider.get_block_hash(block_number).await {
+            Ok(block_hash) => block_hash,
+            Err(err) => {
+                warn!(
+                    pool = %state.pool_id.address,
+                    block_number,
+                    error = %err,
+                    "skipping V3 liquidity refresh because block hash lookup failed"
+                );
+                return Ok(false);
+            }
+        };
+        let refreshed = self
+            .provider
+            .fetch_pool_state_from_registry_at_block_hash(
+                &base_arb_common::types::PoolRegistryEntry {
+                    pool_address: state.pool_id.address,
+                    dex: state.dex,
+                    variant: state.variant,
+                    token0: state.token0,
+                    token1: state.token1,
+                    fee_bps: state.fee_bps,
+                    tick_spacing: None,
+                    stable: None,
+                    enabled: true,
+                },
+                &block_hash,
+                block_number,
+            )
+            .await;
+        match refreshed {
+            Ok(refreshed) => {
+                *state = refreshed;
+                Ok(true)
+            }
+            Err(err) => {
+                warn!(
+                    pool = %state.pool_id.address,
+                    block_number,
+                    error = %err,
+                    "skipping V3 liquidity refresh because block-pinned eth_call failed"
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn publish_initialized_ticks(&self, states: &[PoolState]) -> Result<()> {

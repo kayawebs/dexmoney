@@ -1,7 +1,7 @@
 use alloy_primitives::U256;
 use anyhow::{Context, Result};
 use base_arb_chain::events::DexEvent;
-use base_arb_common::types::{DexKind, PoolState, PoolVariant, V3LiquidityUpdate};
+use base_arb_common::types::{DexKind, PoolState, PoolVariant};
 use chrono::Utc;
 use tracing::debug;
 
@@ -37,11 +37,6 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     else {
         return Ok(false);
     };
-    let topics = event
-        .raw_data_json
-        .get("topics")
-        .and_then(|topics| topics.as_array())
-        .context("pool event missing topics")?;
     let data = event
         .raw_data_json
         .get("data")
@@ -60,24 +55,6 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         state.sqrt_price_x96 = Some(sqrt_price_x96);
         state.liquidity = Some(liquidity);
         state.tick = Some(tick);
-    } else if is_v3_style(state) && (topic0 == V3_MINT_TOPIC || topic0 == V3_BURN_TOPIC) {
-        let Some(update) = apply_v3_liquidity_delta(state, topic0, topics, data)? else {
-            return Ok(false);
-        };
-        debug!(
-            pool = %state.pool_id.address,
-            event_type = event.event_type,
-            tx_hash = %event.tx_hash,
-            log_index = event.log_index,
-            current_tick = update.current_tick,
-            tick_lower = update.tick_lower,
-            tick_upper = update.tick_upper,
-            amount = %update.amount,
-            previous_liquidity = %update.previous_liquidity,
-            next_liquidity = %update.next_liquidity,
-            "V3 active liquidity locally updated"
-        );
-        state.liquidity = Some(update.next_liquidity);
     } else {
         return Ok(false);
     }
@@ -85,6 +62,21 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     state.block_number = event.block_number;
     state.updated_at = Utc::now();
     Ok(true)
+}
+
+pub fn is_v3_liquidity_event(state: &PoolState, event: &DexEvent) -> Result<bool> {
+    if state.pool_id.address != event.pool_address || !is_v3_style(state) {
+        return Ok(false);
+    }
+    let Some(topic0) = event
+        .raw_data_json
+        .get("topics")
+        .and_then(|topics| topics.get(0))
+        .and_then(|topic| topic.as_str())
+    else {
+        return Ok(false);
+    };
+    Ok(topic0 == V3_MINT_TOPIC || topic0 == V3_BURN_TOPIC)
 }
 
 pub fn v3_tick_deltas_from_event(state: &PoolState, event: &DexEvent) -> Result<Vec<TickDelta>> {
@@ -151,38 +143,6 @@ pub fn v3_tick_deltas_from_event(state: &PoolState, event: &DexEvent) -> Result<
     }
 }
 
-pub fn v3_liquidity_update_from_event(
-    state: &PoolState,
-    event: &DexEvent,
-) -> Result<Option<V3LiquidityUpdate>> {
-    if state.pool_id.address != event.pool_address || !is_v3_style(state) {
-        return Ok(None);
-    }
-    let Some(topic0) = event
-        .raw_data_json
-        .get("topics")
-        .and_then(|topics| topics.get(0))
-        .and_then(|topic| topic.as_str())
-    else {
-        return Ok(None);
-    };
-    if topic0 != V3_MINT_TOPIC && topic0 != V3_BURN_TOPIC {
-        return Ok(None);
-    }
-    let topics = event
-        .raw_data_json
-        .get("topics")
-        .and_then(|topics| topics.as_array())
-        .context("pool event missing topics")?;
-    let data = event
-        .raw_data_json
-        .get("data")
-        .and_then(|data| data.as_str())
-        .context("pool event missing data")?;
-
-    apply_v3_liquidity_delta(state, topic0, topics, data)
-}
-
 fn is_v3_style(state: &PoolState) -> bool {
     matches!(
         (state.dex, state.variant),
@@ -210,44 +170,6 @@ fn decode_v3_swap_state(data: &str) -> Result<(U256, U256, i32)> {
     let liquidity = U256::from_str_radix(&clean[192..256], 16)?;
     let tick = decode_i24_word(&clean[256..320])?;
     Ok((sqrt_price_x96, liquidity, tick))
-}
-
-fn apply_v3_liquidity_delta(
-    state: &PoolState,
-    topic0: &str,
-    topics: &[serde_json::Value],
-    data: &str,
-) -> Result<Option<V3LiquidityUpdate>> {
-    let Some(current_tick) = state.tick else {
-        return Ok(None);
-    };
-    let Some(current_liquidity) = state.liquidity else {
-        return Ok(None);
-    };
-    if topics.len() < 4 {
-        anyhow::bail!("V3 Mint/Burn event missing indexed tick topics");
-    }
-
-    let tick_lower = decode_i24_topic(&topics[2])?;
-    let tick_upper = decode_i24_topic(&topics[3])?;
-    if current_tick < tick_lower || current_tick >= tick_upper {
-        return Ok(None);
-    }
-
-    let amount = decode_v3_liquidity_amount(data, topic0 == V3_MINT_TOPIC)?;
-    let next_liquidity = if topic0 == V3_MINT_TOPIC {
-        current_liquidity.saturating_add(amount)
-    } else {
-        current_liquidity.saturating_sub(amount)
-    };
-    Ok(Some(V3LiquidityUpdate {
-        current_tick,
-        tick_lower,
-        tick_upper,
-        amount,
-        previous_liquidity: current_liquidity,
-        next_liquidity,
-    }))
 }
 
 fn decode_v3_liquidity_amount(data: &str, is_mint: bool) -> Result<U256> {
@@ -434,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn applies_v3_mint_liquidity_inside_active_range() {
+    fn ignores_v3_mint_for_active_liquidity_local_state() {
         let pool = address!("4444444444444444444444444444444444444444");
         let mut state = v3_state(pool, Some(42), Some(U256::from(100u64)));
         let event = DexEvent {
@@ -463,13 +385,13 @@ mod tests {
 
         let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
 
-        assert!(changed);
-        assert_eq!(state.liquidity, Some(U256::from(110u64)));
-        assert_eq!(state.block_number, 12);
+        assert!(!changed);
+        assert_eq!(state.liquidity, Some(U256::from(100u64)));
+        assert_eq!(state.block_number, 1);
     }
 
     #[test]
-    fn applies_v3_burn_liquidity_inside_active_range() {
+    fn ignores_v3_burn_for_active_liquidity_local_state() {
         let pool = address!("5555555555555555555555555555555555555555");
         let mut state = v3_state(pool, Some(42), Some(U256::from(100u64)));
         let event = DexEvent {
@@ -497,9 +419,9 @@ mod tests {
 
         let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
 
-        assert!(changed);
-        assert_eq!(state.liquidity, Some(U256::from(93u64)));
-        assert_eq!(state.block_number, 13);
+        assert!(!changed);
+        assert_eq!(state.liquidity, Some(U256::from(100u64)));
+        assert_eq!(state.block_number, 1);
     }
 
     #[test]
