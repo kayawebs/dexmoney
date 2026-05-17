@@ -1056,11 +1056,76 @@ fn render_page(
       padding: 8px 10px;
       white-space: nowrap;
     }}
+    .pair-card-list {{
+      display: grid;
+      gap: 14px;
+    }}
+    .pair-card {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background:
+        linear-gradient(135deg, rgba(74,210,149,0.08), transparent 34%),
+        rgba(13,17,23,0.58);
+      padding: 14px;
+    }}
+    .pair-card-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }}
+    .pair-card-title {{
+      display: grid;
+      gap: 4px;
+    }}
+    .pair-card-title strong {{
+      font-size: 16px;
+    }}
+    .pair-card-meta {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .pair-card-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }}
+    .pair-field {{
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.025);
+    }}
+    .pair-field-label {{
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .pair-actions {{
+      display: grid;
+      gap: 10px;
+    }}
+    .pair-actions-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .pair-actions-row .inline-form {{
+      min-width: 0;
+      margin-right: 0;
+    }}
     .search-config-form {{
       display: grid;
       grid-template-columns: repeat(2, minmax(220px, 1fr));
       gap: 8px;
-      min-width: 760px;
+      width: 100%;
       margin-bottom: 8px;
       padding: 10px;
       border: 1px solid var(--line);
@@ -1070,6 +1135,18 @@ fn render_page(
     .search-config-form .password-wrap,
     .search-config-form button {{
       grid-column: span 2;
+    }}
+    @media (max-width: 720px) {{
+      .pair-card-header {{
+        display: grid;
+      }}
+      .search-config-form {{
+        grid-template-columns: 1fr;
+      }}
+      .search-config-form .password-wrap,
+      .search-config-form button {{
+        grid-column: span 1;
+      }}
     }}
     .delete-btn {{
       background: var(--bad);
@@ -1373,39 +1450,77 @@ fn nav_href(path: &str, auth_password: Option<&str>) -> String {
 }
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
-    let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Token 0 Amounts Raw</th><th>Token 0 Min Profit Raw</th><th>Token 1 Amounts Raw</th><th>Token 1 Min Profit Raw</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>",
-    );
+    let mut html = String::from("<div class=\"pair-card-list\">");
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            fmt_ts(row.created_at),
-            row.chain_id,
-            escape(&row.symbol),
-            copyable(&row.token0),
-            copyable(&row.token1),
-            config_value(row.token0_search_amounts.as_deref()),
-            config_value(row.token0_min_profit.as_deref()),
-            config_value(row.token1_search_amounts.as_deref()),
-            config_value(row.token1_min_profit.as_deref()),
-            row.enabled,
-            render_pair_actions(row),
+            r#"<article class="pair-card">
+  <div class="pair-card-header">
+    <div class="pair-card-title">
+      <strong>{symbol}</strong>
+      <span class="pair-card-meta">chain {chain_id} · created {created_at}</span>
+    </div>
+    <div>{enabled}</div>
+  </div>
+  <div class="pair-card-grid">
+    {token0_field}
+    {token1_field}
+    {token0_amounts_field}
+    {token0_profit_field}
+    {token1_amounts_field}
+    {token1_profit_field}
+  </div>
+  {actions}
+</article>"#,
+            symbol = escape(&row.symbol),
+            chain_id = row.chain_id,
+            created_at = fmt_ts(row.created_at),
+            enabled = monitoring_status(row.enabled),
+            token0_field = pair_field("Token 0", &copyable(&row.token0)),
+            token1_field = pair_field("Token 1", &copyable(&row.token1)),
+            token0_amounts_field = pair_field(
+                "Token 0 Amounts Raw",
+                &config_value(row.token0_search_amounts.as_deref()),
+            ),
+            token0_profit_field = pair_field(
+                "Token 0 Min Profit Raw",
+                &config_value(row.token0_min_profit.as_deref()),
+            ),
+            token1_amounts_field = pair_field(
+                "Token 1 Amounts Raw",
+                &config_value(row.token1_search_amounts.as_deref()),
+            ),
+            token1_profit_field = pair_field(
+                "Token 1 Min Profit Raw",
+                &config_value(row.token1_min_profit.as_deref()),
+            ),
+            actions = render_pair_actions(row),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
+        html.push_str("<div class=\"pair-card\"><span class=\"muted\">No token pairs yet.</span></div>");
     }
-    html.push_str("</tbody></table></div>");
+    html.push_str("</div>");
     html
 }
 
 fn render_pair_actions(row: &TokenPairRow) -> String {
     format!(
-        "{}{}{}{}",
+        r#"<div class="pair-actions">
+  {}
+  <div class="pair-actions-row">{}{}{}</div>
+</div>"#,
         render_search_config_form(row),
         render_rediscover_form(row),
         render_delete_pair_form(row),
         render_remove_pair_form(row)
+    )
+}
+
+fn pair_field(label: &str, value: &str) -> String {
+    format!(
+        r#"<div class="pair-field"><span class="pair-field-label">{}</span><span>{}</span></div>"#,
+        escape(label),
+        value,
     )
 }
 

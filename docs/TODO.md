@@ -20,6 +20,13 @@
 - Add real calldata encoding for `executeWithOwnFunds`.
 - Track actual EOA nonce, ETH balance, pending tx, receipt, and revert reason.
 - Add candidate expiry and replay protection tied to block/timestamp.
+- Add Aerodrome Slipstream executor support without guessing ABI:
+  - Confirm the Base Slipstream router and factory addresses from primary sources/onchain config.
+  - Confirm the router swap function signature and whether execution requires fee, tick spacing, or encoded path.
+  - Extend `Executor` with a dedicated `AerodromeSlipstream` swap branch instead of reusing Classic routing.
+  - Extend execution-manager calldata/path encoding with the exact Slipstream parameters.
+  - Add fork/eth_call tests against a real Slipstream pool before enabling searcher execution paths.
+  - Only enable Slipstream in searcher after executor eth_call succeeds for representative pools.
 
 ## Monitoring
 
