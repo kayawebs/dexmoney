@@ -80,6 +80,18 @@ pub struct PoolRegistryEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenPairSearchConfig {
+    pub chain_id: u64,
+    pub token0: Address,
+    pub token1: Address,
+    pub symbol: String,
+    pub token0_search_amounts: Vec<U256>,
+    pub token1_search_amounts: Vec<U256>,
+    pub token0_min_profit: U256,
+    pub token1_min_profit: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredPool {
     pub state: PoolState,
     pub tick_spacing: Option<i32>,

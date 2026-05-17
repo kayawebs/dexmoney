@@ -1,14 +1,15 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::RecorderStore;
+use crate::{PairSearchConfigStore, RecorderStore};
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
     Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateValidation,
-    PoolStateWarning, PoolVariant, SimulationResult, TxResult, V3LiquidityUpdate,
+    PoolStateWarning, PoolVariant, SimulationResult, TokenPairSearchConfig, TxResult,
+    V3LiquidityUpdate,
 };
 
 #[derive(Clone)]
@@ -88,6 +89,40 @@ impl PostgresStore {
         .bind(discovered.tick_spacing.map(i64::from))
         .bind(discovered.stable)
         .bind(&discovered.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_token_pair_search_config(
+        &self,
+        chain_id: u64,
+        token0: Address,
+        token1: Address,
+        token0_search_amounts: Option<&str>,
+        token1_search_amounts: Option<&str>,
+        token0_min_profit: Option<&str>,
+        token1_min_profit: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE token_pairs
+            SET
+                token0_search_amounts = $4,
+                token1_search_amounts = $5,
+                token0_min_profit = $6,
+                token1_min_profit = $7,
+                updated_at = NOW()
+            WHERE chain_id = $1 AND token0 = $2 AND token1 = $3
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(token0))
+        .bind(address_to_string(token1))
+        .bind(token0_search_amounts)
+        .bind(token1_search_amounts)
+        .bind(token0_min_profit)
+        .bind(token1_min_profit)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -193,6 +228,43 @@ impl PostgresStore {
         .await?;
 
         rows.into_iter().map(PoolRegistryEntry::try_from).collect()
+    }
+
+    pub async fn enabled_pair_search_configs(&self) -> Result<Vec<TokenPairSearchConfig>> {
+        let rows = sqlx::query_as::<_, TokenPairSearchConfigRow>(
+            r#"
+            SELECT
+                chain_id,
+                token0,
+                token1,
+                symbol,
+                token0_search_amounts,
+                token1_search_amounts,
+                token0_min_profit,
+                token1_min_profit
+            FROM token_pairs
+            WHERE enabled = TRUE
+              AND (
+                NULLIF(BTRIM(token0_search_amounts), '') IS NOT NULL
+                OR NULLIF(BTRIM(token1_search_amounts), '') IS NOT NULL
+              )
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .filter_map(|row| match TokenPairSearchConfig::try_from(row) {
+                Ok(config) if !config.token0_search_amounts.is_empty()
+                    || !config.token1_search_amounts.is_empty() =>
+                {
+                    Some(Ok(config))
+                }
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
     }
 
     pub async fn record_pool_state_warning(&self, warning: PoolStateWarning) -> Result<()> {
@@ -340,6 +412,14 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS token_pairs_enabled_idx
             ON token_pairs (enabled, updated_at DESC)"#,
+        r#"ALTER TABLE token_pairs
+            ADD COLUMN IF NOT EXISTS token0_search_amounts TEXT"#,
+        r#"ALTER TABLE token_pairs
+            ADD COLUMN IF NOT EXISTS token1_search_amounts TEXT"#,
+        r#"ALTER TABLE token_pairs
+            ADD COLUMN IF NOT EXISTS token0_min_profit TEXT"#,
+        r#"ALTER TABLE token_pairs
+            ADD COLUMN IF NOT EXISTS token1_min_profit TEXT"#,
         r#"CREATE TABLE IF NOT EXISTS pools (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             token_pair_id UUID REFERENCES token_pairs(id),
@@ -451,6 +531,18 @@ struct PoolRegistryRow {
     enabled: bool,
 }
 
+#[derive(sqlx::FromRow)]
+struct TokenPairSearchConfigRow {
+    chain_id: i64,
+    token0: String,
+    token1: String,
+    symbol: String,
+    token0_search_amounts: Option<String>,
+    token1_search_amounts: Option<String>,
+    token0_min_profit: Option<String>,
+    token1_min_profit: Option<String>,
+}
+
 impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
     type Error = anyhow::Error;
 
@@ -467,6 +559,57 @@ impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
             enabled: row.enabled,
         })
     }
+}
+
+impl TryFrom<TokenPairSearchConfigRow> for TokenPairSearchConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TokenPairSearchConfigRow) -> Result<Self> {
+        Ok(Self {
+            chain_id: u64::try_from(row.chain_id)?,
+            token0: row.token0.parse()?,
+            token1: row.token1.parse()?,
+            symbol: row.symbol,
+            token0_search_amounts: parse_raw_amount_list(row.token0_search_amounts.as_deref())?,
+            token1_search_amounts: parse_raw_amount_list(row.token1_search_amounts.as_deref())?,
+            token0_min_profit: parse_raw_amount(row.token0_min_profit.as_deref())?
+                .unwrap_or(U256::from(1u64)),
+            token1_min_profit: parse_raw_amount(row.token1_min_profit.as_deref())?
+                .unwrap_or(U256::from(1u64)),
+        })
+    }
+}
+
+#[async_trait]
+impl PairSearchConfigStore for PostgresStore {
+    async fn enabled_pair_search_configs(&self) -> Result<Vec<TokenPairSearchConfig>> {
+        PostgresStore::enabled_pair_search_configs(self).await
+    }
+}
+
+fn parse_raw_amount_list(raw: Option<&str>) -> Result<Vec<U256>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(parse_raw_amount(Some(trimmed)).and_then(|value| {
+                    value.ok_or_else(|| anyhow::anyhow!("empty raw amount in list"))
+                }))
+            }
+        })
+        .collect()
+}
+
+fn parse_raw_amount(raw: Option<&str>) -> Result<Option<U256>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(U256::from_str_radix(raw, 10)?))
 }
 
 #[async_trait]

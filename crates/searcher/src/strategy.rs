@@ -1,10 +1,10 @@
-use alloy_primitives::{address, Address, U256};
-use chrono::Utc;
+use alloy_primitives::{Address, U256};
+use std::collections::HashMap;
 
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    ArbPath, Candidate, DexKind, PoolId, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult,
-    SwapStep, TickState,
+    ArbPath, Candidate, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult, SwapStep,
+    TickState, TokenPairSearchConfig,
 };
 use base_arb_dex::aerodrome::AerodromeVolatileQuoter;
 use base_arb_dex::quoter::DexQuoter;
@@ -17,20 +17,22 @@ use crate::opportunity::build_candidate;
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
     pub paths: Vec<ArbPath>,
+    pub pair_configs: Vec<TokenPairSearchConfig>,
     pub min_expected_profit: U256,
     pub max_price_impact_bps: u64,
     pub whitelist_paths: Vec<String>,
     pub candidate_ttl_ms: i64,
-    pub usdc: Address,
-    pub weth: Address,
 }
 
 impl SearchEngine {
+    #[cfg(test)]
     pub fn new(
         candidate_ttl_ms: i64,
         max_price_impact_bps: u64,
         min_expected_profit: U256,
     ) -> Self {
+        use alloy_primitives::address;
+
         let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
         let weth = address!("4200000000000000000000000000000000000006");
         let aero_pool = address!("1111111111111111111111111111111111111111");
@@ -91,12 +93,11 @@ impl SearchEngine {
                     diagnostics: None,
                 },
             ],
+            pair_configs: Vec::new(),
             min_expected_profit,
             max_price_impact_bps,
             whitelist_paths: vec![name1, name2],
             candidate_ttl_ms,
-            usdc,
-            weth,
         }
     }
 
@@ -108,16 +109,17 @@ impl SearchEngine {
         let paths = self.paths_for_pool_states(pool_states);
         let mut out = Vec::new();
 
-        for path in &paths {
-            for amount_in in &self.amount_sizes {
+        for search_path in &paths {
+            for amount_in in &search_path.amount_sizes {
                 if let Some((expected_amount_out, price_impact_bps, diagnostics)) =
-                    quote_path(pool_states, tick_states, path, *amount_in).await?
+                    quote_path(pool_states, tick_states, &search_path.path, *amount_in).await?
                 {
                     if price_impact_bps > self.max_price_impact_bps {
                         continue;
                     }
                     let expected_profit = expected_amount_out.saturating_sub(*amount_in);
-                    let block_number = path
+                    let block_number = search_path
+                        .path
                         .steps
                         .iter()
                         .filter_map(|step| {
@@ -130,16 +132,20 @@ impl SearchEngine {
                         .unwrap_or(0);
                     let candidate = build_candidate(
                         block_number,
-                        "mvp-usdc-weth-usdc".into(),
-                        self.usdc,
+                        "pair-two-pool-cycle".into(),
+                        search_path.path.steps[0].token_in,
                         *amount_in,
                         expected_amount_out,
                         expected_profit,
                         self.min_expected_profit,
                         price_impact_bps,
-                        path_with_diagnostics(path, diagnostics),
+                        path_with_diagnostics(&search_path.path, diagnostics),
                         self.candidate_ttl_ms,
                     );
+                    let candidate = Candidate {
+                        min_profit: search_path.min_profit,
+                        ..candidate
+                    };
                     out.push(candidate);
                 }
             }
@@ -148,53 +154,39 @@ impl SearchEngine {
         Ok(out)
     }
 
-    fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<ArbPath> {
+    fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {
         if !self.paths.is_empty() {
-            return self.paths.clone();
+            return self
+                .paths
+                .iter()
+                .cloned()
+                .map(|path| SearchPath {
+                    path,
+                    amount_sizes: self.amount_sizes.clone(),
+                    min_profit: self.min_expected_profit,
+                })
+                .collect();
         }
 
-        let pools = pool_states
-            .iter()
-            .filter(|state| is_supported_usdc_weth_pool(state, self.usdc, self.weth))
-            .collect::<Vec<_>>();
         let mut paths = Vec::new();
+        let configs = self
+            .pair_configs
+            .iter()
+            .map(|config| ((config.token0, config.token1), config))
+            .collect::<HashMap<_, _>>();
 
-        for first in &pools {
-            for second in &pools {
-                if first.pool_id.address == second.pool_id.address {
-                    continue;
+        for config in configs.values() {
+            let pools = pool_states
+                .iter()
+                .filter(|state| is_supported_config_pool(state, config))
+                .collect::<Vec<_>>();
+            for first in &pools {
+                for second in &pools {
+                    if first.pool_id.address == second.pool_id.address {
+                        continue;
+                    }
+                    add_pair_direction_paths(&mut paths, config, first, second);
                 }
-                if first.dex == second.dex && first.variant == second.variant {
-                    continue;
-                }
-
-                let name = format!(
-                    "usdc-weth-usdc-{}-{}",
-                    pool_label(first),
-                    pool_label(second)
-                );
-                paths.push(ArbPath {
-                    name,
-                    steps: vec![
-                        SwapStep {
-                            dex: first.dex,
-                            variant: Some(first.variant),
-                            pool: first.pool_id.address,
-                            token_in: self.usdc,
-                            token_out: self.weth,
-                            fee_bps: Some(first.fee_bps),
-                        },
-                        SwapStep {
-                            dex: second.dex,
-                            variant: Some(second.variant),
-                            pool: second.pool_id.address,
-                            token_in: self.weth,
-                            token_out: self.usdc,
-                            fee_bps: Some(second.fee_bps),
-                        },
-                    ],
-                    diagnostics: None,
-                });
             }
         }
 
@@ -211,17 +203,24 @@ pub fn engine_from_settings(
     candidate_ttl_ms: i64,
     max_price_impact_bps: u64,
     min_expected_profit: U256,
+    pair_configs: Vec<TokenPairSearchConfig>,
 ) -> anyhow::Result<SearchEngine> {
     Ok(SearchEngine {
         amount_sizes: parse_search_amounts(settings.search_amount_usdc.as_deref())?,
         paths: Vec::new(),
+        pair_configs,
         min_expected_profit,
         max_price_impact_bps,
         whitelist_paths: Vec::new(),
         candidate_ttl_ms,
-        usdc: settings.usdc_address,
-        weth: settings.weth_address,
     })
+}
+
+#[derive(Clone)]
+struct SearchPath {
+    path: ArbPath,
+    amount_sizes: Vec<U256>,
+    min_profit: U256,
 }
 
 fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
@@ -246,7 +245,12 @@ fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
     Ok(out)
 }
 
+#[cfg(test)]
 pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
+    use alloy_primitives::address;
+    use base_arb_common::types::PoolId;
+    use chrono::Utc;
+
     let weth = address!("4200000000000000000000000000000000000006");
     let aero_pool = address!("1111111111111111111111111111111111111111");
     let uni_pool = address!("2222222222222222222222222222222222222222");
@@ -409,17 +413,94 @@ fn impact_from_spot(spot_out: U256, actual_out: U256) -> u64 {
     u64::try_from(bps).unwrap_or(u64::MAX)
 }
 
-fn is_supported_usdc_weth_pool(state: &PoolState, usdc: Address, weth: Address) -> bool {
-    let has_pair = (state.token0 == usdc && state.token1 == weth)
-        || (state.token0 == weth && state.token1 == usdc);
+fn add_pair_direction_paths(
+    paths: &mut Vec<SearchPath>,
+    config: &TokenPairSearchConfig,
+    first: &PoolState,
+    second: &PoolState,
+) {
+    if !config.token0_search_amounts.is_empty() {
+        paths.push(build_search_path(
+            config,
+            first,
+            second,
+            config.token0,
+            config.token1,
+            config.token0_search_amounts.clone(),
+            config.token0_min_profit,
+        ));
+    }
+
+    if !config.token1_search_amounts.is_empty() {
+        paths.push(build_search_path(
+            config,
+            first,
+            second,
+            config.token1,
+            config.token0,
+            config.token1_search_amounts.clone(),
+            config.token1_min_profit,
+        ));
+    }
+}
+
+fn build_search_path(
+    config: &TokenPairSearchConfig,
+    first: &PoolState,
+    second: &PoolState,
+    token_in: Address,
+    token_mid: Address,
+    amount_sizes: Vec<U256>,
+    min_profit: U256,
+) -> SearchPath {
+    let name = format!(
+        "{}-{}-{}-{}-{}",
+        config.symbol,
+        short_token(token_in),
+        short_token(token_mid),
+        pool_label(first),
+        pool_label(second)
+    );
+    SearchPath {
+        path: ArbPath {
+            name,
+            steps: vec![
+                SwapStep {
+                    dex: first.dex,
+                    variant: Some(first.variant),
+                    pool: first.pool_id.address,
+                    token_in,
+                    token_out: token_mid,
+                    fee_bps: Some(first.fee_bps),
+                },
+                SwapStep {
+                    dex: second.dex,
+                    variant: Some(second.variant),
+                    pool: second.pool_id.address,
+                    token_in: token_mid,
+                    token_out: token_in,
+                    fee_bps: Some(second.fee_bps),
+                },
+            ],
+            diagnostics: None,
+        },
+        amount_sizes,
+        min_profit,
+    }
+}
+
+fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -> bool {
+    let has_pair = (state.token0 == config.token0 && state.token1 == config.token1)
+        || (state.token0 == config.token1 && state.token1 == config.token0);
     if !has_pair {
         return false;
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => state.reserve0.is_some() && state.reserve1.is_some(),
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => {
+        PoolVariant::UniswapV3 => {
             state.sqrt_price_x96.is_some() && state.liquidity.is_some() && state.tick.is_some()
         }
+        PoolVariant::AerodromeSlipstream => false,
     }
 }
 
@@ -434,6 +515,11 @@ fn pool_label(state: &PoolState) -> String {
         (DexKind::UniswapV3, PoolVariant::UniswapV3) => format!("uni-v3-{suffix}"),
         _ => format!("pool-{suffix}"),
     }
+}
+
+fn short_token(token: Address) -> String {
+    let token = format!("{token:#x}");
+    token[token.len().saturating_sub(6)..].to_string()
 }
 
 #[cfg(test)]

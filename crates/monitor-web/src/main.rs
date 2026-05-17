@@ -151,6 +151,10 @@ struct TokenPairRow {
     token0: String,
     token1: String,
     enabled: bool,
+    token0_search_amounts: Option<String>,
+    token1_search_amounts: Option<String>,
+    token0_min_profit: Option<String>,
+    token1_min_profit: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -193,6 +197,17 @@ struct DeletePairForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchConfigForm {
+    password: String,
+    token0: String,
+    token1: String,
+    token0_search_amounts: String,
+    token1_search_amounts: String,
+    token0_min_profit: String,
+    token1_min_profit: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
 }
@@ -221,6 +236,7 @@ async fn main() -> Result<()> {
         .route("/pairs/rediscover", post(rediscover_pair))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
+        .route("/pairs/search-config", post(update_pair_search_config))
         .route("/favicon.ico", get(favicon))
         .route("/favicon.svg", get(favicon))
         .route("/healthz", get(healthz))
@@ -537,6 +553,76 @@ async fn remove_pair(
     render_registry_response(&state.pool, None, Some(&message)).await
 }
 
+async fn update_pair_search_config(
+    State(state): State<AppState>,
+    Form(form): Form<SearchConfigForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let token0: Address = form
+        .token0
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1: Address = form
+        .token1
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (token0, token1) = canonical_pair(token0, token1);
+
+    let token0_amounts = normalize_raw_amount_list(&form.token0_search_amounts)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1_amounts = normalize_raw_amount_list(&form.token1_search_amounts)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token0_min_profit =
+        normalize_raw_amount(&form.token0_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let token1_min_profit =
+        normalize_raw_amount(&form.token1_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if token0_amounts.is_some() && token0_min_profit.is_none() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("token0 min profit raw is required when token0 search amounts are set"),
+        )
+        .await;
+    }
+    if token1_amounts.is_some() && token1_min_profit.is_none() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("token1 min profit raw is required when token1 search amounts are set"),
+        )
+        .await;
+    }
+
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    store
+        .update_token_pair_search_config(
+            state.settings.chain_id,
+            token0,
+            token1,
+            token0_amounts.as_deref(),
+            token1_amounts.as_deref(),
+            token0_min_profit.as_deref(),
+            token1_min_profit.as_deref(),
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    render_registry_response(&state.pool, None, Some("pair search config updated")).await
+}
+
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
@@ -665,7 +751,17 @@ async fn render_registry_response(
 async fn fetch_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
     Ok(sqlx::query_as::<_, TokenPairRow>(
         r#"
-        SELECT created_at, chain_id, symbol, token0, token1, enabled
+        SELECT
+            created_at,
+            chain_id,
+            symbol,
+            token0,
+            token1,
+            enabled,
+            token0_search_amounts,
+            token1_search_amounts,
+            token0_min_profit,
+            token1_min_profit
         FROM token_pairs
         ORDER BY created_at DESC
         LIMIT 50
@@ -960,6 +1056,21 @@ fn render_page(
       padding: 8px 10px;
       white-space: nowrap;
     }}
+    .search-config-form {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(220px, 1fr));
+      gap: 8px;
+      min-width: 760px;
+      margin-bottom: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,255,255,0.03);
+    }}
+    .search-config-form .password-wrap,
+    .search-config-form button {{
+      grid-column: span 2;
+    }}
     .delete-btn {{
       background: var(--bad);
       color: #190704;
@@ -1010,6 +1121,9 @@ fn render_page(
       border-radius: 10px;
       color: var(--accent);
       background: rgba(74,210,149,0.08);
+    }}
+    .muted {{
+      color: var(--muted);
     }}
     .card {{
       background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
@@ -1260,22 +1374,26 @@ fn nav_href(path: &str, auth_password: Option<&str>) -> String {
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Chain</th><th>Symbol</th><th>Token 0</th><th>Token 1</th><th>Token 0 Amounts Raw</th><th>Token 0 Min Profit Raw</th><th>Token 1 Amounts Raw</th><th>Token 1 Min Profit Raw</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.chain_id,
             escape(&row.symbol),
             copyable(&row.token0),
             copyable(&row.token1),
+            config_value(row.token0_search_amounts.as_deref()),
+            config_value(row.token0_min_profit.as_deref()),
+            config_value(row.token1_search_amounts.as_deref()),
+            config_value(row.token1_min_profit.as_deref()),
             row.enabled,
             render_pair_actions(row),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1283,10 +1401,41 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
 
 fn render_pair_actions(row: &TokenPairRow) -> String {
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
+        render_search_config_form(row),
         render_rediscover_form(row),
         render_delete_pair_form(row),
         render_remove_pair_form(row)
+    )
+}
+
+fn render_search_config_form(row: &TokenPairRow) -> String {
+    format!(
+        r#"<form method="post" action="/pairs/search-config" class="search-config-form">
+  {password_input}
+  <input name="token0" type="hidden" value="{token0}">
+  <input name="token1" type="hidden" value="{token1}">
+  <label>Token 0 Amounts Raw
+    <input name="token0_search_amounts" value="{token0_amounts}" placeholder="10000000,30000000">
+  </label>
+  <label>Token 0 Min Profit Raw
+    <input name="token0_min_profit" value="{token0_min_profit}" placeholder="500">
+  </label>
+  <label>Token 1 Amounts Raw
+    <input name="token1_search_amounts" value="{token1_amounts}" placeholder="10000000000000000">
+  </label>
+  <label>Token 1 Min Profit Raw
+    <input name="token1_min_profit" value="{token1_min_profit}" placeholder="500000000000000">
+  </label>
+  <button type="submit">Save Search Config</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
+        token0 = escape(&row.token0),
+        token1 = escape(&row.token1),
+        token0_amounts = escape(row.token0_search_amounts.as_deref().unwrap_or_default()),
+        token1_amounts = escape(row.token1_search_amounts.as_deref().unwrap_or_default()),
+        token0_min_profit = escape(row.token0_min_profit.as_deref().unwrap_or_default()),
+        token1_min_profit = escape(row.token1_min_profit.as_deref().unwrap_or_default()),
     )
 }
 
@@ -1615,6 +1764,14 @@ fn monitoring_status(enabled: bool) -> String {
     }
 }
 
+fn config_value(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(escape)
+        .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
+}
+
 fn state_source_label(source: &str) -> String {
     match source {
         "local_event" => "<span class=\"ok\">local_event</span>".into(),
@@ -1672,6 +1829,40 @@ fn canonical_pair(token_a: Address, token_b: Address) -> (Address, Address) {
     } else {
         (token_b, token_a)
     }
+}
+
+fn normalize_raw_amount_list(raw: &str) -> std::result::Result<Option<String>, ()> {
+    let values = raw
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(normalize_raw_amount(trimmed).and_then(|value| value.ok_or(())))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values.join(",")))
+    }
+}
+
+fn normalize_raw_amount(raw: &str) -> std::result::Result<Option<String>, ()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if !raw.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(());
+    }
+    let normalized = raw.trim_start_matches('0');
+    if normalized.is_empty() {
+        return Err(());
+    }
+    Ok(Some(normalized.to_string()))
 }
 
 async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address) -> String {

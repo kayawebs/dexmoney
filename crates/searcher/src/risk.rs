@@ -11,7 +11,12 @@ pub fn validate_candidate(
     max_price_impact_bps: u64,
     whitelist_paths: &[String],
 ) -> Result<()> {
-    if candidate.expected_profit < min_expected_profit {
+    let required_profit = if candidate.min_profit.is_zero() {
+        min_expected_profit
+    } else {
+        candidate.min_profit
+    };
+    if candidate.expected_profit < required_profit {
         return Err(ArbBotError::RiskGate(
             "expected profit below threshold".into(),
         ));

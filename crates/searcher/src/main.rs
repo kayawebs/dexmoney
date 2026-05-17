@@ -5,8 +5,8 @@ mod strategy;
 use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_storage::{
-    postgres::PostgresStore, redis::RedisStore, CandidateStore, PoolStateStore, RecorderStore,
-    TickStateStore,
+    postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
+    PoolStateStore, RecorderStore, TickStateStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info};
@@ -54,13 +54,14 @@ async fn run_search_cycle<P, C, R>(
 where
     P: PoolStateStore + TickStateStore,
     C: CandidateStore,
-    R: RecorderStore,
+    R: RecorderStore + PairSearchConfigStore,
 {
     let engine = strategy::engine_from_settings(
         settings,
         candidate_ttl_ms,
         max_price_impact_bps,
         strategy::usdc_to_units(min_expected_profit_usdc),
+        recorder.enabled_pair_search_configs().await?,
     )?;
     let pool_states = pool_store.all_pool_states().await?;
     if pool_states.is_empty() {

@@ -47,7 +47,8 @@ async fn simulate_inner(
         anyhow::bail!("candidate expired");
     }
 
-    let min_profit_units = U256::from((min_simulated_profit_usdc * 1_000_000.0) as u64);
+    let _ = min_simulated_profit_usdc;
+    let min_profit_units = candidate.min_profit;
     if candidate.expected_profit < min_profit_units {
         anyhow::bail!("profit below simulated threshold");
     }

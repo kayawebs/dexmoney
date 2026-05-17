@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
-    Candidate, EoaLaneState, PoolState, SimulationResult, TickState, TxResult,
+    Candidate, EoaLaneState, PoolState, SimulationResult, TickState, TokenPairSearchConfig,
+    TxResult,
 };
 
 #[async_trait]
@@ -52,6 +53,11 @@ pub trait RecorderStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait PairSearchConfigStore: Send + Sync {
+    async fn enabled_pair_search_configs(&self) -> anyhow::Result<Vec<TokenPairSearchConfig>>;
+}
+
+#[async_trait]
 pub trait EoaStateStore: Send + Sync {
     async fn set_lane_state(&self, lane: EoaLaneState) -> anyhow::Result<()>;
     async fn get_lane_state(&self, address: Address) -> anyhow::Result<Option<EoaLaneState>>;
@@ -73,6 +79,13 @@ pub struct InMemoryStores {
 impl InMemoryStores {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[async_trait]
+impl PairSearchConfigStore for InMemoryStores {
+    async fn enabled_pair_search_configs(&self) -> anyhow::Result<Vec<TokenPairSearchConfig>> {
+        Ok(Vec::new())
     }
 }
 
