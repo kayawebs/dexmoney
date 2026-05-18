@@ -25,6 +25,29 @@ pub struct SearchEngine {
     pub candidate_ttl_ms: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchStats {
+    pub paths: usize,
+    pub quote_attempts: u64,
+    pub quote_successes: u64,
+    pub quote_skipped: u64,
+    pub price_impact_rejected: u64,
+    pub candidates_emitted: u64,
+    pub best_profit: U256,
+}
+
+impl SearchStats {
+    pub fn merge(&mut self, other: &SearchStats) {
+        self.paths += other.paths;
+        self.quote_attempts += other.quote_attempts;
+        self.quote_successes += other.quote_successes;
+        self.quote_skipped += other.quote_skipped;
+        self.price_impact_rejected += other.price_impact_rejected;
+        self.candidates_emitted += other.candidates_emitted;
+        self.best_profit = self.best_profit.max(other.best_profit);
+    }
+}
+
 impl SearchEngine {
     #[cfg(test)]
     pub fn new(
@@ -107,17 +130,37 @@ impl SearchEngine {
         pool_states: &[PoolState],
         tick_states: &[TickState],
     ) -> anyhow::Result<Vec<Candidate>> {
+        Ok(self.search_with_stats(pool_states, tick_states).await?.0)
+    }
+
+    pub async fn search_with_stats(
+        &self,
+        pool_states: &[PoolState],
+        tick_states: &[TickState],
+    ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
         let paths = self.paths_for_pool_states(pool_states);
+        let mut stats = SearchStats {
+            paths: paths.len(),
+            ..SearchStats::default()
+        };
         let mut out = Vec::new();
 
         for search_path in &paths {
             for amount_in in &search_path.amount_sizes {
+                stats.quote_attempts += 1;
                 let quote =
                     match quote_path(pool_states, tick_states, &search_path.path, *amount_in).await
                     {
-                        Ok(Some(quote)) => quote,
-                        Ok(None) => continue,
+                        Ok(Some(quote)) => {
+                            stats.quote_successes += 1;
+                            quote
+                        }
+                        Ok(None) => {
+                            stats.quote_skipped += 1;
+                            continue;
+                        }
                         Err(err) => {
+                            stats.quote_skipped += 1;
                             debug!(
                                 path = %search_path.path.name,
                                 amount_in = %amount_in,
@@ -130,9 +173,11 @@ impl SearchEngine {
                 let (expected_amount_out, price_impact_bps, diagnostics) = quote;
                 {
                     if price_impact_bps > self.max_price_impact_bps {
+                        stats.price_impact_rejected += 1;
                         continue;
                     }
                     let expected_profit = expected_amount_out.saturating_sub(*amount_in);
+                    stats.best_profit = stats.best_profit.max(expected_profit);
                     let block_number = search_path
                         .path
                         .steps
@@ -161,12 +206,13 @@ impl SearchEngine {
                         min_profit: search_path.min_profit,
                         ..candidate
                     };
+                    stats.candidates_emitted += 1;
                     out.push(candidate);
                 }
             }
         }
 
-        Ok(out)
+        Ok((out, stats))
     }
 
     fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {

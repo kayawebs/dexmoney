@@ -8,7 +8,7 @@ use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolStateStore, RecorderStore, TickStateStore,
 };
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
@@ -24,10 +24,12 @@ async fn main() -> Result<()> {
     info!("searcher initialized");
     let mut ticker = interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut aggregate = SearchCycleStats::default();
+    let mut last_summary = Instant::now();
 
     loop {
         ticker.tick().await;
-        run_search_cycle(
+        let stats = run_search_cycle(
             &redis,
             &redis,
             &postgres,
@@ -38,6 +40,38 @@ async fn main() -> Result<()> {
             settings.min_expected_profit_usdc,
         )
         .await?;
+        aggregate.merge(&stats);
+        if last_summary.elapsed() >= Duration::from_secs(30) {
+            info!(
+                paths = aggregate.search.paths,
+                quote_attempts = aggregate.search.quote_attempts,
+                quote_successes = aggregate.search.quote_successes,
+                quote_skipped = aggregate.search.quote_skipped,
+                price_impact_rejected = aggregate.search.price_impact_rejected,
+                candidates_emitted = aggregate.search.candidates_emitted,
+                risk_rejected = aggregate.risk_rejected,
+                opportunities_created = aggregate.opportunities_created,
+                best_profit = %aggregate.search.best_profit,
+                "searcher cycle summary"
+            );
+            aggregate = SearchCycleStats::default();
+            last_summary = Instant::now();
+        }
+    }
+}
+
+#[derive(Default)]
+struct SearchCycleStats {
+    search: strategy::SearchStats,
+    risk_rejected: u64,
+    opportunities_created: u64,
+}
+
+impl SearchCycleStats {
+    fn merge(&mut self, other: &SearchCycleStats) {
+        self.search.merge(&other.search);
+        self.risk_rejected += other.risk_rejected;
+        self.opportunities_created += other.opportunities_created;
     }
 }
 
@@ -50,7 +84,7 @@ async fn run_search_cycle<P, C, R>(
     max_pool_state_age_ms: i64,
     max_price_impact_bps: u64,
     min_expected_profit_usdc: f64,
-) -> Result<()>
+) -> Result<SearchCycleStats>
 where
     P: PoolStateStore + TickStateStore,
     C: CandidateStore,
@@ -66,7 +100,7 @@ where
     let pool_states = pool_store.all_pool_states().await?;
     if pool_states.is_empty() {
         debug!("no pool states available in redis");
-        return Ok(());
+        return Ok(SearchCycleStats::default());
     }
     let mut tick_states = Vec::new();
     for state in &pool_states {
@@ -79,7 +113,11 @@ where
             tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
         }
     }
-    let candidates = engine.search(&pool_states, &tick_states).await?;
+    let (candidates, search_stats) = engine.search_with_stats(&pool_states, &tick_states).await?;
+    let mut cycle_stats = SearchCycleStats {
+        search: search_stats,
+        ..SearchCycleStats::default()
+    };
 
     for candidate in candidates {
         debug!(candidate_id = %candidate.id, "quote generated");
@@ -94,11 +132,15 @@ where
             Ok(()) => {
                 recorder.record_opportunity(candidate.clone()).await?;
                 candidate_store.push_candidate(candidate.clone()).await?;
+                cycle_stats.opportunities_created += 1;
                 debug!(candidate_id = %candidate.id, "candidate created");
             }
-            Err(err) => debug!(candidate_id = %candidate.id, reason = %err, "candidate rejected"),
+            Err(err) => {
+                cycle_stats.risk_rejected += 1;
+                debug!(candidate_id = %candidate.id, reason = %err, "candidate rejected");
+            }
         }
     }
 
-    Ok(())
+    Ok(cycle_stats)
 }
