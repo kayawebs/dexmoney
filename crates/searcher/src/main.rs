@@ -12,8 +12,6 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-const MAX_POOL_STATE_AGE_MS: i64 = 300_000;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -35,6 +33,7 @@ async fn main() -> Result<()> {
             &postgres,
             &settings,
             settings.candidate_ttl_ms,
+            settings.max_pool_state_age_ms,
             settings.max_price_impact_bps,
             settings.min_expected_profit_usdc,
         )
@@ -48,6 +47,7 @@ async fn run_search_cycle<P, C, R>(
     recorder: &R,
     settings: &Settings,
     candidate_ttl_ms: i64,
+    max_pool_state_age_ms: i64,
     max_price_impact_bps: u64,
     min_expected_profit_usdc: f64,
 ) -> Result<()>
@@ -74,6 +74,7 @@ where
             state.variant,
             base_arb_common::types::PoolVariant::AerodromeSlipstream
                 | base_arb_common::types::PoolVariant::UniswapV3
+                | base_arb_common::types::PoolVariant::PancakeV3
         ) {
             tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
         }
@@ -85,7 +86,7 @@ where
         match risk::validate_candidate(
             &candidate,
             &pool_states,
-            MAX_POOL_STATE_AGE_MS,
+            max_pool_state_age_ms,
             engine.min_expected_profit,
             max_price_impact_bps,
             &engine.whitelist_paths,

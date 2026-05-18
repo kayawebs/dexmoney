@@ -2,6 +2,7 @@ use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
+use base_arb_common::constants::PANCAKE_V3_ROUTER;
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
 
@@ -140,6 +141,9 @@ fn executor_dex_kind(dex: DexKind, variant: Option<PoolVariant>) -> Result<u8> {
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => Ok(1),
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => Ok(2),
+        (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
+            Ok(2)
+        }
         _ => anyhow::bail!("dex and pool variant mismatch"),
     }
 }
@@ -169,6 +173,9 @@ fn router_for_step(dex: DexKind, settings: &Settings) -> Option<Address> {
     match dex {
         DexKind::Aerodrome => settings.aerodrome_router,
         DexKind::UniswapV3 => settings.uniswap_v3_router,
+        DexKind::PancakeSwap => settings
+            .pancake_v3_router
+            .or_else(|| PANCAKE_V3_ROUTER.parse().ok()),
     }
 }
 
@@ -230,6 +237,8 @@ mod tests {
             uniswap_v3_quoter: None,
             uniswap_v3_usdc_weth_500_pool: None,
             uniswap_v3_usdc_weth_3000_pool: None,
+            pancake_v3_factory: None,
+            pancake_v3_router: None,
             executor_contract: Some(address!("3333333333333333333333333333333333333333")),
             executor_owner_private_key: None,
             deployer_private_key: None,
@@ -239,6 +248,7 @@ mod tests {
             min_expected_profit_usdc: 0.01,
             min_simulated_profit_usdc: 0.005,
             candidate_ttl_ms: 500,
+            max_pool_state_age_ms: 300_000,
             max_price_impact_bps: 50,
             monitor_web_password: None,
         }

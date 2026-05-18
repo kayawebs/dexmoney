@@ -20,6 +20,7 @@ pub struct PoolId {
 pub enum DexKind {
     Aerodrome,
     UniswapV3,
+    PancakeSwap,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum PoolVariant {
     AerodromeVolatile,
     AerodromeSlipstream,
     UniswapV3,
+    PancakeV3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

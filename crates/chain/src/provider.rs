@@ -2,6 +2,7 @@ use crate::events::DexEvent;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
+use base_arb_common::constants::PANCAKE_V3_FACTORY;
 use base_arb_common::types::{
     DexKind, DiscoveredPool, PoolId, PoolRegistryEntry, PoolState, PoolVariant, TickState,
 };
@@ -18,6 +19,7 @@ const AERODROME_SLIPSTREAM_FACTORIES: [&str; 2] = [
 ];
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
+const PANCAKE_V3_FEE_TIERS: [u32; 4] = [100, 500, 2500, 10000];
 const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 7] = [1, 10, 50, 100, 200, 500, 2000];
 
 #[derive(Debug, Clone)]
@@ -121,13 +123,13 @@ impl ChainProvider {
                 self.fetch_aerodrome_pool_state_at_block(entry.pool_address, block_number)
                     .await
             }
-            DexKind::UniswapV3 => {
+            DexKind::UniswapV3 | DexKind::PancakeSwap => {
                 let (token0, token1) = self
                     .fetch_pool_tokens(entry.pool_address)
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to read token0/token1 for Uniswap V3 registry pool {:#x}",
+                            "failed to read token0/token1 for V3 registry pool {:#x}",
                             entry.pool_address
                         )
                     })?;
@@ -136,7 +138,7 @@ impl ChainProvider {
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to read state for Uniswap V3 registry pool {:#x}",
+                            "failed to read state for V3 registry pool {:#x}",
                             entry.pool_address
                         )
                     })?;
@@ -145,8 +147,8 @@ impl ChainProvider {
                         chain_id: self.chain_id,
                         address: entry.pool_address,
                     },
-                    dex: DexKind::UniswapV3,
-                    variant: PoolVariant::UniswapV3,
+                    dex: entry.dex,
+                    variant: entry.variant,
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
@@ -177,13 +179,13 @@ impl ChainProvider {
                 )
                 .await
             }
-            DexKind::UniswapV3 => {
+            DexKind::UniswapV3 | DexKind::PancakeSwap => {
                 let (token0, token1) = self
                     .fetch_pool_tokens(entry.pool_address)
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to read token0/token1 for Uniswap V3 registry pool {:#x}",
+                            "failed to read token0/token1 for V3 registry pool {:#x}",
                             entry.pool_address
                         )
                     })?;
@@ -192,7 +194,7 @@ impl ChainProvider {
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to read state for Uniswap V3 registry pool {:#x} at block_hash {block_hash}",
+                            "failed to read state for V3 registry pool {:#x} at block_hash {block_hash}",
                             entry.pool_address
                         )
                     })?;
@@ -201,8 +203,8 @@ impl ChainProvider {
                         chain_id: self.chain_id,
                         address: entry.pool_address,
                     },
-                    dex: DexKind::UniswapV3,
-                    variant: PoolVariant::UniswapV3,
+                    dex: entry.dex,
+                    variant: entry.variant,
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
@@ -232,6 +234,8 @@ impl ChainProvider {
         self.discover_aerodrome_slipstream(settings, token_a, token_b, &mut seen, &mut out)
             .await?;
         self.discover_uniswap_v3(settings, token_a, token_b, &mut seen, &mut out)
+            .await?;
+        self.discover_pancake_v3(settings, token_a, token_b, &mut seen, &mut out)
             .await?;
 
         Ok(out)
@@ -547,6 +551,83 @@ impl ChainProvider {
                 }
                 Err(err) => {
                     debug!(factory = %factory, fee, error = %err, "Uniswap V3 discovery probe failed")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn discover_pancake_v3(
+        &self,
+        settings: &Settings,
+        token_a: Address,
+        token_b: Address,
+        seen: &mut HashSet<Address>,
+        out: &mut Vec<DiscoveredPool>,
+    ) -> Result<()> {
+        let factory = settings
+            .pancake_v3_factory
+            .unwrap_or(PANCAKE_V3_FACTORY.parse()?);
+
+        for fee in PANCAKE_V3_FEE_TIERS {
+            let data = encode_get_pool_uint24(token_a, token_b, fee);
+            match self
+                .eth_call(
+                    factory,
+                    &data,
+                    "Pancake V3 factory getPool(address,address,uint24)",
+                )
+                .await
+            {
+                Ok(raw) => {
+                    let pool = decode_single_address(&raw)?;
+                    if pool == Address::ZERO || !seen.insert(pool) {
+                        continue;
+                    }
+                    let (token0, token1) = match self.fetch_pool_tokens(pool).await {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Pancake V3 discovered pool token read failed; skipping");
+                            continue;
+                        }
+                    };
+                    let (sqrt_price_x96, tick, liquidity) = match self
+                        .fetch_uniswap_v3_state(pool)
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(err) => {
+                            debug!(pool = %pool, error = %err, "Pancake V3 discovered pool state read failed; skipping");
+                            continue;
+                        }
+                    };
+                    out.push(DiscoveredPool {
+                        state: PoolState {
+                            pool_id: PoolId {
+                                chain_id: self.chain_id,
+                                address: pool,
+                            },
+                            dex: DexKind::PancakeSwap,
+                            variant: PoolVariant::PancakeV3,
+                            token0,
+                            token1,
+                            fee_bps: fee / 100,
+                            reserve0: None,
+                            reserve1: None,
+                            sqrt_price_x96: Some(sqrt_price_x96),
+                            liquidity: Some(liquidity),
+                            tick: Some(tick),
+                            block_number: self.get_block_number().await?,
+                            updated_at: Utc::now(),
+                        },
+                        tick_spacing: None,
+                        stable: None,
+                        source: format!("pancake_v3_factory_fee_{fee}"),
+                    });
+                }
+                Err(err) => {
+                    debug!(factory = %factory, fee, error = %err, "Pancake V3 discovery probe failed")
                 }
             }
         }
@@ -1290,39 +1371,39 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
             "0x596b573906218d3411850b26a6b437d6c4522fdb43d2d2386263f86d50b8b151",
         ) => "CollectProtocol",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x98636036cb66a9c19a37435efc1e90142190214e8abeb821bdba3f2990dd4c95",
         ) => "Initialize",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
         ) => "Swap",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde",
         ) => "Mint",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c",
         ) => "Burn",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0",
         ) => "Collect",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0xbdbdb71d7860376ba52b25a5028beea23581364a40522f6bcfb86bb1f2dca633",
         ) => "Flash",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0xac49e518f90a358f652e4400164f05a5d8f7e35e7747279bc3a93dbf584e125a",
         ) => "IncreaseObservationCardinalityNext",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x973d8d92bb299f4af6ce49b52a8adb85ae46b9f214c4c4fc06ac77401237b133",
         ) => "SetFeeProtocol",
         (
-            DexKind::UniswapV3,
+            DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x596b573906218d3411850b26a6b437d6c4522fdb43d2d2386263f86d50b8b151",
         ) => "CollectProtocol",
         (_, _) => "Unknown",

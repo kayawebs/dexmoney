@@ -633,7 +633,7 @@ fn discovery_error_message(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "invalid token pair input",
         StatusCode::NOT_FOUND => {
-            "no supported Aerodrome Classic, Aerodrome Slipstream, or Uniswap V3 pools found for this pair"
+            "no supported Aerodrome Classic, Aerodrome Slipstream, Uniswap V3, or Pancake V3 pools found for this pair"
         }
         StatusCode::BAD_GATEWAY => "pool discovery RPC failed; check monitor-web logs",
         StatusCode::INTERNAL_SERVER_ERROR => "pool registry database write failed",
@@ -682,13 +682,18 @@ async fn discover_and_upsert_pair(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
-    let executor_report =
-        match executor_admin::configure_executor_for_pair(&state.provider, &state.settings, &discovered, token0, token1)
-            .await
-        {
-            Ok(report) => report.summary(),
-            Err(err) => format!("executor auto-config failed after registry update: {err}"),
-        };
+    let executor_report = match executor_admin::configure_executor_for_pair(
+        &state.provider,
+        &state.settings,
+        &discovered,
+        token0,
+        token1,
+    )
+    .await
+    {
+        Ok(report) => report.summary(),
+        Err(err) => format!("executor auto-config failed after registry update: {err}"),
+    };
 
     Ok(PairDiscoveryResult {
         symbol,
@@ -1497,7 +1502,9 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<div class=\"pair-card\"><span class=\"muted\">No token pairs yet.</span></div>");
+        html.push_str(
+            "<div class=\"pair-card\"><span class=\"muted\">No token pairs yet.</span></div>",
+        );
     }
     html.push_str("</div>");
     html

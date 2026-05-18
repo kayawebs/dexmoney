@@ -106,12 +106,13 @@ where
                             .await?;
                     }
                     if super::state_updater::is_v3_liquidity_event(state, event)? {
-                        if self.refresh_v3_state_at_block(state, event.block_number).await? {
+                        if self
+                            .refresh_v3_state_at_block(state, event.block_number)
+                            .await?
+                        {
                             changed_pools.insert(state.pool_id.address);
-                            validation_snapshots.insert(
-                                (state.block_number, state.pool_id.address),
-                                state.clone(),
-                            );
+                            validation_snapshots
+                                .insert((state.block_number, state.pool_id.address), state.clone());
                             debug!(
                                 pool = %state.pool_id.address,
                                 block_number = state.block_number,
@@ -560,6 +561,7 @@ fn is_v3_style_state(state: &PoolState) -> bool {
         (state.dex, state.variant),
         (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
             | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+            | (DexKind::PancakeSwap, PoolVariant::PancakeV3)
     )
 }
 
@@ -596,7 +598,8 @@ fn calibration_message(state: &PoolState, drift_bps: u64) -> String {
             )
         }
         (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-        | (DexKind::UniswapV3, PoolVariant::UniswapV3) => {
+        | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+        | (DexKind::PancakeSwap, PoolVariant::PancakeV3) => {
             format!("local V3-style state drifted from onchain slot0/liquidity by {drift_bps} bps")
         }
         _ => format!("local pool state drifted from onchain state by {drift_bps} bps"),
@@ -607,7 +610,8 @@ fn state_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
     match (local.dex, local.variant) {
         (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => reserve_drift_bps(local, onchain),
         (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-        | (DexKind::UniswapV3, PoolVariant::UniswapV3) => v3_state_drift_bps(local, onchain),
+        | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+        | (DexKind::PancakeSwap, PoolVariant::PancakeV3) => v3_state_drift_bps(local, onchain),
         _ => u64::MAX,
     }
 }

@@ -256,8 +256,9 @@ impl PostgresStore {
 
         rows.into_iter()
             .filter_map(|row| match TokenPairSearchConfig::try_from(row) {
-                Ok(config) if !config.token0_search_amounts.is_empty()
-                    || !config.token1_search_amounts.is_empty() =>
+                Ok(config)
+                    if !config.token0_search_amounts.is_empty()
+                        || !config.token1_search_amounts.is_empty() =>
                 {
                     Some(Ok(config))
                 }
@@ -807,6 +808,7 @@ fn dex_to_string(dex: DexKind) -> &'static str {
     match dex {
         DexKind::Aerodrome => "Aerodrome",
         DexKind::UniswapV3 => "UniswapV3",
+        DexKind::PancakeSwap => "PancakeSwap",
     }
 }
 
@@ -815,6 +817,7 @@ fn variant_to_string(variant: PoolVariant) -> &'static str {
         PoolVariant::AerodromeVolatile => "AerodromeVolatile",
         PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
         PoolVariant::UniswapV3 => "UniswapV3",
+        PoolVariant::PancakeV3 => "PancakeV3",
     }
 }
 
@@ -822,6 +825,7 @@ fn parse_dex(value: &str) -> Result<DexKind> {
     match value {
         "Aerodrome" => Ok(DexKind::Aerodrome),
         "UniswapV3" => Ok(DexKind::UniswapV3),
+        "PancakeSwap" => Ok(DexKind::PancakeSwap),
         _ => anyhow::bail!("unknown dex kind {value}"),
     }
 }
@@ -831,6 +835,7 @@ fn parse_variant(value: &str) -> Result<PoolVariant> {
         "AerodromeVolatile" => Ok(PoolVariant::AerodromeVolatile),
         "AerodromeSlipstream" => Ok(PoolVariant::AerodromeSlipstream),
         "UniswapV3" => Ok(PoolVariant::UniswapV3),
+        "PancakeV3" => Ok(PoolVariant::PancakeV3),
         _ => anyhow::bail!("unknown pool variant {value}"),
     }
 }

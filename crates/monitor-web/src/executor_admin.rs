@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::{
     config::Settings,
+    constants::PANCAKE_V3_ROUTER,
     types::{DiscoveredPool, PoolVariant},
 };
 use ethers_core::types::{
@@ -57,7 +58,9 @@ pub async fn configure_executor_for_pair(
     token0: Address,
     token1: Address,
 ) -> Result<ExecutorAdminReport> {
-    let Some(executor) = settings.executor_contract.filter(|address| *address != Address::ZERO)
+    let Some(executor) = settings
+        .executor_contract
+        .filter(|address| *address != Address::ZERO)
     else {
         return Ok(ExecutorAdminReport {
             skipped_reason: Some("EXECUTOR_CONTRACT is not configured".to_string()),
@@ -81,11 +84,9 @@ pub async fn configure_executor_for_pair(
     let mut nonce = provider.get_transaction_count(wallet.address, true).await?;
     let mut report = ExecutorAdminReport::default();
 
-    for router in [settings.aerodrome_router, settings.uniswap_v3_router]
-        .into_iter()
-        .flatten()
-        .filter(|address| *address != Address::ZERO)
-    {
+    let routers = executor_routers(settings, discovered);
+
+    for router in routers.iter().copied() {
         ensure_mapping_enabled(
             provider,
             &wallet,
@@ -139,11 +140,7 @@ pub async fn configure_executor_for_pair(
             "token whitelist",
         )
         .await?;
-        for router in [settings.aerodrome_router, settings.uniswap_v3_router]
-            .into_iter()
-            .flatten()
-            .filter(|address| *address != Address::ZERO)
-        {
+        for router in routers.iter().copied() {
             ensure_token_approval(
                 provider,
                 &wallet,
@@ -175,6 +172,31 @@ pub async fn configure_executor_for_pair(
     }
 
     Ok(report)
+}
+
+fn executor_routers(settings: &Settings, discovered: &[DiscoveredPool]) -> Vec<Address> {
+    let mut routers = [settings.aerodrome_router, settings.uniswap_v3_router]
+        .into_iter()
+        .flatten()
+        .filter(|address| *address != Address::ZERO)
+        .collect::<Vec<_>>();
+
+    if discovered.iter().any(|pool| {
+        pool.state.dex == base_arb_common::types::DexKind::PancakeSwap
+            && pool.state.variant == PoolVariant::PancakeV3
+    }) {
+        if let Some(router) = settings
+            .pancake_v3_router
+            .or_else(|| PANCAKE_V3_ROUTER.parse().ok())
+            .filter(|address| *address != Address::ZERO)
+        {
+            routers.push(router);
+        }
+    }
+
+    routers.sort();
+    routers.dedup();
+    routers
 }
 
 impl AdminWallet {
@@ -288,10 +310,12 @@ async fn send_admin_tx(
     let (max_fee_per_gas, max_priority_fee_per_gas) = provider.suggested_eip1559_fees().await?;
 
     let tx = Eip1559TransactionRequest::new()
-        .from(ethers_core::types::Address::from_slice(wallet.address.as_slice()))
-        .to(NameOrAddress::Address(ethers_core::types::Address::from_slice(
-            to.as_slice(),
-        )))
+        .from(ethers_core::types::Address::from_slice(
+            wallet.address.as_slice(),
+        ))
+        .to(NameOrAddress::Address(
+            ethers_core::types::Address::from_slice(to.as_slice()),
+        ))
         .nonce(EthersU256::from(nonce))
         .chain_id(U64::from(chain_id))
         .gas(alloy_u256_to_ethers(gas_limit)?)

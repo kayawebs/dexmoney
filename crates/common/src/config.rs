@@ -2,7 +2,7 @@ use alloy_primitives::Address;
 use config::{Config, Environment};
 use serde::Deserialize;
 
-use crate::constants::DEFAULT_CANDIDATE_TTL_MS;
+use crate::constants::{DEFAULT_CANDIDATE_TTL_MS, DEFAULT_MAX_POOL_STATE_AGE_MS};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
@@ -22,6 +22,8 @@ pub struct Settings {
     pub uniswap_v3_quoter: Option<Address>,
     pub uniswap_v3_usdc_weth_500_pool: Option<Address>,
     pub uniswap_v3_usdc_weth_3000_pool: Option<Address>,
+    pub pancake_v3_factory: Option<Address>,
+    pub pancake_v3_router: Option<Address>,
     pub executor_contract: Option<Address>,
     pub executor_owner_private_key: Option<String>,
     pub deployer_private_key: Option<String>,
@@ -31,6 +33,7 @@ pub struct Settings {
     pub min_expected_profit_usdc: f64,
     pub min_simulated_profit_usdc: f64,
     pub candidate_ttl_ms: i64,
+    pub max_pool_state_age_ms: i64,
     pub max_price_impact_bps: u64,
     pub monitor_web_password: Option<String>,
 }
@@ -41,6 +44,7 @@ impl Settings {
 
         Config::builder()
             .set_default("candidate_ttl_ms", DEFAULT_CANDIDATE_TTL_MS)?
+            .set_default("max_pool_state_age_ms", DEFAULT_MAX_POOL_STATE_AGE_MS)?
             .set_default("search_amount_usdc", "10,30,50,100")?
             .add_source(Environment::default())
             .build()?

@@ -148,6 +148,7 @@ fn is_v3_style(state: &PoolState) -> bool {
         (state.dex, state.variant),
         (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
             | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+            | (DexKind::PancakeSwap, PoolVariant::PancakeV3)
     )
 }
 

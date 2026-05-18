@@ -347,7 +347,7 @@ async fn quote_path(
                     quote
                 })
                 .map_err(anyhow::Error::from)?,
-            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 => {
+            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
                 let pool_ticks = tick_states
                     .iter()
                     .filter(|tick| tick.pool_id.address == pool_state.pool_id.address)
@@ -512,12 +512,14 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => state.reserve0.is_some() && state.reserve1.is_some(),
-        PoolVariant::UniswapV3 => match (state.sqrt_price_x96, state.liquidity, state.tick) {
-            (Some(sqrt_price_x96), Some(liquidity), Some(_)) => {
-                !sqrt_price_x96.is_zero() && !liquidity.is_zero()
+        PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+            match (state.sqrt_price_x96, state.liquidity, state.tick) {
+                (Some(sqrt_price_x96), Some(liquidity), Some(_)) => {
+                    !sqrt_price_x96.is_zero() && !liquidity.is_zero()
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
         PoolVariant::AerodromeSlipstream => false,
     }
 }
@@ -531,6 +533,7 @@ fn pool_label(state: &PoolState) -> String {
             format!("aero-slipstream-{suffix}")
         }
         (DexKind::UniswapV3, PoolVariant::UniswapV3) => format!("uni-v3-{suffix}"),
+        (DexKind::PancakeSwap, PoolVariant::PancakeV3) => format!("pancake-v3-{suffix}"),
         _ => format!("pool-{suffix}"),
     }
 }
