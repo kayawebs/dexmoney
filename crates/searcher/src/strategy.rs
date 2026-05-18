@@ -11,6 +11,7 @@ use base_arb_dex::quoter::DexQuoter;
 use base_arb_dex::uniswap_v3::{
     quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
 };
+use tracing::debug;
 
 use crate::opportunity::build_candidate;
 
@@ -111,8 +112,22 @@ impl SearchEngine {
 
         for search_path in &paths {
             for amount_in in &search_path.amount_sizes {
-                if let Some((expected_amount_out, price_impact_bps, diagnostics)) =
-                    quote_path(pool_states, tick_states, &search_path.path, *amount_in).await?
+                let quote =
+                    match quote_path(pool_states, tick_states, &search_path.path, *amount_in).await
+                    {
+                        Ok(Some(quote)) => quote,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            debug!(
+                                path = %search_path.path.name,
+                                amount_in = %amount_in,
+                                error = %err,
+                                "quote skipped"
+                            );
+                            continue;
+                        }
+                    };
+                let (expected_amount_out, price_impact_bps, diagnostics) = quote;
                 {
                     if price_impact_bps > self.max_price_impact_bps {
                         continue;
@@ -497,9 +512,12 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => state.reserve0.is_some() && state.reserve1.is_some(),
-        PoolVariant::UniswapV3 => {
-            state.sqrt_price_x96.is_some() && state.liquidity.is_some() && state.tick.is_some()
-        }
+        PoolVariant::UniswapV3 => match (state.sqrt_price_x96, state.liquidity, state.tick) {
+            (Some(sqrt_price_x96), Some(liquidity), Some(_)) => {
+                !sqrt_price_x96.is_zero() && !liquidity.is_zero()
+            }
+            _ => false,
+        },
         PoolVariant::AerodromeSlipstream => false,
     }
 }
