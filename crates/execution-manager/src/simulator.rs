@@ -125,7 +125,11 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
         out.extend(encode_address(step.pool));
         out.extend(encode_address(step.token_in));
         out.extend(encode_address(step.token_out));
-        out.extend(encode_u256(U256::from(step.fee_bps.unwrap_or_default())));
+        out.extend(encode_u256(U256::from(router_fee_for_step(
+            step.dex,
+            step.variant,
+            step.fee_bps,
+        )?)));
         out.extend(encode_bool(classic_stable_flag(step.variant)));
         out.extend(encode_address(factory_for_step(
             step.dex,
@@ -135,6 +139,23 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+fn router_fee_for_step(
+    dex: DexKind,
+    variant: Option<PoolVariant>,
+    fee_bps: Option<u32>,
+) -> Result<u32> {
+    let fee_bps = fee_bps.unwrap_or_default();
+    Ok(match (dex, variant) {
+        (DexKind::UniswapV3, Some(PoolVariant::UniswapV3))
+        | (DexKind::UniswapV3, None)
+        | (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3))
+        | (DexKind::PancakeSwap, None) => fee_bps
+            .checked_mul(100)
+            .ok_or_else(|| anyhow::anyhow!("V3 fee bps overflow"))?,
+        _ => fee_bps,
+    })
 }
 
 fn executor_dex_kind(dex: DexKind, variant: Option<PoolVariant>) -> Result<u8> {
@@ -306,7 +327,9 @@ mod tests {
 
     use base_arb_common::types::{ArbPath, OpportunityStatus, SwapStep};
 
-    use super::{build_execute_calldata, decode_executor_error, decode_uint256_result};
+    use super::{
+        build_execute_calldata, decode_executor_error, decode_uint256_result, router_fee_for_step,
+    };
 
     fn settings() -> base_arb_common::config::Settings {
         base_arb_common::config::Settings {
@@ -391,6 +414,28 @@ mod tests {
                 "0x000000000000000000000000000000000000000000000000000000000000002a"
             ),
             Some(U256::from(42u64))
+        );
+    }
+
+    #[test]
+    fn converts_v3_fee_bps_to_router_fee_tier() {
+        assert_eq!(
+            router_fee_for_step(
+                base_arb_common::types::DexKind::UniswapV3,
+                Some(base_arb_common::types::PoolVariant::UniswapV3),
+                Some(5)
+            )
+            .unwrap(),
+            500
+        );
+        assert_eq!(
+            router_fee_for_step(
+                base_arb_common::types::DexKind::PancakeSwap,
+                Some(base_arb_common::types::PoolVariant::PancakeV3),
+                Some(25)
+            )
+            .unwrap(),
+            2500
         );
     }
 
