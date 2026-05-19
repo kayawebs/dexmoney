@@ -68,12 +68,25 @@ contract MockV3RouterV2 {
     }
 }
 
+contract MockV3FactoryV2 {
+    address public pool;
+
+    function setPool(address value) external {
+        pool = value;
+    }
+
+    function getPool(address, address, uint24) external view returns (address) {
+        return pool;
+    }
+}
+
 contract ExecutorV2Test is Test {
     ExecutorV2 internal executor;
     MockERC20V2 internal usdc;
     MockERC20V2 internal weth;
     MockSlipstreamRouterV2 internal slipstreamRouter;
     MockV3RouterV2 internal v3Router;
+    MockV3FactoryV2 internal v3Factory;
 
     address internal owner = address(0xA11CE);
     address internal operator = address(0xB0B);
@@ -88,6 +101,7 @@ contract ExecutorV2Test is Test {
         weth = new MockERC20V2();
         slipstreamRouter = new MockSlipstreamRouterV2();
         v3Router = new MockV3RouterV2();
+        v3Factory = new MockV3FactoryV2();
 
         usdc.mint(address(executor), 1_000_000);
         weth.mint(address(slipstreamRouter), 1_000_000);
@@ -95,11 +109,10 @@ contract ExecutorV2Test is Test {
 
         slipstreamRouter.setAmountOut(100);
         v3Router.setAmountOut(100_001);
+        v3Factory.setPool(v3Pool);
 
         vm.startPrank(owner);
         executor.setOperator(operator, true);
-        executor.approveToken(address(usdc), address(slipstreamRouter), type(uint256).max);
-        executor.approveToken(address(weth), address(v3Router), type(uint256).max);
         vm.stopPrank();
     }
 
@@ -123,7 +136,7 @@ contract ExecutorV2Test is Test {
             tokenOut: address(usdc),
             fee: 500,
             stable: false,
-            factory: address(0)
+            factory: address(v3Factory)
         });
     }
 
@@ -134,6 +147,8 @@ contract ExecutorV2Test is Test {
         assertEq(profit, 1);
         if (slipstreamRouter.lastTickSpacing() != int24(100)) revert("wrong tick spacing");
         assertEq(usdc.balanceOf(address(executor)), 1_000_001);
+        assertEq(usdc.allowance(address(executor), address(slipstreamRouter)), 0);
+        assertEq(weth.allowance(address(executor), address(v3Router)), 0);
     }
 
     function testRejectsZeroSlipstreamTickSpacing() public {
@@ -143,5 +158,13 @@ contract ExecutorV2Test is Test {
         vm.expectRevert(ExecutorV2.InvalidTickSpacing.selector);
         vm.prank(operator);
         executor.executeWithOwnFunds(address(usdc), 100_000, steps, 0, block.timestamp + 1);
+    }
+
+    function testRejectsPoolMismatchWhenFactoryProvided() public {
+        v3Factory.setPool(address(0xDEAD));
+
+        vm.expectRevert(ExecutorV2.PoolMismatch.selector);
+        vm.prank(operator);
+        executor.executeWithOwnFunds(address(usdc), 100_000, _steps(), 0, block.timestamp + 1);
     }
 }

@@ -165,16 +165,16 @@ if supports_whitelists; then
     ensure_mapping "poolWhitelist" "poolWhitelist(address)(bool)" "setPoolWhitelist(address,bool)" "$pool"
   done
 else
-  echo "executor has no whitelist interface; skipping whitelist sync"
+  echo "executor has no whitelist interface; assuming per-swap approvals and skipping whitelist/approval sync"
 fi
 
 for token in "${TOKENS[@]}"; do
   if supports_whitelists; then
     ensure_mapping "tokenWhitelist" "tokenWhitelist(address)(bool)" "setTokenWhitelist(address,bool)" "$token"
+    for router in "${ROUTERS[@]}"; do
+      ensure_approval "$token" "$router"
+    done
   fi
-  for router in "${ROUTERS[@]}"; do
-    ensure_approval "$token" "$router"
-  done
 done
 
 echo "executor config sync complete"

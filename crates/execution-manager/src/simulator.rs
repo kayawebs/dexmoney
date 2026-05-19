@@ -2,7 +2,9 @@ use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_ROUTER};
+use base_arb_common::constants::{
+    AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER,
+};
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
 
@@ -226,6 +228,26 @@ fn factory_for_step(
         settings
             .aerodrome_pool_factory
             .context("AERODROME_POOL_FACTORY is required for Aerodrome Classic execution")
+    } else if matches!(
+        (dex, variant),
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream))
+    ) {
+        Ok(settings
+            .aerodrome_slipstream_factory
+            .unwrap_or(Address::ZERO))
+    } else if matches!(
+        (dex, variant),
+        (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None)
+    ) {
+        Ok(settings.uniswap_v3_factory.unwrap_or(Address::ZERO))
+    } else if matches!(
+        (dex, variant),
+        (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None)
+    ) {
+        Ok(settings
+            .pancake_v3_factory
+            .or_else(|| PANCAKE_V3_FACTORY.parse().ok())
+            .unwrap_or(Address::ZERO))
     } else {
         Ok(Address::ZERO)
     }
@@ -310,6 +332,7 @@ fn executor_error_name(selector: &str) -> Option<&'static str> {
         "0x13be252b" => Some("Executor revert: InsufficientAllowance"),
         "0xa5d3ca34" => Some("Executor revert: UnsupportedDex"),
         "0x270815a0" => Some("Executor revert: InvalidTickSpacing"),
+        "0xeab28cb4" => Some("Executor revert: PoolMismatch"),
         "0xd433008b" => Some("Executor revert: MinProfitNotMet"),
         "0x90b8ec18" => Some("Executor revert: TransferFailed"),
         "0x8164f842" => Some("Executor revert: ApprovalFailed"),
