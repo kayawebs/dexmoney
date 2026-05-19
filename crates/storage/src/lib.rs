@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use alloy_primitives::Address;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use base_arb_chain::events::DexEvent;
@@ -33,6 +34,12 @@ pub trait TickStateStore: Send + Sync {
 pub trait CandidateStore: Send + Sync {
     async fn push_candidate(&self, candidate: Candidate) -> anyhow::Result<()>;
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>>;
+}
+
+#[async_trait]
+pub trait FailureStore: Send + Sync {
+    async fn mark_failure_key(&self, key: &str, ttl_secs: u64) -> anyhow::Result<()>;
+    async fn has_failure_key(&self, key: &str) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -67,6 +74,7 @@ pub trait EoaStateStore: Send + Sync {
 pub struct InMemoryStores {
     pool_states: Arc<Mutex<BTreeMap<Address, PoolState>>>,
     candidates: Arc<Mutex<VecDeque<Candidate>>>,
+    failures: Arc<Mutex<BTreeMap<String, DateTime<Utc>>>>,
     opportunities: Arc<Mutex<Vec<Candidate>>>,
     simulations: Arc<Mutex<Vec<SimulationResult>>>,
     transactions: Arc<Mutex<Vec<TxResult>>>,
@@ -147,6 +155,21 @@ impl CandidateStore for InMemoryStores {
 
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>> {
         Ok(self.candidates.lock().await.pop_front())
+    }
+}
+
+#[async_trait]
+impl FailureStore for InMemoryStores {
+    async fn mark_failure_key(&self, key: &str, _ttl_secs: u64) -> anyhow::Result<()> {
+        self.failures
+            .lock()
+            .await
+            .insert(key.to_string(), chrono::Utc::now());
+        Ok(())
+    }
+
+    async fn has_failure_key(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(self.failures.lock().await.contains_key(key))
     }
 }
 

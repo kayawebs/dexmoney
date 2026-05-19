@@ -37,6 +37,8 @@ pub struct Settings {
     pub max_price_impact_bps: u64,
     pub v3_tick_refresh_interval_secs: u64,
     pub v3_tick_bitmap_word_radius: i32,
+    pub v3_quote_safety_bps: u64,
+    pub min_profit_failure_ttl_secs: u64,
     pub monitor_web_password: Option<String>,
 }
 
@@ -50,6 +52,8 @@ impl Settings {
             .set_default("search_amount_usdc", "10,30,50,100")?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
+            .set_default("v3_quote_safety_bps", 2u64)?
+            .set_default("min_profit_failure_ttl_secs", 21_600u64)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

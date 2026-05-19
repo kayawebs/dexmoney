@@ -7,7 +7,8 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
 use base_arb_storage::{
-    postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, RecorderStore,
+    postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, FailureStore,
+    RecorderStore,
 };
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -50,7 +51,7 @@ async fn run_execution_cycle<C, E, R>(
     min_simulated_profit_usdc: f64,
 ) -> Result<()>
 where
-    C: CandidateStore,
+    C: CandidateStore + FailureStore,
     E: EoaStateStore,
     R: RecorderStore,
 {
@@ -87,6 +88,21 @@ where
         debug!("no candidate available");
         return Ok(());
     };
+    let min_profit_failure_key = simulator::min_profit_failure_key(&candidate);
+    if candidate_store
+        .has_failure_key(&min_profit_failure_key)
+        .await?
+    {
+        debug!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            amount_in = %candidate.amount_in,
+            min_profit = %candidate.min_profit,
+            expected_profit = %candidate.expected_profit,
+            "candidate skipped after previous MinProfitNotMet for identical path parameters"
+        );
+        return Ok(());
+    }
 
     let simulation = simulator::simulate(
         provider,
@@ -100,6 +116,23 @@ where
     debug!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
 
     if !simulation.success {
+        if simulator::is_min_profit_not_met(&simulation) {
+            candidate_store
+                .mark_failure_key(
+                    &min_profit_failure_key,
+                    settings.min_profit_failure_ttl_secs,
+                )
+                .await?;
+            info!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                amount_in = %candidate.amount_in,
+                min_profit = %candidate.min_profit,
+                expected_profit = %candidate.expected_profit,
+                ttl_secs = settings.min_profit_failure_ttl_secs,
+                "cached MinProfitNotMet candidate fingerprint"
+            );
+        }
         return Ok(());
     }
 

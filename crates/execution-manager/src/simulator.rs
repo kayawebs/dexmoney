@@ -110,6 +110,28 @@ pub fn build_execute_calldata(
     Ok(out)
 }
 
+pub fn min_profit_failure_key(candidate: &Candidate) -> String {
+    let mut raw = format!(
+        "{}|{:#x}|{}|{}|{}",
+        candidate.path.name,
+        candidate.token_in,
+        candidate.amount_in,
+        candidate.min_profit,
+        candidate.expected_profit
+    );
+    for step in &candidate.path.steps {
+        raw.push_str(&format!(
+            "|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}",
+            step.dex, step.variant, step.pool, step.token_in, step.token_out, step.fee_bps
+        ));
+    }
+    format!("{:#x}", keccak256(raw.as_bytes()))
+}
+
+pub fn is_min_profit_not_met(simulation: &SimulationResult) -> bool {
+    simulation.revert_reason.as_deref() == Some("Executor revert: MinProfitNotMet")
+}
+
 fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend(encode_u256(U256::from(candidate.path.steps.len())));
@@ -362,6 +384,10 @@ mod tests {
             candidate_ttl_ms: 500,
             max_pool_state_age_ms: 300_000,
             max_price_impact_bps: 50,
+            v3_tick_refresh_interval_secs: 60,
+            v3_tick_bitmap_word_radius: 8,
+            v3_quote_safety_bps: 2,
+            min_profit_failure_ttl_secs: 21_600,
             monitor_web_password: None,
         }
     }

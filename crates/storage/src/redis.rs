@@ -5,7 +5,7 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use tracing::info;
 
-use crate::{CandidateStore, EoaStateStore, PoolStateStore, TickStateStore};
+use crate::{CandidateStore, EoaStateStore, FailureStore, PoolStateStore, TickStateStore};
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
 #[derive(Clone)]
@@ -147,6 +147,22 @@ impl CandidateStore for RedisStore {
             return Ok(None);
         };
         Ok(Some(serde_json::from_str(&payload)?))
+    }
+}
+
+#[async_trait]
+impl FailureStore for RedisStore {
+    async fn mark_failure_key(&self, key: &str, ttl_secs: u64) -> Result<()> {
+        let mut manager = self.manager.clone();
+        let redis_key = failures_key(key);
+        let _: () = manager.set_ex(redis_key, "1", ttl_secs).await?;
+        Ok(())
+    }
+
+    async fn has_failure_key(&self, key: &str) -> Result<bool> {
+        let mut manager = self.manager.clone();
+        let redis_key = failures_key(key);
+        Ok(manager.exists(redis_key).await?)
     }
 }
 

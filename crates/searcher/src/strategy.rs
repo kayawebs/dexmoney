@@ -23,6 +23,7 @@ pub struct SearchEngine {
     pub max_price_impact_bps: u64,
     pub whitelist_paths: Vec<String>,
     pub candidate_ttl_ms: i64,
+    pub v3_quote_safety_bps: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,6 +123,7 @@ impl SearchEngine {
             max_price_impact_bps,
             whitelist_paths: vec![name1, name2],
             candidate_ttl_ms,
+            v3_quote_safety_bps: 0,
         }
     }
 
@@ -148,28 +150,34 @@ impl SearchEngine {
         for search_path in &paths {
             for amount_in in &search_path.amount_sizes {
                 stats.quote_attempts += 1;
-                let quote =
-                    match quote_path(pool_states, tick_states, &search_path.path, *amount_in).await
-                    {
-                        Ok(Some(quote)) => {
-                            stats.quote_successes += 1;
-                            quote
-                        }
-                        Ok(None) => {
-                            stats.quote_skipped += 1;
-                            continue;
-                        }
-                        Err(err) => {
-                            stats.quote_skipped += 1;
-                            debug!(
-                                path = %search_path.path.name,
-                                amount_in = %amount_in,
-                                error = %err,
-                                "quote skipped"
-                            );
-                            continue;
-                        }
-                    };
+                let quote = match quote_path(
+                    pool_states,
+                    tick_states,
+                    &search_path.path,
+                    *amount_in,
+                    self.v3_quote_safety_bps,
+                )
+                .await
+                {
+                    Ok(Some(quote)) => {
+                        stats.quote_successes += 1;
+                        quote
+                    }
+                    Ok(None) => {
+                        stats.quote_skipped += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        stats.quote_skipped += 1;
+                        debug!(
+                            path = %search_path.path.name,
+                            amount_in = %amount_in,
+                            error = %err,
+                            "quote skipped"
+                        );
+                        continue;
+                    }
+                };
                 let (expected_amount_out, price_impact_bps, diagnostics) = quote;
                 {
                     if price_impact_bps > self.max_price_impact_bps {
@@ -274,6 +282,7 @@ pub fn engine_from_settings(
         max_price_impact_bps,
         whitelist_paths: Vec::new(),
         candidate_ttl_ms,
+        v3_quote_safety_bps: settings.v3_quote_safety_bps,
     })
 }
 
@@ -362,6 +371,7 @@ async fn quote_path(
     tick_states: &[TickState],
     path: &ArbPath,
     amount_in: U256,
+    v3_quote_safety_bps: u64,
 ) -> anyhow::Result<Option<(U256, u64, QuoteDiagnostics)>> {
     let aero = AerodromeVolatileQuoter;
     let uni = UniswapV3CurrentTickQuoter;
@@ -384,7 +394,7 @@ async fn quote_path(
             None => return Ok(None),
         };
 
-        let quote = match pool_state.variant {
+        let mut quote = match pool_state.variant {
             PoolVariant::AerodromeVolatile => aero
                 .quote_exact_in(pool_state, step.token_in, amount)
                 .await
@@ -421,6 +431,9 @@ async fn quote_path(
                 }
             }
         };
+        if is_v3_style_variant(pool_state.variant) && v3_quote_safety_bps > 0 {
+            quote.amount_out = apply_quote_haircut(quote.amount_out, v3_quote_safety_bps)?;
+        }
 
         amount = quote.amount_out;
         max_impact = max_impact.max(estimate_price_impact_bps(pool_state, step.token_in, &quote));
@@ -451,6 +464,27 @@ fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPa
     let mut path = path.clone();
     path.diagnostics = Some(diagnostics);
     path
+}
+
+fn apply_quote_haircut(amount: U256, haircut_bps: u64) -> anyhow::Result<U256> {
+    if haircut_bps == 0 || amount.is_zero() {
+        return Ok(amount);
+    }
+    let denominator = U256::from(10_000u64);
+    let numerator = denominator
+        .checked_sub(U256::from(haircut_bps.min(10_000)))
+        .ok_or_else(|| anyhow::anyhow!("invalid V3 quote haircut"))?;
+    amount
+        .checked_mul(numerator)
+        .and_then(|value| value.checked_div(denominator))
+        .ok_or_else(|| anyhow::anyhow!("V3 quote haircut overflow"))
+}
+
+fn is_v3_style_variant(variant: PoolVariant) -> bool {
+    matches!(
+        variant,
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3
+    )
 }
 
 fn estimate_price_impact_bps(
