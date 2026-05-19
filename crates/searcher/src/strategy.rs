@@ -426,6 +426,24 @@ async fn quote_path(
         max_impact = max_impact.max(estimate_price_impact_bps(pool_state, step.token_in, &quote));
     }
 
+    if diagnostics.v3_pools_without_ticks > 0 {
+        debug!(
+            path = %path.name,
+            missing_v3_tick_pools = diagnostics.v3_pools_without_ticks,
+            "quote skipped: V3 initialized tick data unavailable"
+        );
+        return Ok(None);
+    }
+    if diagnostics.tick_range_exhausted {
+        debug!(
+            path = %path.name,
+            ticks_used = diagnostics.ticks_used,
+            crossed_ticks = diagnostics.crossed_ticks,
+            "quote skipped: V3 quote exhausted known tick range"
+        );
+        return Ok(None);
+    }
+
     Ok(Some((amount, max_impact, diagnostics)))
 }
 
@@ -592,19 +610,46 @@ fn short_token(token: Address) -> String {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, U256};
+    use base_arb_common::types::{PoolId, TickState};
+    use chrono::Utc;
 
     use super::{demo_pool_states, SearchEngine};
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
         let engine = SearchEngine::new(500, 10_000, U256::from(1u64));
-        let candidates = engine
-            .search(
-                &demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")),
-                &[],
-            )
-            .await
-            .unwrap();
+        let pool_states = demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
+        let uni_pool = pool_states
+            .iter()
+            .find(|state| state.dex == base_arb_common::types::DexKind::UniswapV3)
+            .unwrap()
+            .pool_id
+            .address;
+        let tick_states = vec![
+            TickState {
+                pool_id: PoolId {
+                    chain_id: 8453,
+                    address: uni_pool,
+                },
+                tick: -1000,
+                liquidity_net: 0,
+                liquidity_gross: U256::from(1u64),
+                block_number: 1,
+                updated_at: Utc::now(),
+            },
+            TickState {
+                pool_id: PoolId {
+                    chain_id: 8453,
+                    address: uni_pool,
+                },
+                tick: 1000,
+                liquidity_net: 0,
+                liquidity_gross: U256::from(1u64),
+                block_number: 1,
+                updated_at: Utc::now(),
+            },
+        ];
+        let candidates = engine.search(&pool_states, &tick_states).await.unwrap();
 
         assert!(!candidates.is_empty());
         assert!(candidates.iter().all(|c| !c.path.steps.is_empty()));

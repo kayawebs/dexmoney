@@ -14,7 +14,6 @@ const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
-const TICK_BITMAP_WORD_RADIUS: i32 = 2;
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -38,6 +37,9 @@ where
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+        let tick_refresh_interval =
+            Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
+        let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
         let mut recent_logs = RecentLogCache::new(20_000);
         let mut pending_validations = VecDeque::new();
         info!(last_seen_block, "market-data synchronized at startup");
@@ -56,6 +58,10 @@ where
                 if Instant::now() >= next_calibration {
                     monitored_states = self.calibrate_states(monitored_states).await?;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+                }
+                if Instant::now() >= next_tick_refresh {
+                    self.publish_initialized_ticks(&monitored_states).await?;
+                    next_tick_refresh = Instant::now() + tick_refresh_interval;
                 }
                 self.validate_due_snapshots(&mut pending_validations, latest_block)
                     .await?;
@@ -145,6 +151,11 @@ where
             if Instant::now() >= next_calibration {
                 monitored_states = self.calibrate_states(monitored_states).await?;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+            }
+
+            if Instant::now() >= next_tick_refresh {
+                self.publish_initialized_ticks(&monitored_states).await?;
+                next_tick_refresh = Instant::now() + tick_refresh_interval;
             }
 
             last_seen_block = latest_block;
@@ -290,15 +301,35 @@ where
     }
 
     async fn publish_initialized_ticks(&self, states: &[PoolState]) -> Result<()> {
+        let word_radius = self.settings.v3_tick_bitmap_word_radius.max(0);
         for state in states {
             if !is_v3_style_state(state) {
                 continue;
             }
-            let ticks = self
+            let ticks = match self
                 .provider
-                .fetch_initialized_ticks_around_state(state, TICK_BITMAP_WORD_RADIUS)
-                .await?;
+                .fetch_initialized_ticks_around_state(state, word_radius)
+                .await
+            {
+                Ok(ticks) => ticks,
+                Err(err) => {
+                    warn!(
+                        pool = %state.pool_id.address,
+                        dex = ?state.dex,
+                        variant = ?state.variant,
+                        word_radius,
+                        error = %err,
+                        "initialized tick refresh failed for pool"
+                    );
+                    continue;
+                }
+            };
             if ticks.is_empty() {
+                debug!(
+                    pool = %state.pool_id.address,
+                    word_radius,
+                    "initialized tick refresh found no ticks"
+                );
                 continue;
             }
             let count = ticks.len();
@@ -306,6 +337,7 @@ where
             debug!(
                 pool = %state.pool_id.address,
                 count,
+                word_radius,
                 "initialized ticks loaded"
             );
         }

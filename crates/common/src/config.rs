@@ -35,6 +35,8 @@ pub struct Settings {
     pub candidate_ttl_ms: i64,
     pub max_pool_state_age_ms: i64,
     pub max_price_impact_bps: u64,
+    pub v3_tick_refresh_interval_secs: u64,
+    pub v3_tick_bitmap_word_radius: i32,
     pub monitor_web_password: Option<String>,
 }
 
@@ -46,6 +48,8 @@ impl Settings {
             .set_default("candidate_ttl_ms", DEFAULT_CANDIDATE_TTL_MS)?
             .set_default("max_pool_state_age_ms", DEFAULT_MAX_POOL_STATE_AGE_MS)?
             .set_default("search_amount_usdc", "10,30,50,100")?
+            .set_default("v3_tick_refresh_interval_secs", 60u64)?
+            .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

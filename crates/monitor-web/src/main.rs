@@ -1,6 +1,6 @@
 mod executor_admin;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::Address;
 use anyhow::Result;
@@ -13,7 +13,11 @@ use axum::{
 };
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_storage::postgres::{ensure_registry_schema, PostgresStore};
+use base_arb_storage::{
+    postgres::{ensure_registry_schema, PostgresStore},
+    redis::RedisStore,
+    TickStateStore,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sqlx::{FromRow, PgPool};
@@ -41,6 +45,7 @@ const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 #[derive(Clone)]
 struct AppState {
     pool: Arc<PgPool>,
+    tick_store: RedisStore,
     settings: Settings,
     provider: ChainProvider,
     admin_password: Option<String>,
@@ -83,6 +88,12 @@ struct PoolStateRow {
     sqrt_price_x96: Option<String>,
     liquidity: Option<String>,
     tick: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TickCoverage {
+    count: usize,
+    latest_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -219,9 +230,11 @@ async fn main() -> Result<()> {
 
     let settings = Settings::load()?;
     let pool = PgPool::connect(&settings.postgres_url).await?;
+    let tick_store = RedisStore::connect(&settings.redis_url).await?;
     ensure_registry_schema(&pool).await?;
     let state = AppState {
         pool: Arc::new(pool),
+        tick_store,
         provider: ChainProvider::from_settings(&settings),
         admin_password: settings.monitor_web_password.clone(),
         settings,
@@ -267,6 +280,9 @@ async fn index(
     let pool_states = fetch_pool_states(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tick_coverage = fetch_tick_coverage(&state.tick_store, &pool_states)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let warnings = fetch_pool_state_warnings(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -298,7 +314,7 @@ async fn index(
         "#,
         render_pool_state_validations_table(&validations),
         render_pool_state_warnings_table(&warnings),
-        render_pool_states_table(&pool_states),
+        render_pool_states_table(&pool_states, &tick_coverage),
         render_opportunities_table(&opportunities),
     );
 
@@ -339,6 +355,9 @@ async fn activity_page(
     let pool_states = fetch_pool_states(&state.pool)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tick_coverage = fetch_tick_coverage(&state.tick_store, &pool_states)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let content = format!(
         r#"
@@ -357,7 +376,7 @@ async fn activity_page(
         "#,
         render_events_table(&events),
         render_unknown_topics_table(&unknown_topics),
-        render_pool_states_table(&pool_states),
+        render_pool_states_table(&pool_states, &tick_coverage),
     );
 
     Ok(Html(render_page(
@@ -879,6 +898,31 @@ async fn fetch_pool_states(pool: &PgPool) -> Result<Vec<PoolStateRow>> {
     )
     .fetch_all(pool)
     .await?)
+}
+
+async fn fetch_tick_coverage(
+    tick_store: &RedisStore,
+    rows: &[PoolStateRow],
+) -> Result<HashMap<String, TickCoverage>> {
+    let mut out = HashMap::new();
+    for row in rows {
+        if !is_v3_variant(row.variant.as_deref()) {
+            continue;
+        }
+        let Ok(pool) = row.pool_address.parse::<Address>() else {
+            continue;
+        };
+        let ticks = tick_store.get_pool_ticks(pool).await?;
+        let latest_updated_at = ticks.iter().map(|tick| tick.updated_at).max();
+        out.insert(
+            row.pool_address.to_lowercase(),
+            TickCoverage {
+                count: ticks.len(),
+                latest_updated_at,
+            },
+        );
+    }
+    Ok(out)
 }
 
 async fn fetch_pool_state_warnings(pool: &PgPool) -> Result<Vec<PoolStateWarningRow>> {
@@ -1637,13 +1681,17 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     html
 }
 
-fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
+fn render_pool_states_table(
+    rows: &[PoolStateRow],
+    tick_coverage: &HashMap<String, TickCoverage>,
+) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>Source</th><th>DEX</th><th>Variant</th><th>Tick</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Block</th><th>Source</th><th>DEX</th><th>Variant</th><th>Tick</th><th>Tick Data</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee</th><th>Reserve 0</th><th>Reserve 1</th><th>SqrtPriceX96</th><th>Liquidity</th></tr></thead><tbody>",
     );
     for row in rows {
+        let tick_data = render_tick_coverage(row, tick_coverage);
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"state-number\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"state-number\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.updated_at),
             row.block_number,
             state_source_label(&row.source),
@@ -1653,6 +1701,7 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
                 .map(escape)
                 .unwrap_or_else(|| "-".into()),
             row.tick.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            tick_data,
             copyable(&row.pool_address),
             token_label(row.token0_symbol.as_deref(), &row.token0),
             token_label(row.token1_symbol.as_deref(), &row.token1),
@@ -1664,10 +1713,38 @@ fn render_pool_states_table(rows: &[PoolStateRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"14\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
+        html.push_str("<tr><td colspan=\"15\">No rows yet. Start market-data and make sure at least one pool is enabled.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
+}
+
+fn render_tick_coverage(
+    row: &PoolStateRow,
+    tick_coverage: &HashMap<String, TickCoverage>,
+) -> String {
+    if !is_v3_variant(row.variant.as_deref()) {
+        return "-".to_string();
+    }
+    let coverage = tick_coverage
+        .get(&row.pool_address.to_lowercase())
+        .cloned()
+        .unwrap_or_default();
+    if coverage.count == 0 {
+        return "<span class=\"warn\">0 ticks</span>".to_string();
+    }
+    let latest = coverage
+        .latest_updated_at
+        .map(fmt_ts)
+        .unwrap_or_else(|| "-".to_string());
+    format!("{} ticks<br><small>{}</small>", coverage.count, latest)
+}
+
+fn is_v3_variant(variant: Option<&str>) -> bool {
+    matches!(
+        variant,
+        Some("UniswapV3") | Some("PancakeV3") | Some("AerodromeSlipstream")
+    )
 }
 
 fn render_pool_state_warnings_table(rows: &[PoolStateWarningRow]) -> String {
