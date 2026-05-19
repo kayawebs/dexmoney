@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 interface IERC20V2 {
     function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
 }
@@ -91,6 +92,7 @@ contract ExecutorV2 {
 
     event OperatorUpdated(address indexed operator, bool allowed);
     event Paused(bool status);
+    event ApprovalSet(address indexed token, address indexed spender, uint256 amount);
     event EmergencyWithdraw(address indexed token, address indexed to, uint256 amount);
     event Executed(address indexed caller, address indexed tokenIn, uint256 amountIn, uint256 profit);
 
@@ -101,6 +103,7 @@ contract ExecutorV2 {
     error InvalidPath();
     error InvalidStepCount();
     error InsufficientBalance();
+    error InsufficientAllowance();
     error UnsupportedDex();
     error InvalidTickSpacing();
     error PoolMismatch();
@@ -136,6 +139,11 @@ contract ExecutorV2 {
     function setPaused(bool value) external onlyOwner {
         paused = value;
         emit Paused(value);
+    }
+
+    function approveToken(address token, address spender, uint256 amount) external onlyOwner {
+        if (!IERC20V2(token).approve(spender, amount)) revert ApprovalFailed();
+        emit ApprovalSet(token, spender, amount);
     }
 
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
@@ -179,7 +187,9 @@ contract ExecutorV2 {
 
     function _swap(SwapStep calldata step, uint256 amountIn, uint256 deadline) internal returns (uint256 amountOut) {
         _validatePool(step);
-        _forceApprove(step.tokenIn, step.router, amountIn);
+        if (IERC20V2(step.tokenIn).allowance(address(this), step.router) < amountIn) {
+            revert InsufficientAllowance();
+        }
 
         if (step.dex == DexKind.AerodromeClassic) {
             IAerodromeClassicRouterV2.Route[] memory routes = new IAerodromeClassicRouterV2.Route[](1);
@@ -221,8 +231,6 @@ contract ExecutorV2 {
         } else {
             revert UnsupportedDex();
         }
-
-        _forceApprove(step.tokenIn, step.router, 0);
     }
 
     function _validatePool(SwapStep calldata step) internal view {
@@ -241,12 +249,6 @@ contract ExecutorV2 {
         }
 
         if (expectedPool != step.pool) revert PoolMismatch();
-    }
-
-    function _forceApprove(address token, address spender, uint256 amount) internal {
-        IERC20V2 erc20 = IERC20V2(token);
-        if (!erc20.approve(spender, 0)) revert ApprovalFailed();
-        if (amount != 0 && !erc20.approve(spender, amount)) revert ApprovalFailed();
     }
 
     function _decodeTickSpacing(uint24 value) internal pure returns (int24) {

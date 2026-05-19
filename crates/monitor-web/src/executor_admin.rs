@@ -147,20 +147,18 @@ pub async fn configure_executor_for_pair(
             )
             .await?;
         }
-        if whitelist_supported {
-            for router in routers.iter().copied() {
-                ensure_token_approval(
-                    provider,
-                    &wallet,
-                    settings.chain_id,
-                    executor,
-                    token,
-                    router,
-                    &mut nonce,
-                    &mut report,
-                )
-                .await?;
-            }
+        for router in routers.iter().copied() {
+            ensure_token_approval(
+                provider,
+                &wallet,
+                settings.chain_id,
+                executor,
+                token,
+                router,
+                &mut nonce,
+                &mut report,
+            )
+            .await?;
         }
     }
 

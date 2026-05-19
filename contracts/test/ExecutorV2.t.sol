@@ -113,6 +113,8 @@ contract ExecutorV2Test is Test {
 
         vm.startPrank(owner);
         executor.setOperator(operator, true);
+        executor.approveToken(address(usdc), address(slipstreamRouter), type(uint256).max);
+        executor.approveToken(address(weth), address(v3Router), type(uint256).max);
         vm.stopPrank();
     }
 
@@ -147,8 +149,8 @@ contract ExecutorV2Test is Test {
         assertEq(profit, 1);
         if (slipstreamRouter.lastTickSpacing() != int24(100)) revert("wrong tick spacing");
         assertEq(usdc.balanceOf(address(executor)), 1_000_001);
-        assertEq(usdc.allowance(address(executor), address(slipstreamRouter)), 0);
-        assertEq(weth.allowance(address(executor), address(v3Router)), 0);
+        assertEq(usdc.allowance(address(executor), address(slipstreamRouter)), type(uint256).max);
+        assertEq(weth.allowance(address(executor), address(v3Router)), type(uint256).max);
     }
 
     function testRejectsZeroSlipstreamTickSpacing() public {
@@ -166,5 +168,18 @@ contract ExecutorV2Test is Test {
         vm.expectRevert(ExecutorV2.PoolMismatch.selector);
         vm.prank(operator);
         executor.executeWithOwnFunds(address(usdc), 100_000, _steps(), 0, block.timestamp + 1);
+    }
+
+    function testRequiresApproval() public {
+        MockSlipstreamRouterV2 unapprovedRouter = new MockSlipstreamRouterV2();
+        unapprovedRouter.setAmountOut(100);
+        weth.mint(address(unapprovedRouter), 1_000_000);
+
+        ExecutorV2.SwapStep[] memory steps = _steps();
+        steps[0].router = address(unapprovedRouter);
+
+        vm.expectRevert(ExecutorV2.InsufficientAllowance.selector);
+        vm.prank(operator);
+        executor.executeWithOwnFunds(address(usdc), 100_000, steps, 0, block.timestamp + 1);
     }
 }
