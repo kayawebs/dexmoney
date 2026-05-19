@@ -25,15 +25,18 @@ pub async fn simulate(
     .await
     {
         Ok(result) => result,
-        Err(err) => SimulationResult {
-            id: uuid::Uuid::new_v4(),
-            opportunity_id: candidate.id,
-            success: false,
-            simulated_profit: U256::ZERO,
-            gas_estimate: None,
-            revert_reason: Some(format_revert_reason(&err.to_string())),
-            calldata: Vec::new(),
-        },
+        Err(err) => {
+            let raw_error = format!("{err:#}");
+            SimulationResult {
+                id: uuid::Uuid::new_v4(),
+                opportunity_id: candidate.id,
+                success: false,
+                simulated_profit: U256::ZERO,
+                gas_estimate: None,
+                revert_reason: Some(format_revert_reason(&raw_error)),
+                calldata: Vec::new(),
+            }
+        }
     }
 }
 
@@ -211,8 +214,8 @@ fn decode_uint256_result(raw: &str) -> Option<U256> {
 
 fn format_revert_reason(raw: &str) -> String {
     match decode_executor_error(raw) {
-        Some(error) => format!("{error}: {raw}"),
-        None => raw.to_string(),
+        Some(error) => error.to_string(),
+        None => compact_revert_reason(raw),
     }
 }
 
@@ -261,6 +264,29 @@ fn hex_selectors(raw: &str) -> Vec<String> {
         }
     }
     selectors
+}
+
+fn compact_revert_reason(raw: &str) -> String {
+    if raw.contains("candidate expired") {
+        return "candidate expired".to_string();
+    }
+    let mut lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return raw.chars().take(240).collect();
+    }
+    if lines.len() > 3 {
+        lines.truncate(3);
+    }
+    let joined = lines.join(" | ");
+    if joined.len() > 240 {
+        format!("{}...", &joined[..240])
+    } else {
+        joined
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +391,15 @@ mod tests {
         assert_eq!(
             decode_executor_error(raw),
             Some("Executor revert: InsufficientBalance")
+        );
+    }
+
+    #[test]
+    fn formats_decoded_revert_without_calldata_blob() {
+        let raw = r#"eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x51589239 caused by rpc eth_call failed: code=3 message=execution reverted data="0xd433008b""#;
+        assert_eq!(
+            super::format_revert_reason(raw),
+            "Executor revert: MinProfitNotMet"
         );
     }
 }
