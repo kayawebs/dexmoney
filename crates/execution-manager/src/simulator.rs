@@ -31,7 +31,7 @@ pub async fn simulate(
             success: false,
             simulated_profit: U256::ZERO,
             gas_estimate: None,
-            revert_reason: Some(err.to_string()),
+            revert_reason: Some(format_revert_reason(&err.to_string())),
             calldata: Vec::new(),
         },
     }
@@ -209,6 +209,51 @@ fn decode_uint256_result(raw: &str) -> Option<U256> {
     U256::from_str_radix(&clean[0..64], 16).ok()
 }
 
+fn format_revert_reason(raw: &str) -> String {
+    match decode_executor_error(raw) {
+        Some(error) => format!("{error}: {raw}"),
+        None => raw.to_string(),
+    }
+}
+
+fn decode_executor_error(raw: &str) -> Option<&'static str> {
+    let selector = first_hex_selector(raw)?;
+    match selector.as_str() {
+        "0x5fc483c5" => Some("Executor revert: OnlyOwner"),
+        "0x27e1f1e5" => Some("Executor revert: OnlyOperator"),
+        "0xeced32bc" => Some("Executor revert: PausedError"),
+        "0x1ab7da6b" => Some("Executor revert: DeadlineExpired"),
+        "0xf84835a0" => Some("Executor revert: TokenNotWhitelisted"),
+        "0xb76b08ae" => Some("Executor revert: RouterNotWhitelisted"),
+        "0x1b4c7fdf" => Some("Executor revert: PoolNotWhitelisted"),
+        "0x8de0e0da" => Some("Executor revert: FactoryNotWhitelisted"),
+        "0x20db8267" => Some("Executor revert: InvalidPath"),
+        "0x1ae9030e" => Some("Executor revert: InvalidStepCount"),
+        "0xf4d678b8" => Some("Executor revert: InsufficientBalance"),
+        "0x13be252b" => Some("Executor revert: InsufficientAllowance"),
+        "0xa5d3ca34" => Some("Executor revert: UnsupportedDex"),
+        "0xd433008b" => Some("Executor revert: MinProfitNotMet"),
+        "0x90b8ec18" => Some("Executor revert: TransferFailed"),
+        "0x8164f842" => Some("Executor revert: ApprovalFailed"),
+        _ => None,
+    }
+}
+
+fn first_hex_selector(raw: &str) -> Option<String> {
+    for part in raw.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
+    }) {
+        let clean = part.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != 'x');
+        if clean.len() >= 10
+            && clean.starts_with("0x")
+            && clean[2..10].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Some(clean[..10].to_ascii_lowercase());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, U256};
@@ -217,7 +262,7 @@ mod tests {
 
     use base_arb_common::types::{ArbPath, OpportunityStatus, SwapStep};
 
-    use super::{build_execute_calldata, decode_uint256_result};
+    use super::{build_execute_calldata, decode_executor_error, decode_uint256_result};
 
     fn settings() -> base_arb_common::config::Settings {
         base_arb_common::config::Settings {
@@ -302,6 +347,15 @@ mod tests {
                 "0x000000000000000000000000000000000000000000000000000000000000002a"
             ),
             Some(U256::from(42u64))
+        );
+    }
+
+    #[test]
+    fn decodes_executor_revert_selector_from_rpc_error() {
+        let raw = r#"rpc eth_call failed: code=3 message=execution reverted data="0xf4d678b8""#;
+        assert_eq!(
+            decode_executor_error(raw),
+            Some("Executor revert: InsufficientBalance")
         );
     }
 }
