@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::{
     config::Settings,
-    constants::PANCAKE_V3_ROUTER,
+    constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_ROUTER},
     types::{DiscoveredPool, PoolVariant},
 };
 use ethers_core::types::{
@@ -85,27 +85,32 @@ pub async fn configure_executor_for_pair(
     let mut report = ExecutorAdminReport::default();
 
     let routers = executor_routers(settings, discovered);
+    let whitelist_supported = executor_whitelists_supported(provider, executor).await;
 
-    for router in routers.iter().copied() {
-        ensure_mapping_enabled(
-            provider,
-            &wallet,
-            settings.chain_id,
-            executor,
-            &mut nonce,
-            &mut report,
-            ROUTER_WHITELIST_SELECTOR,
-            SET_ROUTER_WHITELIST_SELECTOR,
-            router,
-            "router whitelist",
-        )
-        .await?;
+    if whitelist_supported {
+        for router in routers.iter().copied() {
+            ensure_mapping_enabled(
+                provider,
+                &wallet,
+                settings.chain_id,
+                executor,
+                &mut nonce,
+                &mut report,
+                ROUTER_WHITELIST_SELECTOR,
+                SET_ROUTER_WHITELIST_SELECTOR,
+                router,
+                "router whitelist",
+            )
+            .await?;
+        }
     }
 
-    if discovered.iter().any(|pool| {
-        pool.state.dex == base_arb_common::types::DexKind::Aerodrome
-            && pool.state.variant == PoolVariant::AerodromeVolatile
-    }) {
+    if whitelist_supported
+        && discovered.iter().any(|pool| {
+            pool.state.dex == base_arb_common::types::DexKind::Aerodrome
+                && pool.state.variant == PoolVariant::AerodromeVolatile
+        })
+    {
         if let Some(factory) = settings
             .aerodrome_pool_factory
             .filter(|address| *address != Address::ZERO)
@@ -127,19 +132,21 @@ pub async fn configure_executor_for_pair(
     }
 
     for token in [token0, token1] {
-        ensure_mapping_enabled(
-            provider,
-            &wallet,
-            settings.chain_id,
-            executor,
-            &mut nonce,
-            &mut report,
-            TOKEN_WHITELIST_SELECTOR,
-            SET_TOKEN_WHITELIST_SELECTOR,
-            token,
-            "token whitelist",
-        )
-        .await?;
+        if whitelist_supported {
+            ensure_mapping_enabled(
+                provider,
+                &wallet,
+                settings.chain_id,
+                executor,
+                &mut nonce,
+                &mut report,
+                TOKEN_WHITELIST_SELECTOR,
+                SET_TOKEN_WHITELIST_SELECTOR,
+                token,
+                "token whitelist",
+            )
+            .await?;
+        }
         for router in routers.iter().copied() {
             ensure_token_approval(
                 provider,
@@ -155,20 +162,22 @@ pub async fn configure_executor_for_pair(
         }
     }
 
-    for pool in discovered {
-        ensure_mapping_enabled(
-            provider,
-            &wallet,
-            settings.chain_id,
-            executor,
-            &mut nonce,
-            &mut report,
-            POOL_WHITELIST_SELECTOR,
-            SET_POOL_WHITELIST_SELECTOR,
-            pool.state.pool_id.address,
-            "pool whitelist",
-        )
-        .await?;
+    if whitelist_supported {
+        for pool in discovered {
+            ensure_mapping_enabled(
+                provider,
+                &wallet,
+                settings.chain_id,
+                executor,
+                &mut nonce,
+                &mut report,
+                POOL_WHITELIST_SELECTOR,
+                SET_POOL_WHITELIST_SELECTOR,
+                pool.state.pool_id.address,
+                "pool whitelist",
+            )
+            .await?;
+        }
     }
 
     Ok(report)
@@ -194,9 +203,33 @@ fn executor_routers(settings: &Settings, discovered: &[DiscoveredPool]) -> Vec<A
         }
     }
 
+    if discovered.iter().any(|pool| {
+        pool.state.dex == base_arb_common::types::DexKind::Aerodrome
+            && pool.state.variant == PoolVariant::AerodromeSlipstream
+    }) {
+        if let Some(router) = settings
+            .aerodrome_slipstream_router
+            .or_else(|| AERODROME_SLIPSTREAM_ROUTER.parse().ok())
+            .filter(|address| *address != Address::ZERO)
+        {
+            routers.push(router);
+        }
+    }
+
     routers.sort();
     routers.dedup();
     routers
+}
+
+async fn executor_whitelists_supported(provider: &ChainProvider, executor: Address) -> bool {
+    call_bool(
+        provider,
+        executor,
+        &encode_address_call(TOKEN_WHITELIST_SELECTOR, Address::ZERO),
+        "token whitelist support probe",
+    )
+    .await
+    .is_ok()
 }
 
 impl AdminWallet {

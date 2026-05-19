@@ -83,6 +83,7 @@ impl SearchEngine {
                             token_in: usdc,
                             token_out: weth,
                             fee_bps: Some(30),
+                            tick_spacing: None,
                         },
                         SwapStep {
                             dex: DexKind::UniswapV3,
@@ -91,6 +92,7 @@ impl SearchEngine {
                             token_in: weth,
                             token_out: usdc,
                             fee_bps: Some(30),
+                            tick_spacing: None,
                         },
                     ],
                     diagnostics: None,
@@ -105,6 +107,7 @@ impl SearchEngine {
                             token_in: usdc,
                             token_out: weth,
                             fee_bps: Some(30),
+                            tick_spacing: None,
                         },
                         SwapStep {
                             dex: DexKind::Aerodrome,
@@ -113,6 +116,7 @@ impl SearchEngine {
                             token_in: weth,
                             token_out: usdc,
                             fee_bps: Some(30),
+                            tick_spacing: None,
                         },
                     ],
                     diagnostics: None,
@@ -342,6 +346,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             sqrt_price_x96: None,
             liquidity: None,
             tick: None,
+            tick_spacing: None,
             block_number: 1,
             updated_at: now,
         },
@@ -360,6 +365,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             sqrt_price_x96: Some(U256::from(79_228_162_514_264_337_593_543_950_336u128)),
             liquidity: Some(U256::from(1_000_000_000u64)),
             tick: Some(0),
+            tick_spacing: None,
             block_number: 1,
             updated_at: now,
         },
@@ -585,6 +591,7 @@ fn build_search_path(
                     token_in,
                     token_out: token_mid,
                     fee_bps: Some(first.fee_bps),
+                    tick_spacing: first.tick_spacing,
                 },
                 SwapStep {
                     dex: second.dex,
@@ -593,6 +600,7 @@ fn build_search_path(
                     token_in: token_mid,
                     token_out: token_in,
                     fee_bps: Some(second.fee_bps),
+                    tick_spacing: second.tick_spacing,
                 },
             ],
             diagnostics: None,
@@ -618,7 +626,19 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
                 _ => false,
             }
         }
-        PoolVariant::AerodromeSlipstream => false,
+        PoolVariant::AerodromeSlipstream => {
+            match (
+                state.sqrt_price_x96,
+                state.liquidity,
+                state.tick,
+                state.tick_spacing,
+            ) {
+                (Some(sqrt_price_x96), Some(liquidity), Some(_), Some(tick_spacing)) => {
+                    tick_spacing > 0 && !sqrt_price_x96.is_zero() && !liquidity.is_zero()
+                }
+                _ => false,
+            }
+        }
     }
 }
 

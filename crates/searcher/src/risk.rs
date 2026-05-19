@@ -72,6 +72,7 @@ mod tests {
             sqrt_price_x96: None,
             liquidity: None,
             tick: None,
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         }
@@ -89,6 +90,7 @@ mod tests {
                 token_in: token,
                 token_out: token,
                 fee_bps: Some(30),
+                tick_spacing: None,
             }],
             diagnostics: None,
         };

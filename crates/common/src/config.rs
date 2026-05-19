@@ -15,6 +15,7 @@ pub struct Settings {
     pub weth_address: Address,
     pub aerodrome_router: Option<Address>,
     pub aerodrome_pool_factory: Option<Address>,
+    pub aerodrome_slipstream_router: Option<Address>,
     pub aerodrome_slipstream_factory: Option<Address>,
     pub aerodrome_usdc_weth_pool: Option<Address>,
     pub uniswap_v3_factory: Option<Address>,

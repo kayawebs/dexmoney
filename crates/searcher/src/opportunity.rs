@@ -56,6 +56,7 @@ mod tests {
                 token_in: token,
                 token_out: token,
                 fee_bps: Some(30),
+                tick_spacing: None,
             }],
             diagnostics: None,
         };

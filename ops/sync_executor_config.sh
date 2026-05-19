@@ -18,6 +18,7 @@ OWNER_PRIVATE_KEY="${EXECUTOR_OWNER_PRIVATE_KEY:-${DEPLOYER_PRIVATE_KEY:-}}"
 MAX_UINT="115792089237316195423570985008687907853269984665640564039457584007913129639935"
 ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
 PANCAKE_V3_ROUTER_DEFAULT="0x1b81D678ffb9C0263b24A97847620C99d213eB14"
+AERODROME_SLIPSTREAM_ROUTER_DEFAULT="0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
 DRY_RUN="${DRY_RUN:-0}"
 
 require_env() {
@@ -46,6 +47,10 @@ call_bool() {
   local signature="$1"
   local value="$2"
   cast call "$EXECUTOR" "$signature" "$value" --rpc-url "$RPC_URL" | tr -d '[:space:]'
+}
+
+supports_whitelists() {
+  cast call "$EXECUTOR" "tokenWhitelist(address)(bool)" "$ZERO_ADDRESS" --rpc-url "$RPC_URL" >/dev/null 2>&1
 }
 
 send_or_print() {
@@ -135,6 +140,9 @@ fi
 if psql_at "SELECT EXISTS (SELECT 1 FROM pools WHERE enabled = TRUE AND dex = 'PancakeSwap');" | grep -q '^t$'; then
   ROUTERS+=("${PANCAKE_V3_ROUTER:-$PANCAKE_V3_ROUTER_DEFAULT}")
 fi
+if psql_at "SELECT EXISTS (SELECT 1 FROM pools WHERE enabled = TRUE AND dex = 'Aerodrome' AND variant = 'AerodromeSlipstream');" | grep -q '^t$'; then
+  ROUTERS+=("${AERODROME_SLIPSTREAM_ROUTER:-$AERODROME_SLIPSTREAM_ROUTER_DEFAULT}")
+fi
 
 FACTORIES=()
 if [[ -n "${AERODROME_POOL_FACTORY:-}" ]] && psql_at "SELECT EXISTS (SELECT 1 FROM pools WHERE enabled = TRUE AND dex = 'Aerodrome' AND variant = 'AerodromeVolatile');" | grep -q '^t$'; then
@@ -144,20 +152,26 @@ fi
 echo "executor: $EXECUTOR"
 echo "tokens: ${#TOKENS[@]}, pools: ${#POOLS[@]}, routers: ${#ROUTERS[@]}, factories: ${#FACTORIES[@]}"
 
-for router in "${ROUTERS[@]}"; do
-  ensure_mapping "routerWhitelist" "routerWhitelist(address)(bool)" "setRouterWhitelist(address,bool)" "$router"
-done
+if supports_whitelists; then
+  for router in "${ROUTERS[@]}"; do
+    ensure_mapping "routerWhitelist" "routerWhitelist(address)(bool)" "setRouterWhitelist(address,bool)" "$router"
+  done
 
-for factory in "${FACTORIES[@]}"; do
-  ensure_mapping "factoryWhitelist" "factoryWhitelist(address)(bool)" "setFactoryWhitelist(address,bool)" "$factory"
-done
+  for factory in "${FACTORIES[@]}"; do
+    ensure_mapping "factoryWhitelist" "factoryWhitelist(address)(bool)" "setFactoryWhitelist(address,bool)" "$factory"
+  done
 
-for pool in "${POOLS[@]}"; do
-  ensure_mapping "poolWhitelist" "poolWhitelist(address)(bool)" "setPoolWhitelist(address,bool)" "$pool"
-done
+  for pool in "${POOLS[@]}"; do
+    ensure_mapping "poolWhitelist" "poolWhitelist(address)(bool)" "setPoolWhitelist(address,bool)" "$pool"
+  done
+else
+  echo "executor has no whitelist interface; skipping whitelist sync"
+fi
 
 for token in "${TOKENS[@]}"; do
-  ensure_mapping "tokenWhitelist" "tokenWhitelist(address)(bool)" "setTokenWhitelist(address,bool)" "$token"
+  if supports_whitelists; then
+    ensure_mapping "tokenWhitelist" "tokenWhitelist(address)(bool)" "setTokenWhitelist(address,bool)" "$token"
+  fi
   for router in "${ROUTERS[@]}"; do
     ensure_approval "$token" "$router"
   done

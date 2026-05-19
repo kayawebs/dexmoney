@@ -2,7 +2,7 @@ use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::constants::PANCAKE_V3_ROUTER;
+use base_arb_common::constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_ROUTER};
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
 
@@ -121,8 +121,14 @@ pub fn min_profit_failure_key(candidate: &Candidate) -> String {
     );
     for step in &candidate.path.steps {
         raw.push_str(&format!(
-            "|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}",
-            step.dex, step.variant, step.pool, step.token_in, step.token_out, step.fee_bps
+            "|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}",
+            step.dex,
+            step.variant,
+            step.pool,
+            step.token_in,
+            step.token_out,
+            step.fee_bps,
+            step.tick_spacing
         ));
     }
     format!("{:#x}", keccak256(raw.as_bytes()))
@@ -137,8 +143,8 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     out.extend(encode_u256(U256::from(candidate.path.steps.len())));
 
     for step in &candidate.path.steps {
-        let router = router_for_step(step.dex, settings)
-            .with_context(|| format!("router missing for {:?}", step.dex))?;
+        let router = router_for_step(step.dex, step.variant, settings)
+            .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?;
         out.extend(encode_u256(U256::from(executor_dex_kind(
             step.dex,
             step.variant,
@@ -151,6 +157,7 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             step.dex,
             step.variant,
             step.fee_bps,
+            step.tick_spacing,
         )?)));
         out.extend(encode_bool(classic_stable_flag(step.variant)));
         out.extend(encode_address(factory_for_step(
@@ -167,6 +174,7 @@ fn router_fee_for_step(
     dex: DexKind,
     variant: Option<PoolVariant>,
     fee_bps: Option<u32>,
+    tick_spacing: Option<i32>,
 ) -> Result<u32> {
     let fee_bps = fee_bps.unwrap_or_default();
     Ok(match (dex, variant) {
@@ -176,6 +184,14 @@ fn router_fee_for_step(
         | (DexKind::PancakeSwap, None) => fee_bps
             .checked_mul(100)
             .ok_or_else(|| anyhow::anyhow!("V3 fee bps overflow"))?,
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
+            let tick_spacing =
+                tick_spacing.context("tick_spacing is required for Aerodrome Slipstream")?;
+            if tick_spacing <= 0 {
+                anyhow::bail!("invalid Aerodrome Slipstream tick_spacing {tick_spacing}");
+            }
+            u32::try_from(tick_spacing)?
+        }
         _ => fee_bps,
     })
 }
@@ -215,11 +231,18 @@ fn factory_for_step(
     }
 }
 
-fn router_for_step(dex: DexKind, settings: &Settings) -> Option<Address> {
-    match dex {
-        DexKind::Aerodrome => settings.aerodrome_router,
-        DexKind::UniswapV3 => settings.uniswap_v3_router,
-        DexKind::PancakeSwap => settings
+fn router_for_step(
+    dex: DexKind,
+    variant: Option<PoolVariant>,
+    settings: &Settings,
+) -> Option<Address> {
+    match (dex, variant) {
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => settings
+            .aerodrome_slipstream_router
+            .or_else(|| AERODROME_SLIPSTREAM_ROUTER.parse().ok()),
+        (DexKind::Aerodrome, _) => settings.aerodrome_router,
+        (DexKind::UniswapV3, _) => settings.uniswap_v3_router,
+        (DexKind::PancakeSwap, _) => settings
             .pancake_v3_router
             .or_else(|| PANCAKE_V3_ROUTER.parse().ok()),
     }
@@ -286,6 +309,7 @@ fn executor_error_name(selector: &str) -> Option<&'static str> {
         "0xf4d678b8" => Some("Executor revert: InsufficientBalance"),
         "0x13be252b" => Some("Executor revert: InsufficientAllowance"),
         "0xa5d3ca34" => Some("Executor revert: UnsupportedDex"),
+        "0x270815a0" => Some("Executor revert: InvalidTickSpacing"),
         "0xd433008b" => Some("Executor revert: MinProfitNotMet"),
         "0x90b8ec18" => Some("Executor revert: TransferFailed"),
         "0x8164f842" => Some("Executor revert: ApprovalFailed"),
@@ -364,6 +388,7 @@ mod tests {
             weth_address: address!("4200000000000000000000000000000000000006"),
             aerodrome_router: Some(address!("1111111111111111111111111111111111111111")),
             aerodrome_pool_factory: None,
+            aerodrome_slipstream_router: Some(address!("4444444444444444444444444444444444444444")),
             aerodrome_slipstream_factory: None,
             aerodrome_usdc_weth_pool: None,
             uniswap_v3_factory: None,
@@ -415,6 +440,7 @@ mod tests {
                     token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     token_out: address!("4200000000000000000000000000000000000006"),
                     fee_bps: Some(5),
+                    tick_spacing: None,
                 }],
                 diagnostics: None,
             },
@@ -449,7 +475,8 @@ mod tests {
             router_fee_for_step(
                 base_arb_common::types::DexKind::UniswapV3,
                 Some(base_arb_common::types::PoolVariant::UniswapV3),
-                Some(5)
+                Some(5),
+                None
             )
             .unwrap(),
             500
@@ -458,10 +485,25 @@ mod tests {
             router_fee_for_step(
                 base_arb_common::types::DexKind::PancakeSwap,
                 Some(base_arb_common::types::PoolVariant::PancakeV3),
-                Some(25)
+                Some(25),
+                None
             )
             .unwrap(),
             2500
+        );
+    }
+
+    #[test]
+    fn encodes_slipstream_tick_spacing_as_router_fee_field() {
+        assert_eq!(
+            router_fee_for_step(
+                base_arb_common::types::DexKind::Aerodrome,
+                Some(base_arb_common::types::PoolVariant::AerodromeSlipstream),
+                Some(30),
+                Some(100)
+            )
+            .unwrap(),
+            100
         );
     }
 

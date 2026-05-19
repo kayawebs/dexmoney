@@ -90,6 +90,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
+                    tick_spacing: None,
                     block_number: self.get_block_number().await?,
                     updated_at: now,
                 });
@@ -120,8 +121,12 @@ impl ChainProvider {
     ) -> Result<PoolState> {
         match entry.dex {
             DexKind::Aerodrome => {
-                self.fetch_aerodrome_pool_state_at_block(entry.pool_address, block_number)
-                    .await
+                let mut state = self
+                    .fetch_aerodrome_pool_state_at_block(entry.pool_address, block_number)
+                    .await?;
+                state.fee_bps = entry.fee_bps;
+                state.tick_spacing = entry.tick_spacing;
+                Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
                 let (token0, token1) = self
@@ -157,6 +162,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
+                    tick_spacing: entry.tick_spacing,
                     block_number: block_number.unwrap_or(self.get_block_number().await?),
                     updated_at: Utc::now(),
                 })
@@ -172,12 +178,16 @@ impl ChainProvider {
     ) -> Result<PoolState> {
         match entry.dex {
             DexKind::Aerodrome => {
-                self.fetch_aerodrome_pool_state_at_block_hash(
-                    entry.pool_address,
-                    block_hash,
-                    block_number,
-                )
-                .await
+                let mut state = self
+                    .fetch_aerodrome_pool_state_at_block_hash(
+                        entry.pool_address,
+                        block_hash,
+                        block_number,
+                    )
+                    .await?;
+                state.fee_bps = entry.fee_bps;
+                state.tick_spacing = entry.tick_spacing;
+                Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
                 let (token0, token1) = self
@@ -213,6 +223,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
+                    tick_spacing: entry.tick_spacing,
                     block_number,
                     updated_at: Utc::now(),
                 })
@@ -451,19 +462,21 @@ impl ChainProvider {
                         if pool == Address::ZERO || !seen.insert(pool) {
                             continue;
                         }
-                        let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
-                            || {
+                        let mut state = match self
+                            .fetch_aerodrome_pool_state(pool)
+                            .await
+                            .with_context(|| {
                                 format!(
                                     "Aerodrome Slipstream discovered pool {pool:#x} is not readable"
                                 )
-                            },
-                        ) {
+                            }) {
                             Ok(state) => state,
                             Err(err) => {
                                 debug!(pool = %pool, error = %err, "Aerodrome Slipstream discovered pool skipped");
                                 continue;
                             }
                         };
+                        state.tick_spacing = Some(tick_spacing);
                         out.push(DiscoveredPool {
                             state,
                             tick_spacing: Some(tick_spacing),
@@ -541,6 +554,7 @@ impl ChainProvider {
                             sqrt_price_x96: Some(sqrt_price_x96),
                             liquidity: Some(liquidity),
                             tick: Some(tick),
+                            tick_spacing: None,
                             block_number: self.get_block_number().await?,
                             updated_at: Utc::now(),
                         },
@@ -618,6 +632,7 @@ impl ChainProvider {
                             sqrt_price_x96: Some(sqrt_price_x96),
                             liquidity: Some(liquidity),
                             tick: Some(tick),
+                            tick_spacing: None,
                             block_number: self.get_block_number().await?,
                             updated_at: Utc::now(),
                         },
@@ -753,6 +768,7 @@ impl ChainProvider {
                 sqrt_price_x96: None,
                 liquidity: None,
                 tick: None,
+                tick_spacing: None,
                 block_number,
                 updated_at: Utc::now(),
             }),
@@ -781,6 +797,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
+                    tick_spacing: None,
                     block_number,
                     updated_at: Utc::now(),
                 })
@@ -817,6 +834,7 @@ impl ChainProvider {
                 sqrt_price_x96: None,
                 liquidity: None,
                 tick: None,
+                tick_spacing: None,
                 block_number,
                 updated_at: Utc::now(),
             }),
@@ -845,6 +863,7 @@ impl ChainProvider {
                     sqrt_price_x96: Some(sqrt_price_x96),
                     liquidity: Some(liquidity),
                     tick: Some(tick),
+                    tick_spacing: None,
                     block_number,
                     updated_at: Utc::now(),
                 })
