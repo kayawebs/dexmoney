@@ -217,8 +217,16 @@ fn format_revert_reason(raw: &str) -> String {
 }
 
 fn decode_executor_error(raw: &str) -> Option<&'static str> {
-    let selector = first_hex_selector(raw)?;
-    match selector.as_str() {
+    for selector in hex_selectors(raw) {
+        if let Some(error) = executor_error_name(&selector) {
+            return Some(error);
+        }
+    }
+    None
+}
+
+fn executor_error_name(selector: &str) -> Option<&'static str> {
+    match selector {
         "0x5fc483c5" => Some("Executor revert: OnlyOwner"),
         "0x27e1f1e5" => Some("Executor revert: OnlyOperator"),
         "0xeced32bc" => Some("Executor revert: PausedError"),
@@ -239,7 +247,8 @@ fn decode_executor_error(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn first_hex_selector(raw: &str) -> Option<String> {
+fn hex_selectors(raw: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
     for part in raw.split(|c: char| {
         c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
     }) {
@@ -248,10 +257,10 @@ fn first_hex_selector(raw: &str) -> Option<String> {
             && clean.starts_with("0x")
             && clean[2..10].chars().all(|c| c.is_ascii_hexdigit())
         {
-            return Some(clean[..10].to_ascii_lowercase());
+            selectors.push(clean[..10].to_ascii_lowercase());
         }
     }
-    None
+    selectors
 }
 
 #[cfg(test)]
@@ -352,7 +361,7 @@ mod tests {
 
     #[test]
     fn decodes_executor_revert_selector_from_rpc_error() {
-        let raw = r#"rpc eth_call failed: code=3 message=execution reverted data="0xf4d678b8""#;
+        let raw = r#"eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x51589239 caused by rpc eth_call failed: code=3 message=execution reverted data="0xf4d678b8""#;
         assert_eq!(
             decode_executor_error(raw),
             Some("Executor revert: InsufficientBalance")
