@@ -276,17 +276,26 @@ fn compact_revert_reason(raw: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     if lines.is_empty() {
-        return raw.chars().take(240).collect();
+        return tail_chars(raw, 240);
     }
     if lines.len() > 3 {
         lines.truncate(3);
     }
     let joined = lines.join(" | ");
     if joined.len() > 240 {
-        format!("{}...", &joined[..240])
+        tail_chars(&joined, 240)
     } else {
         joined
     }
+}
+
+fn tail_chars(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    let start = chars.len().saturating_sub(max_chars);
+    format!("...{}", chars[start..].iter().collect::<String>())
 }
 
 #[cfg(test)]
@@ -401,5 +410,17 @@ mod tests {
             super::format_revert_reason(raw),
             "Executor revert: MinProfitNotMet"
         );
+    }
+
+    #[test]
+    fn unknown_revert_keeps_tail_instead_of_calldata_prefix() {
+        let raw = format!(
+            "eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x{}: rpc eth_call failed: code=3 message=execution reverted data=null",
+            "51".repeat(300)
+        );
+        let formatted = super::format_revert_reason(&raw);
+        assert!(formatted.starts_with("..."));
+        assert!(formatted.contains("execution reverted"));
+        assert!(!formatted.contains("executeWithOwnFunds to="));
     }
 }
