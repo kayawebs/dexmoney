@@ -210,8 +210,8 @@ async fn validate_step(
     println!("token_in: {:#x}", step.token_in);
     println!("token_out: {:#x}", step.token_out);
     println!(
-        "fee_bps: {:?} tick_spacing: {:?}",
-        step.fee_bps, step.tick_spacing
+        "fee_bps: {:?} stable: {:?} tick_spacing: {:?}",
+        step.fee_bps, step.stable, step.tick_spacing
     );
 
     let entry = PoolRegistryEntry {
@@ -223,7 +223,7 @@ async fn validate_step(
         token1: step.token_out,
         fee_bps: step.fee_bps.unwrap_or_default(),
         tick_spacing: step.tick_spacing,
-        stable: Some(classic_stable_flag(step.variant)),
+        stable: Some(classic_stable_flag(step)),
         enabled: true,
     };
 
@@ -290,7 +290,7 @@ async fn validate_classic_router_quote(
         U256::from(1_000_000u64),
         step.token_in,
         step.token_out,
-        classic_stable_flag(step.variant),
+        classic_stable_flag(step),
         factory,
     );
     let data_hex = format!("0x{}", hex::encode(data));
@@ -401,11 +401,7 @@ async fn factory_pool_for_step(
 ) -> Result<Address> {
     let data = match (step.dex, step.variant) {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
-            encode_factory_get_pool_bool(
-                step.token_in,
-                step.token_out,
-                classic_stable_flag(step.variant),
-            )
+            encode_factory_get_pool_bool(step.token_in, step.token_out, classic_stable_flag(step))
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
             let spacing = step
@@ -469,7 +465,7 @@ fn encode_executor_steps(path: &ArbPath, settings: &Settings) -> Result<Vec<u8>>
         out.extend(encode_address(step.token_in));
         out.extend(encode_address(step.token_out));
         out.extend(encode_u256(U256::from(router_fee_for_step(step)?)));
-        out.extend(encode_bool(classic_stable_flag(step.variant)));
+        out.extend(encode_bool(classic_stable_flag(step)));
         out.extend(encode_address(
             factory_for_step(step, settings)?.unwrap_or(Address::ZERO),
         ));
@@ -531,8 +527,11 @@ fn default_variant(dex: DexKind) -> PoolVariant {
     }
 }
 
-fn classic_stable_flag(_variant: Option<PoolVariant>) -> bool {
-    false
+fn classic_stable_flag(step: &SwapStep) -> bool {
+    matches!(
+        (step.dex, step.variant),
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
+    ) && step.stable.unwrap_or(false)
 }
 
 fn encode_factory_get_pool_bool(token_in: Address, token_out: Address, stable: bool) -> Vec<u8> {

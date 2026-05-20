@@ -123,7 +123,7 @@ pub fn min_profit_failure_key(candidate: &Candidate) -> String {
     );
     for step in &candidate.path.steps {
         raw.push_str(&format!(
-            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}",
+            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}|{:?}",
             step.dex,
             step.variant,
             step.factory_address,
@@ -131,6 +131,7 @@ pub fn min_profit_failure_key(candidate: &Candidate) -> String {
             step.token_in,
             step.token_out,
             step.fee_bps,
+            step.stable,
             step.tick_spacing
         ));
     }
@@ -162,7 +163,7 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             step.fee_bps,
             step.tick_spacing,
         )?)));
-        out.extend(encode_bool(classic_stable_flag(step.variant)));
+        out.extend(encode_bool(classic_stable_flag(step)));
         out.extend(encode_address(factory_for_step(step, settings)?));
     }
 
@@ -209,8 +210,11 @@ fn executor_dex_kind(dex: DexKind, variant: Option<PoolVariant>) -> Result<u8> {
     }
 }
 
-fn classic_stable_flag(_variant: Option<PoolVariant>) -> bool {
-    false
+fn classic_stable_flag(step: &base_arb_common::types::SwapStep) -> bool {
+    matches!(
+        (step.dex, step.variant),
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
+    ) && step.stable.unwrap_or(false)
 }
 
 fn factory_for_step(
@@ -467,6 +471,7 @@ mod tests {
                     token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     token_out: address!("4200000000000000000000000000000000000006"),
                     fee_bps: Some(5),
+                    stable: None,
                     tick_spacing: None,
                 }],
                 diagnostics: None,

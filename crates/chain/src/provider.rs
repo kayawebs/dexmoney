@@ -86,6 +86,7 @@ impl ChainProvider {
                     token0,
                     token1,
                     fee_bps,
+                    stable: None,
                     reserve0: None,
                     reserve1: None,
                     sqrt_price_x96: Some(sqrt_price_x96),
@@ -128,6 +129,7 @@ impl ChainProvider {
                 state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
+                state.stable = entry.stable;
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -160,6 +162,7 @@ impl ChainProvider {
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
+                    stable: entry.stable,
                     reserve0: None,
                     reserve1: None,
                     sqrt_price_x96: Some(sqrt_price_x96),
@@ -191,6 +194,7 @@ impl ChainProvider {
                 state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
+                state.stable = entry.stable;
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -223,6 +227,7 @@ impl ChainProvider {
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
+                    stable: entry.stable,
                     reserve0: None,
                     reserve1: None,
                     sqrt_price_x96: Some(sqrt_price_x96),
@@ -418,6 +423,7 @@ impl ChainProvider {
                         }
                     };
                     state.factory_address = Some(factory);
+                    state.stable = Some(stable);
                     out.push(DiscoveredPool {
                         state,
                         factory_address: Some(factory),
@@ -485,6 +491,7 @@ impl ChainProvider {
                         };
                         state.tick_spacing = Some(tick_spacing);
                         state.factory_address = Some(factory);
+                        state.stable = None;
                         out.push(DiscoveredPool {
                             state,
                             factory_address: Some(factory),
@@ -559,6 +566,7 @@ impl ChainProvider {
                             token0,
                             token1,
                             fee_bps: fee / 100,
+                            stable: None,
                             reserve0: None,
                             reserve1: None,
                             sqrt_price_x96: Some(sqrt_price_x96),
@@ -639,6 +647,7 @@ impl ChainProvider {
                             token0,
                             token1,
                             fee_bps: fee / 100,
+                            stable: None,
                             reserve0: None,
                             reserve1: None,
                             sqrt_price_x96: Some(sqrt_price_x96),
@@ -777,6 +786,7 @@ impl ChainProvider {
                 token0,
                 token1,
                 fee_bps: 30,
+                stable: None,
                 reserve0: Some(reserve0),
                 reserve1: Some(reserve1),
                 sqrt_price_x96: None,
@@ -807,6 +817,7 @@ impl ChainProvider {
                     token0,
                     token1,
                     fee_bps: 30,
+                    stable: None,
                     reserve0: None,
                     reserve1: None,
                     sqrt_price_x96: Some(sqrt_price_x96),
@@ -845,6 +856,7 @@ impl ChainProvider {
                 token0,
                 token1,
                 fee_bps: 30,
+                stable: None,
                 reserve0: Some(reserve0),
                 reserve1: Some(reserve1),
                 sqrt_price_x96: None,
@@ -875,6 +887,7 @@ impl ChainProvider {
                     token0,
                     token1,
                     fee_bps: 30,
+                    stable: None,
                     reserve0: None,
                     reserve1: None,
                     sqrt_price_x96: Some(sqrt_price_x96),
