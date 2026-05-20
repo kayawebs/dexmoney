@@ -10,9 +10,12 @@ use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, FailureStore,
     RecorderStore,
 };
+use chrono::Utc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,7 +87,7 @@ where
     sync_idle_lane(&mut lane, provider).await?;
     eoa_store.set_lane_state(lane.state.clone()).await?;
 
-    let Some(candidate) = candidate_store.pop_candidate().await? else {
+    let Some(candidate) = pop_fresh_candidate(candidate_store).await? else {
         debug!("no candidate available");
         return Ok(());
     };
@@ -184,6 +187,39 @@ where
     }
 
     Ok(())
+}
+
+async fn pop_fresh_candidate<C>(
+    candidate_store: &C,
+) -> Result<Option<base_arb_common::types::Candidate>>
+where
+    C: CandidateStore,
+{
+    let now = Utc::now();
+    let mut expired = 0usize;
+
+    for _ in 0..MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE {
+        let Some(candidate) = candidate_store.pop_candidate().await? else {
+            if expired > 0 {
+                info!(expired, "drained expired candidates from queue");
+            }
+            return Ok(None);
+        };
+        if candidate.is_expired(now) {
+            expired += 1;
+            continue;
+        }
+        if expired > 0 {
+            info!(expired, "drained expired candidates from queue");
+        }
+        return Ok(Some(candidate));
+    }
+
+    info!(
+        expired,
+        "expired candidate drain limit reached; continuing next cycle"
+    );
+    Ok(None)
 }
 
 async fn sync_idle_lane(lane: &mut eoa_lane::EoaLane, provider: &ChainProvider) -> Result<()> {
