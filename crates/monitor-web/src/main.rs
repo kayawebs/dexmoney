@@ -121,9 +121,11 @@ struct PoolStateValidationRow {
 
 #[derive(Debug, FromRow)]
 struct OpportunityRow {
+    id: String,
     created_at: DateTime<Utc>,
     block_number: i64,
     strategy: String,
+    path_name: String,
     amount_in: String,
     expected_profit: String,
     quote_modes: Option<String>,
@@ -137,6 +139,8 @@ struct OpportunityRow {
 #[derive(Debug, FromRow)]
 struct SimulationRow {
     created_at: DateTime<Utc>,
+    opportunity_id: String,
+    path_name: String,
     success: bool,
     simulated_profit: Option<String>,
     gas_estimate: Option<String>,
@@ -955,9 +959,11 @@ async fn fetch_opportunities(pool: &PgPool) -> Result<Vec<OpportunityRow>> {
     Ok(sqlx::query_as::<_, OpportunityRow>(
         r#"
         SELECT
+            id::text AS id,
             created_at,
             block_number,
             strategy,
+            path_json->>'name' AS path_name,
             amount_in,
             expected_profit,
             path_json->'diagnostics'->>'modes' AS quote_modes,
@@ -978,9 +984,17 @@ async fn fetch_opportunities(pool: &PgPool) -> Result<Vec<OpportunityRow>> {
 async fn fetch_simulations(pool: &PgPool) -> Result<Vec<SimulationRow>> {
     Ok(sqlx::query_as::<_, SimulationRow>(
         r#"
-        SELECT created_at, success, simulated_profit, gas_estimate, revert_reason
-        FROM simulations
-        ORDER BY created_at DESC
+        SELECT
+            s.created_at,
+            s.opportunity_id::text AS opportunity_id,
+            COALESCE(o.path_json->>'name', '-') AS path_name,
+            s.success,
+            s.simulated_profit,
+            s.gas_estimate,
+            s.revert_reason
+        FROM simulations s
+        LEFT JOIN opportunities o ON o.id = s.opportunity_id
+        ORDER BY s.created_at DESC
         LIMIT 25
         "#,
     )
@@ -1806,7 +1820,7 @@ fn render_pool_state_validations_table(rows: &[PoolStateValidationRow]) -> Strin
 
 fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Quote Modes</th><th>Ticks Used</th><th>Crossed</th><th>Range Exhausted</th><th>Missing Ticks</th><th>Status</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>UUID</th><th>Path</th><th>Block</th><th>Strategy</th><th>Amount In</th><th>Expected Profit</th><th>Quote Modes</th><th>Ticks Used</th><th>Crossed</th><th>Range Exhausted</th><th>Missing Ticks</th><th>Status</th></tr></thead><tbody>",
     );
     for row in rows {
         let range_exhausted = match row.tick_range_exhausted {
@@ -1815,8 +1829,10 @@ fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
             None => "-".to_string(),
         };
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
+            copyable(&row.id),
+            copyable(&row.path_name),
             row.block_number,
             escape(&row.strategy),
             escape(&row.amount_in),
@@ -1830,7 +1846,7 @@ fn render_opportunities_table(rows: &[OpportunityRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"11\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"13\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -1852,13 +1868,15 @@ fn fmt_warn_i64(value: Option<i64>) -> String {
 
 fn render_simulations_table(rows: &[SimulationRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Success</th><th>Profit</th><th>Gas</th><th>Revert</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Opportunity UUID</th><th>Path</th><th>Success</th><th>Profit</th><th>Gas</th><th>Revert</th></tr></thead><tbody>",
     );
     for row in rows {
         let class = if row.success { "ok" } else { "bad" };
         html.push_str(&format!(
-            "<tr><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
+            copyable(&row.opportunity_id),
+            copyable(&row.path_name),
             class,
             row.success,
             escape(row.simulated_profit.as_deref().unwrap_or("-")),
@@ -1867,7 +1885,7 @@ fn render_simulations_table(rows: &[SimulationRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"5\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"7\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
