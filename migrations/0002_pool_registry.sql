@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS pools (
     fee_bps BIGINT,
     tick_spacing BIGINT,
     stable BOOLEAN,
+    factory_address TEXT,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     source TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

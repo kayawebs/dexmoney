@@ -64,6 +64,7 @@ mod tests {
             },
             dex: DexKind::Aerodrome,
             variant: PoolVariant::AerodromeVolatile,
+            factory_address: None,
             token0: pool,
             token1: address!("4200000000000000000000000000000000000001"),
             fee_bps: 30,
@@ -86,6 +87,7 @@ mod tests {
             steps: vec![SwapStep {
                 dex: DexKind::Aerodrome,
                 variant: None,
+                factory_address: None,
                 pool: token,
                 token_in: token,
                 token_out: token,

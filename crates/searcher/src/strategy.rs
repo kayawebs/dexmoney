@@ -79,6 +79,7 @@ impl SearchEngine {
                         SwapStep {
                             dex: DexKind::Aerodrome,
                             variant: Some(PoolVariant::AerodromeVolatile),
+                            factory_address: None,
                             pool: aero_pool,
                             token_in: usdc,
                             token_out: weth,
@@ -88,6 +89,7 @@ impl SearchEngine {
                         SwapStep {
                             dex: DexKind::UniswapV3,
                             variant: Some(PoolVariant::UniswapV3),
+                            factory_address: None,
                             pool: uni_pool,
                             token_in: weth,
                             token_out: usdc,
@@ -103,6 +105,7 @@ impl SearchEngine {
                         SwapStep {
                             dex: DexKind::UniswapV3,
                             variant: Some(PoolVariant::UniswapV3),
+                            factory_address: None,
                             pool: uni_pool,
                             token_in: usdc,
                             token_out: weth,
@@ -112,6 +115,7 @@ impl SearchEngine {
                         SwapStep {
                             dex: DexKind::Aerodrome,
                             variant: Some(PoolVariant::AerodromeVolatile),
+                            factory_address: None,
                             pool: aero_pool,
                             token_in: weth,
                             token_out: usdc,
@@ -338,6 +342,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             },
             dex: DexKind::Aerodrome,
             variant: PoolVariant::AerodromeVolatile,
+            factory_address: None,
             token0: usdc,
             token1: weth,
             fee_bps: 30,
@@ -357,6 +362,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             },
             dex: DexKind::UniswapV3,
             variant: PoolVariant::UniswapV3,
+            factory_address: None,
             token0: weth,
             token1: usdc,
             fee_bps: 30,
@@ -587,6 +593,7 @@ fn build_search_path(
                 SwapStep {
                     dex: first.dex,
                     variant: Some(first.variant),
+                    factory_address: first.factory_address,
                     pool: first.pool_id.address,
                     token_in,
                     token_out: token_mid,
@@ -596,6 +603,7 @@ fn build_search_path(
                 SwapStep {
                     dex: second.dex,
                     variant: Some(second.variant),
+                    factory_address: second.factory_address,
                     pool: second.pool_id.address,
                     token_in: token_mid,
                     token_out: token_in,

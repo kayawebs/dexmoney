@@ -61,8 +61,8 @@ impl PostgresStore {
             r#"
             INSERT INTO pools (
                 id, token_pair_id, chain_id, pool_address, dex, variant, token0, token1,
-                fee_bps, tick_spacing, stable, enabled, source, created_at, updated_at
-            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,$11,NOW(),NOW())
+                fee_bps, tick_spacing, stable, factory_address, enabled, source, created_at, updated_at
+            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,$12,NOW(),NOW())
             ON CONFLICT (chain_id, pool_address)
             DO UPDATE SET
                 token_pair_id = EXCLUDED.token_pair_id,
@@ -73,6 +73,7 @@ impl PostgresStore {
                 fee_bps = EXCLUDED.fee_bps,
                 tick_spacing = EXCLUDED.tick_spacing,
                 stable = EXCLUDED.stable,
+                factory_address = EXCLUDED.factory_address,
                 enabled = TRUE,
                 source = EXCLUDED.source,
                 updated_at = NOW()
@@ -88,6 +89,7 @@ impl PostgresStore {
         .bind(i64::from(state.fee_bps))
         .bind(discovered.tick_spacing.map(i64::from))
         .bind(discovered.stable)
+        .bind(discovered.factory_address.map(address_to_string))
         .bind(&discovered.source)
         .execute(&self.pool)
         .await?;
@@ -218,7 +220,8 @@ impl PostgresStore {
         let rows = sqlx::query_as::<_, PoolRegistryRow>(
             r#"
             SELECT DISTINCT ON (lower(pool_address))
-                pool_address, dex, variant, token0, token1, fee_bps, tick_spacing, stable, enabled
+                pool_address, dex, variant, factory_address, token0, token1, fee_bps,
+                tick_spacing, stable, enabled
             FROM pools
             WHERE enabled = TRUE
             ORDER BY lower(pool_address), updated_at DESC
@@ -433,6 +436,7 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             fee_bps BIGINT,
             tick_spacing BIGINT,
             stable BOOLEAN,
+            factory_address TEXT,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
             source TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -443,6 +447,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pools (enabled, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pools_pair_idx
             ON pools (token_pair_id, enabled)"#,
+        r#"ALTER TABLE pools
+            ADD COLUMN IF NOT EXISTS factory_address TEXT"#,
         r#"CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
             ON dex_events (pool_address, block_number DESC, event_type)"#,
         r#"ALTER TABLE pool_states
@@ -524,6 +530,7 @@ struct PoolRegistryRow {
     pool_address: String,
     dex: String,
     variant: String,
+    factory_address: Option<String>,
     token0: String,
     token1: String,
     fee_bps: Option<i64>,
@@ -552,6 +559,7 @@ impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
             pool_address: row.pool_address.parse()?,
             dex: parse_dex(&row.dex)?,
             variant: parse_variant(&row.variant)?,
+            factory_address: row.factory_address.as_deref().map(str::parse).transpose()?,
             token0: row.token0.parse()?,
             token1: row.token1.parse()?,
             fee_bps: u32::try_from(row.fee_bps.unwrap_or_default())?,

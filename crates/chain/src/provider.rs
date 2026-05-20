@@ -82,6 +82,7 @@ impl ChainProvider {
                     },
                     dex: DexKind::UniswapV3,
                     variant: PoolVariant::UniswapV3,
+                    factory_address: settings.uniswap_v3_factory,
                     token0,
                     token1,
                     fee_bps,
@@ -126,6 +127,7 @@ impl ChainProvider {
                     .await?;
                 state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
+                state.factory_address = entry.factory_address;
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -154,6 +156,7 @@ impl ChainProvider {
                     },
                     dex: entry.dex,
                     variant: entry.variant,
+                    factory_address: entry.factory_address,
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
@@ -187,6 +190,7 @@ impl ChainProvider {
                     .await?;
                 state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
+                state.factory_address = entry.factory_address;
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -215,6 +219,7 @@ impl ChainProvider {
                     },
                     dex: entry.dex,
                     variant: entry.variant,
+                    factory_address: entry.factory_address,
                     token0,
                     token1,
                     fee_bps: entry.fee_bps,
@@ -403,7 +408,7 @@ impl ChainProvider {
                     if pool == Address::ZERO || !seen.insert(pool) {
                         continue;
                     }
-                    let state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
+                    let mut state = match self.fetch_aerodrome_pool_state(pool).await.with_context(
                         || format!("Aerodrome classic discovered pool {pool:#x} is not readable"),
                     ) {
                         Ok(state) => state,
@@ -412,8 +417,10 @@ impl ChainProvider {
                             continue;
                         }
                     };
+                    state.factory_address = Some(factory);
                     out.push(DiscoveredPool {
                         state,
+                        factory_address: Some(factory),
                         tick_spacing: None,
                         stable: Some(stable),
                         source: "aerodrome_classic_factory".to_string(),
@@ -477,8 +484,10 @@ impl ChainProvider {
                             }
                         };
                         state.tick_spacing = Some(tick_spacing);
+                        state.factory_address = Some(factory);
                         out.push(DiscoveredPool {
                             state,
+                            factory_address: Some(factory),
                             tick_spacing: Some(tick_spacing),
                             stable: None,
                             source: "aerodrome_slipstream_factory".to_string(),
@@ -546,6 +555,7 @@ impl ChainProvider {
                             },
                             dex: DexKind::UniswapV3,
                             variant: PoolVariant::UniswapV3,
+                            factory_address: Some(factory),
                             token0,
                             token1,
                             fee_bps: fee / 100,
@@ -558,6 +568,7 @@ impl ChainProvider {
                             block_number: self.get_block_number().await?,
                             updated_at: Utc::now(),
                         },
+                        factory_address: Some(factory),
                         tick_spacing: None,
                         stable: None,
                         source: format!("uniswap_v3_factory_fee_{fee}"),
@@ -624,6 +635,7 @@ impl ChainProvider {
                             },
                             dex: DexKind::PancakeSwap,
                             variant: PoolVariant::PancakeV3,
+                            factory_address: Some(factory),
                             token0,
                             token1,
                             fee_bps: fee / 100,
@@ -636,6 +648,7 @@ impl ChainProvider {
                             block_number: self.get_block_number().await?,
                             updated_at: Utc::now(),
                         },
+                        factory_address: Some(factory),
                         tick_spacing: None,
                         stable: None,
                         source: format!("pancake_v3_factory_fee_{fee}"),
@@ -760,6 +773,7 @@ impl ChainProvider {
                 },
                 dex: DexKind::Aerodrome,
                 variant: PoolVariant::AerodromeVolatile,
+                factory_address: None,
                 token0,
                 token1,
                 fee_bps: 30,
@@ -789,6 +803,7 @@ impl ChainProvider {
                     },
                     dex: DexKind::Aerodrome,
                     variant: PoolVariant::AerodromeSlipstream,
+                    factory_address: None,
                     token0,
                     token1,
                     fee_bps: 30,
@@ -826,6 +841,7 @@ impl ChainProvider {
                 },
                 dex: DexKind::Aerodrome,
                 variant: PoolVariant::AerodromeVolatile,
+                factory_address: None,
                 token0,
                 token1,
                 fee_bps: 30,
@@ -855,6 +871,7 @@ impl ChainProvider {
                     },
                     dex: DexKind::Aerodrome,
                     variant: PoolVariant::AerodromeSlipstream,
+                    factory_address: None,
                     token0,
                     token1,
                     fee_bps: 30,

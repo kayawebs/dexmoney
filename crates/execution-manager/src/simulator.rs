@@ -123,9 +123,10 @@ pub fn min_profit_failure_key(candidate: &Candidate) -> String {
     );
     for step in &candidate.path.steps {
         raw.push_str(&format!(
-            "|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}",
+            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}",
             step.dex,
             step.variant,
+            step.factory_address,
             step.pool,
             step.token_in,
             step.token_out,
@@ -162,11 +163,7 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             step.tick_spacing,
         )?)));
         out.extend(encode_bool(classic_stable_flag(step.variant)));
-        out.extend(encode_address(factory_for_step(
-            step.dex,
-            step.variant,
-            settings,
-        )?));
+        out.extend(encode_address(factory_for_step(step, settings)?));
     }
 
     Ok(out)
@@ -217,10 +214,15 @@ fn classic_stable_flag(_variant: Option<PoolVariant>) -> bool {
 }
 
 fn factory_for_step(
-    dex: DexKind,
-    variant: Option<PoolVariant>,
+    step: &base_arb_common::types::SwapStep,
     settings: &Settings,
 ) -> Result<Address> {
+    if let Some(factory) = step.factory_address {
+        return Ok(factory);
+    }
+
+    let dex = step.dex;
+    let variant = step.variant;
     if matches!(
         (dex, variant),
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
@@ -460,6 +462,7 @@ mod tests {
                 steps: vec![SwapStep {
                     dex: base_arb_common::types::DexKind::UniswapV3,
                     variant: Some(base_arb_common::types::PoolVariant::UniswapV3),
+                    factory_address: None,
                     pool: address!("5555555555555555555555555555555555555555"),
                     token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     token_out: address!("4200000000000000000000000000000000000006"),

@@ -206,6 +206,7 @@ async fn validate_step(
     println!("\n== Step {step_no} ==");
     println!("dex: {:?} variant: {:?}", step.dex, step.variant);
     println!("pool: {:#x}", step.pool);
+    println!("factory: {:?}", step.factory_address);
     println!("token_in: {:#x}", step.token_in);
     println!("token_out: {:#x}", step.token_out);
     println!(
@@ -217,6 +218,7 @@ async fn validate_step(
         pool_address: step.pool,
         dex: step.dex,
         variant: step.variant.unwrap_or(default_variant(step.dex)),
+        factory_address: step.factory_address,
         token0: step.token_in,
         token1: step.token_out,
         fee_bps: step.fee_bps.unwrap_or_default(),
@@ -279,8 +281,9 @@ async fn validate_classic_router_quote(
         println!("classic_router_quote: skipped (AERODROME_ROUTER not configured)");
         return Ok(());
     };
-    let factory = settings
-        .aerodrome_pool_factory
+    let factory = step
+        .factory_address
+        .or(settings.aerodrome_pool_factory)
         .or_else(|| DEFAULT_AERODROME_FACTORY.parse().ok())
         .unwrap_or(Address::ZERO);
     let data = encode_get_amounts_out(
@@ -355,6 +358,10 @@ async fn validate_executor_call(
 }
 
 fn factory_for_step(step: &SwapStep, settings: &Settings) -> Result<Option<Address>> {
+    if let Some(factory) = step.factory_address {
+        return Ok(Some(factory));
+    }
+
     match (step.dex, step.variant) {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
             Ok(Some(

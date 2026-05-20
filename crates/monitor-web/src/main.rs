@@ -180,6 +180,7 @@ struct PoolRegistryRow {
     variant: String,
     pair_symbol: Option<String>,
     pool_address: String,
+    factory_address: Option<String>,
     token0: String,
     token1: String,
     token0_symbol: Option<String>,
@@ -809,6 +810,7 @@ async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
             p.variant,
             tp.symbol AS pair_symbol,
             p.pool_address,
+            p.factory_address,
             p.token0,
             p.token1,
             split_part(tp.symbol, '/', 1) AS token0_symbol,
@@ -1663,11 +1665,11 @@ fn render_remove_pair_form(row: &TokenPairRow) -> String {
 
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Last Update Time</th><th>Activity</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Last Update Time</th><th>Activity</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Factory</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.last_update_time
                 .map(fmt_ts)
@@ -1680,6 +1682,7 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
                 .map(escape)
                 .unwrap_or_else(|| "-".into()),
             copyable(&row.pool_address),
+            copyable_optional(row.factory_address.as_deref()),
             token_label(row.token0_symbol.as_deref(), &row.token0),
             token_label(row.token1_symbol.as_deref(), &row.token1),
             row.fee_bps.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
@@ -1689,7 +1692,7 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"13\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"14\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html

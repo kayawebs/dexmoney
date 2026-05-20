@@ -52,6 +52,7 @@ mod tests {
             steps: vec![SwapStep {
                 dex: DexKind::Aerodrome,
                 variant: None,
+                factory_address: None,
                 pool: token,
                 token_in: token,
                 token_out: token,

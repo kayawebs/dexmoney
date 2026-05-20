@@ -36,6 +36,8 @@ pub struct PoolState {
     pub pool_id: PoolId,
     pub dex: DexKind,
     pub variant: PoolVariant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_address: Option<Address>,
     pub token0: Address,
     pub token1: Address,
     pub fee_bps: u32,
@@ -75,6 +77,7 @@ pub struct PoolRegistryEntry {
     pub pool_address: Address,
     pub dex: DexKind,
     pub variant: PoolVariant,
+    pub factory_address: Option<Address>,
     pub token0: Address,
     pub token1: Address,
     pub fee_bps: u32,
@@ -98,6 +101,7 @@ pub struct TokenPairSearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredPool {
     pub state: PoolState,
+    pub factory_address: Option<Address>,
     pub tick_spacing: Option<i32>,
     pub stable: Option<bool>,
     pub source: String,
@@ -144,6 +148,8 @@ pub struct SwapStep {
     pub dex: DexKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<PoolVariant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_address: Option<Address>,
     pub pool: Address,
     pub token_in: Address,
     pub token_out: Address,
