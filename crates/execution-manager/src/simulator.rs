@@ -138,8 +138,45 @@ pub fn min_profit_failure_key(candidate: &Candidate) -> String {
     format!("{:#x}", keccak256(raw.as_bytes()))
 }
 
+pub fn route_failure_key(candidate: &Candidate) -> String {
+    let mut raw = format!(
+        "{}|{:#x}|{}",
+        candidate.path.name, candidate.token_in, candidate.amount_in
+    );
+    append_step_fingerprint(&mut raw, candidate);
+    format!("{:#x}", keccak256(raw.as_bytes()))
+}
+
 pub fn is_min_profit_not_met(simulation: &SimulationResult) -> bool {
     simulation.revert_reason.as_deref() == Some("Executor revert: MinProfitNotMet")
+}
+
+pub fn is_structural_route_failure(simulation: &SimulationResult) -> bool {
+    matches!(
+        simulation.revert_reason.as_deref(),
+        Some("router/no-revert-data")
+            | Some("Executor revert: PoolMismatch")
+            | Some("Executor revert: UnsupportedDex")
+            | Some("Executor revert: InvalidPath")
+            | Some("Executor revert: InvalidTickSpacing")
+    )
+}
+
+fn append_step_fingerprint(raw: &mut String, candidate: &Candidate) {
+    for step in &candidate.path.steps {
+        raw.push_str(&format!(
+            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}|{:?}",
+            step.dex,
+            step.variant,
+            step.factory_address,
+            step.pool,
+            step.token_in,
+            step.token_out,
+            step.fee_bps,
+            step.stable,
+            step.tick_spacing
+        ));
+    }
 }
 
 fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
@@ -366,6 +403,12 @@ fn compact_revert_reason(raw: &str) -> String {
     if raw.contains("candidate expired") {
         return "candidate expired".to_string();
     }
+    if raw.contains("execution reverted data=-")
+        || raw.contains("execution reverted data=null")
+        || raw.contains("execution reverted data=\"0x\"")
+    {
+        return "router/no-revert-data".to_string();
+    }
     let mut lines = raw
         .lines()
         .map(str::trim)
@@ -558,9 +601,15 @@ mod tests {
     }
 
     #[test]
+    fn formats_router_revert_without_data() {
+        let raw = r#"eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x51589239 caused by rpc eth_call failed: code=3 message=execution reverted data=-"#;
+        assert_eq!(super::format_revert_reason(raw), "router/no-revert-data");
+    }
+
+    #[test]
     fn unknown_revert_keeps_tail_instead_of_calldata_prefix() {
         let raw = format!(
-            "eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x{}: rpc eth_call failed: code=3 message=execution reverted data=null",
+            "eth_call Executor executeWithOwnFunds to=0x63dfe526981eae8688b6bfaf5cfec575d8e89a43 data=0x{}: rpc eth_call failed: code=3 message=execution reverted with unknown selector",
             "51".repeat(300)
         );
         let formatted = super::format_revert_reason(&raw);

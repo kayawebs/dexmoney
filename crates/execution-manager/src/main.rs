@@ -106,6 +106,18 @@ where
         );
         return Ok(());
     }
+    let route_failure_key = simulator::route_failure_key(&candidate);
+    if candidate_store.has_failure_key(&route_failure_key).await? {
+        debug!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            amount_in = %candidate.amount_in,
+            min_profit = %candidate.min_profit,
+            expected_profit = %candidate.expected_profit,
+            "candidate skipped after previous structural route failure for identical path parameters"
+        );
+        return Ok(());
+    }
 
     let simulation = simulator::simulate(
         provider,
@@ -134,6 +146,20 @@ where
                 expected_profit = %candidate.expected_profit,
                 ttl_secs = settings.min_profit_failure_ttl_secs,
                 "cached MinProfitNotMet candidate fingerprint"
+            );
+        } else if simulator::is_structural_route_failure(&simulation) {
+            candidate_store
+                .mark_failure_key(&route_failure_key, settings.min_profit_failure_ttl_secs)
+                .await?;
+            info!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                amount_in = %candidate.amount_in,
+                min_profit = %candidate.min_profit,
+                expected_profit = %candidate.expected_profit,
+                reason = ?simulation.revert_reason,
+                ttl_secs = settings.min_profit_failure_ttl_secs,
+                "cached structural route failure candidate fingerprint"
             );
         }
         return Ok(());
