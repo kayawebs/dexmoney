@@ -206,6 +206,11 @@ struct RediscoverPairForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct RediscoverAllPairsForm {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct DeletePairForm {
     password: String,
     token0: String,
@@ -252,6 +257,7 @@ async fn main() -> Result<()> {
         .route("/execution", get(execution_page))
         .route("/pairs", post(add_pair))
         .route("/pairs/rediscover", post(rediscover_pair))
+        .route("/pairs/rediscover-all", post(rediscover_all_pairs))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/search-config", post(update_pair_search_config))
@@ -500,6 +506,72 @@ async fn rediscover_pair(
         result.discovered_count,
         result.executor_report,
         symbol = result.symbol,
+    );
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
+async fn rediscover_all_pairs(
+    State(state): State<AppState>,
+    Form(form): Form<RediscoverAllPairsForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let pairs = fetch_enabled_token_pairs(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if pairs.is_empty() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("no enabled token pairs to rediscover"),
+        )
+        .await;
+    }
+
+    let mut succeeded = 0usize;
+    let mut failed = Vec::new();
+    let mut discovered_total = 0usize;
+
+    for pair in pairs {
+        match discover_and_upsert_pair(&state, &pair.token0, &pair.token1).await {
+            Ok(result) => {
+                succeeded += 1;
+                discovered_total += result.discovered_count;
+            }
+            Err(status) => {
+                failed.push(format!(
+                    "{}: {}",
+                    pair.symbol,
+                    discovery_error_message(status)
+                ));
+            }
+        }
+    }
+
+    let failure_summary = if failed.is_empty() {
+        "no failures".to_string()
+    } else {
+        let mut shown = failed
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if failed.len() > 4 {
+            shown.push_str(&format!("; +{} more", failed.len() - 4));
+        }
+        shown
+    };
+    let message = format!(
+        "rediscovered enabled pairs: {succeeded} succeeded, {} failed, {discovered_total} pools discovered; {failure_summary}",
+        failed.len()
     );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
@@ -753,6 +825,7 @@ async fn render_registry_response(
             </label>
             <button type="submit">Discover Pools</button>
           </form>
+          {rediscover_all_form}
         </section>
         <section class="card">
           <h2>Token Pairs</h2>
@@ -766,6 +839,7 @@ async fn render_registry_response(
         render_token_pairs_table(&token_pairs),
         render_registry_pools_table(&registry_pools),
         password_input = password_input(None, true),
+        rediscover_all_form = render_rediscover_all_form(),
     );
 
     Ok(Html(render_page(
@@ -794,6 +868,29 @@ async fn fetch_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
         FROM token_pairs
         ORDER BY created_at DESC
         LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_enabled_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
+    Ok(sqlx::query_as::<_, TokenPairRow>(
+        r#"
+        SELECT
+            created_at,
+            chain_id,
+            symbol,
+            token0,
+            token1,
+            enabled,
+            token0_search_amounts,
+            token1_search_amounts,
+            token0_min_profit,
+            token1_min_profit
+        FROM token_pairs
+        WHERE enabled = TRUE
+        ORDER BY created_at DESC
         "#,
     )
     .fetch_all(pool)
@@ -1632,6 +1729,18 @@ fn render_rediscover_form(row: &TokenPairRow) -> String {
         password_input = password_input(Some("password"), false),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
+    )
+}
+
+fn render_rediscover_all_form() -> String {
+    format!(
+        r#"<form method="post" action="/pairs/rediscover-all" onsubmit="return confirm('Rediscover all enabled token pairs? This will call pool factories and update registry rows.');">
+  <label>Password
+    {password_input}
+  </label>
+  <button type="submit">Rediscover All Enabled Pairs</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
     )
 }
 
