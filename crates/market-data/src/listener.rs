@@ -3,7 +3,8 @@ use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    DexKind, PoolId, PoolState, PoolStateValidation, PoolStateWarning, PoolVariant, TickState,
+    DexKind, PoolId, PoolRegistryEntry, PoolState, PoolStateValidation, PoolStateWarning,
+    PoolVariant, TickState,
 };
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -37,6 +38,9 @@ where
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+        let active_refresh_interval =
+            Duration::from_secs(self.settings.pool_active_refresh_interval_secs.max(10));
+        let mut next_active_refresh = Instant::now() + active_refresh_interval;
         let tick_refresh_interval =
             Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
         let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
@@ -55,11 +59,15 @@ where
                     monitored_states = self.reload_if_changed(monitored_states).await?;
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
                 }
-                if Instant::now() >= next_calibration {
+                if Instant::now() >= next_active_refresh {
+                    monitored_states = self.active_refresh_states(monitored_states).await?;
+                    next_active_refresh = Instant::now() + active_refresh_interval;
+                    next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+                    next_tick_refresh = Instant::now() + tick_refresh_interval;
+                } else if Instant::now() >= next_calibration {
                     monitored_states = self.calibrate_states(monitored_states).await?;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-                }
-                if Instant::now() >= next_tick_refresh {
+                } else if Instant::now() >= next_tick_refresh {
                     self.publish_initialized_ticks(&monitored_states).await?;
                     next_tick_refresh = Instant::now() + tick_refresh_interval;
                 }
@@ -148,12 +156,15 @@ where
             self.validate_due_snapshots(&mut pending_validations, latest_block)
                 .await?;
 
-            if Instant::now() >= next_calibration {
+            if Instant::now() >= next_active_refresh {
+                monitored_states = self.active_refresh_states(monitored_states).await?;
+                next_active_refresh = Instant::now() + active_refresh_interval;
+                next_calibration = Instant::now() + CALIBRATION_INTERVAL;
+                next_tick_refresh = Instant::now() + tick_refresh_interval;
+            } else if Instant::now() >= next_calibration {
                 monitored_states = self.calibrate_states(monitored_states).await?;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-            }
-
-            if Instant::now() >= next_tick_refresh {
+            } else if Instant::now() >= next_tick_refresh {
                 self.publish_initialized_ticks(&monitored_states).await?;
                 next_tick_refresh = Instant::now() + tick_refresh_interval;
             }
@@ -246,6 +257,112 @@ where
             );
         }
         Ok(())
+    }
+
+    async fn active_refresh_states(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
+        if states.is_empty() {
+            return Ok(states);
+        }
+
+        let block_number = self.provider.get_block_number().await?;
+        let block_hash = self.provider.get_block_hash(block_number).await?;
+        let mut refreshed_pools = HashSet::new();
+        let mut refreshed_v3_states = Vec::new();
+        let mut drifted = 0usize;
+        let mut failed = 0usize;
+
+        for state in &mut states {
+            let local = state.clone();
+            let entry = registry_entry_from_state(&local);
+            let onchain = self
+                .provider
+                .fetch_pool_state_from_registry_at_block_hash(&entry, &block_hash, block_number)
+                .await;
+            let onchain = match onchain {
+                Ok(onchain) => onchain,
+                Err(err) => {
+                    failed += 1;
+                    warn!(
+                        pool = %local.pool_id.address,
+                        dex = ?local.dex,
+                        variant = ?local.variant,
+                        block_number,
+                        error = %err,
+                        "active pool state refresh failed"
+                    );
+                    continue;
+                }
+            };
+
+            let drift_bps = state_drift_bps(&local, &onchain);
+            let passed = drift_bps == 0;
+            let message = if passed {
+                "active refresh validation passed".to_string()
+            } else {
+                format!("active refresh found latest onchain drift by {drift_bps} bps")
+            };
+
+            self.recorder
+                .record_pool_state_validation(PoolStateValidation {
+                    pool_address: local.pool_id.address,
+                    dex: local.dex,
+                    variant: local.variant,
+                    block_number,
+                    block_hash: block_hash.clone(),
+                    local_state: local.clone(),
+                    onchain_state: onchain.clone(),
+                    drift_bps,
+                    passed,
+                    message: message.clone(),
+                    created_at: chrono::Utc::now(),
+                })
+                .await?;
+
+            if !passed {
+                drifted += 1;
+                warn!(
+                    pool = %local.pool_id.address,
+                    dex = ?local.dex,
+                    variant = ?local.variant,
+                    local_block = local.block_number,
+                    onchain_block = onchain.block_number,
+                    drift_bps,
+                    "active pool state refresh corrected drift"
+                );
+                self.recorder
+                    .record_pool_state_warning(PoolStateWarning {
+                        pool_address: local.pool_id.address,
+                        dex: local.dex,
+                        variant: local.variant,
+                        block_number,
+                        local_state: local,
+                        onchain_state: onchain.clone(),
+                        drift_bps,
+                        message,
+                        created_at: chrono::Utc::now(),
+                    })
+                    .await?;
+            }
+
+            refreshed_pools.insert(onchain.pool_id.address);
+            if is_v3_style_state(&onchain) {
+                refreshed_v3_states.push(onchain.clone());
+            }
+            *state = onchain;
+        }
+
+        if !refreshed_pools.is_empty() {
+            self.publish_selected_states(&states, &refreshed_pools, "active_refresh")
+                .await?;
+            self.publish_initialized_ticks(&refreshed_v3_states).await?;
+        }
+
+        info!(
+            refreshed = refreshed_pools.len(),
+            failed, drifted, block_number, "active pool state refresh complete"
+        );
+
+        Ok(states)
     }
 
     async fn refresh_v3_state_at_block(
@@ -613,6 +730,20 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
         .iter()
         .map(|state| format!("{:#x}", state.pool_id.address))
         .collect()
+}
+
+fn registry_entry_from_state(state: &PoolState) -> PoolRegistryEntry {
+    PoolRegistryEntry {
+        pool_address: state.pool_id.address,
+        dex: state.dex,
+        variant: state.variant,
+        token0: state.token0,
+        token1: state.token1,
+        fee_bps: state.fee_bps,
+        tick_spacing: state.tick_spacing,
+        stable: None,
+        enabled: true,
+    }
 }
 
 fn should_calibrate(state: &PoolState) -> bool {

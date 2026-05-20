@@ -232,6 +232,7 @@ mod tests {
             sqrt_price_x96: None,
             liquidity: None,
             tick: None,
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         };
@@ -274,6 +275,7 @@ mod tests {
             sqrt_price_x96: Some(U256::from(1u64)),
             liquidity: Some(U256::from(2u64)),
             tick: Some(3),
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         };
@@ -324,6 +326,7 @@ mod tests {
             sqrt_price_x96: None,
             liquidity: None,
             tick: None,
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         };
@@ -478,6 +481,7 @@ mod tests {
             sqrt_price_x96: Some(U256::from(1u64)),
             liquidity,
             tick,
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         }

@@ -8,7 +8,9 @@ license.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 base-arb-common = { path = "../common" }
+base-arb-chain = { path = "../chain" }
 chrono.workspace = true
+hex = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

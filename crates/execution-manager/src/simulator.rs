@@ -432,6 +432,7 @@ mod tests {
             candidate_ttl_ms: 500,
             max_pool_state_age_ms: 300_000,
             max_price_impact_bps: 50,
+            pool_active_refresh_interval_secs: 60,
             v3_tick_refresh_interval_secs: 60,
             v3_tick_bitmap_word_radius: 8,
             v3_quote_safety_bps: 2,
