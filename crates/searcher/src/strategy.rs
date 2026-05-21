@@ -633,7 +633,12 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
         return false;
     }
     match state.variant {
-        PoolVariant::AerodromeVolatile => state.reserve0.is_some() && state.reserve1.is_some(),
+        PoolVariant::AerodromeVolatile => {
+            if state.stable.unwrap_or(false) {
+                return false;
+            }
+            state.reserve0.is_some() && state.reserve1.is_some()
+        }
         PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
             match (state.sqrt_price_x96, state.liquidity, state.tick) {
                 (Some(sqrt_price_x96), Some(liquidity), Some(_)) => {
@@ -680,10 +685,10 @@ fn short_token(token: Address) -> String {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, U256};
-    use base_arb_common::types::{PoolId, TickState};
+    use base_arb_common::types::{PoolId, TickState, TokenPairSearchConfig};
     use chrono::Utc;
 
-    use super::{demo_pool_states, SearchEngine};
+    use super::{demo_pool_states, is_supported_config_pool, SearchEngine};
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
@@ -723,5 +728,33 @@ mod tests {
 
         assert!(!candidates.is_empty());
         assert!(candidates.iter().all(|c| !c.path.steps.is_empty()));
+    }
+
+    #[test]
+    fn supported_pool_filter_skips_aerodrome_classic_stable_pools() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let weth = address!("4200000000000000000000000000000000000006");
+        let mut pool_states =
+            demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
+        let classic = pool_states
+            .iter()
+            .position(|state| state.dex == base_arb_common::types::DexKind::Aerodrome)
+            .unwrap();
+        let config = TokenPairSearchConfig {
+            chain_id: 8453,
+            token0: usdc,
+            token1: weth,
+            symbol: "USDC/WETH".into(),
+            token0_search_amounts: vec![U256::from(1u64)],
+            token1_search_amounts: Vec::new(),
+            token0_min_profit: U256::from(1u64),
+            token1_min_profit: U256::ZERO,
+        };
+
+        pool_states[classic].stable = Some(false);
+        assert!(is_supported_config_pool(&pool_states[classic], &config));
+
+        pool_states[classic].stable = Some(true);
+        assert!(!is_supported_config_pool(&pool_states[classic], &config));
     }
 }
