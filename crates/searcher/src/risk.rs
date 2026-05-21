@@ -67,6 +67,8 @@ mod tests {
             factory_address: None,
             token0: pool,
             token1: address!("4200000000000000000000000000000000000001"),
+            token0_decimals: None,
+            token1_decimals: None,
             fee_bps: 30,
             stable: Some(false),
             reserve0: Some(U256::from(1_000u64)),

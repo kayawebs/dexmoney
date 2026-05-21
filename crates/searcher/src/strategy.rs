@@ -6,7 +6,7 @@ use base_arb_common::types::{
     ArbPath, Candidate, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult, SwapStep,
     TickState, TokenPairSearchConfig,
 };
-use base_arb_dex::aerodrome::AerodromeVolatileQuoter;
+use base_arb_dex::aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter};
 use base_arb_dex::quoter::DexQuoter;
 use base_arb_dex::uniswap_v3::{
     quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
@@ -349,6 +349,8 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             factory_address: None,
             token0: usdc,
             token1: weth,
+            token0_decimals: Some(6),
+            token1_decimals: Some(18),
             fee_bps: 30,
             stable: Some(false),
             reserve0: Some(U256::from(200_000_000_000u64)),
@@ -370,6 +372,8 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             factory_address: None,
             token0: weth,
             token1: usdc,
+            token0_decimals: Some(18),
+            token1_decimals: Some(6),
             fee_bps: 30,
             stable: None,
             reserve0: None,
@@ -391,7 +395,8 @@ async fn quote_path(
     amount_in: U256,
     v3_quote_safety_bps: u64,
 ) -> anyhow::Result<Option<(U256, u64, QuoteDiagnostics)>> {
-    let aero = AerodromeVolatileQuoter;
+    let aero_stable = AerodromeStableQuoter;
+    let aero_volatile = AerodromeVolatileQuoter;
     let uni = UniswapV3CurrentTickQuoter;
     let mut amount = amount_in;
     let mut max_impact = 0u64;
@@ -413,14 +418,27 @@ async fn quote_path(
         };
 
         let mut quote = match pool_state.variant {
-            PoolVariant::AerodromeVolatile => aero
-                .quote_exact_in(pool_state, step.token_in, amount)
-                .await
-                .map(|quote| {
-                    diagnostics.modes.push("classic_reserve".into());
-                    quote
-                })
-                .map_err(anyhow::Error::from)?,
+            PoolVariant::AerodromeVolatile => {
+                if pool_state.stable.unwrap_or(false) {
+                    aero_stable
+                        .quote_exact_in(pool_state, step.token_in, amount)
+                        .await
+                        .map(|quote| {
+                            diagnostics.modes.push("classic_stable".into());
+                            quote
+                        })
+                        .map_err(anyhow::Error::from)?
+                } else {
+                    aero_volatile
+                        .quote_exact_in(pool_state, step.token_in, amount)
+                        .await
+                        .map(|quote| {
+                            diagnostics.modes.push("classic_volatile".into());
+                            quote
+                        })
+                        .map_err(anyhow::Error::from)?
+                }
+            }
             PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
                 let pool_ticks = tick_states
                     .iter()
@@ -634,7 +652,9 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => {
-            if state.stable.unwrap_or(false) {
+            if state.stable.unwrap_or(false)
+                && (state.token0_decimals.is_none() || state.token1_decimals.is_none())
+            {
                 return false;
             }
             state.reserve0.is_some() && state.reserve1.is_some()
@@ -731,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_pool_filter_skips_aerodrome_classic_stable_pools() {
+    fn supported_pool_filter_requires_decimals_for_aerodrome_classic_stable_pools() {
         let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
         let weth = address!("4200000000000000000000000000000000000006");
         let mut pool_states =
@@ -755,6 +775,11 @@ mod tests {
         assert!(is_supported_config_pool(&pool_states[classic], &config));
 
         pool_states[classic].stable = Some(true);
+        pool_states[classic].token0_decimals = None;
         assert!(!is_supported_config_pool(&pool_states[classic], &config));
+
+        pool_states[classic].token0_decimals = Some(6);
+        pool_states[classic].token1_decimals = Some(18);
+        assert!(is_supported_config_pool(&pool_states[classic], &config));
     }
 }

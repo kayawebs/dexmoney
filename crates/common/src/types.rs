@@ -40,6 +40,10 @@ pub struct PoolState {
     pub factory_address: Option<Address>,
     pub token0: Address,
     pub token1: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token0_decimals: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token1_decimals: Option<u8>,
     pub fee_bps: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,

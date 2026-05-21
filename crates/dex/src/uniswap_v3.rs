@@ -489,6 +489,8 @@ mod tests {
             factory_address: None,
             token0,
             token1,
+            token0_decimals: None,
+            token1_decimals: None,
             fee_bps: 30,
             stable: None,
             reserve0: None,
@@ -496,6 +498,7 @@ mod tests {
             sqrt_price_x96: Some(U256::from(1u64) << 96),
             liquidity: Some(U256::from(1_000_000_000_000u64)),
             tick: Some(0),
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         };
@@ -530,6 +533,8 @@ mod tests {
             factory_address: None,
             token0,
             token1,
+            token0_decimals: None,
+            token1_decimals: None,
             fee_bps: 30,
             stable: None,
             reserve0: None,
@@ -537,6 +542,7 @@ mod tests {
             sqrt_price_x96: Some(U256::from(1u64) << 96),
             liquidity: Some(U256::from(1_000_000_000_000u64)),
             tick: Some(0),
+            tick_spacing: None,
             block_number: 1,
             updated_at: Utc::now(),
         };

@@ -85,6 +85,8 @@ impl ChainProvider {
                     factory_address: settings.uniswap_v3_factory,
                     token0,
                     token1,
+                    token0_decimals: self.fetch_token_decimals(token0).await.ok(),
+                    token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps,
                     stable: None,
                     reserve0: None,
@@ -161,6 +163,8 @@ impl ChainProvider {
                     factory_address: entry.factory_address,
                     token0,
                     token1,
+                    token0_decimals: self.fetch_token_decimals(token0).await.ok(),
+                    token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps: entry.fee_bps,
                     stable: entry.stable,
                     reserve0: None,
@@ -226,6 +230,8 @@ impl ChainProvider {
                     factory_address: entry.factory_address,
                     token0,
                     token1,
+                    token0_decimals: self.fetch_token_decimals(token0).await.ok(),
+                    token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps: entry.fee_bps,
                     stable: entry.stable,
                     reserve0: None,
@@ -565,6 +571,8 @@ impl ChainProvider {
                             factory_address: Some(factory),
                             token0,
                             token1,
+                            token0_decimals: self.fetch_token_decimals(token0).await.ok(),
+                            token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                             fee_bps: fee / 100,
                             stable: None,
                             reserve0: None,
@@ -646,6 +654,8 @@ impl ChainProvider {
                             factory_address: Some(factory),
                             token0,
                             token1,
+                            token0_decimals: self.fetch_token_decimals(token0).await.ok(),
+                            token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                             fee_bps: fee / 100,
                             stable: None,
                             reserve0: None,
@@ -770,6 +780,8 @@ impl ChainProvider {
         let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
             format!("failed to read token0/token1 for Aerodrome pool {pool:#x}")
         })?;
+        let token0_decimals = self.fetch_token_decimals(token0).await.ok();
+        let token1_decimals = self.fetch_token_decimals(token1).await.ok();
 
         match self
             .fetch_aerodrome_reserves_at_block(pool, Some(block_number))
@@ -785,6 +797,8 @@ impl ChainProvider {
                 factory_address: None,
                 token0,
                 token1,
+                token0_decimals,
+                token1_decimals,
                 fee_bps: 30,
                 stable: None,
                 reserve0: Some(reserve0),
@@ -816,6 +830,8 @@ impl ChainProvider {
                     factory_address: None,
                     token0,
                     token1,
+                    token0_decimals,
+                    token1_decimals,
                     fee_bps: 30,
                     stable: None,
                     reserve0: None,
@@ -840,6 +856,8 @@ impl ChainProvider {
         let (token0, token1) = self.fetch_pool_tokens(pool).await.with_context(|| {
             format!("failed to read token0/token1 for Aerodrome pool {pool:#x}")
         })?;
+        let token0_decimals = self.fetch_token_decimals(token0).await.ok();
+        let token1_decimals = self.fetch_token_decimals(token1).await.ok();
 
         match self
             .fetch_aerodrome_reserves_at_block_hash(pool, block_hash)
@@ -855,6 +873,8 @@ impl ChainProvider {
                 factory_address: None,
                 token0,
                 token1,
+                token0_decimals,
+                token1_decimals,
                 fee_bps: 30,
                 stable: None,
                 reserve0: Some(reserve0),
@@ -886,6 +906,8 @@ impl ChainProvider {
                     factory_address: None,
                     token0,
                     token1,
+                    token0_decimals,
+                    token1_decimals,
                     fee_bps: 30,
                     stable: None,
                     reserve0: None,
@@ -939,6 +961,16 @@ impl ChainProvider {
             parse_word_address(&token0_words[0])?,
             parse_word_address(&token1_words[0])?,
         ))
+    }
+
+    async fn fetch_token_decimals(&self, token: Address) -> Result<u8> {
+        let raw = self.eth_call(token, "0x313ce567", "decimals()").await?;
+        let words = decode_32byte_words(&raw)?;
+        let decimals = parse_word_u256(&words[0])?;
+        let decimals_u64 = u64::try_from(decimals)
+            .map_err(|_| anyhow::anyhow!("token decimals too large for {token:#x}: {decimals}"))?;
+        u8::try_from(decimals_u64)
+            .map_err(|_| anyhow::anyhow!("token decimals too large for {token:#x}: {decimals_u64}"))
     }
 
     async fn fetch_aerodrome_reserves_at_block(
