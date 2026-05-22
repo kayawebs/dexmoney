@@ -457,6 +457,7 @@ dependencies = [
  "anyhow",
  "base-arb-chain",
  "base-arb-common",
+ "base-arb-dex",
  "chrono",
  "hex",
  "serde",

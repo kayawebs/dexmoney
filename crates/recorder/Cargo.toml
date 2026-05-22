@@ -9,6 +9,7 @@ alloy-primitives.workspace = true
 anyhow.workspace = true
 base-arb-common = { path = "../common" }
 base-arb-chain = { path = "../chain" }
+base-arb-dex = { path = "../dex" }
 chrono.workspace = true
 hex = "0.4"
 serde.workspace = true

@@ -8,6 +8,10 @@ use base_arb_common::{
     constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER},
     types::{ArbPath, DexKind, PoolRegistryEntry, PoolVariant, SwapStep},
 };
+use base_arb_dex::{
+    aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter},
+    quoter::DexQuoter,
+};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use tracing_subscriber::EnvFilter;
@@ -86,12 +90,72 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
+    validate_step_quotes(&path, amount_in, &provider, &block_hash, block_number).await?;
 
     if !cli.skip_executor_call {
         validate_executor_call(&path, token_in, amount_in, min_profit, &settings, &provider)
             .await?;
     }
 
+    Ok(())
+}
+
+async fn validate_step_quotes(
+    path: &ArbPath,
+    amount_in: U256,
+    provider: &ChainProvider,
+    block_hash: &str,
+    block_number: u64,
+) -> Result<()> {
+    println!("\n== Step Quote Check ==");
+    let mut amount = amount_in;
+    for (idx, step) in path.steps.iter().enumerate() {
+        let step_no = idx + 1;
+        if !matches!(
+            (step.dex, step.variant),
+            (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
+        ) {
+            println!(
+                "step {step_no}: skipped local/onchain direct quote for {:?} {:?}",
+                step.dex, step.variant
+            );
+            continue;
+        }
+
+        let entry = PoolRegistryEntry {
+            pool_address: step.pool,
+            dex: step.dex,
+            variant: step.variant.unwrap_or(default_variant(step.dex)),
+            factory_address: step.factory_address,
+            token0: step.token_in,
+            token1: step.token_out,
+            fee_bps: step.fee_bps.unwrap_or_default(),
+            tick_spacing: step.tick_spacing,
+            stable: Some(classic_stable_flag(step)),
+            enabled: true,
+        };
+        let state = provider
+            .fetch_pool_state_from_registry_at_block_hash(&entry, block_hash, block_number)
+            .await
+            .with_context(|| format!("failed to fetch state for step {step_no} quote check"))?;
+        let local = if classic_stable_flag(step) {
+            AerodromeStableQuoter
+                .quote_exact_in(&state, step.token_in, amount)
+                .await?
+                .amount_out
+        } else {
+            AerodromeVolatileQuoter
+                .quote_exact_in(&state, step.token_in, amount)
+                .await?
+                .amount_out
+        };
+        let onchain = pool_get_amount_out(provider, step.pool, amount, step.token_in).await?;
+        println!(
+            "step {step_no}: amount_in={amount} local_quote={local} pool_getAmountOut={onchain} diff_bps={}",
+            diff_bps(local, onchain)
+        );
+        amount = onchain;
+    }
     Ok(())
 }
 
@@ -307,6 +371,29 @@ async fn validate_classic_router_quote(
         }
     }
     Ok(())
+}
+
+async fn pool_get_amount_out(
+    provider: &ChainProvider,
+    pool: Address,
+    amount_in: U256,
+    token_in: Address,
+) -> Result<U256> {
+    let data = encode_pool_get_amount_out(amount_in, token_in);
+    let data_hex = format!("0x{}", hex::encode(data));
+    let raw = provider
+        .eth_call_from(None, pool, &data_hex, "Aerodrome pool getAmountOut")
+        .await?;
+    decode_single_uint(&raw).context("failed to decode pool getAmountOut")
+}
+
+fn diff_bps(a: U256, b: U256) -> U256 {
+    let denominator = a.max(b);
+    if denominator.is_zero() {
+        return U256::ZERO;
+    }
+    let diff = if a > b { a - b } else { b - a };
+    diff.saturating_mul(U256::from(10_000u64)) / denominator
 }
 
 async fn validate_executor_call(
@@ -577,6 +664,13 @@ fn encode_get_amounts_out(
     out
 }
 
+fn encode_pool_get_amount_out(amount_in: U256, token_in: Address) -> Vec<u8> {
+    let mut out = keccak256(b"getAmountOut(uint256,address)")[..4].to_vec();
+    out.extend(encode_u256(amount_in));
+    out.extend(encode_address(token_in));
+    out
+}
+
 fn encode_address(address: Address) -> Vec<u8> {
     let mut out = vec![0u8; 12];
     out.extend_from_slice(address.as_slice());
@@ -619,6 +713,10 @@ fn decode_uint_array(raw: &str) -> Vec<U256> {
     }
     let len = words[1].to::<usize>();
     words.into_iter().skip(2).take(len).collect()
+}
+
+fn decode_single_uint(raw: &str) -> Option<U256> {
+    decode_words(raw).into_iter().next()
 }
 
 fn decode_words(raw: &str) -> Vec<U256> {
