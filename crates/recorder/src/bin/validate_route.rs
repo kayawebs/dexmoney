@@ -90,7 +90,17 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
-    validate_step_quotes(&path, amount_in, &provider, &block_hash, block_number).await?;
+    let expected_profit =
+        parse_u256_decimal(&row.expected_profit).context("invalid opportunity expected_profit")?;
+    validate_step_quotes(
+        &path,
+        amount_in,
+        expected_profit,
+        &provider,
+        &block_hash,
+        block_number,
+    )
+    .await?;
 
     if !cli.skip_executor_call {
         validate_executor_call(&path, token_in, amount_in, min_profit, &settings, &provider)
@@ -103,12 +113,14 @@ async fn main() -> Result<()> {
 async fn validate_step_quotes(
     path: &ArbPath,
     amount_in: U256,
+    opportunity_expected_profit: U256,
     provider: &ChainProvider,
     block_hash: &str,
     block_number: u64,
 ) -> Result<()> {
     println!("\n== Step Quote Check ==");
     let mut amount = amount_in;
+    let mut local_amount = amount_in;
     for (idx, step) in path.steps.iter().enumerate() {
         let step_no = idx + 1;
         if !matches!(
@@ -140,22 +152,29 @@ async fn validate_step_quotes(
             .with_context(|| format!("failed to fetch state for step {step_no} quote check"))?;
         let local = if classic_stable_flag(step) {
             AerodromeStableQuoter
-                .quote_exact_in(&state, step.token_in, amount)
+                .quote_exact_in(&state, step.token_in, local_amount)
                 .await?
                 .amount_out
         } else {
             AerodromeVolatileQuoter
-                .quote_exact_in(&state, step.token_in, amount)
+                .quote_exact_in(&state, step.token_in, local_amount)
                 .await?
                 .amount_out
         };
         let onchain = pool_get_amount_out(provider, step.pool, amount, step.token_in).await?;
         println!(
-            "step {step_no}: amount_in={amount} local_quote={local} pool_getAmountOut={onchain} diff_bps={}",
+            "step {step_no}: amount_in={amount} local_amount_in={local_amount} local_quote={local} pool_getAmountOut={onchain} diff_bps={}",
             diff_bps(local, onchain)
         );
         amount = onchain;
+        local_amount = local;
     }
+    println!(
+        "final: opportunity_expected_profit={} latest_local_profit={} latest_pool_getAmountOut_profit={}",
+        opportunity_expected_profit,
+        local_amount.saturating_sub(amount_in),
+        amount.saturating_sub(amount_in)
+    );
     Ok(())
 }
 
