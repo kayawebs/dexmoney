@@ -128,10 +128,13 @@ impl ChainProvider {
                 let mut state = self
                     .fetch_aerodrome_pool_state_at_block(entry.pool_address, block_number)
                     .await?;
-                state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
+                state.fee_bps = self
+                    .fetch_aerodrome_classic_fee_bps_for_entry(entry)
+                    .await
+                    .unwrap_or(entry.fee_bps);
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -195,10 +198,13 @@ impl ChainProvider {
                         block_number,
                     )
                     .await?;
-                state.fee_bps = entry.fee_bps;
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
+                state.fee_bps = self
+                    .fetch_aerodrome_classic_fee_bps_for_entry(entry)
+                    .await
+                    .unwrap_or(entry.fee_bps);
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -430,6 +436,10 @@ impl ChainProvider {
                     };
                     state.factory_address = Some(factory);
                     state.stable = Some(stable);
+                    state.fee_bps = self
+                        .fetch_aerodrome_classic_fee_bps(factory, pool, stable)
+                        .await
+                        .unwrap_or(state.fee_bps);
                     out.push(DiscoveredPool {
                         state,
                         factory_address: Some(factory),
@@ -971,6 +981,36 @@ impl ChainProvider {
             .map_err(|_| anyhow::anyhow!("token decimals too large for {token:#x}: {decimals}"))?;
         u8::try_from(decimals_u64)
             .map_err(|_| anyhow::anyhow!("token decimals too large for {token:#x}: {decimals_u64}"))
+    }
+
+    async fn fetch_aerodrome_classic_fee_bps_for_entry(
+        &self,
+        entry: &PoolRegistryEntry,
+    ) -> Result<u32> {
+        let factory = entry
+            .factory_address
+            .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
+        self.fetch_aerodrome_classic_fee_bps(
+            factory,
+            entry.pool_address,
+            entry.stable.unwrap_or(false),
+        )
+        .await
+    }
+
+    async fn fetch_aerodrome_classic_fee_bps(
+        &self,
+        factory: Address,
+        pool: Address,
+        stable: bool,
+    ) -> Result<u32> {
+        let data = encode_get_fee(pool, stable);
+        let raw = self
+            .eth_call(factory, &data, "Aerodrome factory getFee(address,bool)")
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
     }
 
     async fn fetch_aerodrome_reserves_at_block(
@@ -1635,6 +1675,14 @@ fn encode_get_pool_bool(token_a: Address, token_b: Address, stable: bool) -> Str
         "0x79bc57d5{}{}{}",
         encode_address_word(token_a),
         encode_address_word(token_b),
+        encode_bool_word(stable),
+    )
+}
+
+fn encode_get_fee(pool: Address, stable: bool) -> String {
+    format!(
+        "0xcc56b2c5{}{}",
+        encode_address_word(pool),
         encode_bool_word(stable),
     )
 }
