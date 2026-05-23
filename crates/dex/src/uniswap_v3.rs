@@ -40,7 +40,7 @@ impl DexQuoter for UniswapV3CurrentTickQuoter {
             return Err(ArbBotError::Quote("empty V3 state".into()));
         }
 
-        let amount_in_less_fee = apply_fee(amount_in, pool_state.fee_bps)?;
+        let amount_in_less_fee = apply_v3_fee(amount_in, pool_state)?;
         let amount_out = if token_in == pool_state.token0 {
             quote_token0_for_token1(amount_in_less_fee, sqrt_price_x96, liquidity)?
         } else {
@@ -119,7 +119,7 @@ pub fn quote_exact_in_with_ticks_diagnostics(
     let current_tick = pool_state
         .tick
         .ok_or_else(|| ArbBotError::Quote("missing tick".into()))?;
-    let amount_remaining = apply_fee(amount_in, pool_state.fee_bps)?;
+    let amount_remaining = apply_v3_fee(amount_in, pool_state)?;
     let (amount_out, diagnostics) = if token_in == pool_state.token0 {
         simulate_zero_for_one(
             amount_remaining,
@@ -248,10 +248,13 @@ fn simulate_one_for_zero(
     Ok((amount_out, diagnostics))
 }
 
-fn apply_fee(amount_in: U256, fee_bps: u32) -> Result<U256> {
-    let fee_denominator = U256::from(10_000u64);
+fn apply_v3_fee(amount_in: U256, pool_state: &PoolState) -> Result<U256> {
+    let fee_pips = pool_state
+        .fee_pips
+        .unwrap_or_else(|| pool_state.fee_bps.saturating_mul(100));
+    let fee_denominator = U256::from(1_000_000u64);
     let fee_numerator = fee_denominator
-        .checked_sub(U256::from(fee_bps))
+        .checked_sub(U256::from(fee_pips))
         .ok_or_else(|| ArbBotError::Quote("invalid fee".into()))?;
     amount_in
         .checked_mul(fee_numerator)
@@ -492,6 +495,7 @@ mod tests {
             token0_decimals: None,
             token1_decimals: None,
             fee_bps: 30,
+            fee_pips: Some(3_000),
             stable: None,
             reserve0: None,
             reserve1: None,
@@ -536,6 +540,7 @@ mod tests {
             token0_decimals: None,
             token1_decimals: None,
             fee_bps: 30,
+            fee_pips: Some(3_000),
             stable: None,
             reserve0: None,
             reserve1: None,

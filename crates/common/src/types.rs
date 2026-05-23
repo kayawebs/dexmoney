@@ -46,6 +46,8 @@ pub struct PoolState {
     pub token1_decimals: Option<u8>,
     pub fee_bps: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_pips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
     pub reserve0: Option<U256>,
     pub reserve1: Option<U256>,

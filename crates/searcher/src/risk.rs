@@ -70,6 +70,7 @@ mod tests {
             token0_decimals: None,
             token1_decimals: None,
             fee_bps: 30,
+            fee_pips: None,
             stable: Some(false),
             reserve0: Some(U256::from(1_000u64)),
             reserve1: Some(U256::from(2_000u64)),

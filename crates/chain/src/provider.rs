@@ -88,6 +88,7 @@ impl ChainProvider {
                     token0_decimals: self.fetch_token_decimals(token0).await.ok(),
                     token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps,
+                    fee_pips: Some(fee_bps.saturating_mul(100)),
                     stable: None,
                     reserve0: None,
                     reserve1: None,
@@ -131,10 +132,20 @@ impl ChainProvider {
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
-                state.fee_bps = self
-                    .fetch_aerodrome_classic_fee_bps_for_entry(entry)
-                    .await
-                    .unwrap_or(entry.fee_bps);
+                if entry.variant == PoolVariant::AerodromeSlipstream {
+                    state.fee_pips = self
+                        .fetch_aerodrome_slipstream_fee_pips_for_entry(entry)
+                        .await
+                        .ok();
+                    if let Some(fee_pips) = state.fee_pips {
+                        state.fee_bps = fee_pips / 100;
+                    }
+                } else {
+                    state.fee_bps = self
+                        .fetch_aerodrome_classic_fee_bps_for_entry(entry)
+                        .await
+                        .unwrap_or(entry.fee_bps);
+                }
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -169,6 +180,7 @@ impl ChainProvider {
                     token0_decimals: self.fetch_token_decimals(token0).await.ok(),
                     token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps: entry.fee_bps,
+                    fee_pips: Some(entry.fee_bps.saturating_mul(100)),
                     stable: entry.stable,
                     reserve0: None,
                     reserve1: None,
@@ -201,10 +213,20 @@ impl ChainProvider {
                 state.tick_spacing = entry.tick_spacing;
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
-                state.fee_bps = self
-                    .fetch_aerodrome_classic_fee_bps_for_entry(entry)
-                    .await
-                    .unwrap_or(entry.fee_bps);
+                if entry.variant == PoolVariant::AerodromeSlipstream {
+                    state.fee_pips = self
+                        .fetch_aerodrome_slipstream_fee_pips_for_entry(entry)
+                        .await
+                        .ok();
+                    if let Some(fee_pips) = state.fee_pips {
+                        state.fee_bps = fee_pips / 100;
+                    }
+                } else {
+                    state.fee_bps = self
+                        .fetch_aerodrome_classic_fee_bps_for_entry(entry)
+                        .await
+                        .unwrap_or(entry.fee_bps);
+                }
                 Ok(state)
             }
             DexKind::UniswapV3 | DexKind::PancakeSwap => {
@@ -239,6 +261,7 @@ impl ChainProvider {
                     token0_decimals: self.fetch_token_decimals(token0).await.ok(),
                     token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                     fee_bps: entry.fee_bps,
+                    fee_pips: Some(entry.fee_bps.saturating_mul(100)),
                     stable: entry.stable,
                     reserve0: None,
                     reserve1: None,
@@ -508,6 +531,13 @@ impl ChainProvider {
                         state.tick_spacing = Some(tick_spacing);
                         state.factory_address = Some(factory);
                         state.stable = None;
+                        state.fee_pips = self
+                            .fetch_aerodrome_slipstream_fee_pips(factory, pool)
+                            .await
+                            .ok();
+                        if let Some(fee_pips) = state.fee_pips {
+                            state.fee_bps = fee_pips / 100;
+                        }
                         out.push(DiscoveredPool {
                             state,
                             factory_address: Some(factory),
@@ -584,6 +614,7 @@ impl ChainProvider {
                             token0_decimals: self.fetch_token_decimals(token0).await.ok(),
                             token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                             fee_bps: fee / 100,
+                            fee_pips: Some(fee),
                             stable: None,
                             reserve0: None,
                             reserve1: None,
@@ -667,6 +698,7 @@ impl ChainProvider {
                             token0_decimals: self.fetch_token_decimals(token0).await.ok(),
                             token1_decimals: self.fetch_token_decimals(token1).await.ok(),
                             fee_bps: fee / 100,
+                            fee_pips: Some(fee),
                             stable: None,
                             reserve0: None,
                             reserve1: None,
@@ -810,6 +842,7 @@ impl ChainProvider {
                 token0_decimals,
                 token1_decimals,
                 fee_bps: 30,
+                fee_pips: None,
                 stable: None,
                 reserve0: Some(reserve0),
                 reserve1: Some(reserve1),
@@ -843,6 +876,7 @@ impl ChainProvider {
                     token0_decimals,
                     token1_decimals,
                     fee_bps: 30,
+                    fee_pips: None,
                     stable: None,
                     reserve0: None,
                     reserve1: None,
@@ -886,6 +920,7 @@ impl ChainProvider {
                 token0_decimals,
                 token1_decimals,
                 fee_bps: 30,
+                fee_pips: None,
                 stable: None,
                 reserve0: Some(reserve0),
                 reserve1: Some(reserve1),
@@ -919,6 +954,7 @@ impl ChainProvider {
                     token0_decimals,
                     token1_decimals,
                     fee_bps: 30,
+                    fee_pips: None,
                     stable: None,
                     reserve0: None,
                     reserve1: None,
@@ -1011,6 +1047,31 @@ impl ChainProvider {
         let words = decode_32byte_words(&raw)?;
         let fee = parse_word_u256(&words[0])?;
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
+    }
+
+    async fn fetch_aerodrome_slipstream_fee_pips_for_entry(
+        &self,
+        entry: &PoolRegistryEntry,
+    ) -> Result<u32> {
+        let factory = entry
+            .factory_address
+            .unwrap_or(AERODROME_SLIPSTREAM_FACTORIES[0].parse()?);
+        self.fetch_aerodrome_slipstream_fee_pips(factory, entry.pool_address)
+            .await
+    }
+
+    async fn fetch_aerodrome_slipstream_fee_pips(
+        &self,
+        factory: Address,
+        pool: Address,
+    ) -> Result<u32> {
+        let data = encode_get_swap_fee(pool);
+        let raw = self
+            .eth_call(factory, &data, "Aerodrome Slipstream getSwapFee(address)")
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome Slipstream fee too large: {fee}"))
     }
 
     async fn fetch_aerodrome_reserves_at_block(
@@ -1685,6 +1746,10 @@ fn encode_get_fee(pool: Address, stable: bool) -> String {
         encode_address_word(pool),
         encode_bool_word(stable),
     )
+}
+
+fn encode_get_swap_fee(pool: Address) -> String {
+    format!("0x35458dcc{}", encode_address_word(pool))
 }
 
 fn encode_get_pool_uint24(token_a: Address, token_b: Address, fee: u32) -> String {
