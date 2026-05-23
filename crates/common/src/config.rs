@@ -41,6 +41,13 @@ pub struct Settings {
     pub v3_tick_bitmap_word_radius: i32,
     pub v3_quote_safety_bps: u64,
     pub min_profit_failure_ttl_secs: u64,
+    pub execution_min_priority_fee_wei: Option<String>,
+    pub execution_priority_fee_multiplier_bps: u64,
+    pub execution_max_fee_multiplier_bps: u64,
+    pub execution_pending_replacement_blocks: u64,
+    pub execution_replacement_fee_bump_bps: u64,
+    pub execution_max_replacements: u32,
+    pub execution_gas_profit_buffer_bps: u64,
     pub monitor_web_password: Option<String>,
 }
 
@@ -57,6 +64,12 @@ impl Settings {
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 2u64)?
             .set_default("min_profit_failure_ttl_secs", 21_600u64)?
+            .set_default("execution_priority_fee_multiplier_bps", 20_000u64)?
+            .set_default("execution_max_fee_multiplier_bps", 30_000u64)?
+            .set_default("execution_pending_replacement_blocks", 2u64)?
+            .set_default("execution_replacement_fee_bump_bps", 12_500u64)?
+            .set_default("execution_max_replacements", 3u32)?
+            .set_default("execution_gas_profit_buffer_bps", 15_000u64)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

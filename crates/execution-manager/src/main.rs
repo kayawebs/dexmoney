@@ -8,7 +8,7 @@ use base_arb_common::config::Settings;
 use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, FailureStore,
-    RecorderStore,
+    PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
@@ -56,7 +56,7 @@ async fn run_execution_cycle<C, E, R>(
 where
     C: CandidateStore + FailureStore,
     E: EoaStateStore,
-    R: RecorderStore,
+    R: RecorderStore + PendingTransactionStore,
 {
     let private_key = settings
         .eoa_private_key_1
@@ -79,8 +79,10 @@ where
         .map(|state| eoa_lane::EoaLane { state })
         .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
 
+    reconcile_db_pending_transactions(recorder, provider, wallet.address()).await?;
+
     if lane.state.status == EoaLaneStatus::Pending {
-        handle_pending_lane(&mut lane, eoa_store, recorder, provider).await?;
+        handle_pending_lane(&mut lane, eoa_store, recorder, provider, &wallet, settings).await?;
         return Ok(());
     }
 
@@ -175,6 +177,10 @@ where
                 submission.simulation_id,
                 submission.tx_hash,
                 submission.nonce,
+                submission.submitted_block,
+                submission.gas_limit,
+                submission.max_fee_per_gas,
+                submission.max_priority_fee_per_gas,
             );
             eoa_store.set_lane_state(lane.state.clone()).await?;
             recorder
@@ -267,10 +273,12 @@ async fn handle_pending_lane<E, R>(
     eoa_store: &E,
     recorder: &R,
     provider: &ChainProvider,
+    wallet: &tx_manager::ExecutionWallet,
+    settings: &Settings,
 ) -> Result<()>
 where
     E: EoaStateStore,
-    R: RecorderStore,
+    R: RecorderStore + PendingTransactionStore,
 {
     let Some(tx_hash) = lane.state.pending_tx else {
         lane.mark_blocked();
@@ -292,6 +300,7 @@ where
     let simulation_id = lane.state.pending_simulation_id;
 
     let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+        maybe_replace_pending_tx(lane, eoa_store, recorder, provider, wallet, settings).await?;
         debug!(tx_hash = %tx_hash, "pending tx has no receipt yet");
         return Ok(());
     };
@@ -330,5 +339,154 @@ where
         );
     }
 
+    Ok(())
+}
+
+async fn maybe_replace_pending_tx<E, R>(
+    lane: &mut eoa_lane::EoaLane,
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    wallet: &tx_manager::ExecutionWallet,
+    settings: &Settings,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    if lane.state.pending_replacement_count >= settings.execution_max_replacements {
+        return Ok(());
+    }
+    let Some(submitted_block) = lane.state.pending_submitted_block else {
+        return Ok(());
+    };
+    let current_block = provider.get_block_number().await?;
+    let pending_blocks = current_block.saturating_sub(submitted_block);
+    if pending_blocks < settings.execution_pending_replacement_blocks {
+        return Ok(());
+    }
+
+    let Some(opportunity_id) = lane.state.pending_opportunity_id else {
+        return Ok(());
+    };
+    let Some(simulation_id) = lane.state.pending_simulation_id else {
+        return Ok(());
+    };
+    let Some(nonce) = lane.state.pending_nonce else {
+        return Ok(());
+    };
+    let Some(gas_limit) = lane.state.pending_gas_limit else {
+        return Ok(());
+    };
+    let Some(previous_max_fee_per_gas) = lane.state.pending_max_fee_per_gas else {
+        return Ok(());
+    };
+    let Some(previous_max_priority_fee_per_gas) = lane.state.pending_max_priority_fee_per_gas
+    else {
+        return Ok(());
+    };
+    let Some(old_tx_hash) = lane.state.pending_tx else {
+        return Ok(());
+    };
+    let Some(calldata) = recorder.simulation_calldata(simulation_id).await? else {
+        warn!(
+            simulation_id = %simulation_id,
+            "cannot replace pending tx because simulation calldata is missing"
+        );
+        return Ok(());
+    };
+
+    match tx_manager::replace_pending_transaction(
+        provider,
+        wallet,
+        settings,
+        &calldata,
+        nonce,
+        gas_limit,
+        previous_max_fee_per_gas,
+        previous_max_priority_fee_per_gas,
+    )
+    .await
+    {
+        Ok(submission) => {
+            recorder
+                .record_transaction(tx_manager::dropped_replaced_tx_result(
+                    opportunity_id,
+                    Some(simulation_id),
+                    lane.state.address,
+                    old_tx_hash,
+                    nonce,
+                    submission.tx_hash,
+                ))
+                .await?;
+            recorder
+                .record_transaction(tx_manager::pending_replacement_tx_result(
+                    opportunity_id,
+                    Some(simulation_id),
+                    lane.state.address,
+                    &submission,
+                ))
+                .await?;
+            lane.mark_replaced(
+                submission.tx_hash,
+                submission.submitted_block,
+                submission.gas_limit,
+                submission.max_fee_per_gas,
+                submission.max_priority_fee_per_gas,
+            );
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            info!(
+                opportunity_id = %opportunity_id,
+                old_tx_hash = %old_tx_hash,
+                new_tx_hash = %submission.tx_hash,
+                nonce,
+                pending_blocks,
+                replacement_count = lane.state.pending_replacement_count,
+                "pending tx replaced with higher fee"
+            );
+        }
+        Err(err) => {
+            warn!(
+                opportunity_id = %opportunity_id,
+                tx_hash = %old_tx_hash,
+                nonce,
+                pending_blocks,
+                error = %err,
+                "pending tx replacement failed"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn reconcile_db_pending_transactions<R>(
+    recorder: &R,
+    provider: &ChainProvider,
+    eoa: alloy_primitives::Address,
+) -> Result<()>
+where
+    R: RecorderStore + PendingTransactionStore,
+{
+    for pending in recorder.pending_transactions_for_eoa(eoa, 20).await? {
+        let Some(receipt) = provider.get_transaction_receipt(pending.tx_hash).await? else {
+            continue;
+        };
+        recorder
+            .record_transaction(tx_manager::receipt_tx_result(
+                pending.opportunity_id,
+                pending.simulation_id,
+                pending.eoa,
+                pending.nonce,
+                &receipt,
+            ))
+            .await?;
+        debug!(
+            tx_hash = %pending.tx_hash,
+            block_number = ?receipt.block_number,
+            success = receipt.success,
+            "reconciled pending transaction from receipt"
+        );
+    }
     Ok(())
 }

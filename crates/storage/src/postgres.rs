@@ -1,10 +1,12 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::{PairSearchConfigStore, RecorderStore};
+use crate::{
+    PairSearchConfigStore, PendingTransactionRecord, PendingTransactionStore, RecorderStore,
+};
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
     Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateValidation,
@@ -397,6 +399,71 @@ impl PostgresStore {
         .await?;
 
         Ok(exists)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingTransactionRow {
+    opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
+    eoa: String,
+    tx_hash: String,
+    nonce: i64,
+}
+
+#[async_trait]
+impl PendingTransactionStore for PostgresStore {
+    async fn pending_transactions_for_eoa(
+        &self,
+        eoa: Address,
+        limit: i64,
+    ) -> Result<Vec<PendingTransactionRecord>> {
+        let rows: Vec<PendingTransactionRow> = sqlx::query_as(
+            r#"
+            SELECT opportunity_id, simulation_id, eoa, tx_hash, nonce
+            FROM transactions
+            WHERE eoa = $1
+              AND status = 'Pending'
+              AND tx_hash IS NOT NULL
+            ORDER BY created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(address_to_string(eoa))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingTransactionRecord {
+                    opportunity_id: row.opportunity_id,
+                    simulation_id: row.simulation_id,
+                    eoa: row.eoa.parse()?,
+                    tx_hash: row.tx_hash.parse::<B256>()?,
+                    nonce: u64::try_from(row.nonce)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn simulation_calldata(&self, simulation_id: uuid::Uuid) -> Result<Option<Vec<u8>>> {
+        let raw: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT calldata
+            FROM simulations
+            WHERE id = $1
+            "#,
+        )
+        .bind(simulation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        raw.map(|value| {
+            hex::decode(value.trim_start_matches("0x"))
+                .map_err(|err| anyhow::anyhow!("invalid simulation calldata hex: {err}"))
+        })
+        .transpose()
     }
 }
 

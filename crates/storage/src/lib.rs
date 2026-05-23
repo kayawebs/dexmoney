@@ -5,7 +5,7 @@ pub mod schema;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
@@ -68,6 +68,28 @@ pub trait PairSearchConfigStore: Send + Sync {
 pub trait EoaStateStore: Send + Sync {
     async fn set_lane_state(&self, lane: EoaLaneState) -> anyhow::Result<()>;
     async fn get_lane_state(&self, address: Address) -> anyhow::Result<Option<EoaLaneState>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTransactionRecord {
+    pub opportunity_id: uuid::Uuid,
+    pub simulation_id: Option<uuid::Uuid>,
+    pub eoa: Address,
+    pub tx_hash: B256,
+    pub nonce: u64,
+}
+
+#[async_trait]
+pub trait PendingTransactionStore: Send + Sync {
+    async fn pending_transactions_for_eoa(
+        &self,
+        eoa: Address,
+        limit: i64,
+    ) -> anyhow::Result<Vec<PendingTransactionRecord>>;
+    async fn simulation_calldata(
+        &self,
+        simulation_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<Vec<u8>>>;
 }
 
 #[derive(Clone, Default)]
@@ -210,5 +232,48 @@ impl EoaStateStore for InMemoryStores {
 
     async fn get_lane_state(&self, address: Address) -> anyhow::Result<Option<EoaLaneState>> {
         Ok(self.lanes.lock().await.get(&address).cloned())
+    }
+}
+
+#[async_trait]
+impl PendingTransactionStore for InMemoryStores {
+    async fn pending_transactions_for_eoa(
+        &self,
+        eoa: Address,
+        limit: i64,
+    ) -> anyhow::Result<Vec<PendingTransactionRecord>> {
+        let limit = usize::try_from(limit.max(0)).unwrap_or_default();
+        Ok(self
+            .transactions
+            .lock()
+            .await
+            .iter()
+            .filter(|tx| {
+                tx.eoa == eoa && matches!(tx.status, base_arb_common::types::TxStatus::Pending)
+            })
+            .filter_map(|tx| {
+                Some(PendingTransactionRecord {
+                    opportunity_id: tx.opportunity_id,
+                    simulation_id: tx.simulation_id,
+                    eoa: tx.eoa,
+                    tx_hash: tx.tx_hash?,
+                    nonce: tx.nonce,
+                })
+            })
+            .take(limit)
+            .collect())
+    }
+
+    async fn simulation_calldata(
+        &self,
+        simulation_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .simulations
+            .lock()
+            .await
+            .iter()
+            .find(|simulation| simulation.id == simulation_id)
+            .map(|simulation| simulation.calldata.clone()))
     }
 }

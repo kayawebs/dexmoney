@@ -349,7 +349,7 @@ impl ChainProvider {
         parse_hex_u256(value.as_str().unwrap_or("0x0"))
     }
 
-    pub async fn suggested_eip1559_fees(&self) -> Result<(U256, U256)> {
+    pub async fn suggested_eip1559_fee_details(&self) -> Result<Eip1559FeeSuggestion> {
         let priority = match self.rpc("eth_maxPriorityFeePerGas", json!([])).await {
             Ok(value) => parse_hex_u256(value.as_str().unwrap_or("0x0"))?,
             Err(_) => U256::from(1_000_000u64),
@@ -366,7 +366,16 @@ impl ChainProvider {
         let max_fee = base_fee
             .saturating_mul(U256::from(2u64))
             .saturating_add(priority);
-        Ok((max_fee, priority))
+        Ok(Eip1559FeeSuggestion {
+            base_fee_per_gas: base_fee,
+            max_fee_per_gas: max_fee,
+            max_priority_fee_per_gas: priority,
+        })
+    }
+
+    pub async fn suggested_eip1559_fees(&self) -> Result<(U256, U256)> {
+        let details = self.suggested_eip1559_fee_details().await?;
+        Ok((details.max_fee_per_gas, details.max_priority_fee_per_gas))
     }
 
     pub async fn send_raw_transaction(&self, raw_tx: &str) -> Result<B256> {
@@ -1465,6 +1474,13 @@ pub struct TxReceipt {
     pub effective_gas_price: Option<U256>,
     pub block_number: Option<u64>,
     pub raw: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Eip1559FeeSuggestion {
+    pub base_fee_per_gas: U256,
+    pub max_fee_per_gas: U256,
+    pub max_priority_fee_per_gas: U256,
 }
 
 #[derive(Debug, Deserialize)]

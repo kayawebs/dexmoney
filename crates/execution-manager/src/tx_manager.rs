@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
-use base_arb_chain::provider::{ChainProvider, TxReceipt};
+use base_arb_chain::provider::{ChainProvider, Eip1559FeeSuggestion, TxReceipt};
+use base_arb_common::config::Settings;
 use base_arb_common::types::{Candidate, SimulationResult, TxResult, TxStatus};
 use ethers_core::types::{
     transaction::eip2718::TypedTransaction, Bytes, Eip1559TransactionRequest, NameOrAddress,
@@ -23,6 +24,10 @@ pub struct Submission {
     pub tx_hash: B256,
     pub nonce: u64,
     pub simulation_id: uuid::Uuid,
+    pub submitted_block: u64,
+    pub gas_limit: U256,
+    pub max_fee_per_gas: U256,
+    pub max_priority_fee_per_gas: U256,
 }
 
 impl ExecutionWallet {
@@ -43,7 +48,7 @@ impl ExecutionWallet {
 pub async fn submit_candidate(
     provider: &ChainProvider,
     wallet: &ExecutionWallet,
-    settings: &base_arb_common::config::Settings,
+    settings: &Settings,
     candidate: &Candidate,
     simulation: &SimulationResult,
     nonce: u64,
@@ -62,8 +67,118 @@ pub async fn submit_candidate(
         .await
         .context("failed to estimate executor tx gas")?;
     let gas_limit = bump_gas_limit(estimated_gas);
-    let (max_fee_per_gas, max_priority_fee_per_gas) = provider.suggested_eip1559_fees().await?;
+    let fees = aggressive_fee_suggestion(provider, settings).await?;
+    ensure_expected_profit_covers_gas(settings, candidate, gas_limit, fees.max_fee_per_gas)?;
 
+    let submitted_block = provider.get_block_number().await?;
+    let tx_hash = sign_and_send(
+        provider,
+        wallet,
+        settings,
+        executor,
+        &simulation.calldata,
+        nonce,
+        gas_limit,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    )
+    .await?;
+
+    tracing::info!(
+        candidate_id = %candidate.id,
+        tx_hash = %tx_hash,
+        nonce,
+        gas_limit = %gas_limit,
+        max_fee_per_gas = %fees.max_fee_per_gas,
+        max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
+        submitted_block,
+        "tx submitted"
+    );
+
+    Ok(Submission {
+        tx_hash,
+        nonce,
+        simulation_id: simulation.id,
+        submitted_block,
+        gas_limit,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+    })
+}
+
+pub async fn replace_pending_transaction(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    calldata: &[u8],
+    nonce: u64,
+    gas_limit: U256,
+    previous_max_fee_per_gas: U256,
+    previous_max_priority_fee_per_gas: U256,
+) -> Result<Submission> {
+    let executor = settings
+        .executor_contract
+        .filter(|address| *address != Address::ZERO)
+        .context("EXECUTOR_CONTRACT is not configured")?;
+    if calldata.is_empty() {
+        anyhow::bail!("replacement calldata is empty");
+    }
+
+    let suggested = aggressive_fee_suggestion(provider, settings).await?;
+    let max_fee_per_gas = suggested.max_fee_per_gas.max(bump_fee(
+        previous_max_fee_per_gas,
+        settings.execution_replacement_fee_bump_bps,
+    ));
+    let max_priority_fee_per_gas = suggested.max_priority_fee_per_gas.max(bump_fee(
+        previous_max_priority_fee_per_gas,
+        settings.execution_replacement_fee_bump_bps,
+    ));
+    let submitted_block = provider.get_block_number().await?;
+    let tx_hash = sign_and_send(
+        provider,
+        wallet,
+        settings,
+        executor,
+        calldata,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    )
+    .await?;
+
+    tracing::info!(
+        tx_hash = %tx_hash,
+        nonce,
+        gas_limit = %gas_limit,
+        max_fee_per_gas = %max_fee_per_gas,
+        max_priority_fee_per_gas = %max_priority_fee_per_gas,
+        submitted_block,
+        "replacement tx submitted"
+    );
+
+    Ok(Submission {
+        tx_hash,
+        nonce,
+        simulation_id: uuid::Uuid::nil(),
+        submitted_block,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    })
+}
+
+async fn sign_and_send(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    executor: Address,
+    calldata: &[u8],
+    nonce: u64,
+    gas_limit: U256,
+    max_fee_per_gas: U256,
+    max_priority_fee_per_gas: U256,
+) -> Result<B256> {
     let tx = Eip1559TransactionRequest::new()
         .from(alloy_address_to_ethers(wallet.address))
         .to(NameOrAddress::Address(alloy_address_to_ethers(executor)))
@@ -73,26 +188,12 @@ pub async fn submit_candidate(
         .max_fee_per_gas(alloy_u256_to_ethers(max_fee_per_gas)?)
         .max_priority_fee_per_gas(alloy_u256_to_ethers(max_priority_fee_per_gas)?)
         .value(EthersU256::zero())
-        .data(Bytes::from(simulation.calldata.clone()));
+        .data(Bytes::from(calldata.to_vec()));
     let typed = TypedTransaction::Eip1559(tx);
     let signature = wallet.wallet.sign_transaction(&typed).await?;
     let raw = typed.rlp_signed(&signature);
     let raw_hex = format!("0x{}", hex::encode(raw.as_ref()));
-    let tx_hash = provider.send_raw_transaction(&raw_hex).await?;
-
-    tracing::info!(
-        candidate_id = %candidate.id,
-        tx_hash = %tx_hash,
-        nonce,
-        gas_limit = %gas_limit,
-        "tx submitted"
-    );
-
-    Ok(Submission {
-        tx_hash,
-        nonce,
-        simulation_id: simulation.id,
-    })
+    provider.send_raw_transaction(&raw_hex).await
 }
 
 pub fn pending_tx_result(candidate: &Candidate, eoa: Address, submission: &Submission) -> TxResult {
@@ -107,6 +208,50 @@ pub fn pending_tx_result(candidate: &Candidate, eoa: Address, submission: &Submi
         gas_used: None,
         effective_gas_price: None,
         revert_reason: None,
+        receipt_json: None,
+    }
+}
+
+pub fn pending_replacement_tx_result(
+    opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
+    eoa: Address,
+    submission: &Submission,
+) -> TxResult {
+    TxResult {
+        opportunity_id,
+        simulation_id,
+        eoa,
+        tx_hash: Some(submission.tx_hash),
+        nonce: submission.nonce,
+        status: TxStatus::Pending,
+        realized_profit: None,
+        gas_used: None,
+        effective_gas_price: None,
+        revert_reason: None,
+        receipt_json: None,
+    }
+}
+
+pub fn dropped_replaced_tx_result(
+    opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
+    eoa: Address,
+    old_tx_hash: B256,
+    nonce: u64,
+    new_tx_hash: B256,
+) -> TxResult {
+    TxResult {
+        opportunity_id,
+        simulation_id,
+        eoa,
+        tx_hash: Some(old_tx_hash),
+        nonce,
+        status: TxStatus::Dropped,
+        realized_profit: None,
+        gas_used: None,
+        effective_gas_price: None,
+        revert_reason: Some(format!("replaced by {new_tx_hash:#x}")),
         receipt_json: None,
     }
 }
@@ -175,6 +320,75 @@ fn bump_gas_limit(value: U256) -> U256 {
         .checked_div(U256::from(10_000u64))
         .unwrap_or(value)
         .saturating_add(U256::from(25_000u64))
+}
+
+async fn aggressive_fee_suggestion(
+    provider: &ChainProvider,
+    settings: &Settings,
+) -> Result<Eip1559FeeSuggestion> {
+    let suggested = provider.suggested_eip1559_fee_details().await?;
+    let min_priority = parse_optional_u256(settings.execution_min_priority_fee_wei.as_deref())?
+        .unwrap_or(U256::ZERO);
+    let priority = apply_bps(
+        suggested.max_priority_fee_per_gas,
+        settings.execution_priority_fee_multiplier_bps,
+    )
+    .max(min_priority);
+    let base_component = apply_bps(
+        suggested.base_fee_per_gas,
+        settings.execution_max_fee_multiplier_bps,
+    );
+    let max_fee = base_component
+        .saturating_add(priority)
+        .max(suggested.max_fee_per_gas);
+
+    Ok(Eip1559FeeSuggestion {
+        base_fee_per_gas: suggested.base_fee_per_gas,
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: priority,
+    })
+}
+
+fn ensure_expected_profit_covers_gas(
+    settings: &Settings,
+    candidate: &Candidate,
+    gas_limit: U256,
+    max_fee_per_gas: U256,
+) -> Result<()> {
+    if candidate.token_in != settings.weth_address {
+        return Ok(());
+    }
+    let gas_cost_cap = gas_limit.saturating_mul(max_fee_per_gas);
+    let required_profit =
+        apply_bps(gas_cost_cap, settings.execution_gas_profit_buffer_bps).max(candidate.min_profit);
+    if candidate.expected_profit < required_profit {
+        anyhow::bail!(
+            "expected WETH profit {} below gas-adjusted threshold {} (gas_limit={}, max_fee_per_gas={})",
+            candidate.expected_profit,
+            required_profit,
+            gas_limit,
+            max_fee_per_gas
+        );
+    }
+    Ok(())
+}
+
+fn bump_fee(value: U256, bump_bps: u64) -> U256 {
+    apply_bps(value, bump_bps).saturating_add(U256::from(1u64))
+}
+
+fn apply_bps(value: U256, bps: u64) -> U256 {
+    value
+        .saturating_mul(U256::from(bps))
+        .checked_div(U256::from(10_000u64))
+        .unwrap_or(value)
+}
+
+fn parse_optional_u256(raw: Option<&str>) -> Result<Option<U256>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(U256::from_str_radix(raw, 10)?))
 }
 
 fn alloy_address_to_ethers(address: Address) -> ethers_core::types::Address {

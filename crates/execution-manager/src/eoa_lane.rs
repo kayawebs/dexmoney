@@ -19,6 +19,11 @@ impl EoaLane {
                 pending_opportunity_id: None,
                 pending_simulation_id: None,
                 pending_nonce: None,
+                pending_submitted_block: None,
+                pending_replacement_count: 0,
+                pending_gas_limit: None,
+                pending_max_fee_per_gas: None,
+                pending_max_priority_fee_per_gas: None,
                 eth_balance: U256::ZERO,
                 status: EoaLaneStatus::Idle,
             },
@@ -31,12 +36,39 @@ impl EoaLane {
         simulation_id: Uuid,
         tx_hash: B256,
         nonce: u64,
+        submitted_block: u64,
+        gas_limit: U256,
+        max_fee_per_gas: U256,
+        max_priority_fee_per_gas: U256,
     ) {
         self.state.pending_tx = Some(tx_hash);
         self.state.pending_opportunity_id = Some(opportunity_id);
         self.state.pending_simulation_id = Some(simulation_id);
         self.state.pending_nonce = Some(nonce);
+        self.state.pending_submitted_block = Some(submitted_block);
+        self.state.pending_replacement_count = 0;
+        self.state.pending_gas_limit = Some(gas_limit);
+        self.state.pending_max_fee_per_gas = Some(max_fee_per_gas);
+        self.state.pending_max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
         self.state.local_nonce = nonce.saturating_add(1);
+        self.state.status = EoaLaneStatus::Pending;
+    }
+
+    pub fn mark_replaced(
+        &mut self,
+        tx_hash: B256,
+        submitted_block: u64,
+        gas_limit: U256,
+        max_fee_per_gas: U256,
+        max_priority_fee_per_gas: U256,
+    ) {
+        self.state.pending_tx = Some(tx_hash);
+        self.state.pending_submitted_block = Some(submitted_block);
+        self.state.pending_replacement_count =
+            self.state.pending_replacement_count.saturating_add(1);
+        self.state.pending_gas_limit = Some(gas_limit);
+        self.state.pending_max_fee_per_gas = Some(max_fee_per_gas);
+        self.state.pending_max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
         self.state.status = EoaLaneStatus::Pending;
     }
 
@@ -46,6 +78,11 @@ impl EoaLane {
         self.state.pending_opportunity_id = None;
         self.state.pending_simulation_id = None;
         self.state.pending_nonce = None;
+        self.state.pending_submitted_block = None;
+        self.state.pending_replacement_count = 0;
+        self.state.pending_gas_limit = None;
+        self.state.pending_max_fee_per_gas = None;
+        self.state.pending_max_priority_fee_per_gas = None;
         self.state.status = EoaLaneStatus::Idle;
     }
 
@@ -78,10 +115,16 @@ mod tests {
             uuid::Uuid::new_v4(),
             b256!("0101010101010101010101010101010101010101010101010101010101010101"),
             7,
+            100,
+            alloy_primitives::U256::from(350_000u64),
+            alloy_primitives::U256::from(10u64),
+            alloy_primitives::U256::from(2u64),
         );
         assert_eq!(lane.state.status, EoaLaneStatus::Pending);
         assert_eq!(lane.state.local_nonce, 8);
         assert_eq!(lane.state.pending_nonce, Some(7));
+        assert_eq!(lane.state.pending_submitted_block, Some(100));
+        assert_eq!(lane.state.pending_replacement_count, 0);
 
         lane.mark_confirmed(1);
         assert_eq!(lane.state.status, EoaLaneStatus::Idle);
@@ -90,6 +133,7 @@ mod tests {
         assert!(lane.state.pending_opportunity_id.is_none());
         assert!(lane.state.pending_simulation_id.is_none());
         assert!(lane.state.pending_nonce.is_none());
+        assert!(lane.state.pending_submitted_block.is_none());
 
         lane.mark_blocked();
         assert_eq!(lane.state.status, EoaLaneStatus::Blocked);

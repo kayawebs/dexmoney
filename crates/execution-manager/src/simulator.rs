@@ -486,6 +486,13 @@ mod tests {
             v3_tick_bitmap_word_radius: 8,
             v3_quote_safety_bps: 2,
             min_profit_failure_ttl_secs: 21_600,
+            execution_min_priority_fee_wei: None,
+            execution_priority_fee_multiplier_bps: 20_000,
+            execution_max_fee_multiplier_bps: 30_000,
+            execution_pending_replacement_blocks: 2,
+            execution_replacement_fee_bump_bps: 12_500,
+            execution_max_replacements: 3,
+            execution_gas_profit_buffer_bps: 15_000,
             monitor_web_password: None,
         }
     }

@@ -281,6 +281,16 @@ pub struct EoaLaneState {
     pub pending_simulation_id: Option<Uuid>,
     #[serde(default)]
     pub pending_nonce: Option<u64>,
+    #[serde(default)]
+    pub pending_submitted_block: Option<u64>,
+    #[serde(default)]
+    pub pending_replacement_count: u32,
+    #[serde(default)]
+    pub pending_gas_limit: Option<U256>,
+    #[serde(default)]
+    pub pending_max_fee_per_gas: Option<U256>,
+    #[serde(default)]
+    pub pending_max_priority_fee_per_gas: Option<U256>,
     pub eth_balance: U256,
     pub status: EoaLaneStatus,
 }
