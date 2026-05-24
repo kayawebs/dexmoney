@@ -183,6 +183,44 @@ pub struct QuoteDiagnostics {
     pub crossed_ticks: u32,
     pub tick_range_exhausted: bool,
     pub v3_pools_without_ticks: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<QuoteStepDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuoteStepDiagnostics {
+    pub step_no: u32,
+    pub mode: String,
+    pub pool: Address,
+    pub variant: PoolVariant,
+    pub source_block: u64,
+    pub state_updated_at: DateTime<Utc>,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub amount_in: U256,
+    pub amount_out_raw: U256,
+    pub amount_out: U256,
+    pub fee_bps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_pips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_spacing: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqrt_price_x96: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquidity: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve0: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve1: Option<U256>,
+    pub tick_count: u32,
+    pub ticks_used: u32,
+    pub crossed_ticks: u32,
+    pub tick_range_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

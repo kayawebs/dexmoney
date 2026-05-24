@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
-    ArbPath, Candidate, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult, SwapStep,
-    TickState, TokenPairSearchConfig,
+    ArbPath, Candidate, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult,
+    QuoteStepDiagnostics, SwapStep, TickState, TokenPairSearchConfig,
 };
 use base_arb_dex::aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter};
 use base_arb_dex::quoter::DexQuoter;
@@ -408,9 +408,10 @@ async fn quote_path(
         crossed_ticks: 0,
         tick_range_exhausted: false,
         v3_pools_without_ticks: 0,
+        steps: Vec::new(),
     };
 
-    for step in &path.steps {
+    for (step_index, step) in path.steps.iter().enumerate() {
         let pool_state = match pool_states
             .iter()
             .find(|state| state.pool_id.address == step.pool)
@@ -419,6 +420,13 @@ async fn quote_path(
             None => return Ok(None),
         };
 
+        let amount_before = amount;
+        let mut mode = String::new();
+        let mut tick_count = 0u32;
+        let mut step_ticks_used = 0u32;
+        let mut step_crossed_ticks = 0u32;
+        let mut step_tick_range_exhausted = false;
+
         let mut quote = match pool_state.variant {
             PoolVariant::AerodromeVolatile => {
                 if pool_state.stable.unwrap_or(false) {
@@ -426,7 +434,8 @@ async fn quote_path(
                         .quote_exact_in(pool_state, step.token_in, amount)
                         .await
                         .map(|quote| {
-                            diagnostics.modes.push("classic_stable".into());
+                            mode = "classic_stable".into();
+                            diagnostics.modes.push(mode.clone());
                             quote
                         })
                         .map_err(anyhow::Error::from)?
@@ -435,7 +444,8 @@ async fn quote_path(
                         .quote_exact_in(pool_state, step.token_in, amount)
                         .await
                         .map(|quote| {
-                            diagnostics.modes.push("classic_volatile".into());
+                            mode = "classic_volatile".into();
+                            diagnostics.modes.push(mode.clone());
                             quote
                         })
                         .map_err(anyhow::Error::from)?
@@ -447,8 +457,10 @@ async fn quote_path(
                     .filter(|tick| tick.pool_id.address == pool_state.pool_id.address)
                     .cloned()
                     .collect::<Vec<_>>();
+                tick_count = pool_ticks.len() as u32;
                 if pool_ticks.is_empty() {
-                    diagnostics.modes.push("v3_current_tick_fallback".into());
+                    mode = "v3_current_tick_fallback".into();
+                    diagnostics.modes.push(mode.clone());
                     diagnostics.v3_pools_without_ticks += 1;
                     uni.quote_exact_in(pool_state, step.token_in, amount)
                         .await
@@ -461,7 +473,11 @@ async fn quote_path(
                         amount,
                     )
                     .map_err(anyhow::Error::from)?;
-                    diagnostics.modes.push("v3_cross_tick".into());
+                    mode = "v3_cross_tick".into();
+                    diagnostics.modes.push(mode.clone());
+                    step_ticks_used = v3_diagnostics.ticks_used;
+                    step_crossed_ticks = v3_diagnostics.crossed_ticks;
+                    step_tick_range_exhausted = v3_diagnostics.tick_range_exhausted;
                     diagnostics.ticks_used += v3_diagnostics.ticks_used;
                     diagnostics.crossed_ticks += v3_diagnostics.crossed_ticks;
                     diagnostics.tick_range_exhausted |= v3_diagnostics.tick_range_exhausted;
@@ -469,11 +485,38 @@ async fn quote_path(
                 }
             }
         };
+        let amount_out_raw = quote.amount_out;
         if is_v3_style_variant(pool_state.variant) && v3_quote_safety_bps > 0 {
             quote.amount_out = apply_quote_haircut(quote.amount_out, v3_quote_safety_bps)?;
         }
 
         amount = quote.amount_out;
+        diagnostics.steps.push(QuoteStepDiagnostics {
+            step_no: (step_index + 1) as u32,
+            mode,
+            pool: pool_state.pool_id.address,
+            variant: pool_state.variant,
+            source_block: pool_state.block_number,
+            state_updated_at: pool_state.updated_at,
+            token_in: step.token_in,
+            token_out: step.token_out,
+            amount_in: amount_before,
+            amount_out_raw,
+            amount_out: quote.amount_out,
+            fee_bps: pool_state.fee_bps,
+            fee_pips: pool_state.fee_pips,
+            stable: pool_state.stable,
+            tick_spacing: pool_state.tick_spacing,
+            sqrt_price_x96: pool_state.sqrt_price_x96,
+            liquidity: pool_state.liquidity,
+            tick: pool_state.tick,
+            reserve0: pool_state.reserve0,
+            reserve1: pool_state.reserve1,
+            tick_count,
+            ticks_used: step_ticks_used,
+            crossed_ticks: step_crossed_ticks,
+            tick_range_exhausted: step_tick_range_exhausted,
+        });
         max_impact = max_impact.max(estimate_price_impact_bps(pool_state, step.token_in, &quote));
     }
 

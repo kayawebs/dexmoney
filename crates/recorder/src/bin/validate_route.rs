@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
     println!("amount_in: {amount_in}");
     println!("expected_profit: {}", row.expected_profit);
     println!("min_profit: {min_profit}");
+    print_recorded_quote_diagnostics(&path);
 
     let block_number = provider.get_block_number().await?;
     let block_hash = provider.get_block_hash(block_number).await?;
@@ -112,6 +113,53 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_recorded_quote_diagnostics(path: &ArbPath) {
+    let Some(diagnostics) = &path.diagnostics else {
+        return;
+    };
+    if diagnostics.steps.is_empty() {
+        return;
+    }
+    println!("\n== Recorded Quote Snapshot ==");
+    println!(
+        "modes={:?} ticks_used={} crossed_ticks={} exhausted={} missing_v3_tick_pools={}",
+        diagnostics.modes,
+        diagnostics.ticks_used,
+        diagnostics.crossed_ticks,
+        diagnostics.tick_range_exhausted,
+        diagnostics.v3_pools_without_ticks
+    );
+    for step in &diagnostics.steps {
+        println!(
+            "recorded step {}: mode={} pool={:#x} variant={:?} source_block={} updated_at={} token_in={:#x} token_out={:#x} amount_in={} amount_out_raw={} amount_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?} tick_count={} ticks_used={} crossed_ticks={} exhausted={}",
+            step.step_no,
+            step.mode,
+            step.pool,
+            step.variant,
+            step.source_block,
+            step.state_updated_at,
+            step.token_in,
+            step.token_out,
+            step.amount_in,
+            step.amount_out_raw,
+            step.amount_out,
+            step.fee_bps,
+            step.fee_pips,
+            step.stable,
+            step.tick_spacing,
+            step.sqrt_price_x96,
+            step.liquidity,
+            step.tick,
+            step.reserve0,
+            step.reserve1,
+            step.tick_count,
+            step.ticks_used,
+            step.crossed_ticks,
+            step.tick_range_exhausted
+        );
+    }
 }
 
 async fn validate_step_quotes(
