@@ -13,7 +13,7 @@ use base_arb_dex::{
     quoter::DexQuoter,
     uniswap_v3::{quote_exact_in_with_ticks_diagnostics, UniswapV3CurrentTickQuoter},
 };
-use base_arb_storage::{redis::RedisStore, TickStateStore};
+use base_arb_storage::{redis::RedisStore, PoolStateStore, TickStateStore};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use tracing_subscriber::EnvFilter;
@@ -178,6 +178,54 @@ async fn validate_step_quotes(
         direct_profit
             .map(|profit| profit.to_string())
             .unwrap_or_else(|| "unavailable".into())
+    );
+
+    validate_redis_quotes(path, amount_in, opportunity_expected_profit, tick_store).await?;
+    Ok(())
+}
+
+async fn validate_redis_quotes(
+    path: &ArbPath,
+    amount_in: U256,
+    opportunity_expected_profit: U256,
+    store: &RedisStore,
+) -> Result<()> {
+    println!("\n== Redis State Quote Check ==");
+    let mut amount = amount_in;
+    for (idx, step) in path.steps.iter().enumerate() {
+        let step_no = idx + 1;
+        let Some(state) = store.get_pool_state(step.pool).await? else {
+            println!(
+                "redis step {step_no}: missing pool state pool={:#x}",
+                step.pool
+            );
+            return Ok(());
+        };
+        println!(
+            "redis step {step_no}: pool={:#x} source_block={} updated_at={} variant={:?} fee_bps={} fee_pips={:?} stable={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?}",
+            step.pool,
+            state.block_number,
+            state.updated_at,
+            state.variant,
+            state.fee_bps,
+            state.fee_pips,
+            state.stable,
+            state.sqrt_price_x96,
+            state.liquidity,
+            state.tick,
+            state.reserve0,
+            state.reserve1
+        );
+        let next = quote_local_step(step, &state, amount, store)
+            .await
+            .with_context(|| format!("failed Redis local quote for step {step_no}"))?;
+        println!("redis step {step_no}: amount_in={amount} amount_out={next}");
+        amount = next;
+    }
+    println!(
+        "redis final: opportunity_expected_profit={} redis_local_profit={}",
+        opportunity_expected_profit,
+        amount.saturating_sub(amount_in)
     );
     Ok(())
 }
