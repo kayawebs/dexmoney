@@ -165,6 +165,8 @@ async fn validate_step_quotes(
                     "step {step_no}: local_amount_in={local_amount} local_quote={local} pool_getAmountOut=skipped_after_v3"
                 );
             }
+        } else {
+            direct_amount = None;
         }
         local_amount = local;
     }
