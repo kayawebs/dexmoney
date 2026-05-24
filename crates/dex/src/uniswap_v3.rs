@@ -1,12 +1,13 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{aliases::U512, Address, U256};
 use async_trait::async_trait;
 
 use base_arb_common::errors::{ArbBotError, Result};
-use base_arb_common::types::{PoolState, QuoteResult, TickState};
+use base_arb_common::types::{PoolState, PoolVariant, QuoteResult, TickState};
 
 use crate::quoter::DexQuoter;
 
 const Q96_BITS: usize = 96;
+const FEE_DENOMINATOR: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct UniswapV3CurrentTickQuoter;
@@ -40,7 +41,12 @@ impl DexQuoter for UniswapV3CurrentTickQuoter {
             return Err(ArbBotError::Quote("empty V3 state".into()));
         }
 
-        let amount_in_less_fee = apply_v3_fee(amount_in, pool_state)?;
+        let fee_pips = v3_fee_pips(pool_state)?;
+        let amount_in_less_fee = mul_div(
+            amount_in,
+            U256::from(FEE_DENOMINATOR.saturating_sub(fee_pips)),
+            U256::from(FEE_DENOMINATOR),
+        )?;
         let amount_out = if token_in == pool_state.token0 {
             quote_token0_for_token1(amount_in_less_fee, sqrt_price_x96, liquidity)?
         } else {
@@ -119,22 +125,24 @@ pub fn quote_exact_in_with_ticks_diagnostics(
     let current_tick = pool_state
         .tick
         .ok_or_else(|| ArbBotError::Quote("missing tick".into()))?;
-    let amount_remaining = apply_v3_fee(amount_in, pool_state)?;
+    let fee_pips = v3_fee_pips(pool_state)?;
     let (amount_out, diagnostics) = if token_in == pool_state.token0 {
         simulate_zero_for_one(
-            amount_remaining,
+            amount_in,
             sqrt_price_x96,
             liquidity,
             current_tick,
             initialized_ticks,
+            fee_pips,
         )?
     } else {
         simulate_one_for_zero(
-            amount_remaining,
+            amount_in,
             sqrt_price_x96,
             liquidity,
             current_tick,
             initialized_ticks,
+            fee_pips,
         )?
     };
 
@@ -154,6 +162,7 @@ fn simulate_zero_for_one(
     mut liquidity: U256,
     current_tick: i32,
     initialized_ticks: &[TickState],
+    fee_pips: u32,
 ) -> Result<(U256, V3QuoteDiagnostics)> {
     let mut amount_out = U256::ZERO;
     let mut diagnostics = V3QuoteDiagnostics::default();
@@ -169,30 +178,43 @@ fn simulate_zero_for_one(
         }
         diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
-        let amount_to_target = amount0_delta(liquidity, target_sqrt, sqrt_price, true)?;
-        if amount_remaining >= amount_to_target {
-            amount_remaining = amount_remaining.saturating_sub(amount_to_target);
+        let step = compute_swap_step(
+            sqrt_price,
+            target_sqrt,
+            liquidity,
+            amount_remaining,
+            fee_pips,
+            true,
+        )?;
+        let step_consumed = step
+            .amount_in
+            .checked_add(step.fee_amount)
+            .ok_or_else(|| ArbBotError::Quote("step amount overflow".into()))?;
+        amount_remaining = amount_remaining.saturating_sub(step_consumed);
+        amount_out = amount_out
+            .checked_add(step.amount_out)
+            .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
+        sqrt_price = step.sqrt_next;
+        if sqrt_price == target_sqrt {
             diagnostics.crossed_ticks += 1;
-            amount_out = amount_out
-                .checked_add(amount1_delta(liquidity, target_sqrt, sqrt_price, false)?)
-                .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
-            sqrt_price = target_sqrt;
             liquidity = apply_liquidity_delta(liquidity, -tick.liquidity_net)?;
         } else {
-            let next_sqrt =
-                next_sqrt_price_from_amount0_in(sqrt_price, liquidity, amount_remaining)?;
-            amount_out = amount_out
-                .checked_add(amount1_delta(liquidity, next_sqrt, sqrt_price, false)?)
-                .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
             return Ok((amount_out, diagnostics));
         }
     }
 
     if !amount_remaining.is_zero() && !liquidity.is_zero() {
         diagnostics.tick_range_exhausted = true;
-        let next_sqrt = next_sqrt_price_from_amount0_in(sqrt_price, liquidity, amount_remaining)?;
+        let step = compute_swap_step(
+            sqrt_price,
+            U256::from(1u64),
+            liquidity,
+            amount_remaining,
+            fee_pips,
+            true,
+        )?;
         amount_out = amount_out
-            .checked_add(amount1_delta(liquidity, next_sqrt, sqrt_price, false)?)
+            .checked_add(step.amount_out)
             .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
     }
     Ok((amount_out, diagnostics))
@@ -204,6 +226,7 @@ fn simulate_one_for_zero(
     mut liquidity: U256,
     current_tick: i32,
     initialized_ticks: &[TickState],
+    fee_pips: u32,
 ) -> Result<(U256, V3QuoteDiagnostics)> {
     let mut amount_out = U256::ZERO;
     let mut diagnostics = V3QuoteDiagnostics::default();
@@ -219,122 +242,176 @@ fn simulate_one_for_zero(
         }
         diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
-        let amount_to_target = amount1_delta(liquidity, sqrt_price, target_sqrt, true)?;
-        if amount_remaining >= amount_to_target {
-            amount_remaining = amount_remaining.saturating_sub(amount_to_target);
+        let step = compute_swap_step(
+            sqrt_price,
+            target_sqrt,
+            liquidity,
+            amount_remaining,
+            fee_pips,
+            false,
+        )?;
+        let step_consumed = step
+            .amount_in
+            .checked_add(step.fee_amount)
+            .ok_or_else(|| ArbBotError::Quote("step amount overflow".into()))?;
+        amount_remaining = amount_remaining.saturating_sub(step_consumed);
+        amount_out = amount_out
+            .checked_add(step.amount_out)
+            .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
+        sqrt_price = step.sqrt_next;
+        if sqrt_price == target_sqrt {
             diagnostics.crossed_ticks += 1;
-            amount_out = amount_out
-                .checked_add(amount0_delta(liquidity, sqrt_price, target_sqrt, false)?)
-                .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
-            sqrt_price = target_sqrt;
             liquidity = apply_liquidity_delta(liquidity, tick.liquidity_net)?;
         } else {
-            let next_sqrt =
-                next_sqrt_price_from_amount1_in(sqrt_price, liquidity, amount_remaining)?;
-            amount_out = amount_out
-                .checked_add(amount0_delta(liquidity, sqrt_price, next_sqrt, false)?)
-                .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
             return Ok((amount_out, diagnostics));
         }
     }
 
     if !amount_remaining.is_zero() && !liquidity.is_zero() {
         diagnostics.tick_range_exhausted = true;
-        let next_sqrt = next_sqrt_price_from_amount1_in(sqrt_price, liquidity, amount_remaining)?;
+        let step = compute_swap_step(
+            sqrt_price,
+            U256::MAX,
+            liquidity,
+            amount_remaining,
+            fee_pips,
+            false,
+        )?;
         amount_out = amount_out
-            .checked_add(amount0_delta(liquidity, sqrt_price, next_sqrt, false)?)
+            .checked_add(step.amount_out)
             .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))?;
     }
     Ok((amount_out, diagnostics))
 }
 
-fn apply_v3_fee(amount_in: U256, pool_state: &PoolState) -> Result<U256> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwapStepResult {
+    sqrt_next: U256,
+    amount_in: U256,
+    amount_out: U256,
+    fee_amount: U256,
+}
+
+fn compute_swap_step(
+    sqrt_current: U256,
+    sqrt_target: U256,
+    liquidity: U256,
+    amount_remaining: U256,
+    fee_pips: u32,
+    zero_for_one: bool,
+) -> Result<SwapStepResult> {
+    if amount_remaining.is_zero() || liquidity.is_zero() {
+        return Ok(SwapStepResult {
+            sqrt_next: sqrt_current,
+            amount_in: U256::ZERO,
+            amount_out: U256::ZERO,
+            fee_amount: U256::ZERO,
+        });
+    }
+
+    let amount_remaining_less_fee = mul_div(
+        amount_remaining,
+        U256::from(FEE_DENOMINATOR.saturating_sub(fee_pips)),
+        U256::from(FEE_DENOMINATOR),
+    )?;
+    let amount_in_to_target = if zero_for_one {
+        amount0_delta(liquidity, sqrt_target, sqrt_current, true)?
+    } else {
+        amount1_delta(liquidity, sqrt_current, sqrt_target, true)?
+    };
+    let reached_target = amount_remaining_less_fee >= amount_in_to_target;
+    let sqrt_next = if reached_target {
+        sqrt_target
+    } else if zero_for_one {
+        next_sqrt_price_from_amount0_in(sqrt_current, liquidity, amount_remaining_less_fee)?
+    } else {
+        next_sqrt_price_from_amount1_in(sqrt_current, liquidity, amount_remaining_less_fee)?
+    };
+
+    let amount_in = if zero_for_one {
+        amount0_delta(liquidity, sqrt_next, sqrt_current, true)?
+    } else {
+        amount1_delta(liquidity, sqrt_current, sqrt_next, true)?
+    };
+    let amount_out = if zero_for_one {
+        amount1_delta(liquidity, sqrt_next, sqrt_current, false)?
+    } else {
+        amount0_delta(liquidity, sqrt_current, sqrt_next, false)?
+    };
+    let fee_amount = if reached_target {
+        mul_div_rounding_up(
+            amount_in,
+            U256::from(fee_pips),
+            U256::from(FEE_DENOMINATOR.saturating_sub(fee_pips)),
+        )?
+    } else {
+        amount_remaining.saturating_sub(amount_in)
+    };
+
+    Ok(SwapStepResult {
+        sqrt_next,
+        amount_in,
+        amount_out,
+        fee_amount,
+    })
+}
+
+fn v3_fee_pips(pool_state: &PoolState) -> Result<u32> {
+    if pool_state.variant == PoolVariant::AerodromeSlipstream && pool_state.fee_pips.is_none() {
+        return Err(ArbBotError::Quote(
+            "missing Aerodrome Slipstream fee_pips".into(),
+        ));
+    }
     let fee_pips = pool_state
         .fee_pips
         .unwrap_or_else(|| pool_state.fee_bps.saturating_mul(100));
-    let fee_denominator = U256::from(1_000_000u64);
-    let fee_numerator = fee_denominator
-        .checked_sub(U256::from(fee_pips))
-        .ok_or_else(|| ArbBotError::Quote("invalid fee".into()))?;
-    amount_in
-        .checked_mul(fee_numerator)
-        .and_then(|value| value.checked_div(fee_denominator))
-        .ok_or_else(|| ArbBotError::Quote("fee calculation overflow".into()))
+    if fee_pips >= FEE_DENOMINATOR {
+        return Err(ArbBotError::Quote("invalid V3 fee".into()));
+    }
+    Ok(fee_pips)
 }
 
 fn quote_token0_for_token1(amount_in: U256, sqrt_price_x96: U256, liquidity: U256) -> Result<U256> {
     if amount_in.is_zero() {
         return Ok(U256::ZERO);
     }
-    let q96 = q96();
-    let scaled_amount = amount_in
-        .checked_mul(sqrt_price_x96)
-        .and_then(|value| value.checked_div(q96))
-        .ok_or_else(|| ArbBotError::Quote("scaled amount overflow".into()))?;
-    let denominator = liquidity
-        .checked_add(scaled_amount)
-        .ok_or_else(|| ArbBotError::Quote("sqrt denominator overflow".into()))?;
-    if denominator.is_zero() {
-        return Err(ArbBotError::Quote("zero sqrt denominator".into()));
-    }
-    let next_sqrt_price = liquidity
-        .checked_mul(sqrt_price_x96)
-        .and_then(|value| value.checked_div(denominator))
-        .ok_or_else(|| ArbBotError::Quote("next sqrt overflow".into()))?;
-    let sqrt_delta = sqrt_price_x96.saturating_sub(next_sqrt_price);
-    liquidity
-        .checked_mul(sqrt_delta)
-        .and_then(|value| value.checked_div(q96))
-        .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))
+    let next_sqrt_price = next_sqrt_price_from_amount0_in(sqrt_price_x96, liquidity, amount_in)?;
+    amount1_delta(liquidity, next_sqrt_price, sqrt_price_x96, false)
 }
 
 fn quote_token1_for_token0(amount_in: U256, sqrt_price_x96: U256, liquidity: U256) -> Result<U256> {
     if amount_in.is_zero() {
         return Ok(U256::ZERO);
     }
-    let q96 = q96();
-    let sqrt_delta = amount_in
-        .checked_mul(q96)
-        .and_then(|value| value.checked_div(liquidity))
-        .ok_or_else(|| ArbBotError::Quote("sqrt delta overflow".into()))?;
-    let next_sqrt_price = sqrt_price_x96
-        .checked_add(sqrt_delta)
-        .ok_or_else(|| ArbBotError::Quote("next sqrt overflow".into()))?;
-    let numerator = liquidity
-        .checked_mul(sqrt_delta)
-        .and_then(|value| value.checked_mul(q96))
-        .ok_or_else(|| ArbBotError::Quote("amount0 numerator overflow".into()))?;
-    let denominator = next_sqrt_price
-        .checked_mul(sqrt_price_x96)
-        .ok_or_else(|| ArbBotError::Quote("amount0 denominator overflow".into()))?;
-    if denominator.is_zero() {
-        return Err(ArbBotError::Quote("zero amount0 denominator".into()));
-    }
-    numerator
-        .checked_div(denominator)
-        .ok_or_else(|| ArbBotError::Quote("amount_out overflow".into()))
+    let next_sqrt_price = next_sqrt_price_from_amount1_in(sqrt_price_x96, liquidity, amount_in)?;
+    amount0_delta(liquidity, sqrt_price_x96, next_sqrt_price, false)
 }
 
 fn amount0_delta(liquidity: U256, sqrt_a: U256, sqrt_b: U256, round_up: bool) -> Result<U256> {
     let (lower, upper) = ordered(sqrt_a, sqrt_b);
     let diff = upper.saturating_sub(lower);
-    let numerator = liquidity
-        .checked_mul(diff)
-        .and_then(|value| value.checked_mul(q96()))
+    let numerator1 = liquidity
+        .checked_shl(Q96_BITS)
         .ok_or_else(|| ArbBotError::Quote("amount0 numerator overflow".into()))?;
-    let denominator = upper
-        .checked_mul(lower)
-        .ok_or_else(|| ArbBotError::Quote("amount0 denominator overflow".into()))?;
-    div_round(numerator, denominator, round_up)
+    if round_up {
+        let value = mul_div_rounding_up(numerator1, diff, upper)?;
+        div_round(value, lower, true)
+    } else {
+        let value = mul_div(numerator1, diff, upper)?;
+        value
+            .checked_div(lower)
+            .ok_or_else(|| ArbBotError::Quote("amount0 denominator overflow".into()))
+    }
 }
 
 fn amount1_delta(liquidity: U256, sqrt_a: U256, sqrt_b: U256, round_up: bool) -> Result<U256> {
     let (lower, upper) = ordered(sqrt_a, sqrt_b);
     let diff = upper.saturating_sub(lower);
-    let numerator = liquidity
-        .checked_mul(diff)
-        .ok_or_else(|| ArbBotError::Quote("amount1 numerator overflow".into()))?;
-    div_round(numerator, q96(), round_up)
+    if round_up {
+        mul_div_rounding_up(liquidity, diff, q96())
+    } else {
+        mul_div(liquidity, diff, q96())
+    }
 }
 
 fn next_sqrt_price_from_amount0_in(
@@ -342,15 +419,13 @@ fn next_sqrt_price_from_amount0_in(
     liquidity: U256,
     amount_in: U256,
 ) -> Result<U256> {
-    let numerator = liquidity
-        .checked_mul(sqrt_price)
-        .and_then(|value| value.checked_mul(q96()))
+    let numerator1 = liquidity
+        .checked_shl(Q96_BITS)
         .ok_or_else(|| ArbBotError::Quote("next sqrt numerator overflow".into()))?;
-    let denominator = liquidity
-        .checked_mul(q96())
-        .and_then(|value| value.checked_add(amount_in.checked_mul(sqrt_price)?))
+    let denominator = U512::from(numerator1)
+        .checked_add(U512::from(amount_in) * U512::from(sqrt_price))
         .ok_or_else(|| ArbBotError::Quote("next sqrt denominator overflow".into()))?;
-    div_round(numerator, denominator, true)
+    mul_div_rounding_up_u512(numerator1, sqrt_price, denominator)
 }
 
 fn next_sqrt_price_from_amount1_in(
@@ -358,10 +433,7 @@ fn next_sqrt_price_from_amount1_in(
     liquidity: U256,
     amount_in: U256,
 ) -> Result<U256> {
-    let delta = amount_in
-        .checked_mul(q96())
-        .and_then(|value| value.checked_div(liquidity))
-        .ok_or_else(|| ArbBotError::Quote("sqrt delta overflow".into()))?;
+    let delta = mul_div(amount_in, q96(), liquidity)?;
     sqrt_price
         .checked_add(delta)
         .ok_or_else(|| ArbBotError::Quote("next sqrt overflow".into()))
@@ -397,6 +469,53 @@ fn div_round(numerator: U256, denominator: U256, round_up: bool) -> Result<U256>
     } else {
         Ok(quotient)
     }
+}
+
+fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256> {
+    if denominator.is_zero() {
+        return Err(ArbBotError::Quote("division by zero".into()));
+    }
+    u512_to_u256((U512::from(a) * U512::from(b)) / U512::from(denominator))
+}
+
+fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Result<U256> {
+    if denominator.is_zero() {
+        return Err(ArbBotError::Quote("division by zero".into()));
+    }
+    let numerator = U512::from(a) * U512::from(b);
+    let denominator = U512::from(denominator);
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let value = u512_to_u256(quotient)?;
+    if remainder.is_zero() {
+        Ok(value)
+    } else {
+        value
+            .checked_add(U256::from(1u64))
+            .ok_or_else(|| ArbBotError::Quote("mulDiv rounding overflow".into()))
+    }
+}
+
+fn mul_div_rounding_up_u512(a: U256, b: U256, denominator: U512) -> Result<U256> {
+    if denominator.is_zero() {
+        return Err(ArbBotError::Quote("division by zero".into()));
+    }
+    let numerator = U512::from(a) * U512::from(b);
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let value = u512_to_u256(quotient)?;
+    if remainder.is_zero() {
+        Ok(value)
+    } else {
+        value
+            .checked_add(U256::from(1u64))
+            .ok_or_else(|| ArbBotError::Quote("mulDiv rounding overflow".into()))
+    }
+}
+
+fn u512_to_u256(value: U512) -> Result<U256> {
+    U256::checked_from_limbs_slice(value.as_limbs())
+        .ok_or_else(|| ArbBotError::Quote("mulDiv overflow".into()))
 }
 
 fn sqrt_ratio_at_tick(tick: i32) -> Result<U256> {
