@@ -48,6 +48,7 @@ pub struct Settings {
     pub execution_replacement_fee_bump_bps: u64,
     pub execution_max_replacements: u32,
     pub execution_gas_profit_buffer_bps: u64,
+    pub searcher_onchain_validate: bool,
     pub monitor_web_password: Option<String>,
 }
 
@@ -70,6 +71,7 @@ impl Settings {
             .set_default("execution_replacement_fee_bump_bps", 12_500u64)?
             .set_default("execution_max_replacements", 3u32)?
             .set_default("execution_gas_profit_buffer_bps", 15_000u64)?
+            .set_default("searcher_onchain_validate", true)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()
