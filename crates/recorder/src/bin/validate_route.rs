@@ -6,12 +6,14 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::{
     config::Settings,
     constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER},
-    types::{ArbPath, DexKind, PoolRegistryEntry, PoolVariant, SwapStep},
+    types::{ArbPath, DexKind, PoolRegistryEntry, PoolState, PoolVariant, SwapStep},
 };
 use base_arb_dex::{
     aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter},
     quoter::DexQuoter,
+    uniswap_v3::{quote_exact_in_with_ticks_diagnostics, UniswapV3CurrentTickQuoter},
 };
+use base_arb_storage::{redis::RedisStore, TickStateStore};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use tracing_subscriber::EnvFilter;
@@ -50,6 +52,7 @@ async fn main() -> Result<()> {
     let cli = parse_args(env::args().skip(1))?;
     let settings = Settings::load()?;
     let pool = PgPool::connect(&settings.postgres_url).await?;
+    let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
 
     let row = load_opportunity(&pool, &cli).await?;
@@ -97,6 +100,7 @@ async fn main() -> Result<()> {
         amount_in,
         expected_profit,
         &provider,
+        &redis,
         &block_hash,
         block_number,
     )
@@ -115,25 +119,15 @@ async fn validate_step_quotes(
     amount_in: U256,
     opportunity_expected_profit: U256,
     provider: &ChainProvider,
+    tick_store: &RedisStore,
     block_hash: &str,
     block_number: u64,
 ) -> Result<()> {
     println!("\n== Step Quote Check ==");
-    let mut amount = amount_in;
     let mut local_amount = amount_in;
+    let mut direct_amount = Some(amount_in);
     for (idx, step) in path.steps.iter().enumerate() {
         let step_no = idx + 1;
-        if !matches!(
-            (step.dex, step.variant),
-            (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
-        ) {
-            println!(
-                "step {step_no}: skipped local/onchain direct quote for {:?} {:?}",
-                step.dex, step.variant
-            );
-            continue;
-        }
-
         let entry = PoolRegistryEntry {
             pool_address: step.pool,
             dex: step.dex,
@@ -150,32 +144,90 @@ async fn validate_step_quotes(
             .fetch_pool_state_from_registry_at_block_hash(&entry, block_hash, block_number)
             .await
             .with_context(|| format!("failed to fetch state for step {step_no} quote check"))?;
-        let local = if classic_stable_flag(step) {
-            AerodromeStableQuoter
-                .quote_exact_in(&state, step.token_in, local_amount)
-                .await?
-                .amount_out
-        } else {
-            AerodromeVolatileQuoter
-                .quote_exact_in(&state, step.token_in, local_amount)
-                .await?
-                .amount_out
-        };
-        let onchain = pool_get_amount_out(provider, step.pool, amount, step.token_in).await?;
-        println!(
-            "step {step_no}: amount_in={amount} local_amount_in={local_amount} local_quote={local} pool_getAmountOut={onchain} diff_bps={}",
-            diff_bps(local, onchain)
-        );
-        amount = onchain;
+        let local = quote_local_step(step, &state, local_amount, tick_store)
+            .await
+            .with_context(|| format!("failed local quote for step {step_no}"))?;
+
+        if matches!(
+            (step.dex, step.variant),
+            (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
+        ) {
+            if let Some(amount) = direct_amount {
+                let onchain =
+                    pool_get_amount_out(provider, step.pool, amount, step.token_in).await?;
+                println!(
+                    "step {step_no}: amount_in={amount} local_amount_in={local_amount} local_quote={local} pool_getAmountOut={onchain} diff_bps={}",
+                    diff_bps(local, onchain)
+                );
+                direct_amount = Some(onchain);
+            } else {
+                println!(
+                    "step {step_no}: local_amount_in={local_amount} local_quote={local} pool_getAmountOut=skipped_after_v3"
+                );
+            }
+        }
         local_amount = local;
     }
+    let direct_profit = direct_amount.map(|amount| amount.saturating_sub(amount_in));
     println!(
         "final: opportunity_expected_profit={} latest_local_profit={} latest_pool_getAmountOut_profit={}",
         opportunity_expected_profit,
         local_amount.saturating_sub(amount_in),
-        amount.saturating_sub(amount_in)
+        direct_profit
+            .map(|profit| profit.to_string())
+            .unwrap_or_else(|| "unavailable".into())
     );
     Ok(())
+}
+
+async fn quote_local_step(
+    step: &SwapStep,
+    state: &PoolState,
+    amount_in: U256,
+    tick_store: &RedisStore,
+) -> Result<U256> {
+    match state.variant {
+        PoolVariant::AerodromeVolatile => {
+            let quote = if state.stable.unwrap_or(false) {
+                AerodromeStableQuoter
+                    .quote_exact_in(state, step.token_in, amount_in)
+                    .await?
+            } else {
+                AerodromeVolatileQuoter
+                    .quote_exact_in(state, step.token_in, amount_in)
+                    .await?
+            };
+            Ok(quote.amount_out)
+        }
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+            let ticks = tick_store.get_pool_ticks(state.pool_id.address).await?;
+            if ticks.is_empty() {
+                let quote = UniswapV3CurrentTickQuoter
+                    .quote_exact_in(state, step.token_in, amount_in)
+                    .await?;
+                println!(
+                    "v3_local_quote: pool={:#x} mode=current_tick_fallback fee_pips={:?} tick_count=0 amount_in={} amount_out={}",
+                    step.pool, state.fee_pips, amount_in, quote.amount_out
+                );
+                Ok(quote.amount_out)
+            } else {
+                let (quote, diagnostics) =
+                    quote_exact_in_with_ticks_diagnostics(state, &ticks, step.token_in, amount_in)?;
+                println!(
+                    "v3_local_quote: pool={:#x} mode=cross_tick fee_pips={:?} tick_count={} amount_in={} amount_out={} ticks_used={} crossed_ticks={} exhausted={}",
+                    step.pool,
+                    state.fee_pips,
+                    ticks.len(),
+                    amount_in,
+                    quote.amount_out,
+                    diagnostics.ticks_used,
+                    diagnostics.crossed_ticks,
+                    diagnostics.tick_range_exhausted
+                );
+                Ok(quote.amount_out)
+            }
+        }
+    }
 }
 
 fn parse_args<I>(args: I) -> Result<Cli>
