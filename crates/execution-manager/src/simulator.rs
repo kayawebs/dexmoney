@@ -493,7 +493,6 @@ mod tests {
             execution_replacement_fee_bump_bps: 12_500,
             execution_max_replacements: 3,
             execution_gas_profit_buffer_bps: 15_000,
-            searcher_onchain_validate: true,
             monitor_web_password: None,
         }
     }
