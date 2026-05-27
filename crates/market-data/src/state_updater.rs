@@ -10,6 +10,8 @@ const AERODROME_SYNC_TOPIC: &str =
 const UNISWAP_V2_SYNC_TOPIC: &str =
     "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const PANCAKE_V3_SWAP_TOPIC: &str =
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const V3_MINT_TOPIC: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
 const V3_BURN_TOPIC: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
 
@@ -53,7 +55,10 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         let (reserve0, reserve1) = decode_sync_reserves(data)?;
         state.reserve0 = Some(reserve0);
         state.reserve1 = Some(reserve1);
-    } else if is_v3_style(state) && topic0 == V3_SWAP_TOPIC {
+    } else if is_v3_style(state)
+        && (topic0 == V3_SWAP_TOPIC
+            || (state.variant == PoolVariant::PancakeV3 && topic0 == PANCAKE_V3_SWAP_TOPIC))
+    {
         let (sqrt_price_x96, liquidity, tick) = decode_v3_swap_state(data)?;
         state.sqrt_price_x96 = Some(sqrt_price_x96);
         state.liquidity = Some(liquidity);
@@ -375,6 +380,43 @@ mod tests {
         assert_eq!(state.liquidity, Some(U256::from(555u64)));
         assert_eq!(state.tick, Some(42));
         assert_eq!(state.block_number, 11);
+    }
+
+    #[test]
+    fn applies_pancake_v3_swap_state_with_protocol_fee_words() {
+        let pool = address!("7777777777777777777777777777777777777777");
+        let mut state = v3_state(pool, Some(3), Some(U256::from(2u64)));
+        state.dex = DexKind::PancakeSwap;
+        state.variant = PoolVariant::PancakeV3;
+        let event = DexEvent {
+            block_number: 15,
+            tx_hash: "0xpancake".into(),
+            log_index: 0,
+            pool_address: pool,
+            dex: DexKind::PancakeSwap,
+            event_type: "Swap".into(),
+            raw_data_json: json!({
+                "topics": [super::PANCAKE_V3_SWAP_TOPIC],
+                "data": concat!(
+                    "0x",
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "000000000000000000000000000000000000000000000000000000000000007b",
+                    "00000000000000000000000000000000000000000000000000000000000001c8",
+                    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcf1da",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                    "0000000000000000000000000000000000000000000000000000000000000000"
+                )
+            }),
+        };
+
+        let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
+
+        assert!(changed);
+        assert_eq!(state.sqrt_price_x96, Some(U256::from(123u64)));
+        assert_eq!(state.liquidity, Some(U256::from(456u64)));
+        assert_eq!(state.tick, Some(-200_230));
+        assert_eq!(state.block_number, 15);
     }
 
     #[test]

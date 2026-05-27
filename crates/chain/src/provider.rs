@@ -1633,6 +1633,10 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
             "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
         ) => "Swap",
         (
+            DexKind::PancakeSwap,
+            "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83",
+        ) => "Swap",
+        (
             DexKind::UniswapV3 | DexKind::PancakeSwap,
             "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde",
         ) => "Mint",
