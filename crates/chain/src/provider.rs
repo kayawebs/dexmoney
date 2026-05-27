@@ -133,18 +133,15 @@ impl ChainProvider {
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
                 if entry.variant == PoolVariant::AerodromeSlipstream {
-                    state.fee_pips = self
+                    let fee_pips = self
                         .fetch_aerodrome_slipstream_fee_pips_for_entry_at_block(entry, block_number)
-                        .await
-                        .ok();
-                    if let Some(fee_pips) = state.fee_pips {
-                        state.fee_bps = fee_pips / 100;
-                    }
+                        .await?;
+                    state.fee_pips = Some(fee_pips);
+                    state.fee_bps = fee_pips / 100;
                 } else {
                     state.fee_bps = self
-                        .fetch_aerodrome_classic_fee_bps_for_entry(entry)
-                        .await
-                        .unwrap_or(entry.fee_bps);
+                        .fetch_aerodrome_classic_fee_bps_for_entry_at_block(entry, block_number)
+                        .await?;
                 }
                 Ok(state)
             }
@@ -214,20 +211,17 @@ impl ChainProvider {
                 state.factory_address = entry.factory_address;
                 state.stable = entry.stable;
                 if entry.variant == PoolVariant::AerodromeSlipstream {
-                    state.fee_pips = self
+                    let fee_pips = self
                         .fetch_aerodrome_slipstream_fee_pips_for_entry_at_block_hash(
                             entry, block_hash,
                         )
-                        .await
-                        .ok();
-                    if let Some(fee_pips) = state.fee_pips {
-                        state.fee_bps = fee_pips / 100;
-                    }
+                        .await?;
+                    state.fee_pips = Some(fee_pips);
+                    state.fee_bps = fee_pips / 100;
                 } else {
                     state.fee_bps = self
-                        .fetch_aerodrome_classic_fee_bps_for_entry(entry)
-                        .await
-                        .unwrap_or(entry.fee_bps);
+                        .fetch_aerodrome_classic_fee_bps_for_entry_at_block_hash(entry, block_hash)
+                        .await?;
                 }
                 Ok(state)
             }
@@ -1033,17 +1027,19 @@ impl ChainProvider {
             .map_err(|_| anyhow::anyhow!("token decimals too large for {token:#x}: {decimals_u64}"))
     }
 
-    async fn fetch_aerodrome_classic_fee_bps_for_entry(
+    async fn fetch_aerodrome_classic_fee_bps_for_entry_at_block(
         &self,
         entry: &PoolRegistryEntry,
+        block_number: Option<u64>,
     ) -> Result<u32> {
         let factory = entry
             .factory_address
             .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
-        self.fetch_aerodrome_classic_fee_bps(
+        self.fetch_aerodrome_classic_fee_bps_at_block(
             factory,
             entry.pool_address,
             entry.stable.unwrap_or(false),
+            block_number,
         )
         .await
     }
@@ -1054,9 +1050,61 @@ impl ChainProvider {
         pool: Address,
         stable: bool,
     ) -> Result<u32> {
+        self.fetch_aerodrome_classic_fee_bps_at_block(factory, pool, stable, None)
+            .await
+    }
+
+    async fn fetch_aerodrome_classic_fee_bps_at_block(
+        &self,
+        factory: Address,
+        pool: Address,
+        stable: bool,
+        block_number: Option<u64>,
+    ) -> Result<u32> {
         let data = encode_get_fee(pool, stable);
         let raw = self
-            .eth_call(factory, &data, "Aerodrome factory getFee(address,bool)")
+            .eth_call_at_block(
+                factory,
+                &data,
+                "Aerodrome factory getFee(address,bool)",
+                block_number,
+            )
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
+    }
+
+    async fn fetch_aerodrome_classic_fee_bps_for_entry_at_block_hash(
+        &self,
+        entry: &PoolRegistryEntry,
+        block_hash: &str,
+    ) -> Result<u32> {
+        self.fetch_aerodrome_classic_fee_bps_at_block_hash(
+            entry.factory_address,
+            entry.pool_address,
+            entry.stable.unwrap_or(false),
+            block_hash,
+        )
+        .await
+    }
+
+    pub async fn fetch_aerodrome_classic_fee_bps_at_block_hash(
+        &self,
+        factory: Option<Address>,
+        pool: Address,
+        stable: bool,
+        block_hash: &str,
+    ) -> Result<u32> {
+        let factory = factory.unwrap_or(AERODROME_POOL_FACTORY.parse()?);
+        let data = encode_get_fee(pool, stable);
+        let raw = self
+            .eth_call_at_block_hash(
+                factory,
+                &data,
+                "Aerodrome factory getFee(address,bool)",
+                block_hash,
+            )
             .await?;
         let words = decode_32byte_words(&raw)?;
         let fee = parse_word_u256(&words[0])?;

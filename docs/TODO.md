@@ -1,5 +1,21 @@
 # TODO
 
+## Current: Aerodrome Quote Correctness
+
+- [x] Decode all known quote-state pool events for the supported pool variants:
+  - Aerodrome Classic reserve updates from `Sync(uint256,uint256)`.
+  - Aerodrome Slipstream V3-style `Swap`, `Mint`, and `Burn`.
+  - Uniswap V3 `Swap`, `Mint`, and `Burn`.
+  - Pancake V3 extended `Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)`, plus V3 liquidity events.
+- [x] Read Aerodrome Classic and Slipstream fees in the same block-pinned snapshot as reserves/slot0 state.
+- [x] Refresh dynamic Slipstream fees when a swap event changes locally published state.
+- [x] Refresh Classic factory fees before publishing a locally applied reserve update.
+- [x] Include Aerodrome fee mismatches in pool-state validation and drift warnings.
+- [ ] Audit the deployed Base Aerodrome Classic factory, Slipstream factories, and configured Slipstream fee modules for every fee-changing code path and emitted event.
+- [ ] Subscribe to factory/module fee-change events where the deployed contracts expose them; retain periodic onchain refresh for any fee changes that have no event.
+- [ ] If the deployed Slipstream fee module formula is stable and based only on locally available inputs, implement and test local fee evaluation; otherwise document RPC refresh as required input to exact quotes.
+- [ ] Add fork/replay tests that compare each supported local path quote with contract output across recorded profitable and `MinProfitNotMet` candidates.
+
 ## Immediate
 
 - Replace demo `market-data` bootstrap with real Base RPC/WS initialization.

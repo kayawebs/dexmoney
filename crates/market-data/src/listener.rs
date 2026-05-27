@@ -92,6 +92,7 @@ where
 
             let mut changed_pools = HashSet::new();
             let mut validation_snapshots = BTreeMap::new();
+            let mut classic_fee_refreshes = HashMap::new();
             let mut slipstream_fee_refreshes = HashMap::new();
             for event in &events {
                 if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
@@ -144,6 +145,11 @@ where
                         ) {
                             slipstream_fee_refreshes
                                 .insert(state.pool_id.address, event.block_number);
+                        } else if matches!(
+                            (state.dex, state.variant),
+                            (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
+                        ) {
+                            classic_fee_refreshes.insert(state.pool_id.address, event.block_number);
                         }
                         debug!(
                             pool = %state.pool_id.address,
@@ -152,6 +158,50 @@ where
                         );
                     }
                     break;
+                }
+            }
+
+            for (pool, block_number) in classic_fee_refreshes {
+                let Some(state) = monitored_states
+                    .iter_mut()
+                    .find(|state| state.pool_id.address == pool)
+                else {
+                    continue;
+                };
+                let fee_result = async {
+                    let block_hash = self.provider.get_block_hash(block_number).await?;
+                    self.provider
+                        .fetch_aerodrome_classic_fee_bps_at_block_hash(
+                            state.factory_address,
+                            pool,
+                            state.stable.unwrap_or(false),
+                            &block_hash,
+                        )
+                        .await
+                }
+                .await;
+                match fee_result {
+                    Ok(fee_bps) => {
+                        state.fee_bps = fee_bps;
+                        validation_snapshots
+                            .insert((state.block_number, state.pool_id.address), state.clone());
+                        debug!(
+                            pool = %pool,
+                            block_number,
+                            fee_bps,
+                            "Aerodrome Classic factory fee refreshed after reserve event"
+                        );
+                    }
+                    Err(err) => {
+                        changed_pools.remove(&pool);
+                        validation_snapshots.retain(|(_, address), _| *address != pool);
+                        warn!(
+                            pool = %pool,
+                            block_number,
+                            error = %err,
+                            "Classic state update withheld because factory fee refresh failed"
+                        );
+                    }
                 }
             }
 
@@ -379,6 +429,10 @@ where
                     local_block = local.block_number,
                     onchain_block = onchain.block_number,
                     drift_bps,
+                    local_fee_bps = local.fee_bps,
+                    onchain_fee_bps = onchain.fee_bps,
+                    local_fee_pips = ?local.fee_pips,
+                    onchain_fee_pips = ?onchain.fee_pips,
                     "active pool state refresh corrected drift"
                 );
                 self.recorder
@@ -615,6 +669,10 @@ where
                     local_block = state.block_number,
                     onchain_block = onchain.block_number,
                     drift_bps,
+                    local_fee_bps = state.fee_bps,
+                    onchain_fee_bps = onchain.fee_bps,
+                    local_fee_pips = ?state.fee_pips,
+                    onchain_fee_pips = ?onchain.fee_pips,
                     "pool state calibration mismatch"
                 );
                 self.recorder
@@ -720,6 +778,10 @@ where
                     variant = ?state.variant,
                     block_number = state.block_number,
                     drift_bps,
+                    local_fee_bps = state.fee_bps,
+                    onchain_fee_bps = onchain.fee_bps,
+                    local_fee_pips = ?state.fee_pips,
+                    onchain_fee_pips = ?onchain.fee_pips,
                     "delayed block validation mismatch"
                 );
             } else {
@@ -827,12 +889,27 @@ fn calibration_message(state: &PoolState, drift_bps: u64) -> String {
 
 fn state_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
     match (local.dex, local.variant) {
-        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => reserve_drift_bps(local, onchain),
-        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-        | (DexKind::UniswapV3, PoolVariant::UniswapV3)
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => {
+            reserve_drift_bps(local, onchain).max(aerodrome_fee_drift_bps(local, onchain))
+        }
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream) => {
+            v3_state_drift_bps(local, onchain).max(aerodrome_fee_drift_bps(local, onchain))
+        }
+        (DexKind::UniswapV3, PoolVariant::UniswapV3)
         | (DexKind::PancakeSwap, PoolVariant::PancakeV3) => v3_state_drift_bps(local, onchain),
         _ => u64::MAX,
     }
+}
+
+fn aerodrome_fee_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
+    if local.variant == PoolVariant::AerodromeSlipstream {
+        return match (local.fee_pips, onchain.fee_pips) {
+            (Some(local), Some(onchain)) if local == onchain => 0,
+            (Some(local), Some(onchain)) => u64::from(local.abs_diff(onchain).div_ceil(100).max(1)),
+            _ => u64::MAX,
+        };
+    }
+    u64::from(local.fee_bps.abs_diff(onchain.fee_bps))
 }
 
 fn reserve_drift_bps(local: &PoolState, onchain: &PoolState) -> u64 {
@@ -925,5 +1002,59 @@ impl RecentLogCache {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, U256};
+    use chrono::Utc;
+
+    use super::state_drift_bps;
+    use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
+
+    fn pool_state(variant: PoolVariant) -> PoolState {
+        PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: Address::ZERO,
+            },
+            dex: DexKind::Aerodrome,
+            variant,
+            factory_address: None,
+            token0: Address::ZERO,
+            token1: Address::ZERO,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps: 30,
+            fee_pips: (variant == PoolVariant::AerodromeSlipstream).then_some(3_000),
+            stable: Some(false),
+            reserve0: Some(U256::from(1_000_000u64)),
+            reserve1: Some(U256::from(2_000_000u64)),
+            sqrt_price_x96: Some(U256::from(3_000_000u64)),
+            liquidity: Some(U256::from(4_000_000u64)),
+            tick: Some(1),
+            tick_spacing: None,
+            block_number: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn classic_fee_change_is_state_drift_without_reserve_change() {
+        let local = pool_state(PoolVariant::AerodromeVolatile);
+        let mut onchain = local.clone();
+        onchain.fee_bps = 5;
+
+        assert_eq!(state_drift_bps(&local, &onchain), 25);
+    }
+
+    #[test]
+    fn slipstream_sub_bps_fee_change_is_nonzero_state_drift() {
+        let local = pool_state(PoolVariant::AerodromeSlipstream);
+        let mut onchain = local.clone();
+        onchain.fee_pips = Some(3_001);
+
+        assert_eq!(state_drift_bps(&local, &onchain), 1);
     }
 }
