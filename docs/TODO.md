@@ -10,6 +10,7 @@
 - [x] Read Aerodrome Classic and Slipstream fees in the same block-pinned snapshot as reserves/slot0 state.
 - [x] Refresh dynamic Slipstream fees when a swap event changes locally published state.
 - [x] Refresh Classic factory fees before publishing a locally applied reserve update.
+- [x] Refresh Aerodrome fees on a cheap dedicated interval independent of full pool state refresh.
 - [x] Include Aerodrome fee mismatches in pool-state validation and drift warnings.
 - [ ] Audit the deployed Base Aerodrome Classic factory, Slipstream factories, and configured Slipstream fee modules for every fee-changing code path and emitted event.
 - [ ] Subscribe to factory/module fee-change events where the deployed contracts expose them; retain periodic onchain refresh for any fee changes that have no event.

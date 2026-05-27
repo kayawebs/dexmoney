@@ -37,6 +37,7 @@ pub struct Settings {
     pub max_pool_state_age_ms: i64,
     pub max_price_impact_bps: u64,
     pub pool_active_refresh_interval_secs: u64,
+    pub aerodrome_fee_refresh_interval_secs: u64,
     pub v3_tick_refresh_interval_secs: u64,
     pub v3_tick_bitmap_word_radius: i32,
     pub v3_quote_safety_bps: u64,
@@ -60,6 +61,7 @@ impl Settings {
             .set_default("max_pool_state_age_ms", DEFAULT_MAX_POOL_STATE_AGE_MS)?
             .set_default("search_amount_usdc", "10,30,50,100")?
             .set_default("pool_active_refresh_interval_secs", 60u64)?
+            .set_default("aerodrome_fee_refresh_interval_secs", 15u64)?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 2u64)?

@@ -41,6 +41,9 @@ where
         let active_refresh_interval =
             Duration::from_secs(self.settings.pool_active_refresh_interval_secs.max(10));
         let mut next_active_refresh = Instant::now() + active_refresh_interval;
+        let aerodrome_fee_refresh_interval =
+            Duration::from_secs(self.settings.aerodrome_fee_refresh_interval_secs.max(5));
+        let mut next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
         let tick_refresh_interval =
             Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
         let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
@@ -62,8 +65,12 @@ where
                 if Instant::now() >= next_active_refresh {
                     monitored_states = self.active_refresh_states(monitored_states).await?;
                     next_active_refresh = Instant::now() + active_refresh_interval;
+                    next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                     next_tick_refresh = Instant::now() + tick_refresh_interval;
+                } else if Instant::now() >= next_aerodrome_fee_refresh {
+                    monitored_states = self.refresh_aerodrome_fees(monitored_states).await?;
+                    next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                 } else if Instant::now() >= next_calibration {
                     monitored_states = self.calibrate_states(monitored_states).await?;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -261,8 +268,12 @@ where
             if Instant::now() >= next_active_refresh {
                 monitored_states = self.active_refresh_states(monitored_states).await?;
                 next_active_refresh = Instant::now() + active_refresh_interval;
+                next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                 next_tick_refresh = Instant::now() + tick_refresh_interval;
+            } else if Instant::now() >= next_aerodrome_fee_refresh {
+                monitored_states = self.refresh_aerodrome_fees(monitored_states).await?;
+                next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
             } else if Instant::now() >= next_calibration {
                 monitored_states = self.calibrate_states(monitored_states).await?;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -466,6 +477,125 @@ where
         info!(
             refreshed = refreshed_pools.len(),
             failed, drifted, block_number, "active pool state refresh complete"
+        );
+
+        Ok(states)
+    }
+
+    async fn refresh_aerodrome_fees(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
+        if states.is_empty() {
+            return Ok(states);
+        }
+
+        let block_number = self.provider.get_block_number().await?;
+        let block_hash = self.provider.get_block_hash(block_number).await?;
+        let mut changed_pools = HashSet::new();
+        let mut checked = 0usize;
+        let mut failed = 0usize;
+
+        for state in &mut states {
+            if !is_aerodrome_fee_state(state) {
+                continue;
+            }
+            checked += 1;
+            let local = state.clone();
+            let fee_result = match state.variant {
+                PoolVariant::AerodromeVolatile => self
+                    .provider
+                    .fetch_aerodrome_classic_fee_bps_at_block_hash(
+                        state.factory_address,
+                        state.pool_id.address,
+                        state.stable.unwrap_or(false),
+                        &block_hash,
+                    )
+                    .await
+                    .map(AerodromeFee::Classic),
+                PoolVariant::AerodromeSlipstream => self
+                    .provider
+                    .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
+                        state.factory_address,
+                        state.pool_id.address,
+                        &block_hash,
+                    )
+                    .await
+                    .map(AerodromeFee::Slipstream),
+                _ => continue,
+            };
+
+            let fee = match fee_result {
+                Ok(fee) => fee,
+                Err(err) => {
+                    failed += 1;
+                    warn!(
+                        pool = %state.pool_id.address,
+                        dex = ?state.dex,
+                        variant = ?state.variant,
+                        block_number,
+                        error = %err,
+                        "Aerodrome fee refresh failed"
+                    );
+                    continue;
+                }
+            };
+
+            if !apply_aerodrome_fee(state, fee) {
+                continue;
+            }
+
+            let drift_bps = state_drift_bps(&local, state);
+            let message = format!("Aerodrome fee refresh corrected fee drift by {drift_bps} bps");
+            self.recorder
+                .record_pool_state_validation(PoolStateValidation {
+                    pool_address: local.pool_id.address,
+                    dex: local.dex,
+                    variant: local.variant,
+                    block_number,
+                    block_hash: block_hash.clone(),
+                    local_state: local.clone(),
+                    onchain_state: state.clone(),
+                    drift_bps,
+                    passed: false,
+                    message: message.clone(),
+                    created_at: chrono::Utc::now(),
+                })
+                .await?;
+            self.recorder
+                .record_pool_state_warning(PoolStateWarning {
+                    pool_address: local.pool_id.address,
+                    dex: local.dex,
+                    variant: local.variant,
+                    block_number,
+                    local_state: local,
+                    onchain_state: state.clone(),
+                    drift_bps,
+                    message,
+                    created_at: chrono::Utc::now(),
+                })
+                .await?;
+            changed_pools.insert(state.pool_id.address);
+            warn!(
+                pool = %state.pool_id.address,
+                dex = ?state.dex,
+                variant = ?state.variant,
+                block_number,
+                fee_bps = state.fee_bps,
+                fee_pips = ?state.fee_pips,
+                drift_bps,
+                "Aerodrome fee refresh corrected drift"
+            );
+        }
+
+        if !changed_pools.is_empty() {
+            self.publish_selected_states(&states, &changed_pools, "fee_refresh")
+                .await?;
+        }
+
+        debug!(
+            checked,
+            changed = changed_pools.len(),
+            failed,
+            block_number,
+            "Aerodrome fee refresh complete"
         );
 
         Ok(states)
@@ -831,6 +961,41 @@ fn is_v3_style_state(state: &PoolState) -> bool {
     )
 }
 
+fn is_aerodrome_fee_state(state: &PoolState) -> bool {
+    matches!(
+        (state.dex, state.variant),
+        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
+            | (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AerodromeFee {
+    Classic(u32),
+    Slipstream(u32),
+}
+
+fn apply_aerodrome_fee(state: &mut PoolState, fee: AerodromeFee) -> bool {
+    match (state.variant, fee) {
+        (PoolVariant::AerodromeVolatile, AerodromeFee::Classic(fee_bps))
+            if state.fee_bps != fee_bps =>
+        {
+            state.fee_bps = fee_bps;
+            state.updated_at = chrono::Utc::now();
+            true
+        }
+        (PoolVariant::AerodromeSlipstream, AerodromeFee::Slipstream(fee_pips))
+            if state.fee_pips != Some(fee_pips) =>
+        {
+            state.fee_pips = Some(fee_pips);
+            state.fee_bps = fee_pips / 100;
+            state.updated_at = chrono::Utc::now();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn apply_signed_u256_delta(value: U256, delta: i128) -> Result<U256> {
     if delta >= 0 {
         value
@@ -1010,7 +1175,7 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use chrono::Utc;
 
-    use super::state_drift_bps;
+    use super::{apply_aerodrome_fee, state_drift_bps, AerodromeFee};
     use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
 
     fn pool_state(variant: PoolVariant) -> PoolState {
@@ -1056,5 +1221,27 @@ mod tests {
         onchain.fee_pips = Some(3_001);
 
         assert_eq!(state_drift_bps(&local, &onchain), 1);
+    }
+
+    #[test]
+    fn applies_classic_fee_update_only_when_changed() {
+        let mut state = pool_state(PoolVariant::AerodromeVolatile);
+
+        assert!(!apply_aerodrome_fee(&mut state, AerodromeFee::Classic(30)));
+        assert!(apply_aerodrome_fee(&mut state, AerodromeFee::Classic(5)));
+        assert_eq!(state.fee_bps, 5);
+        assert_eq!(state.fee_pips, None);
+    }
+
+    #[test]
+    fn applies_slipstream_fee_update_as_pips() {
+        let mut state = pool_state(PoolVariant::AerodromeSlipstream);
+
+        assert!(apply_aerodrome_fee(
+            &mut state,
+            AerodromeFee::Slipstream(85)
+        ));
+        assert_eq!(state.fee_pips, Some(85));
+        assert_eq!(state.fee_bps, 0);
     }
 }
