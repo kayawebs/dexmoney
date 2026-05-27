@@ -170,6 +170,19 @@ struct TokenPairRow {
     token1_search_amounts: Option<String>,
     token0_min_profit: Option<String>,
     token1_min_profit: Option<String>,
+    token0_default_search_amounts: Option<String>,
+    token1_default_search_amounts: Option<String>,
+    token0_default_min_profit: Option<String>,
+    token1_default_min_profit: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct TokenSearchDefaultRow {
+    chain_id: i64,
+    symbol: String,
+    token_address: String,
+    search_amounts: Option<String>,
+    min_profit: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -229,6 +242,14 @@ struct SearchConfigForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct TokenSearchDefaultForm {
+    password: String,
+    token_address: String,
+    search_amounts: String,
+    min_profit: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
 }
@@ -261,6 +282,7 @@ async fn main() -> Result<()> {
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/search-config", post(update_pair_search_config))
+        .route("/tokens/search-default", post(update_token_search_default))
         .route("/favicon.ico", get(favicon))
         .route("/favicon.svg", get(favicon))
         .route("/healthz", get(healthz))
@@ -719,6 +741,53 @@ async fn update_pair_search_config(
     render_registry_response(&state.pool, None, Some("pair search config updated")).await
 }
 
+async fn update_token_search_default(
+    State(state): State<AppState>,
+    Form(form): Form<TokenSearchDefaultForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let token_address: Address = form
+        .token_address
+        .trim()
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let search_amounts =
+        normalize_raw_amount_list(&form.search_amounts).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let min_profit = normalize_raw_amount(&form.min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if search_amounts.is_some() != min_profit.is_some() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("token default amounts raw and min profit raw must be set together"),
+        )
+        .await;
+    }
+
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    store
+        .update_token_search_default(
+            state.settings.chain_id,
+            token_address,
+            search_amounts.as_deref(),
+            min_profit.as_deref(),
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    render_registry_response(&state.pool, None, Some("token search default updated")).await
+}
+
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
@@ -806,6 +875,9 @@ async fn render_registry_response(
     let token_pairs = fetch_token_pairs(pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token_defaults = fetch_token_search_defaults(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let registry_pools = fetch_registry_pools(pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -828,6 +900,10 @@ async fn render_registry_response(
           {rediscover_all_form}
         </section>
         <section class="card">
+          <h2>Token Search Defaults</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
           <h2>Token Pairs</h2>
           <div class="card-body">{}</div>
         </section>
@@ -836,6 +912,7 @@ async fn render_registry_response(
           <div class="card-body">{}</div>
         </section>
         "#,
+        render_token_search_defaults(&token_defaults),
         render_token_pairs_table(&token_pairs),
         render_registry_pools_table(&registry_pools),
         password_input = password_input(None, true),
@@ -855,18 +932,26 @@ async fn fetch_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
     Ok(sqlx::query_as::<_, TokenPairRow>(
         r#"
         SELECT
-            created_at,
-            chain_id,
-            symbol,
-            token0,
-            token1,
-            enabled,
-            token0_search_amounts,
-            token1_search_amounts,
-            token0_min_profit,
-            token1_min_profit
-        FROM token_pairs
-        ORDER BY created_at DESC
+            tp.created_at,
+            tp.chain_id,
+            tp.symbol,
+            tp.token0,
+            tp.token1,
+            tp.enabled,
+            tp.token0_search_amounts,
+            tp.token1_search_amounts,
+            tp.token0_min_profit,
+            tp.token1_min_profit,
+            d0.search_amounts AS token0_default_search_amounts,
+            d1.search_amounts AS token1_default_search_amounts,
+            d0.min_profit AS token0_default_min_profit,
+            d1.min_profit AS token1_default_min_profit
+        FROM token_pairs tp
+        LEFT JOIN token_search_defaults d0
+          ON d0.chain_id = tp.chain_id AND d0.token_address = tp.token0
+        LEFT JOIN token_search_defaults d1
+          ON d1.chain_id = tp.chain_id AND d1.token_address = tp.token1
+        ORDER BY tp.created_at DESC
         LIMIT 50
         "#,
     )
@@ -878,19 +963,59 @@ async fn fetch_enabled_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
     Ok(sqlx::query_as::<_, TokenPairRow>(
         r#"
         SELECT
-            created_at,
-            chain_id,
-            symbol,
-            token0,
-            token1,
-            enabled,
-            token0_search_amounts,
-            token1_search_amounts,
-            token0_min_profit,
-            token1_min_profit
-        FROM token_pairs
-        WHERE enabled = TRUE
-        ORDER BY created_at DESC
+            tp.created_at,
+            tp.chain_id,
+            tp.symbol,
+            tp.token0,
+            tp.token1,
+            tp.enabled,
+            tp.token0_search_amounts,
+            tp.token1_search_amounts,
+            tp.token0_min_profit,
+            tp.token1_min_profit,
+            d0.search_amounts AS token0_default_search_amounts,
+            d1.search_amounts AS token1_default_search_amounts,
+            d0.min_profit AS token0_default_min_profit,
+            d1.min_profit AS token1_default_min_profit
+        FROM token_pairs tp
+        LEFT JOIN token_search_defaults d0
+          ON d0.chain_id = tp.chain_id AND d0.token_address = tp.token0
+        LEFT JOIN token_search_defaults d1
+          ON d1.chain_id = tp.chain_id AND d1.token_address = tp.token1
+        WHERE tp.enabled = TRUE
+        ORDER BY tp.created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDefaultRow>> {
+    Ok(sqlx::query_as::<_, TokenSearchDefaultRow>(
+        r#"
+        WITH tokens AS (
+            SELECT chain_id, token0 AS token_address, split_part(symbol, '/', 1) AS symbol
+            FROM token_pairs
+            UNION
+            SELECT chain_id, token1 AS token_address, split_part(symbol, '/', 2) AS symbol
+            FROM token_pairs
+        )
+        SELECT
+            tokens.chain_id,
+            MIN(tokens.symbol) AS symbol,
+            tokens.token_address,
+            cfg.search_amounts,
+            cfg.min_profit
+        FROM tokens
+        LEFT JOIN token_search_defaults cfg
+          ON cfg.chain_id = tokens.chain_id
+         AND cfg.token_address = tokens.token_address
+        GROUP BY
+            tokens.chain_id,
+            tokens.token_address,
+            cfg.search_amounts,
+            cfg.min_profit
+        ORDER BY MIN(tokens.symbol), tokens.token_address
         "#,
     )
     .fetch_all(pool)
@@ -1640,20 +1765,36 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
             token0_field = pair_field("Token 0", &copyable(&row.token0)),
             token1_field = pair_field("Token 1", &copyable(&row.token1)),
             token0_amounts_field = pair_field(
-                "Token 0 Amounts Raw",
-                &config_value(row.token0_search_amounts.as_deref()),
+                "Token 0 Amounts Raw (Effective)",
+                &effective_config_value(
+                    row.token0_search_amounts.as_deref(),
+                    row.token0_default_search_amounts.as_deref(),
+                ),
             ),
             token0_profit_field = pair_field(
-                "Token 0 Min Profit Raw",
-                &config_value(row.token0_min_profit.as_deref()),
+                "Token 0 Min Profit Raw (Effective)",
+                &effective_config_value(
+                    row.token0_search_amounts
+                        .as_deref()
+                        .and(row.token0_min_profit.as_deref()),
+                    row.token0_default_min_profit.as_deref(),
+                ),
             ),
             token1_amounts_field = pair_field(
-                "Token 1 Amounts Raw",
-                &config_value(row.token1_search_amounts.as_deref()),
+                "Token 1 Amounts Raw (Effective)",
+                &effective_config_value(
+                    row.token1_search_amounts.as_deref(),
+                    row.token1_default_search_amounts.as_deref(),
+                ),
             ),
             token1_profit_field = pair_field(
-                "Token 1 Min Profit Raw",
-                &config_value(row.token1_min_profit.as_deref()),
+                "Token 1 Min Profit Raw (Effective)",
+                &effective_config_value(
+                    row.token1_search_amounts
+                        .as_deref()
+                        .and(row.token1_min_profit.as_deref()),
+                    row.token1_default_min_profit.as_deref(),
+                ),
             ),
             actions = render_pair_actions(row),
         ));
@@ -1661,6 +1802,47 @@ fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     if rows.is_empty() {
         html.push_str(
             "<div class=\"pair-card\"><span class=\"muted\">No token pairs yet.</span></div>",
+        );
+    }
+    html.push_str("</div>");
+    html
+}
+
+fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
+    let mut html = String::from("<div class=\"pair-card-list\">");
+    for row in rows {
+        html.push_str(&format!(
+            r#"<article class="pair-card">
+  <div class="pair-card-header">
+    <div class="pair-card-title">
+      <strong>{symbol}</strong>
+      <span class="pair-card-meta">chain {chain_id} · applies when a pair direction has no override</span>
+    </div>
+  </div>
+  <div class="pair-card-grid">
+    {token_field}
+    {amounts_field}
+    {profit_field}
+  </div>
+  {form}
+</article>"#,
+            symbol = escape(&row.symbol),
+            chain_id = row.chain_id,
+            token_field = pair_field("Token", &copyable(&row.token_address)),
+            amounts_field = pair_field(
+                "Default Amounts Raw",
+                &config_value(row.search_amounts.as_deref()),
+            ),
+            profit_field = pair_field(
+                "Default Min Profit Raw",
+                &config_value(row.min_profit.as_deref()),
+            ),
+            form = render_token_search_default_form(row),
+        ));
+    }
+    if rows.is_empty() {
+        html.push_str(
+            "<div class=\"pair-card\"><span class=\"muted\">Add a token pair before configuring token defaults.</span></div>",
         );
     }
     html.push_str("</div>");
@@ -1694,19 +1876,19 @@ fn render_search_config_form(row: &TokenPairRow) -> String {
   {password_input}
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
-  <label>Token 0 Amounts Raw
+  <label>Token 0 Amounts Raw Override (blank = inherit)
     <input name="token0_search_amounts" value="{token0_amounts}" placeholder="10000000,30000000">
   </label>
-  <label>Token 0 Min Profit Raw
+  <label>Token 0 Min Profit Raw Override
     <input name="token0_min_profit" value="{token0_min_profit}" placeholder="500">
   </label>
-  <label>Token 1 Amounts Raw
+  <label>Token 1 Amounts Raw Override (blank = inherit)
     <input name="token1_search_amounts" value="{token1_amounts}" placeholder="10000000000000000">
   </label>
-  <label>Token 1 Min Profit Raw
+  <label>Token 1 Min Profit Raw Override
     <input name="token1_min_profit" value="{token1_min_profit}" placeholder="500000000000000">
   </label>
-  <button type="submit">Save Search Config</button>
+  <button type="submit">Save Pair Overrides</button>
 </form>"#,
         password_input = password_input(Some("password"), false),
         token0 = escape(&row.token0),
@@ -1715,6 +1897,26 @@ fn render_search_config_form(row: &TokenPairRow) -> String {
         token1_amounts = escape(row.token1_search_amounts.as_deref().unwrap_or_default()),
         token0_min_profit = escape(row.token0_min_profit.as_deref().unwrap_or_default()),
         token1_min_profit = escape(row.token1_min_profit.as_deref().unwrap_or_default()),
+    )
+}
+
+fn render_token_search_default_form(row: &TokenSearchDefaultRow) -> String {
+    format!(
+        r#"<form method="post" action="/tokens/search-default" class="search-config-form">
+  {password_input}
+  <input name="token_address" type="hidden" value="{token_address}">
+  <label>Default Amounts Raw
+    <input name="search_amounts" value="{search_amounts}" placeholder="10000000,30000000">
+  </label>
+  <label>Default Min Profit Raw
+    <input name="min_profit" value="{min_profit}" placeholder="500">
+  </label>
+  <button type="submit">Save Token Default</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
+        token_address = escape(&row.token_address),
+        search_amounts = escape(row.search_amounts.as_deref().unwrap_or_default()),
+        min_profit = escape(row.min_profit.as_deref().unwrap_or_default()),
     )
 }
 
@@ -2098,6 +2300,20 @@ fn config_value(value: Option<&str>) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(escape)
+        .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
+}
+
+fn effective_config_value(override_value: Option<&str>, default_value: Option<&str>) -> String {
+    if let Some(value) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return escape(value);
+    }
+    default_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("<span class=\"muted\">inherited: {}</span>", escape(value)))
         .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
 }
 
