@@ -5,7 +5,10 @@ use base_arb_common::types::{DexKind, PoolState, PoolVariant};
 use chrono::Utc;
 use tracing::debug;
 
-const SYNC_TOPIC: &str = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
+const AERODROME_SYNC_TOPIC: &str =
+    "0xcf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a";
+const UNISWAP_V2_SYNC_TOPIC: &str =
+    "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
 const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 const V3_MINT_TOPIC: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
 const V3_BURN_TOPIC: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
@@ -45,7 +48,7 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
 
     if state.dex == DexKind::Aerodrome
         && state.variant == PoolVariant::AerodromeVolatile
-        && topic0 == SYNC_TOPIC
+        && (topic0 == AERODROME_SYNC_TOPIC || topic0 == UNISWAP_V2_SYNC_TOPIC)
     {
         let (reserve0, reserve1) = decode_sync_reserves(data)?;
         state.reserve0 = Some(reserve0);
@@ -249,7 +252,7 @@ mod tests {
             dex: DexKind::Aerodrome,
             event_type: "Sync".into(),
             raw_data_json: json!({
-                "topics": [super::SYNC_TOPIC],
+                "topics": [super::AERODROME_SYNC_TOPIC],
                 "data": "0x000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000014"
             }),
         };

@@ -389,11 +389,14 @@ impl ChainProvider {
 
     pub async fn get_transaction_receipt(&self, tx_hash: B256) -> Result<Option<TxReceipt>> {
         let value = self
-            .rpc(
+            .rpc_optional(
                 "eth_getTransactionReceipt",
                 json!([format!("{tx_hash:#x}")]),
             )
             .await?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
         if value.is_null() {
             return Ok(None);
         }
@@ -1395,6 +1398,12 @@ impl ChainProvider {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        self.rpc_optional(method, params)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rpc {method} returned no result"))
+    }
+
+    async fn rpc_optional(&self, method: &str, params: Value) -> Result<Option<Value>> {
         let response: RpcResponse = self
             .client
             .post(&self.http_url)
@@ -1424,9 +1433,7 @@ impl ChainProvider {
             );
         }
 
-        response
-            .result
-            .ok_or_else(|| anyhow::anyhow!("rpc {method} returned no result"))
+        Ok(response.result)
     }
 }
 
@@ -1502,11 +1509,19 @@ fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {
     match (dex, topic0.unwrap_or_default()) {
         (
             DexKind::Aerodrome,
+            "0xcf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a",
+        ) => "Sync",
+        (
+            DexKind::Aerodrome,
             "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1",
         ) => "Sync",
         (
             DexKind::Aerodrome,
             "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
+        ) => "Swap",
+        (
+            DexKind::Aerodrome,
+            "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b",
         ) => "Swap",
         (
             DexKind::Aerodrome,
