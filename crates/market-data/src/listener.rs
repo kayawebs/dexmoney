@@ -7,7 +7,7 @@ use base_arb_common::types::{
     PoolVariant, TickState,
 };
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
@@ -92,6 +92,7 @@ where
 
             let mut changed_pools = HashSet::new();
             let mut validation_snapshots = BTreeMap::new();
+            let mut slipstream_fee_refreshes = HashMap::new();
             for event in &events {
                 if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
                     warn!(
@@ -137,6 +138,13 @@ where
                         changed_pools.insert(state.pool_id.address);
                         validation_snapshots
                             .insert((state.block_number, state.pool_id.address), state.clone());
+                        if matches!(
+                            (state.dex, state.variant),
+                            (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+                        ) {
+                            slipstream_fee_refreshes
+                                .insert(state.pool_id.address, event.block_number);
+                        }
                         debug!(
                             pool = %state.pool_id.address,
                             block_number = state.block_number,
@@ -144,6 +152,50 @@ where
                         );
                     }
                     break;
+                }
+            }
+
+            for (pool, block_number) in slipstream_fee_refreshes {
+                let Some(state) = monitored_states
+                    .iter_mut()
+                    .find(|state| state.pool_id.address == pool)
+                else {
+                    continue;
+                };
+                let fee_result = async {
+                    let block_hash = self.provider.get_block_hash(block_number).await?;
+                    self.provider
+                        .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
+                            state.factory_address,
+                            pool,
+                            &block_hash,
+                        )
+                        .await
+                }
+                .await;
+                match fee_result {
+                    Ok(fee_pips) => {
+                        state.fee_pips = Some(fee_pips);
+                        state.fee_bps = fee_pips / 100;
+                        validation_snapshots
+                            .insert((state.block_number, state.pool_id.address), state.clone());
+                        debug!(
+                            pool = %pool,
+                            block_number,
+                            fee_pips,
+                            "Slipstream dynamic fee refreshed after swap event"
+                        );
+                    }
+                    Err(err) => {
+                        changed_pools.remove(&pool);
+                        validation_snapshots.retain(|(_, address), _| *address != pool);
+                        warn!(
+                            pool = %pool,
+                            block_number,
+                            error = %err,
+                            "Slipstream state update withheld because dynamic fee refresh failed"
+                        );
+                    }
                 }
             }
 

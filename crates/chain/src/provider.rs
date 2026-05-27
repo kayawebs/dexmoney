@@ -134,7 +134,7 @@ impl ChainProvider {
                 state.stable = entry.stable;
                 if entry.variant == PoolVariant::AerodromeSlipstream {
                     state.fee_pips = self
-                        .fetch_aerodrome_slipstream_fee_pips_for_entry(entry)
+                        .fetch_aerodrome_slipstream_fee_pips_for_entry_at_block(entry, block_number)
                         .await
                         .ok();
                     if let Some(fee_pips) = state.fee_pips {
@@ -215,7 +215,9 @@ impl ChainProvider {
                 state.stable = entry.stable;
                 if entry.variant == PoolVariant::AerodromeSlipstream {
                     state.fee_pips = self
-                        .fetch_aerodrome_slipstream_fee_pips_for_entry(entry)
+                        .fetch_aerodrome_slipstream_fee_pips_for_entry_at_block_hash(
+                            entry, block_hash,
+                        )
                         .await
                         .ok();
                     if let Some(fee_pips) = state.fee_pips {
@@ -1061,15 +1063,56 @@ impl ChainProvider {
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
     }
 
-    async fn fetch_aerodrome_slipstream_fee_pips_for_entry(
+    async fn fetch_aerodrome_slipstream_fee_pips_for_entry_at_block(
         &self,
         entry: &PoolRegistryEntry,
+        block_number: Option<u64>,
     ) -> Result<u32> {
         let factory = entry
             .factory_address
             .unwrap_or(AERODROME_SLIPSTREAM_FACTORIES[0].parse()?);
-        self.fetch_aerodrome_slipstream_fee_pips(factory, entry.pool_address)
-            .await
+        let data = encode_get_swap_fee(entry.pool_address);
+        let raw = self
+            .eth_call_at_block(
+                factory,
+                &data,
+                "Aerodrome Slipstream getSwapFee(address)",
+                block_number,
+            )
+            .await?;
+        decode_fee_pips(&raw)
+    }
+
+    async fn fetch_aerodrome_slipstream_fee_pips_for_entry_at_block_hash(
+        &self,
+        entry: &PoolRegistryEntry,
+        block_hash: &str,
+    ) -> Result<u32> {
+        self.fetch_aerodrome_slipstream_fee_pips_at_block_hash(
+            entry.factory_address,
+            entry.pool_address,
+            block_hash,
+        )
+        .await
+    }
+
+    pub async fn fetch_aerodrome_slipstream_fee_pips_at_block_hash(
+        &self,
+        factory: Option<Address>,
+        pool: Address,
+        block_hash: &str,
+    ) -> Result<u32> {
+        let factory = factory.unwrap_or(AERODROME_SLIPSTREAM_FACTORIES[0].parse()?);
+        let data = encode_get_swap_fee(pool);
+        let raw = self
+            .eth_call_at_block_hash(
+                factory,
+                &data,
+                "Aerodrome Slipstream getSwapFee(address)",
+                block_hash,
+            )
+            .await?;
+        decode_fee_pips(&raw)
     }
 
     async fn fetch_aerodrome_slipstream_fee_pips(
@@ -1081,9 +1124,7 @@ impl ChainProvider {
         let raw = self
             .eth_call(factory, &data, "Aerodrome Slipstream getSwapFee(address)")
             .await?;
-        let words = decode_32byte_words(&raw)?;
-        let fee = parse_word_u256(&words[0])?;
-        u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome Slipstream fee too large: {fee}"))
+        decode_fee_pips(&raw)
     }
 
     async fn fetch_aerodrome_reserves_at_block(
@@ -1656,6 +1697,12 @@ fn decode_32byte_words(data: &str) -> Result<Vec<String>> {
 
 fn parse_word_u256(word: &str) -> Result<U256> {
     Ok(U256::from_str_radix(word, 16)?)
+}
+
+fn decode_fee_pips(data: &str) -> Result<u32> {
+    let words = decode_32byte_words(data)?;
+    let fee = parse_word_u256(&words[0])?;
+    u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome Slipstream fee too large: {fee}"))
 }
 
 fn parse_word_address(word: &str) -> Result<Address> {
