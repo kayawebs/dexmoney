@@ -66,11 +66,12 @@ impl Settings {
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 2u64)?
             .set_default("min_profit_failure_ttl_secs", 21_600u64)?
-            .set_default("execution_priority_fee_multiplier_bps", 20_000u64)?
-            .set_default("execution_max_fee_multiplier_bps", 30_000u64)?
-            .set_default("execution_pending_replacement_blocks", 2u64)?
-            .set_default("execution_replacement_fee_bump_bps", 12_500u64)?
-            .set_default("execution_max_replacements", 3u32)?
+            .set_default("execution_min_priority_fee_wei", "2000000")?
+            .set_default("execution_priority_fee_multiplier_bps", 30_000u64)?
+            .set_default("execution_max_fee_multiplier_bps", 50_000u64)?
+            .set_default("execution_pending_replacement_blocks", 1u64)?
+            .set_default("execution_replacement_fee_bump_bps", 15_000u64)?
+            .set_default("execution_max_replacements", 4u32)?
             .set_default("execution_gas_profit_buffer_bps", 15_000u64)?
             .add_source(Environment::default())
             .build()?

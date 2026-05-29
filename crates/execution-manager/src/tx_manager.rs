@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::{ChainProvider, Eip1559FeeSuggestion, TxReceipt};
 use base_arb_common::config::Settings;
 use base_arb_common::types::{Candidate, SimulationResult, TxResult, TxStatus};
+use chrono::Utc;
 use ethers_core::types::{
     transaction::eip2718::TypedTransaction, Bytes, Eip1559TransactionRequest, NameOrAddress,
     U256 as EthersU256, U64,
@@ -69,6 +70,9 @@ pub async fn submit_candidate(
     let gas_limit = bump_gas_limit(estimated_gas);
     let fees = aggressive_fee_suggestion(provider, settings).await?;
     ensure_expected_profit_covers_gas(settings, candidate, gas_limit, fees.max_fee_per_gas)?;
+    if candidate.is_expired(Utc::now()) {
+        anyhow::bail!("candidate expired before tx broadcast");
+    }
 
     let submitted_block = provider.get_block_number().await?;
     let tx_hash = sign_and_send(

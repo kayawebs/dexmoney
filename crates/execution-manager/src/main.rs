@@ -167,6 +167,17 @@ where
         return Ok(());
     }
 
+    if candidate.is_expired(Utc::now()) {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            created_at = %candidate.created_at,
+            expires_at = %candidate.expires_at,
+            "candidate expired after simulation; skipping tx submission"
+        );
+        return Ok(());
+    }
+
     let nonce = lane.state.local_nonce;
     match tx_manager::submit_candidate(provider, &wallet, settings, &candidate, &simulation, nonce)
         .await
