@@ -300,6 +300,20 @@ where
     let simulation_id = lane.state.pending_simulation_id;
 
     let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+        if clear_lane_if_pending_nonce_consumed(
+            lane,
+            eoa_store,
+            recorder,
+            provider,
+            tx_hash,
+            opportunity_id,
+            simulation_id,
+            nonce,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         maybe_replace_pending_tx(lane, eoa_store, recorder, provider, wallet, settings).await?;
         debug!(tx_hash = %tx_hash, "pending tx has no receipt yet");
         return Ok(());
@@ -340,6 +354,53 @@ where
     }
 
     Ok(())
+}
+
+async fn clear_lane_if_pending_nonce_consumed<E, R>(
+    lane: &mut eoa_lane::EoaLane,
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    tx_hash: alloy_primitives::B256,
+    opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
+    nonce: u64,
+) -> Result<bool>
+where
+    E: EoaStateStore,
+    R: RecorderStore,
+{
+    let confirmed_nonce = provider
+        .get_transaction_count(lane.state.address, false)
+        .await?;
+    if confirmed_nonce <= nonce {
+        return Ok(false);
+    }
+
+    let pending_nonce = provider
+        .get_transaction_count(lane.state.address, true)
+        .await?;
+    let eth_balance = provider.get_balance(lane.state.address).await?;
+    recorder
+        .record_transaction(tx_manager::dropped_consumed_nonce_tx_result(
+            opportunity_id,
+            simulation_id,
+            lane.state.address,
+            tx_hash,
+            nonce,
+            confirmed_nonce,
+        ))
+        .await?;
+    lane.clear_consumed_pending(confirmed_nonce, pending_nonce, eth_balance);
+    eoa_store.set_lane_state(lane.state.clone()).await?;
+    warn!(
+        tx_hash = %tx_hash,
+        nonce,
+        confirmed_nonce,
+        pending_nonce,
+        "pending tx has no receipt but its nonce is already consumed; cleared EOA lane"
+    );
+    Ok(true)
 }
 
 async fn maybe_replace_pending_tx<E, R>(
@@ -468,8 +529,27 @@ async fn reconcile_db_pending_transactions<R>(
 where
     R: RecorderStore + PendingTransactionStore,
 {
+    let confirmed_nonce = provider.get_transaction_count(eoa, false).await?;
     for pending in recorder.pending_transactions_for_eoa(eoa, 20).await? {
         let Some(receipt) = provider.get_transaction_receipt(pending.tx_hash).await? else {
+            if confirmed_nonce > pending.nonce {
+                recorder
+                    .record_transaction(tx_manager::dropped_consumed_nonce_tx_result(
+                        pending.opportunity_id,
+                        pending.simulation_id,
+                        pending.eoa,
+                        pending.tx_hash,
+                        pending.nonce,
+                        confirmed_nonce,
+                    ))
+                    .await?;
+                warn!(
+                    tx_hash = %pending.tx_hash,
+                    nonce = pending.nonce,
+                    confirmed_nonce,
+                    "reconciled pending transaction as dropped because its nonce is already consumed"
+                );
+            }
             continue;
         };
         recorder

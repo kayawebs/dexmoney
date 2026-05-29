@@ -86,6 +86,17 @@ impl EoaLane {
         self.state.status = EoaLaneStatus::Idle;
     }
 
+    pub fn clear_consumed_pending(
+        &mut self,
+        confirmed_nonce: u64,
+        local_nonce: u64,
+        eth_balance: U256,
+    ) {
+        self.mark_confirmed(confirmed_nonce);
+        self.state.local_nonce = local_nonce;
+        self.state.eth_balance = eth_balance;
+    }
+
     pub fn mark_blocked(&mut self) {
         self.state.status = EoaLaneStatus::Blocked;
     }
@@ -140,5 +151,38 @@ mod tests {
 
         lane.mark_cooldown();
         assert_eq!(lane.state.status, EoaLaneStatus::Cooldown);
+    }
+
+    #[test]
+    fn clear_consumed_pending_syncs_lane_to_chain_nonce() {
+        let address = address!("4200000000000000000000000000000000000006");
+        let mut lane = EoaLane::new(address);
+
+        lane.mark_submitted(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            b256!("0202020202020202020202020202020202020202020202020202020202020202"),
+            189,
+            46575829,
+            alloy_primitives::U256::from(475_650u64),
+            alloy_primitives::U256::from(135_992_647u64),
+            alloy_primitives::U256::from(1_440_001u64),
+        );
+
+        lane.clear_consumed_pending(194, 194, alloy_primitives::U256::from(1_000_000_000u64));
+
+        assert_eq!(lane.state.status, EoaLaneStatus::Idle);
+        assert_eq!(lane.state.confirmed_nonce, 194);
+        assert_eq!(lane.state.local_nonce, 194);
+        assert_eq!(
+            lane.state.eth_balance,
+            alloy_primitives::U256::from(1_000_000_000u64)
+        );
+        assert!(lane.state.pending_tx.is_none());
+        assert!(lane.state.pending_opportunity_id.is_none());
+        assert!(lane.state.pending_simulation_id.is_none());
+        assert!(lane.state.pending_nonce.is_none());
+        assert!(lane.state.pending_submitted_block.is_none());
+        assert_eq!(lane.state.pending_replacement_count, 0);
     }
 }

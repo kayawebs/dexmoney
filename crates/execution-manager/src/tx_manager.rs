@@ -256,6 +256,31 @@ pub fn dropped_replaced_tx_result(
     }
 }
 
+pub fn dropped_consumed_nonce_tx_result(
+    opportunity_id: uuid::Uuid,
+    simulation_id: Option<uuid::Uuid>,
+    eoa: Address,
+    tx_hash: B256,
+    nonce: u64,
+    confirmed_nonce: u64,
+) -> TxResult {
+    TxResult {
+        opportunity_id,
+        simulation_id,
+        eoa,
+        tx_hash: Some(tx_hash),
+        nonce,
+        status: TxStatus::Dropped,
+        realized_profit: None,
+        gas_used: None,
+        effective_gas_price: None,
+        revert_reason: Some(format!(
+            "pending nonce {nonce} already consumed by chain confirmed nonce {confirmed_nonce}"
+        )),
+        receipt_json: None,
+    }
+}
+
 pub fn receipt_tx_result(
     opportunity_id: uuid::Uuid,
     simulation_id: Option<uuid::Uuid>,
