@@ -1,4 +1,4 @@
-use std::{env, str::FromStr};
+use std::{collections::BTreeSet, env, str::FromStr};
 
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
@@ -17,6 +17,8 @@ struct Cli {
     address: Address,
     days: i64,
     hydrate_limit: i64,
+    hydrate_all: bool,
+    hydrate_peer_blocks: i64,
     from_block: Option<u64>,
     to_block: Option<u64>,
     log_chunk_blocks: u64,
@@ -33,6 +35,8 @@ struct HitRow {
     max_priority_fee_per_gas: Option<String>,
     max_fee_per_gas: Option<String>,
     gas_used: Option<String>,
+    base_fee_per_gas: Option<String>,
+    paid_priority_fee_per_gas: Option<String>,
     pools: Option<String>,
     protocols: Option<String>,
 }
@@ -44,6 +48,7 @@ struct RankRow {
     transaction_index: Option<i64>,
     effective_gas_price: Option<String>,
     max_priority_fee_per_gas: Option<String>,
+    paid_priority_fee_per_gas: Option<String>,
     observed_pool_txs_in_block: Option<i64>,
     effective_gas_rank: Option<i64>,
     priority_gas_rank: Option<i64>,
@@ -82,6 +87,7 @@ async fn main() -> Result<()> {
     print_scope(&store.pool, &cli, from_block, to_block).await?;
     collect_address_transfer_logs(&store.pool, &provider, &cli, from_block, to_block).await?;
     hydrate_missing_transactions(&store.pool, &provider, &cli).await?;
+    hydrate_peer_block_transactions(&store.pool, &provider, &cli).await?;
     print_report(&store.pool, &cli).await?;
     Ok(())
 }
@@ -93,6 +99,8 @@ where
     let mut address = None;
     let mut days = 30_i64;
     let mut hydrate_limit = 5_000_i64;
+    let mut hydrate_all = false;
+    let mut hydrate_peer_blocks = 0_i64;
     let mut from_block = None;
     let mut to_block = None;
     let mut log_chunk_blocks = 2_000_u64;
@@ -119,6 +127,16 @@ where
                     .context("missing value for --hydrate-limit")?
                     .parse()
                     .context("invalid --hydrate-limit")?;
+            }
+            "--hydrate-all" => {
+                hydrate_all = true;
+            }
+            "--hydrate-peer-blocks" => {
+                hydrate_peer_blocks = iter
+                    .next()
+                    .context("missing value for --hydrate-peer-blocks")?
+                    .parse()
+                    .context("invalid --hydrate-peer-blocks")?;
             }
             "--from-block" => {
                 from_block = Some(
@@ -151,10 +169,19 @@ where
         }
     }
 
+    if hydrate_limit <= 0 {
+        bail!("--hydrate-limit must be positive");
+    }
+    if hydrate_peer_blocks < 0 {
+        bail!("--hydrate-peer-blocks must be non-negative");
+    }
+
     Ok(Cli {
         address: address.context("--address is required")?,
         days,
         hydrate_limit,
+        hydrate_all,
+        hydrate_peer_blocks,
         from_block,
         to_block,
         log_chunk_blocks,
@@ -163,7 +190,7 @@ where
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -p base-arb-recorder --bin competitor_report -- --address <addr> [--days 30] [--from-block N] [--to-block N] [--hydrate-limit 5000] [--log-chunk-blocks 2000]"
+        "Usage: cargo run -p base-arb-recorder --bin competitor_report -- --address <addr> [--days 30] [--from-block N] [--to-block N] [--hydrate-limit 5000] [--hydrate-all] [--hydrate-peer-blocks 50] [--log-chunk-blocks 2000]"
     );
 }
 
@@ -219,7 +246,75 @@ async fn hydrate_missing_transactions(
     cli: &Cli,
 ) -> Result<()> {
     let address = format!("{:#x}", cli.address).to_ascii_lowercase();
-    let hashes: Vec<String> = sqlx::query_scalar(
+    println!("== Hydrate ==");
+
+    let mut total_inserted = 0usize;
+    let mut total_skipped = 0usize;
+    let mut total_blocks = BTreeSet::new();
+    let mut batches = 0usize;
+
+    loop {
+        let hashes = fetch_missing_transaction_hashes(pool, &address, cli.hydrate_limit).await?;
+        if hashes.is_empty() {
+            if batches == 0 {
+                println!("no missing observed transactions");
+            }
+            break;
+        }
+
+        println!(
+            "batch {} fetching {} tx/receipt rows from RPC",
+            batches + 1,
+            hashes.len()
+        );
+        let mut inserted = 0usize;
+        let mut skipped = 0usize;
+        let mut batch_blocks = BTreeSet::new();
+        for raw_hash in hashes {
+            let tx_hash =
+                B256::from_str(&raw_hash).with_context(|| format!("invalid tx hash {raw_hash}"))?;
+            let Some(tx_json) = provider.get_transaction_by_hash(tx_hash).await? else {
+                skipped += 1;
+                continue;
+            };
+            let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+                skipped += 1;
+                continue;
+            };
+            if let Some(block_number) =
+                upsert_observed_transaction(pool, &tx_json, &receipt.raw).await?
+            {
+                batch_blocks.insert(block_number);
+                total_blocks.insert(block_number);
+            }
+            inserted += 1;
+        }
+
+        hydrate_observed_blocks(pool, provider, batch_blocks).await?;
+        total_inserted += inserted;
+        total_skipped += skipped;
+        batches += 1;
+
+        if !cli.hydrate_all || inserted == 0 {
+            break;
+        }
+    }
+
+    hydrate_missing_blocks_for_address(pool, provider, &address).await?;
+    println!(
+        "batches: {batches} upserted: {total_inserted} skipped_missing_rpc: {total_skipped} blocks_touched: {}",
+        total_blocks.len()
+    );
+    println!();
+    Ok(())
+}
+
+async fn fetch_missing_transaction_hashes(
+    pool: &PgPool,
+    address: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    sqlx::query_scalar(
         r#"
         SELECT t.tx_hash
         FROM observed_address_transfers t
@@ -232,38 +327,113 @@ async fn hydrate_missing_transactions(
         "#,
     )
     .bind(address)
-    .bind(cli.hydrate_limit)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch missing observed transaction hashes")
+}
+
+async fn hydrate_peer_block_transactions(
+    pool: &PgPool,
+    provider: &ChainProvider,
+    cli: &Cli,
+) -> Result<()> {
+    if cli.hydrate_peer_blocks <= 0 {
+        return Ok(());
+    }
+
+    let address = format!("{:#x}", cli.address).to_ascii_lowercase();
+    let blocks: Vec<i64> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT ot.block_number
+        FROM observed_address_transfers t
+        JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
+        WHERE lower(t.seed_address) = lower($1)
+        ORDER BY ot.block_number DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(address)
+    .bind(cli.hydrate_peer_blocks)
     .fetch_all(pool)
     .await?;
 
-    if hashes.is_empty() {
-        println!("== Hydrate ==");
-        println!("no missing observed transactions");
+    println!("== Hydrate Peer Blocks ==");
+    if blocks.is_empty() {
+        println!("no hydrated related tx blocks available");
         println!();
         return Ok(());
     }
 
-    println!("== Hydrate ==");
-    println!("fetching {} tx/receipt rows from RPC", hashes.len());
-    let mut inserted = 0usize;
-    let mut skipped = 0usize;
-    for raw_hash in hashes {
-        let tx_hash =
-            B256::from_str(&raw_hash).with_context(|| format!("invalid tx hash {raw_hash}"))?;
-        let Some(tx_json) = provider.get_transaction_by_hash(tx_hash).await? else {
-            skipped += 1;
+    let mut block_count = 0usize;
+    let mut tx_seen = 0usize;
+    let mut tx_fetched = 0usize;
+    let mut tx_skipped = 0usize;
+
+    for block_number in blocks {
+        if block_number < 0 {
+            continue;
+        }
+        let Some(block_json) = provider
+            .get_block_by_number_raw(block_number as u64, false)
+            .await
+            .with_context(|| format!("failed to fetch peer block {block_number}"))?
+        else {
             continue;
         };
-        let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
-            skipped += 1;
-            continue;
-        };
-        upsert_observed_transaction(pool, &tx_json, &receipt.raw).await?;
-        inserted += 1;
+        upsert_observed_block(pool, block_number, &block_json).await?;
+        block_count += 1;
+
+        let txs = block_json
+            .get("transactions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        tx_seen += txs.len();
+
+        for tx_value in txs {
+            let Some(raw_hash) = tx_value.as_str() else {
+                continue;
+            };
+            if observed_transaction_exists(pool, raw_hash).await? {
+                continue;
+            }
+            let tx_hash =
+                B256::from_str(raw_hash).with_context(|| format!("invalid tx hash {raw_hash}"))?;
+            let Some(tx_json) = provider.get_transaction_by_hash(tx_hash).await? else {
+                tx_skipped += 1;
+                continue;
+            };
+            let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+                tx_skipped += 1;
+                continue;
+            };
+            upsert_observed_transaction(pool, &tx_json, &receipt.raw).await?;
+            tx_fetched += 1;
+        }
     }
-    println!("upserted: {inserted} skipped_missing_rpc: {skipped}");
+
+    println!(
+        "blocks: {block_count} block_txs_seen: {tx_seen} newly_hydrated_peer_txs: {tx_fetched} skipped_missing_rpc: {tx_skipped}"
+    );
     println!();
     Ok(())
+}
+
+async fn observed_transaction_exists(pool: &PgPool, tx_hash: &str) -> Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM observed_transactions
+            WHERE lower(tx_hash) = lower($1)
+        )
+        "#,
+    )
+    .bind(tx_hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
 }
 
 async fn collect_address_transfer_logs(
@@ -395,7 +565,11 @@ async fn upsert_address_transfer(
     Ok(result.rows_affected() > 0)
 }
 
-async fn upsert_observed_transaction(pool: &PgPool, tx: &Value, receipt: &Value) -> Result<()> {
+async fn upsert_observed_transaction(
+    pool: &PgPool,
+    tx: &Value,
+    receipt: &Value,
+) -> Result<Option<i64>> {
     let tx_hash = required_str(tx, "hash").or_else(|_| required_str(receipt, "transactionHash"))?;
     let block_number = hex_i64(receipt.get("blockNumber").and_then(Value::as_str))
         .or_else(|| hex_i64(tx.get("blockNumber").and_then(Value::as_str)))
@@ -453,16 +627,251 @@ async fn upsert_observed_transaction(pool: &PgPool, tx: &Value, receipt: &Value)
     .bind(receipt)
     .execute(pool)
     .await?;
+    Ok(Some(block_number))
+}
+
+async fn hydrate_missing_blocks_for_address(
+    pool: &PgPool,
+    provider: &ChainProvider,
+    address: &str,
+) -> Result<()> {
+    let block_numbers: Vec<i64> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT ot.block_number
+        FROM observed_address_transfers t
+        JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
+        LEFT JOIN observed_blocks b ON b.block_number = ot.block_number
+        WHERE lower(t.seed_address) = lower($1)
+          AND b.block_number IS NULL
+        ORDER BY ot.block_number DESC
+        LIMIT 10000
+        "#,
+    )
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    hydrate_observed_blocks(pool, provider, block_numbers.into_iter().collect()).await
+}
+
+async fn hydrate_observed_blocks(
+    pool: &PgPool,
+    provider: &ChainProvider,
+    block_numbers: BTreeSet<i64>,
+) -> Result<()> {
+    if block_numbers.is_empty() {
+        return Ok(());
+    }
+
+    let mut upserted = 0usize;
+    for block_number in block_numbers {
+        if block_number < 0 {
+            continue;
+        }
+        let Some(block_json) = provider
+            .get_block_by_number_raw(block_number as u64, false)
+            .await
+            .with_context(|| format!("failed to fetch block {block_number}"))?
+        else {
+            continue;
+        };
+        upsert_observed_block(pool, block_number, &block_json).await?;
+        upserted += 1;
+    }
+
+    println!("hydrated_blocks: {upserted}");
+    Ok(())
+}
+
+async fn upsert_observed_block(pool: &PgPool, block_number: i64, block: &Value) -> Result<()> {
+    let tx_count = block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .map(|items| i64::try_from(items.len()).unwrap_or(i64::MAX));
+
+    sqlx::query(
+        r#"
+        INSERT INTO observed_blocks (
+            block_number, block_hash, base_fee_per_gas, gas_used, gas_limit,
+            block_timestamp, tx_count, block_json, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        ON CONFLICT (block_number)
+        DO UPDATE SET
+            block_hash = EXCLUDED.block_hash,
+            base_fee_per_gas = EXCLUDED.base_fee_per_gas,
+            gas_used = EXCLUDED.gas_used,
+            gas_limit = EXCLUDED.gas_limit,
+            block_timestamp = EXCLUDED.block_timestamp,
+            tx_count = EXCLUDED.tx_count,
+            block_json = EXCLUDED.block_json,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(block_number)
+    .bind(optional_str(block, "hash"))
+    .bind(hex_decimal(
+        block.get("baseFeePerGas").and_then(Value::as_str),
+    ))
+    .bind(hex_decimal(block.get("gasUsed").and_then(Value::as_str)))
+    .bind(hex_decimal(block.get("gasLimit").and_then(Value::as_str)))
+    .bind(hex_i64(block.get("timestamp").and_then(Value::as_str)))
+    .bind(tx_count)
+    .bind(block)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 async fn print_report(pool: &PgPool, cli: &Cli) -> Result<()> {
     let address = format!("{:#x}", cli.address).to_ascii_lowercase();
     print_transfer_counterparties(pool, &address).await?;
+    print_address_gas_summary(pool, &address).await?;
+    print_execution_lanes(pool, &address).await?;
     print_address_hits(pool, &address, cli.days).await?;
     print_address_gas_ranks(pool, &address, cli.days).await?;
     print_receipt_topic_summary(pool, &address).await?;
     print_related_watched_pool_swaps(pool, &address).await?;
+    Ok(())
+}
+
+async fn print_address_gas_summary(pool: &PgPool, address: &str) -> Result<()> {
+    let row = sqlx::query(
+        r#"
+        WITH related AS (
+            SELECT DISTINCT tx_hash
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+        ),
+        gas AS (
+            SELECT
+                ot.effective_gas_price::numeric AS effective_gas_price,
+                ot.gas_used::numeric AS gas_used,
+                CASE
+                    WHEN ot.effective_gas_price IS NOT NULL
+                     AND ob.base_fee_per_gas IS NOT NULL
+                     AND ot.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                    THEN ot.effective_gas_price::numeric - ob.base_fee_per_gas::numeric
+                    ELSE NULL
+                END AS paid_priority_fee_per_gas
+            FROM observed_transactions ot
+            JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+            LEFT JOIN observed_blocks ob ON ob.block_number = ot.block_number
+            WHERE ot.effective_gas_price IS NOT NULL
+        )
+        SELECT
+            COUNT(*)::bigint AS n,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY effective_gas_price) AS p50_effective,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY effective_gas_price) AS p90_effective,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY effective_gas_price) AS p99_effective,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p50_paid_priority,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p90_paid_priority,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p99_paid_priority,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY gas_used) AS p50_gas_used,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY gas_used) AS p90_gas_used,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY gas_used) AS p99_gas_used
+        FROM gas
+        "#,
+    )
+    .bind(address)
+    .fetch_one(pool)
+    .await?;
+
+    println!("== Address Gas Summary ==");
+    println!("txs: {}", cell_i64(&row, "n").unwrap_or_default());
+    println!(
+        "effective_gas_price wei p50={} p90={} p99={}",
+        cell_f64(&row, "p50_effective").unwrap_or_default(),
+        cell_f64(&row, "p90_effective").unwrap_or_default(),
+        cell_f64(&row, "p99_effective").unwrap_or_default(),
+    );
+    println!(
+        "paid_priority_fee wei p50={} p90={} p99={}",
+        cell_f64(&row, "p50_paid_priority").unwrap_or_default(),
+        cell_f64(&row, "p90_paid_priority").unwrap_or_default(),
+        cell_f64(&row, "p99_paid_priority").unwrap_or_default(),
+    );
+    println!(
+        "gas_used p50={} p90={} p99={}",
+        cell_f64(&row, "p50_gas_used").unwrap_or_default(),
+        cell_f64(&row, "p90_gas_used").unwrap_or_default(),
+        cell_f64(&row, "p99_gas_used").unwrap_or_default(),
+    );
+    println!();
+    Ok(())
+}
+
+async fn print_execution_lanes(pool: &PgPool, address: &str) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        WITH related AS (
+            SELECT DISTINCT tx_hash
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+        ),
+        gas AS (
+            SELECT
+                COALESCE(lower(ot.from_address), '-') AS from_address,
+                COALESCE(lower(ot.to_address), '-') AS to_address,
+                ot.block_number,
+                ot.effective_gas_price::numeric AS effective_gas_price,
+                ot.gas_used::numeric AS gas_used,
+                CASE
+                    WHEN ot.effective_gas_price IS NOT NULL
+                     AND ob.base_fee_per_gas IS NOT NULL
+                     AND ot.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                    THEN ot.effective_gas_price::numeric - ob.base_fee_per_gas::numeric
+                    ELSE NULL
+                END AS paid_priority_fee_per_gas
+            FROM observed_transactions ot
+            JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+            LEFT JOIN observed_blocks ob ON ob.block_number = ot.block_number
+            WHERE ot.effective_gas_price IS NOT NULL
+        )
+        SELECT
+            from_address,
+            to_address,
+            COUNT(*)::bigint AS txs,
+            MIN(block_number)::bigint AS first_block,
+            MAX(block_number)::bigint AS latest_block,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY effective_gas_price) AS p50_effective,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY effective_gas_price) AS p90_effective,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p50_paid_priority,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p90_paid_priority,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY gas_used) AS p50_gas_used,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY gas_used) AS p90_gas_used
+        FROM gas
+        GROUP BY from_address, to_address
+        ORDER BY txs DESC, latest_block DESC
+        LIMIT 20
+        "#,
+    )
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    println!("== Execution Lanes By From -> To ==");
+    if rows.is_empty() {
+        println!("no hydrated transaction lanes");
+        println!();
+        return Ok(());
+    }
+    for row in rows {
+        println!(
+            "from={} to={} txs={} blocks={}..{} effective_p50={} effective_p90={} paid_priority_p50={} paid_priority_p90={} gas_used_p50={} gas_used_p90={}",
+            cell_string(&row, "from_address").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "to_address").unwrap_or_else(|| "-".into()),
+            cell_i64(&row, "txs").unwrap_or_default(),
+            cell_i64(&row, "first_block").unwrap_or_default(),
+            cell_i64(&row, "latest_block").unwrap_or_default(),
+            cell_f64(&row, "p50_effective").unwrap_or_default(),
+            cell_f64(&row, "p90_effective").unwrap_or_default(),
+            cell_f64(&row, "p50_paid_priority").unwrap_or_default(),
+            cell_f64(&row, "p90_paid_priority").unwrap_or_default(),
+            cell_f64(&row, "p50_gas_used").unwrap_or_default(),
+            cell_f64(&row, "p90_gas_used").unwrap_or_default(),
+        );
+    }
+    println!();
     Ok(())
 }
 
@@ -528,10 +937,19 @@ async fn print_address_hits(pool: &PgPool, address: &str, days: i64) -> Result<(
             ot.max_priority_fee_per_gas,
             ot.max_fee_per_gas,
             ot.gas_used,
+            ob.base_fee_per_gas,
+            CASE
+                WHEN ot.effective_gas_price IS NOT NULL
+                 AND ob.base_fee_per_gas IS NOT NULL
+                 AND ot.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                THEN (ot.effective_gas_price::numeric - ob.base_fee_per_gas::numeric)::text
+                ELSE NULL
+            END AS paid_priority_fee_per_gas,
             string_agg(DISTINCT lower(e.pool_address), ', ' ORDER BY lower(e.pool_address)) FILTER (WHERE e.pool_address IS NOT NULL) AS pools,
             string_agg(DISTINCT e.dex || ':' || e.event_type, ', ' ORDER BY e.dex || ':' || e.event_type) FILTER (WHERE e.dex IS NOT NULL) AS protocols
         FROM observed_transactions ot
         JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+        LEFT JOIN observed_blocks ob ON ob.block_number = ot.block_number
         LEFT JOIN dex_events e ON lower(e.tx_hash) = lower(ot.tx_hash)
         WHERE ot.block_number >= (
             SELECT COALESCE(MAX(block_number), 0) - ($2::bigint * 43200)
@@ -540,7 +958,7 @@ async fn print_address_hits(pool: &PgPool, address: &str, days: i64) -> Result<(
         GROUP BY
             ot.block_number, ot.transaction_index, ot.tx_hash, ot.from_address,
             ot.to_address, ot.effective_gas_price, ot.max_priority_fee_per_gas,
-            ot.max_fee_per_gas, ot.gas_used
+            ot.max_fee_per_gas, ot.gas_used, ob.base_fee_per_gas
         ORDER BY ot.block_number DESC, ot.transaction_index DESC
         LIMIT 50
         "#,
@@ -558,13 +976,15 @@ async fn print_address_hits(pool: &PgPool, address: &str, days: i64) -> Result<(
     }
     for row in rows {
         println!(
-            "block={} idx={} tx={} from={} to={} effective={} priority={} max_fee={} gas_used={} pools=[{}] proto=[{}]",
+            "block={} idx={} tx={} from={} to={} effective={} base_fee={} paid_priority={} tx_priority={} max_fee={} gas_used={} pools=[{}] proto=[{}]",
             row.block_number,
             row.transaction_index.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             row.tx_hash,
             row.from_address.unwrap_or_else(|| "-".into()),
             row.to_address.unwrap_or_else(|| "-".into()),
             row.effective_gas_price.unwrap_or_else(|| "-".into()),
+            row.base_fee_per_gas.unwrap_or_else(|| "-".into()),
+            row.paid_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.max_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.max_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.gas_used.unwrap_or_else(|| "-".into()),
@@ -601,6 +1021,13 @@ async fn print_address_gas_ranks(pool: &PgPool, address: &str, days: i64) -> Res
             h.transaction_index,
             h.effective_gas_price,
             h.max_priority_fee_per_gas,
+            CASE
+                WHEN h.effective_gas_price IS NOT NULL
+                 AND ob.base_fee_per_gas IS NOT NULL
+                 AND h.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                THEN (h.effective_gas_price::numeric - ob.base_fee_per_gas::numeric)::text
+                ELSE NULL
+            END AS paid_priority_fee_per_gas,
             (
                 SELECT COUNT(*)::bigint
                 FROM observed_transactions p
@@ -618,12 +1045,17 @@ async fn print_address_gas_ranks(pool: &PgPool, address: &str, days: i64) -> Res
             (
                 SELECT COUNT(*)::bigint + 1
                 FROM observed_transactions p
+                LEFT JOIN observed_blocks pob ON pob.block_number = p.block_number
                 WHERE p.block_number = h.block_number
-                  AND p.max_priority_fee_per_gas IS NOT NULL
-                  AND h.max_priority_fee_per_gas IS NOT NULL
-                  AND p.max_priority_fee_per_gas::numeric > h.max_priority_fee_per_gas::numeric
+                  AND p.effective_gas_price IS NOT NULL
+                  AND pob.base_fee_per_gas IS NOT NULL
+                  AND h.effective_gas_price IS NOT NULL
+                  AND ob.base_fee_per_gas IS NOT NULL
+                  AND (p.effective_gas_price::numeric - pob.base_fee_per_gas::numeric) >
+                      (h.effective_gas_price::numeric - ob.base_fee_per_gas::numeric)
             ) AS priority_gas_rank
         FROM hits h
+        LEFT JOIN observed_blocks ob ON ob.block_number = h.block_number
         ORDER BY h.block_number DESC, h.transaction_index DESC
         "#,
     )
@@ -640,7 +1072,7 @@ async fn print_address_gas_ranks(pool: &PgPool, address: &str, days: i64) -> Res
     }
     for row in rows {
         println!(
-            "block={} idx={} tx={} effective={} rank={} peers={} priority={} priority_rank={}",
+            "block={} idx={} tx={} effective={} rank={} peers={} paid_priority={} tx_priority={} paid_priority_rank={}",
             row.block_number,
             row.transaction_index
                 .map(|v| v.to_string())
@@ -653,6 +1085,7 @@ async fn print_address_gas_ranks(pool: &PgPool, address: &str, days: i64) -> Res
             row.observed_pool_txs_in_block
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".into()),
+            row.paid_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.max_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.priority_gas_rank
                 .map(|v| v.to_string())
@@ -721,16 +1154,25 @@ async fn print_related_watched_pool_swaps(pool: &PgPool, address: &str) -> Resul
             ot.max_priority_fee_per_gas,
             ot.max_fee_per_gas,
             ot.gas_used,
+            ob.base_fee_per_gas,
+            CASE
+                WHEN ot.effective_gas_price IS NOT NULL
+                 AND ob.base_fee_per_gas IS NOT NULL
+                 AND ot.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                THEN (ot.effective_gas_price::numeric - ob.base_fee_per_gas::numeric)::text
+                ELSE NULL
+            END AS paid_priority_fee_per_gas,
             string_agg(DISTINCT lower(e.pool_address), ', ' ORDER BY lower(e.pool_address)) AS pools,
             string_agg(DISTINCT e.dex || ':' || e.event_type, ', ' ORDER BY e.dex || ':' || e.event_type) AS protocols
         FROM observed_transactions ot
         JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+        LEFT JOIN observed_blocks ob ON ob.block_number = ot.block_number
         JOIN dex_events e ON lower(e.tx_hash) = lower(ot.tx_hash)
         WHERE e.event_type = 'Swap'
         GROUP BY
             ot.block_number, ot.transaction_index, ot.tx_hash, ot.from_address,
             ot.to_address, ot.effective_gas_price, ot.max_priority_fee_per_gas,
-            ot.max_fee_per_gas, ot.gas_used
+            ot.max_fee_per_gas, ot.gas_used, ob.base_fee_per_gas
         ORDER BY ot.block_number DESC, ot.transaction_index DESC
         LIMIT 50
         "#,
@@ -747,7 +1189,7 @@ async fn print_related_watched_pool_swaps(pool: &PgPool, address: &str) -> Resul
     }
     for row in rows {
         println!(
-            "block={} idx={} tx={} from={} to={} effective={} priority={} pools=[{}] proto=[{}]",
+            "block={} idx={} tx={} from={} to={} effective={} base_fee={} paid_priority={} tx_priority={} pools=[{}] proto=[{}]",
             row.block_number,
             row.transaction_index
                 .map(|v| v.to_string())
@@ -756,6 +1198,8 @@ async fn print_related_watched_pool_swaps(pool: &PgPool, address: &str) -> Resul
             row.from_address.unwrap_or_else(|| "-".into()),
             row.to_address.unwrap_or_else(|| "-".into()),
             row.effective_gas_price.unwrap_or_else(|| "-".into()),
+            row.base_fee_per_gas.unwrap_or_else(|| "-".into()),
+            row.paid_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.max_priority_fee_per_gas.unwrap_or_else(|| "-".into()),
             row.pools.unwrap_or_else(|| "-".into()),
             row.protocols.unwrap_or_else(|| "-".into()),
@@ -817,6 +1261,10 @@ fn optional_lower_str(value: &Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(|raw| raw.to_ascii_lowercase())
 }
 
+fn optional_str(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_string)
+}
+
 fn address_topic(address: Address) -> String {
     format!("0x{:0>64}", hex::encode(address.as_slice()))
 }
@@ -847,4 +1295,8 @@ fn cell_i64(row: &sqlx::postgres::PgRow, key: &str) -> Option<i64> {
 
 fn cell_f64(row: &sqlx::postgres::PgRow, key: &str) -> Option<f64> {
     row.try_get::<Option<f64>, _>(key).ok().flatten()
+}
+
+fn cell_string(row: &sqlx::postgres::PgRow, key: &str) -> Option<String> {
+    row.try_get::<Option<String>, _>(key).ok().flatten()
 }

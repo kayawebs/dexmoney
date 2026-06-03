@@ -689,10 +689,23 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS observed_transactions_block_idx
             ON observed_transactions (block_number, transaction_index)"#,
+        r#"CREATE INDEX IF NOT EXISTS observed_transactions_tx_hash_lower_idx
+            ON observed_transactions (lower(tx_hash))"#,
         r#"CREATE INDEX IF NOT EXISTS observed_transactions_from_idx
             ON observed_transactions (lower(from_address))"#,
         r#"CREATE INDEX IF NOT EXISTS observed_transactions_to_idx
             ON observed_transactions (lower(to_address))"#,
+        r#"CREATE TABLE IF NOT EXISTS observed_blocks (
+            block_number BIGINT PRIMARY KEY,
+            block_hash TEXT,
+            base_fee_per_gas TEXT,
+            gas_used TEXT,
+            gas_limit TEXT,
+            block_timestamp BIGINT,
+            tx_count BIGINT,
+            block_json JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
         r#"CREATE TABLE IF NOT EXISTS observed_address_transfers (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             seed_address TEXT NOT NULL,
@@ -715,6 +728,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON observed_address_transfers (lower(counterparty))"#,
         r#"CREATE INDEX IF NOT EXISTS observed_address_transfers_tx_idx
             ON observed_address_transfers (lower(tx_hash))"#,
+        r#"CREATE INDEX IF NOT EXISTS observed_address_transfers_seed_tx_idx
+            ON observed_address_transfers (lower(seed_address), lower(tx_hash))"#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }

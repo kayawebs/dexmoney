@@ -317,6 +317,18 @@ impl ChainProvider {
         Ok(hash.to_string())
     }
 
+    pub async fn get_block_by_number_raw(
+        &self,
+        block_number: u64,
+        full_transactions: bool,
+    ) -> Result<Option<Value>> {
+        self.rpc_optional(
+            "eth_getBlockByNumber",
+            json!([format!("0x{block_number:x}"), full_transactions]),
+        )
+        .await
+    }
+
     pub async fn get_transaction_count(&self, address: Address, pending: bool) -> Result<u64> {
         let tag = if pending { "pending" } else { "latest" };
         let value = self
