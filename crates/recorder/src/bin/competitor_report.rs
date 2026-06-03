@@ -727,6 +727,7 @@ async fn print_report(pool: &PgPool, cli: &Cli) -> Result<()> {
     print_transfer_counterparties(pool, &address).await?;
     print_address_gas_summary(pool, &address).await?;
     print_execution_lanes(pool, &address).await?;
+    print_gas_strategy_recommendation(pool, &address).await?;
     print_address_hits(pool, &address, cli.days).await?;
     print_address_gas_ranks(pool, &address, cli.days).await?;
     print_receipt_topic_summary(pool, &address).await?;
@@ -871,6 +872,97 @@ async fn print_execution_lanes(pool: &PgPool, address: &str) -> Result<()> {
             cell_f64(&row, "p90_gas_used").unwrap_or_default(),
         );
     }
+    println!();
+    Ok(())
+}
+
+async fn print_gas_strategy_recommendation(pool: &PgPool, address: &str) -> Result<()> {
+    let row = sqlx::query(
+        r#"
+        WITH related AS (
+            SELECT DISTINCT tx_hash
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+        ),
+        gas AS (
+            SELECT
+                ob.base_fee_per_gas::numeric AS base_fee_per_gas,
+                ot.effective_gas_price::numeric AS effective_gas_price,
+                ot.gas_used::numeric AS gas_used,
+                CASE
+                    WHEN ot.effective_gas_price IS NOT NULL
+                     AND ob.base_fee_per_gas IS NOT NULL
+                     AND ot.effective_gas_price::numeric >= ob.base_fee_per_gas::numeric
+                    THEN ot.effective_gas_price::numeric - ob.base_fee_per_gas::numeric
+                    ELSE NULL
+                END AS paid_priority_fee_per_gas
+            FROM observed_transactions ot
+            JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+            JOIN observed_blocks ob ON ob.block_number = ot.block_number
+            WHERE ot.effective_gas_price IS NOT NULL
+              AND ob.base_fee_per_gas IS NOT NULL
+        )
+        SELECT
+            COUNT(*)::bigint AS n,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY base_fee_per_gas) AS p50_base_fee,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY base_fee_per_gas) AS p90_base_fee,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY base_fee_per_gas) AS p99_base_fee,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p50_paid_priority,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p90_paid_priority,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY paid_priority_fee_per_gas) AS p99_paid_priority,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY gas_used) AS p90_gas_used,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY gas_used) AS p99_gas_used
+        FROM gas
+        "#,
+    )
+    .bind(address)
+    .fetch_one(pool)
+    .await?;
+
+    let n = cell_i64(&row, "n").unwrap_or_default();
+    let p50_priority = cell_f64(&row, "p50_paid_priority").unwrap_or_default();
+    let p90_priority = cell_f64(&row, "p90_paid_priority").unwrap_or_default();
+    let p99_priority = cell_f64(&row, "p99_paid_priority").unwrap_or_default();
+    let p90_base = cell_f64(&row, "p90_base_fee").unwrap_or_default();
+    let p99_base = cell_f64(&row, "p99_base_fee").unwrap_or_default();
+    let p90_gas = cell_f64(&row, "p90_gas_used").unwrap_or_default();
+    let p99_gas = cell_f64(&row, "p99_gas_used").unwrap_or_default();
+
+    let normal_priority = p90_priority.max(p50_priority * 1.10).ceil();
+    let aggressive_priority = p99_priority.max(normal_priority * 2.0).ceil();
+    let normal_max_fee = (p90_base + normal_priority).ceil();
+    let aggressive_max_fee = (p99_base + aggressive_priority).ceil();
+    let normal_eth_budget = normal_max_fee * p90_gas / 1e18;
+    let aggressive_eth_budget = aggressive_max_fee * p99_gas / 1e18;
+
+    println!("== Gas Strategy Recommendation ==");
+    if n == 0 {
+        println!("not enough hydrated block gas data");
+        println!();
+        return Ok(());
+    }
+    println!(
+        "samples: {n} base_fee_p90={} base_fee_p99={} paid_priority_p50={} paid_priority_p90={} paid_priority_p99={}",
+        fmt_wei(p90_base),
+        fmt_wei(p99_base),
+        fmt_wei(p50_priority),
+        fmt_wei(p90_priority),
+        fmt_wei(p99_priority),
+    );
+    println!(
+        "normal: priority_fee={} max_fee={} gas_limit_floor≈{} eth_budget≈{:.8}",
+        fmt_wei(normal_priority),
+        fmt_wei(normal_max_fee),
+        p90_gas.ceil() as u64,
+        normal_eth_budget,
+    );
+    println!(
+        "aggressive: priority_fee={} max_fee={} gas_limit_floor≈{} eth_budget≈{:.8}",
+        fmt_wei(aggressive_priority),
+        fmt_wei(aggressive_max_fee),
+        p99_gas.ceil() as u64,
+        aggressive_eth_budget,
+    );
     println!();
     Ok(())
 }
@@ -1299,4 +1391,8 @@ fn cell_f64(row: &sqlx::postgres::PgRow, key: &str) -> Option<f64> {
 
 fn cell_string(row: &sqlx::postgres::PgRow, key: &str) -> Option<String> {
     row.try_get::<Option<String>, _>(key).ok().flatten()
+}
+
+fn fmt_wei(value: f64) -> String {
+    format!("{:.0}", value.max(0.0))
 }
