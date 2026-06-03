@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 
 ARG APP_BIN=searcher
 WORKDIR /app
@@ -25,4 +25,3 @@ COPY migrations ./migrations
 COPY .env.example ./.env.example
 
 CMD ["app"]
-
