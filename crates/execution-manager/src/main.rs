@@ -2,6 +2,7 @@ mod eoa_lane;
 mod simulator;
 mod tx_manager;
 
+use alloy_primitives::Address;
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -58,36 +59,29 @@ where
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
-    let private_key = settings
-        .eoa_private_key_1
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EOA_PRIVATE_KEY_1 is required"))?;
-    let wallet = tx_manager::ExecutionWallet::from_private_key(private_key, settings.chain_id)?;
-    if let Some(configured) = settings.eoa_address_1 {
-        if configured != wallet.address() {
-            warn!(
-                configured = %configured,
-                derived = %wallet.address(),
-                "EOA_ADDRESS_1 does not match EOA_PRIVATE_KEY_1 derived address"
-            );
+    let wallet = configured_wallet(settings)?;
+    let operator = operator_address(settings, wallet.as_ref())?;
+
+    if settings.execution_submit_enabled {
+        let Some(wallet) = wallet.as_ref() else {
+            anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+        };
+        let mut lane = eoa_store
+            .get_lane_state(wallet.address())
+            .await?
+            .map(|state| eoa_lane::EoaLane { state })
+            .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
+
+        reconcile_db_pending_transactions(recorder, provider, wallet.address()).await?;
+
+        if lane.state.status == EoaLaneStatus::Pending {
+            handle_pending_lane(&mut lane, eoa_store, recorder, provider, wallet, settings).await?;
+            return Ok(());
         }
+
+        sync_idle_lane(&mut lane, provider).await?;
+        eoa_store.set_lane_state(lane.state.clone()).await?;
     }
-
-    let mut lane = eoa_store
-        .get_lane_state(wallet.address())
-        .await?
-        .map(|state| eoa_lane::EoaLane { state })
-        .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
-
-    reconcile_db_pending_transactions(recorder, provider, wallet.address()).await?;
-
-    if lane.state.status == EoaLaneStatus::Pending {
-        handle_pending_lane(&mut lane, eoa_store, recorder, provider, &wallet, settings).await?;
-        return Ok(());
-    }
-
-    sync_idle_lane(&mut lane, provider).await?;
-    eoa_store.set_lane_state(lane.state.clone()).await?;
 
     let Some(candidate) = pop_fresh_candidate(candidate_store).await? else {
         debug!("no candidate available");
@@ -124,7 +118,7 @@ where
     let simulation = simulator::simulate(
         provider,
         settings,
-        wallet.address(),
+        operator,
         &candidate,
         min_simulated_profit_usdc,
     )
@@ -178,6 +172,28 @@ where
         return Ok(());
     }
 
+    if !settings.execution_submit_enabled {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            simulated_profit = %simulation.simulated_profit,
+            net_simulated_profit = ?simulation.net_simulated_profit,
+            gas_estimate = ?simulation.gas_estimate,
+            max_fee_per_gas = ?simulation.max_fee_per_gas,
+            max_priority_fee_per_gas = ?simulation.max_priority_fee_per_gas,
+            "simulation-only mode; skipping tx submission"
+        );
+        return Ok(());
+    }
+
+    let Some(wallet) = wallet.as_ref() else {
+        anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+    };
+    let mut lane = eoa_store
+        .get_lane_state(wallet.address())
+        .await?
+        .map(|state| eoa_lane::EoaLane { state })
+        .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
     let nonce = lane.state.local_nonce;
     match tx_manager::submit_candidate(provider, &wallet, settings, &candidate, &simulation, nonce)
         .await
@@ -230,6 +246,37 @@ where
     }
 
     Ok(())
+}
+
+fn configured_wallet(settings: &Settings) -> Result<Option<tx_manager::ExecutionWallet>> {
+    let Some(private_key) = settings.eoa_private_key_1.as_deref() else {
+        return Ok(None);
+    };
+
+    let wallet = tx_manager::ExecutionWallet::from_private_key(private_key, settings.chain_id)?;
+    if let Some(configured_address) = settings.eoa_address_1 {
+        if configured_address != wallet.address() {
+            warn!(
+                configured_address = %configured_address,
+                wallet_address = %wallet.address(),
+                "EOA_ADDRESS_1 does not match EOA_PRIVATE_KEY_1; using private-key-derived address"
+            );
+        }
+    }
+    Ok(Some(wallet))
+}
+
+fn operator_address(
+    settings: &Settings,
+    wallet: Option<&tx_manager::ExecutionWallet>,
+) -> Result<Address> {
+    if let Some(wallet) = wallet {
+        return Ok(wallet.address());
+    }
+    if let Some(address) = settings.eoa_address_1 {
+        return Ok(address);
+    }
+    anyhow::bail!("EOA_ADDRESS_1 or EOA_PRIVATE_KEY_1 is required for simulation");
 }
 
 async fn pop_fresh_candidate<C>(

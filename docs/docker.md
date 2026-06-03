@@ -37,7 +37,9 @@ sudo docker compose --env-file .env.docker -f docker-compose.apps.yml up -d --bu
 ## Start Or Restart Executor
 
 The executor is behind the `executor` profile so a normal `up -d` does not start
-trading by accident.
+trading by accident. `execution-manager` also defaults to simulation-only mode:
+it consumes candidates, records simulations with gas/net-profit metrics, and does
+not submit transactions unless `EXECUTION_SUBMIT_ENABLED=true` is explicitly set.
 
 ```bash
 sudo docker compose --env-file .env.docker -f docker-compose.apps.yml --profile executor up -d --build execution-manager
