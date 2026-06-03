@@ -434,6 +434,11 @@ impl ChainProvider {
             .await
     }
 
+    pub async fn get_logs_raw(&self, params: Value) -> Result<Vec<Value>> {
+        let value = self.rpc("eth_getLogs", params).await?;
+        serde_json::from_value(value).context("failed to decode eth_getLogs result")
+    }
+
     async fn discover_aerodrome_classic(
         &self,
         settings: &Settings,
