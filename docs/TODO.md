@@ -37,6 +37,21 @@
 - Add real calldata encoding for `executeWithOwnFunds`.
 - Track actual EOA nonce, ETH balance, pending tx, receipt, and revert reason.
 - Add candidate expiry and replay protection tied to block/timestamp.
+- [ ] Add EOA address library management:
+  - Auto-generate/import execution EOAs into an encrypted/key-managed address pool.
+  - Track per-address lane state, nonce, ETH balance, cooldown, and last use.
+  - Allocate candidates across lanes without reusing a pending nonce lane.
+  - Add operator controls to pause, drain, or retire individual lanes.
+- [ ] Add automated gas funding for execution EOAs:
+  - Maintain target ETH balances based on measured gas cost percentiles and configured attempts-per-address.
+  - Fund only when network gas is below a configurable percentile/threshold.
+  - Record all funding transactions and reconcile balances before marking an address ready.
+  - Never auto-transfer strategy principal; funding automation is gas-only.
+- [ ] Add competitor gas strategy analysis:
+  - Cache observed watched-pool tx/receipt data in `observed_transactions`.
+  - Compare our submitted txs against same-block watched-pool tx gas ranks.
+  - Analyze known competitor addresses/executors over a rolling 30d window.
+  - Feed measured p90/p99 priority fee and effective gas into execution gas defaults and address funding targets.
 - Add Aerodrome Slipstream executor support without guessing ABI:
   - Confirm the Base Slipstream router and factory addresses from primary sources/onchain config.
   - Confirm the router swap function signature and whether execution requires fee, tick spacing, or encoded path.

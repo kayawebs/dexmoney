@@ -429,6 +429,11 @@ impl ChainProvider {
         }))
     }
 
+    pub async fn get_transaction_by_hash(&self, tx_hash: B256) -> Result<Option<Value>> {
+        self.rpc_optional("eth_getTransactionByHash", json!([format!("{tx_hash:#x}")]))
+            .await
+    }
+
     async fn discover_aerodrome_classic(
         &self,
         settings: &Settings,
