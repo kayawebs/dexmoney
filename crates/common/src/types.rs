@@ -269,8 +269,30 @@ pub struct SimulationResult {
     pub id: Uuid,
     pub opportunity_id: Uuid,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_in: Option<Address>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_in: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_profit: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_profit: Option<U256>,
     pub simulated_profit: U256,
     pub gas_estimate: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_fee_per_gas: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_cost_cap: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_simulated_profit: Option<U256>,
     pub revert_reason: Option<String>,
     pub calldata: Vec<u8>,
 }

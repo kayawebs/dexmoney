@@ -10,6 +10,12 @@ use sqlx::{FromRow, PgPool, Row};
 use tracing_subscriber::EnvFilter;
 
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const UNI_V3_SWAP_TOPIC: &str =
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const PANCAKE_V3_SWAP_TOPIC: &str =
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
+const CLASSIC_SWAP_TOPIC: &str =
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
 
 #[derive(Debug, Clone)]
@@ -731,6 +737,7 @@ async fn print_report(pool: &PgPool, cli: &Cli) -> Result<()> {
     print_address_hits(pool, &address, cli.days).await?;
     print_address_gas_ranks(pool, &address, cli.days).await?;
     print_receipt_topic_summary(pool, &address).await?;
+    print_competitor_swap_pool_summary(pool, &address).await?;
     print_related_watched_pool_swaps(pool, &address).await?;
     Ok(())
 }
@@ -1228,6 +1235,86 @@ async fn print_receipt_topic_summary(pool: &PgPool, address: &str) -> Result<()>
     Ok(())
 }
 
+async fn print_competitor_swap_pool_summary(pool: &PgPool, address: &str) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        WITH related AS (
+            SELECT DISTINCT tx_hash
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+        ),
+        swap_logs AS (
+            SELECT
+                lower(log->>'address') AS pool_address,
+                lower(log->'topics'->>0) AS topic0,
+                ot.tx_hash,
+                ot.block_number
+            FROM observed_transactions ot
+            JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+            CROSS JOIN LATERAL jsonb_array_elements(ot.receipt_json->'logs') AS log
+            WHERE lower(log->'topics'->>0) = ANY($2)
+        )
+        SELECT
+            sl.pool_address,
+            CASE sl.topic0
+                WHEN $3 THEN 'v3/slipstream'
+                WHEN $4 THEN 'pancake-v3'
+                WHEN $5 THEN 'classic-v2'
+                ELSE sl.topic0
+            END AS swap_family,
+            COALESCE(p.dex, '-') AS dex,
+            COALESCE(p.variant, '-') AS variant,
+            COALESCE(tp.symbol, '-') AS symbol,
+            COUNT(*)::bigint AS swap_logs,
+            COUNT(DISTINCT sl.tx_hash)::bigint AS txs,
+            MIN(sl.block_number)::bigint AS first_block,
+            MAX(sl.block_number)::bigint AS latest_block,
+            BOOL_OR(p.pool_address IS NOT NULL) AS registered
+        FROM swap_logs sl
+        LEFT JOIN pools p ON lower(p.pool_address) = sl.pool_address
+        LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        GROUP BY sl.pool_address, sl.topic0, p.dex, p.variant, tp.symbol
+        ORDER BY txs DESC, swap_logs DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(address)
+    .bind(vec![
+        UNI_V3_SWAP_TOPIC.to_string(),
+        PANCAKE_V3_SWAP_TOPIC.to_string(),
+        CLASSIC_SWAP_TOPIC.to_string(),
+    ])
+    .bind(UNI_V3_SWAP_TOPIC)
+    .bind(PANCAKE_V3_SWAP_TOPIC)
+    .bind(CLASSIC_SWAP_TOPIC)
+    .fetch_all(pool)
+    .await?;
+
+    println!("== Competitor Swap Pools / Protocols ==");
+    if rows.is_empty() {
+        println!("no swap logs found in hydrated related receipts");
+        println!();
+        return Ok(());
+    }
+    for row in rows {
+        println!(
+            "pool={} family={} registered={} symbol={} dex={} variant={} txs={} logs={} blocks={}..{}",
+            cell_string(&row, "pool_address").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "swap_family").unwrap_or_else(|| "-".into()),
+            cell_bool(&row, "registered").unwrap_or(false),
+            cell_string(&row, "symbol").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "dex").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "variant").unwrap_or_else(|| "-".into()),
+            cell_i64(&row, "txs").unwrap_or_default(),
+            cell_i64(&row, "swap_logs").unwrap_or_default(),
+            cell_i64(&row, "first_block").unwrap_or_default(),
+            cell_i64(&row, "latest_block").unwrap_or_default(),
+        );
+    }
+    println!();
+    Ok(())
+}
+
 async fn print_related_watched_pool_swaps(pool: &PgPool, address: &str) -> Result<()> {
     let rows: Vec<HitRow> = sqlx::query_as(
         r#"
@@ -1391,6 +1478,10 @@ fn cell_f64(row: &sqlx::postgres::PgRow, key: &str) -> Option<f64> {
 
 fn cell_string(row: &sqlx::postgres::PgRow, key: &str) -> Option<String> {
     row.try_get::<Option<String>, _>(key).ok().flatten()
+}
+
+fn cell_bool(row: &sqlx::postgres::PgRow, key: &str) -> Option<bool> {
+    row.try_get::<Option<bool>, _>(key).ok().flatten()
 }
 
 fn fmt_wei(value: f64) -> String {

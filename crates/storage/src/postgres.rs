@@ -730,6 +730,22 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON observed_address_transfers (lower(tx_hash))"#,
         r#"CREATE INDEX IF NOT EXISTS observed_address_transfers_seed_tx_idx
             ON observed_address_transfers (lower(seed_address), lower(tx_hash))"#,
+        r#"ALTER TABLE simulations
+            ADD COLUMN IF NOT EXISTS block_number BIGINT,
+            ADD COLUMN IF NOT EXISTS token_in TEXT,
+            ADD COLUMN IF NOT EXISTS amount_in TEXT,
+            ADD COLUMN IF NOT EXISTS expected_profit TEXT,
+            ADD COLUMN IF NOT EXISTS min_profit TEXT,
+            ADD COLUMN IF NOT EXISTS path_name TEXT,
+            ADD COLUMN IF NOT EXISTS base_fee_per_gas TEXT,
+            ADD COLUMN IF NOT EXISTS max_fee_per_gas TEXT,
+            ADD COLUMN IF NOT EXISTS max_priority_fee_per_gas TEXT,
+            ADD COLUMN IF NOT EXISTS gas_cost_cap TEXT,
+            ADD COLUMN IF NOT EXISTS net_simulated_profit TEXT"#,
+        r#"CREATE INDEX IF NOT EXISTS simulations_block_idx
+            ON simulations (block_number DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS simulations_path_created_idx
+            ON simulations (path_name, created_at DESC)"#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
@@ -929,8 +945,10 @@ impl RecorderStore for PostgresStore {
             r#"
             INSERT INTO simulations (
                 id, opportunity_id, created_at, success, simulated_profit, gas_estimate,
-                revert_reason, calldata, raw_result
-            ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8)
+                revert_reason, calldata, raw_result, block_number, token_in, amount_in,
+                expected_profit, min_profit, path_name, base_fee_per_gas, max_fee_per_gas,
+                max_priority_fee_per_gas, gas_cost_cap, net_simulated_profit
+            ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             "#,
         )
         .bind(simulation.id)
@@ -943,7 +961,34 @@ impl RecorderStore for PostgresStore {
         .bind(sqlx::types::Json(serde_json::json!({
             "success": simulation.success,
             "gas_estimate": simulation.gas_estimate.map(|v| v.to_string()),
+            "block_number": simulation.block_number,
+            "token_in": simulation.token_in.map(address_to_string),
+            "amount_in": simulation.amount_in.map(|v| v.to_string()),
+            "expected_profit": simulation.expected_profit.map(|v| v.to_string()),
+            "min_profit": simulation.min_profit.map(|v| v.to_string()),
+            "path_name": simulation.path_name.clone(),
+            "base_fee_per_gas": simulation.base_fee_per_gas.map(|v| v.to_string()),
+            "max_fee_per_gas": simulation.max_fee_per_gas.map(|v| v.to_string()),
+            "max_priority_fee_per_gas": simulation.max_priority_fee_per_gas.map(|v| v.to_string()),
+            "gas_cost_cap": simulation.gas_cost_cap.map(|v| v.to_string()),
+            "net_simulated_profit": simulation.net_simulated_profit.map(|v| v.to_string()),
         })))
+        .bind(
+            simulation
+                .block_number
+                .map(|v| i64::try_from(v))
+                .transpose()?,
+        )
+        .bind(simulation.token_in.map(address_to_string))
+        .bind(simulation.amount_in.map(|v| v.to_string()))
+        .bind(simulation.expected_profit.map(|v| v.to_string()))
+        .bind(simulation.min_profit.map(|v| v.to_string()))
+        .bind(simulation.path_name.clone())
+        .bind(simulation.base_fee_per_gas.map(|v| v.to_string()))
+        .bind(simulation.max_fee_per_gas.map(|v| v.to_string()))
+        .bind(simulation.max_priority_fee_per_gas.map(|v| v.to_string()))
+        .bind(simulation.gas_cost_cap.map(|v| v.to_string()))
+        .bind(simulation.net_simulated_profit.map(|v| v.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())

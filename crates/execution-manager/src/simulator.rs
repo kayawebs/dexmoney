@@ -33,8 +33,19 @@ pub async fn simulate(
                 id: uuid::Uuid::new_v4(),
                 opportunity_id: candidate.id,
                 success: false,
+                path_name: Some(candidate.path.name.clone()),
+                token_in: Some(candidate.token_in),
+                amount_in: Some(candidate.amount_in),
+                expected_profit: Some(candidate.expected_profit),
+                min_profit: Some(candidate.min_profit),
                 simulated_profit: U256::ZERO,
                 gas_estimate: None,
+                block_number: None,
+                base_fee_per_gas: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                gas_cost_cap: None,
+                net_simulated_profit: None,
                 revert_reason: Some(format_revert_reason(&raw_error)),
                 calldata: Vec::new(),
             }
@@ -76,19 +87,84 @@ async fn simulate_inner(
         )
         .await?;
     let simulated_profit = decode_uint256_result(&raw_result).unwrap_or(candidate.expected_profit);
+    let gas_estimate = provider
+        .estimate_gas(operator, executor, &data)
+        .await
+        .context("failed to estimate executor tx gas after successful eth_call")?;
+    let fees = simulation_fee_suggestion(provider, settings).await?;
+    let gas_cost_cap = gas_estimate.saturating_mul(fees.max_fee_per_gas);
+    let net_simulated_profit = if candidate.token_in == settings.weth_address {
+        Some(simulated_profit.saturating_sub(gas_cost_cap))
+    } else {
+        None
+    };
+    let profit_meets_threshold = if let Some(net_profit) = net_simulated_profit {
+        net_profit >= min_profit_units
+    } else {
+        simulated_profit >= min_profit_units
+    };
+    let block_number = provider.get_block_number().await.ok();
 
     Ok(SimulationResult {
         id: uuid::Uuid::new_v4(),
         opportunity_id: candidate.id,
-        success: simulated_profit >= min_profit_units,
+        success: profit_meets_threshold,
+        path_name: Some(candidate.path.name.clone()),
+        token_in: Some(candidate.token_in),
+        amount_in: Some(candidate.amount_in),
+        expected_profit: Some(candidate.expected_profit),
+        min_profit: Some(candidate.min_profit),
         simulated_profit,
-        gas_estimate: Some(U256::from(350_000u64)),
-        revert_reason: if simulated_profit < min_profit_units {
-            Some("simulated profit below threshold".into())
+        gas_estimate: Some(gas_estimate),
+        block_number,
+        base_fee_per_gas: Some(fees.base_fee_per_gas),
+        max_fee_per_gas: Some(fees.max_fee_per_gas),
+        max_priority_fee_per_gas: Some(fees.max_priority_fee_per_gas),
+        gas_cost_cap: Some(gas_cost_cap),
+        net_simulated_profit,
+        revert_reason: if !profit_meets_threshold {
+            if net_simulated_profit.is_some() {
+                Some("net simulated profit below threshold after gas".into())
+            } else {
+                Some("simulated profit below threshold".into())
+            }
         } else {
             None
         },
         calldata,
+    })
+}
+
+struct SimulationFeeSuggestion {
+    base_fee_per_gas: U256,
+    max_fee_per_gas: U256,
+    max_priority_fee_per_gas: U256,
+}
+
+async fn simulation_fee_suggestion(
+    provider: &ChainProvider,
+    settings: &Settings,
+) -> Result<SimulationFeeSuggestion> {
+    let suggested = provider.suggested_eip1559_fee_details().await?;
+    let min_priority = parse_optional_u256(settings.execution_min_priority_fee_wei.as_deref())?
+        .unwrap_or(U256::ZERO);
+    let priority = apply_bps(
+        suggested.max_priority_fee_per_gas,
+        settings.execution_priority_fee_multiplier_bps,
+    )
+    .max(min_priority);
+    let base_component = apply_bps(
+        suggested.base_fee_per_gas,
+        settings.execution_max_fee_multiplier_bps,
+    );
+    let max_fee = base_component
+        .saturating_add(priority)
+        .max(suggested.max_fee_per_gas);
+
+    Ok(SimulationFeeSuggestion {
+        base_fee_per_gas: suggested.base_fee_per_gas,
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: priority,
     })
 }
 
@@ -435,6 +511,19 @@ fn tail_chars(value: &str, max_chars: usize) -> String {
     }
     let start = chars.len().saturating_sub(max_chars);
     format!("...{}", chars[start..].iter().collect::<String>())
+}
+
+fn apply_bps(value: U256, bps: u64) -> U256 {
+    value
+        .saturating_mul(U256::from(bps))
+        .checked_div(U256::from(10_000u64))
+        .unwrap_or(value)
+}
+
+fn parse_optional_u256(raw: Option<&str>) -> Result<Option<U256>> {
+    raw.map(|value| U256::from_str_radix(value.trim_start_matches("0x"), 10))
+        .transpose()
+        .context("invalid U256 decimal config value")
 }
 
 #[cfg(test)]
