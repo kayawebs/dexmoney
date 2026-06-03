@@ -1,0 +1,63 @@
+name: dexmoney-apps
+
+x-app-common: &app-common
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment:
+    POSTGRES_URL: ${POSTGRES_URL_DOCKER:-postgres://user:password@base-arb-postgres:5432/base_arb}
+    REDIS_URL: ${REDIS_URL_DOCKER:-redis://base-arb-redis:6379}
+    BASE_RPC_HTTP: ${BASE_RPC_HTTP_DOCKER:-http://node-execution-1:8545}
+    BASE_RPC_WS: ${BASE_RPC_WS_DOCKER:-ws://node-execution-1:8546}
+  networks:
+    - dexmoney
+    - base-node
+
+services:
+  market-data:
+    <<: *app-common
+    container_name: dexmoney-market-data
+    image: dexmoney-market-data:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_BIN: market-data
+
+  searcher:
+    <<: *app-common
+    container_name: dexmoney-searcher
+    image: dexmoney-searcher:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_BIN: searcher
+
+  monitor-web:
+    <<: *app-common
+    container_name: dexmoney-monitor-web
+    image: dexmoney-monitor-web:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_BIN: monitor-web
+    ports:
+      - "${MONITOR_WEB_BIND:-127.0.0.1}:${MONITOR_WEB_PORT:-8085}:8085"
+
+  execution-manager:
+    <<: *app-common
+    container_name: dexmoney-execution-manager
+    image: dexmoney-execution-manager:${DEXMONEY_IMAGE_TAG:-latest}
+    profiles:
+      - executor
+    build:
+      context: .
+      args:
+        APP_BIN: execution-manager
+
+networks:
+  dexmoney:
+    name: ${DEXMONEY_DOCKER_NETWORK:-dexmoney_default}
+    external: true
+  base-node:
+    name: ${BASE_NODE_DOCKER_NETWORK:-node_default}
+    external: true
