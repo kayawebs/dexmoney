@@ -741,6 +741,7 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS max_fee_per_gas TEXT,
             ADD COLUMN IF NOT EXISTS max_priority_fee_per_gas TEXT,
             ADD COLUMN IF NOT EXISTS gas_cost_cap TEXT,
+            ADD COLUMN IF NOT EXISTS gas_cost_expected TEXT,
             ADD COLUMN IF NOT EXISTS net_simulated_profit TEXT"#,
         r#"CREATE INDEX IF NOT EXISTS simulations_block_idx
             ON simulations (block_number DESC)"#,
@@ -947,8 +948,8 @@ impl RecorderStore for PostgresStore {
                 id, opportunity_id, created_at, success, simulated_profit, gas_estimate,
                 revert_reason, calldata, raw_result, block_number, token_in, amount_in,
                 expected_profit, min_profit, path_name, base_fee_per_gas, max_fee_per_gas,
-                max_priority_fee_per_gas, gas_cost_cap, net_simulated_profit
-            ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                max_priority_fee_per_gas, gas_cost_cap, gas_cost_expected, net_simulated_profit
+            ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
             "#,
         )
         .bind(simulation.id)
@@ -971,6 +972,7 @@ impl RecorderStore for PostgresStore {
             "max_fee_per_gas": simulation.max_fee_per_gas.map(|v| v.to_string()),
             "max_priority_fee_per_gas": simulation.max_priority_fee_per_gas.map(|v| v.to_string()),
             "gas_cost_cap": simulation.gas_cost_cap.map(|v| v.to_string()),
+            "gas_cost_expected": simulation.gas_cost_expected.map(|v| v.to_string()),
             "net_simulated_profit": simulation.net_simulated_profit.map(|v| v.to_string()),
         })))
         .bind(
@@ -988,6 +990,7 @@ impl RecorderStore for PostgresStore {
         .bind(simulation.max_fee_per_gas.map(|v| v.to_string()))
         .bind(simulation.max_priority_fee_per_gas.map(|v| v.to_string()))
         .bind(simulation.gas_cost_cap.map(|v| v.to_string()))
+        .bind(simulation.gas_cost_expected.map(|v| v.to_string()))
         .bind(simulation.net_simulated_profit.map(|v| v.to_string()))
         .execute(&self.pool)
         .await?;

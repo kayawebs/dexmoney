@@ -145,6 +145,7 @@ struct SimulationRow {
     simulated_profit: Option<String>,
     gas_estimate: Option<String>,
     gas_cost_cap: Option<String>,
+    gas_cost_expected: Option<String>,
     net_simulated_profit: Option<String>,
     max_fee_per_gas: Option<String>,
     max_priority_fee_per_gas: Option<String>,
@@ -1221,6 +1222,7 @@ async fn fetch_simulations(pool: &PgPool) -> Result<Vec<SimulationRow>> {
             s.simulated_profit,
             s.gas_estimate,
             s.gas_cost_cap,
+            s.gas_cost_expected,
             s.net_simulated_profit,
             s.max_fee_per_gas,
             s.max_priority_fee_per_gas,
@@ -2192,12 +2194,12 @@ fn fmt_warn_i64(value: Option<i64>) -> String {
 
 fn render_simulations_table(rows: &[SimulationRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Opportunity UUID</th><th>Path</th><th>Success</th><th>Gross Profit</th><th>Gas Est</th><th>Gas Cost Cap</th><th>Net Profit</th><th>Max Fee</th><th>Priority</th><th>Revert</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table><thead><tr><th>Time</th><th>Block</th><th>Opportunity UUID</th><th>Path</th><th>Success</th><th>Gross Profit</th><th>Gas Est</th><th>Gas Expected</th><th>Gas Cap</th><th>Net Profit</th><th>Max Fee</th><th>Priority</th><th>Revert</th></tr></thead><tbody>",
     );
     for row in rows {
         let class = if row.success { "ok" } else { "bad" };
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             fmt_ts(row.created_at),
             row.block_number
                 .map(|value| value.to_string())
@@ -2208,6 +2210,7 @@ fn render_simulations_table(rows: &[SimulationRow]) -> String {
             row.success,
             escape(row.simulated_profit.as_deref().unwrap_or("-")),
             escape(row.gas_estimate.as_deref().unwrap_or("-")),
+            escape(row.gas_cost_expected.as_deref().unwrap_or("-")),
             escape(row.gas_cost_cap.as_deref().unwrap_or("-")),
             escape(row.net_simulated_profit.as_deref().unwrap_or("-")),
             escape(row.max_fee_per_gas.as_deref().unwrap_or("-")),
@@ -2216,7 +2219,7 @@ fn render_simulations_table(rows: &[SimulationRow]) -> String {
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"12\">No rows yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"13\">No rows yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html

@@ -69,7 +69,13 @@ pub async fn submit_candidate(
         .context("failed to estimate executor tx gas")?;
     let gas_limit = bump_gas_limit(estimated_gas);
     let fees = aggressive_fee_suggestion(provider, settings).await?;
-    ensure_expected_profit_covers_gas(settings, candidate, gas_limit, fees.max_fee_per_gas)?;
+    ensure_expected_profit_covers_gas(
+        settings,
+        candidate,
+        gas_limit,
+        fees.base_fee_per_gas
+            .saturating_add(fees.max_priority_fee_per_gas),
+    )?;
     if candidate.is_expired(Utc::now()) {
         anyhow::bail!("candidate expired before tx broadcast");
     }
@@ -382,21 +388,21 @@ fn ensure_expected_profit_covers_gas(
     settings: &Settings,
     candidate: &Candidate,
     gas_limit: U256,
-    max_fee_per_gas: U256,
+    expected_fee_per_gas: U256,
 ) -> Result<()> {
     if candidate.token_in != settings.weth_address {
         return Ok(());
     }
-    let gas_cost_cap = gas_limit.saturating_mul(max_fee_per_gas);
-    let required_profit =
-        apply_bps(gas_cost_cap, settings.execution_gas_profit_buffer_bps).max(candidate.min_profit);
+    let expected_gas_cost = gas_limit.saturating_mul(expected_fee_per_gas);
+    let required_profit = apply_bps(expected_gas_cost, settings.execution_gas_profit_buffer_bps)
+        .max(candidate.min_profit);
     if candidate.expected_profit < required_profit {
         anyhow::bail!(
-            "expected WETH profit {} below gas-adjusted threshold {} (gas_limit={}, max_fee_per_gas={})",
+            "expected WETH profit {} below gas-adjusted threshold {} (gas_limit={}, expected_fee_per_gas={})",
             candidate.expected_profit,
             required_profit,
             gas_limit,
-            max_fee_per_gas
+            expected_fee_per_gas
         );
     }
     Ok(())

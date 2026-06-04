@@ -45,6 +45,7 @@ pub async fn simulate(
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 gas_cost_cap: None,
+                gas_cost_expected: None,
                 net_simulated_profit: None,
                 revert_reason: Some(format_revert_reason(&raw_error)),
                 calldata: Vec::new(),
@@ -93,8 +94,9 @@ async fn simulate_inner(
         .context("failed to estimate executor tx gas after successful eth_call")?;
     let fees = simulation_fee_suggestion(provider, settings).await?;
     let gas_cost_cap = gas_estimate.saturating_mul(fees.max_fee_per_gas);
+    let gas_cost_expected = gas_estimate.saturating_mul(fees.expected_fee_per_gas);
     let net_simulated_profit = if candidate.token_in == settings.weth_address {
-        Some(simulated_profit.saturating_sub(gas_cost_cap))
+        Some(simulated_profit.saturating_sub(gas_cost_expected))
     } else {
         None
     };
@@ -121,6 +123,7 @@ async fn simulate_inner(
         max_fee_per_gas: Some(fees.max_fee_per_gas),
         max_priority_fee_per_gas: Some(fees.max_priority_fee_per_gas),
         gas_cost_cap: Some(gas_cost_cap),
+        gas_cost_expected: Some(gas_cost_expected),
         net_simulated_profit,
         revert_reason: if !profit_meets_threshold {
             if net_simulated_profit.is_some() {
@@ -137,6 +140,7 @@ async fn simulate_inner(
 
 struct SimulationFeeSuggestion {
     base_fee_per_gas: U256,
+    expected_fee_per_gas: U256,
     max_fee_per_gas: U256,
     max_priority_fee_per_gas: U256,
 }
@@ -163,6 +167,7 @@ async fn simulation_fee_suggestion(
 
     Ok(SimulationFeeSuggestion {
         base_fee_per_gas: suggested.base_fee_per_gas,
+        expected_fee_per_gas: suggested.base_fee_per_gas.saturating_add(priority),
         max_fee_per_gas: max_fee,
         max_priority_fee_per_gas: priority,
     })
@@ -218,6 +223,19 @@ pub fn route_failure_key(candidate: &Candidate) -> String {
     let mut raw = format!(
         "{}|{:#x}|{}",
         candidate.path.name, candidate.token_in, candidate.amount_in
+    );
+    append_step_fingerprint(&mut raw, candidate);
+    format!("{:#x}", keccak256(raw.as_bytes()))
+}
+
+pub fn candidate_block_seen_key(candidate: &Candidate) -> String {
+    let mut raw = format!(
+        "candidate-block|{}|{}|{:#x}|{}|{}",
+        candidate.block_number,
+        candidate.path.name,
+        candidate.token_in,
+        candidate.amount_in,
+        candidate.min_profit,
     );
     append_step_fingerprint(&mut raw, candidate);
     format!("{:#x}", keccak256(raw.as_bytes()))

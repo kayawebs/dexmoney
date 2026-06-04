@@ -292,6 +292,8 @@ pub struct SimulationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gas_cost_cap: Option<U256>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_cost_expected: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_simulated_profit: Option<U256>,
     pub revert_reason: Option<String>,
     pub calldata: Vec<u8>,

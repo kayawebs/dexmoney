@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
+const MIN_CANDIDATE_SEEN_TTL_SECS: u64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,6 +88,7 @@ where
         debug!("no candidate available");
         return Ok(());
     };
+    let candidate_seen_key = simulator::candidate_block_seen_key(&candidate);
     let min_profit_failure_key = simulator::min_profit_failure_key(&candidate);
     if candidate_store
         .has_failure_key(&min_profit_failure_key)
@@ -114,6 +116,21 @@ where
         );
         return Ok(());
     }
+    if candidate_store.has_failure_key(&candidate_seen_key).await? {
+        debug!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            block_number = candidate.block_number,
+            amount_in = %candidate.amount_in,
+            min_profit = %candidate.min_profit,
+            expected_profit = %candidate.expected_profit,
+            "candidate skipped after previous simulation for identical path parameters in same block"
+        );
+        return Ok(());
+    }
+    candidate_store
+        .mark_failure_key(&candidate_seen_key, candidate_seen_ttl_secs(settings))
+        .await?;
 
     let simulation = simulator::simulate(
         provider,
@@ -277,6 +294,16 @@ fn operator_address(
         return Ok(address);
     }
     anyhow::bail!("EOA_ADDRESS_1 or EOA_PRIVATE_KEY_1 is required for simulation");
+}
+
+fn candidate_seen_ttl_secs(settings: &Settings) -> u64 {
+    let ttl_from_candidate = settings
+        .candidate_ttl_ms
+        .max(0)
+        .saturating_add(999)
+        .checked_div(1000)
+        .unwrap_or(0) as u64;
+    ttl_from_candidate.saturating_add(MIN_CANDIDATE_SEEN_TTL_SECS)
 }
 
 async fn pop_fresh_candidate<C>(
