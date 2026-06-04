@@ -187,6 +187,7 @@ struct TokenSearchDefaultRow {
     chain_id: i64,
     symbol: String,
     token_address: String,
+    enabled: bool,
     search_amounts: Option<String>,
     min_profit: Option<String>,
 }
@@ -211,10 +212,9 @@ struct PoolRegistryRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct AddPairForm {
+struct AddTokenForm {
     password: String,
-    token0: String,
-    token1: String,
+    token_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +255,17 @@ struct TokenSearchDefaultForm {
     min_profit: String,
 }
 
+#[derive(Debug, Clone)]
+struct TokenUpdateChange {
+    symbol: String,
+    token_address: String,
+    old_search_amounts: Option<String>,
+    new_search_amounts: Option<String>,
+    old_min_profit: Option<String>,
+    new_min_profit: Option<String>,
+    became_anchor: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
@@ -282,13 +293,17 @@ async fn main() -> Result<()> {
         .route("/registry", get(registry_page))
         .route("/activity", get(activity_page))
         .route("/execution", get(execution_page))
-        .route("/pairs", post(add_pair))
+        .route("/tokens", post(add_token))
         .route("/pairs/rediscover", post(rediscover_pair))
         .route("/pairs/rediscover-all", post(rediscover_all_pairs))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/search-config", post(update_pair_search_config))
         .route("/tokens/search-default", post(update_token_search_default))
+        .route(
+            "/tokens/search-defaults",
+            post(update_token_search_defaults),
+        )
         .route("/favicon.ico", get(favicon))
         .route("/favicon.svg", get(favicon))
         .route("/healthz", get(healthz))
@@ -474,9 +489,9 @@ async fn execution_page(
     )))
 }
 
-async fn add_pair(
+async fn add_token(
     State(state): State<AppState>,
-    Form(form): Form<AddPairForm>,
+    Form(form): Form<AddTokenForm>,
 ) -> Result<Html<String>, StatusCode> {
     if !password_matches(state.admin_password.as_deref(), &form.password) {
         return render_registry_response(
@@ -487,20 +502,26 @@ async fn add_pair(
         .await;
     }
 
-    let result = match discover_and_upsert_pair(&state, &form.token0, &form.token1).await {
-        Ok(result) => result,
-        Err(status) => {
-            return render_registry_response(
-                &state.pool,
-                None,
-                Some(discovery_error_message(status)),
-            )
-            .await;
+    let token: Address = match form.token_address.trim().parse() {
+        Ok(token) => token,
+        Err(_) => {
+            return render_registry_response(&state.pool, None, Some("invalid token address"))
+                .await;
         }
     };
+    let symbol = token_symbol(&state.provider, token).await;
+    if upsert_token_registry(&state.pool, state.settings.chain_id, token, &symbol)
+        .await
+        .is_err()
+    {
+        return render_registry_response(&state.pool, None, Some("token registry write failed"))
+            .await;
+    }
+
+    let discovery = discover_pairs_for_new_token(&state, token).await;
     let message = format!(
-        "added pair {}; discovered {} pools; {}",
-        result.symbol, result.discovered_count, result.executor_report
+        "added token {symbol} {token:#x}; {}",
+        summarize_discovery("anchor pair discovery", discovery),
     );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
@@ -794,6 +815,134 @@ async fn update_token_search_default(
     render_registry_response(&state.pool, None, Some("token search default updated")).await
 }
 
+async fn update_token_search_defaults(
+    State(state): State<AppState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Html<String>, StatusCode> {
+    let password = form.get("password").map(String::as_str).unwrap_or_default();
+    if !password_matches(state.admin_password.as_deref(), password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let rows = fetch_token_search_defaults(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token_addresses = form
+        .get("token_addresses")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    if token_addresses.is_empty() {
+        return render_registry_response(&state.pool, None, Some("no tokens submitted")).await;
+    }
+
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    let mut changes = Vec::new();
+    let mut discovery_results = Vec::new();
+
+    for token_address in token_addresses {
+        let token_address = token_address.trim().to_lowercase();
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.token_address.eq_ignore_ascii_case(&token_address))
+        else {
+            continue;
+        };
+        let token: Address = row
+            .token_address
+            .parse()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let raw_amounts = form
+            .get(&format!("search_amounts_{token_address}"))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let raw_min_profit = form
+            .get(&format!("min_profit_{token_address}"))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let search_amounts =
+            normalize_raw_amount_list(raw_amounts).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let min_profit =
+            normalize_raw_amount(raw_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if search_amounts.is_some() != min_profit.is_some() {
+            return render_registry_response(
+                &state.pool,
+                None,
+                Some("token default amounts raw and min profit raw must be set together"),
+            )
+            .await;
+        }
+
+        if search_amounts == row.search_amounts && min_profit == row.min_profit {
+            continue;
+        }
+
+        let was_anchor = row.search_amounts.is_some() && row.min_profit.is_some();
+        let became_anchor = !was_anchor && search_amounts.is_some() && min_profit.is_some();
+        store
+            .update_token_search_default(
+                state.settings.chain_id,
+                token,
+                search_amounts.as_deref(),
+                min_profit.as_deref(),
+            )
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        upsert_token_registry(&state.pool, state.settings.chain_id, token, &row.symbol)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let change = TokenUpdateChange {
+            symbol: row.symbol.clone(),
+            token_address: row.token_address.clone(),
+            old_search_amounts: row.search_amounts.clone(),
+            new_search_amounts: search_amounts.clone(),
+            old_min_profit: row.min_profit.clone(),
+            new_min_profit: min_profit.clone(),
+            became_anchor,
+        };
+        if became_anchor {
+            discovery_results.push((
+                row.symbol.clone(),
+                discover_pairs_for_anchor(&state, token).await,
+            ));
+        }
+        changes.push(change);
+    }
+
+    let mut message = summarize_token_changes(&changes);
+    if !discovery_results.is_empty() {
+        let discovery_summary = discovery_results
+            .into_iter()
+            .map(|(symbol, result)| {
+                format!(
+                    "{symbol}: {}",
+                    summarize_discovery("anchor rediscovery", result)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&discovery_summary);
+    }
+    if message.is_empty() {
+        message = "no token defaults changed".to_string();
+    }
+
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
 struct PairDiscoveryResult {
     symbol: String,
     discovered_count: usize,
@@ -825,11 +974,18 @@ async fn discover_and_upsert_pair(
         .trim()
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    discover_and_upsert_pair_addresses(state, token_a, token_b).await
+}
+
+async fn discover_and_upsert_pair_addresses(
+    state: &AppState,
+    token_a: Address,
+    token_b: Address,
+) -> Result<PairDiscoveryResult, StatusCode> {
     let (token0, token1) = canonical_pair(token_a, token_b);
     if token0 == token1 {
         return Err(StatusCode::BAD_REQUEST);
     }
-
     let symbol = pair_symbol(&state.provider, token0, token1).await;
     let discovered = state
         .provider
@@ -843,6 +999,22 @@ async fn discover_and_upsert_pair(
     let store = PostgresStore {
         pool: (*state.pool).clone(),
     };
+    upsert_token_registry(
+        &state.pool,
+        state.settings.chain_id,
+        token0,
+        symbol.split('/').next().unwrap_or_default(),
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    upsert_token_registry(
+        &state.pool,
+        state.settings.chain_id,
+        token1,
+        symbol.split('/').nth(1).unwrap_or_default(),
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let pair_id = store
         .upsert_token_pair(state.settings.chain_id, token0, token1, &symbol)
         .await
@@ -873,6 +1045,86 @@ async fn discover_and_upsert_pair(
     })
 }
 
+#[derive(Default)]
+struct TokenPairDiscoverySummary {
+    attempted: usize,
+    succeeded: usize,
+    discovered_pools: usize,
+    skipped: usize,
+    failed: Vec<String>,
+}
+
+async fn discover_pairs_for_new_token(
+    state: &AppState,
+    token: Address,
+) -> TokenPairDiscoverySummary {
+    let anchors = fetch_funding_anchors(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|anchor| *anchor != token)
+        .collect::<Vec<_>>();
+    discover_pairs_for_token_set(state, token, anchors).await
+}
+
+async fn discover_pairs_for_anchor(state: &AppState, anchor: Address) -> TokenPairDiscoverySummary {
+    let tokens = fetch_enabled_tokens(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|token| *token != anchor)
+        .collect::<Vec<_>>();
+    discover_pairs_for_token_set(state, anchor, tokens).await
+}
+
+async fn discover_pairs_for_token_set(
+    state: &AppState,
+    token: Address,
+    peers: Vec<Address>,
+) -> TokenPairDiscoverySummary {
+    let mut summary = TokenPairDiscoverySummary::default();
+    for peer in peers {
+        summary.attempted += 1;
+        match discover_and_upsert_pair_addresses(state, token, peer).await {
+            Ok(result) => {
+                summary.succeeded += 1;
+                summary.discovered_pools += result.discovered_count;
+            }
+            Err(StatusCode::NOT_FOUND) => {
+                summary.skipped += 1;
+            }
+            Err(status) => {
+                summary
+                    .failed
+                    .push(discovery_error_message(status).to_string());
+            }
+        }
+    }
+    summary
+}
+
+fn summarize_discovery(label: &str, summary: TokenPairDiscoverySummary) -> String {
+    let failure_summary = if summary.failed.is_empty() {
+        "no failures".to_string()
+    } else {
+        let mut shown = summary
+            .failed
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if summary.failed.len() > 3 {
+            shown.push_str(&format!("; +{} more", summary.failed.len() - 3));
+        }
+        shown
+    };
+    format!(
+        "{label}: {} attempted, {} pairs discovered, {} pools, {} no-pool skips, {failure_summary}",
+        summary.attempted, summary.succeeded, summary.discovered_pools, summary.skipped
+    )
+}
+
 async fn render_registry_response(
     pool: &PgPool,
     auth_password: Option<&str>,
@@ -891,22 +1143,19 @@ async fn render_registry_response(
     let content = format!(
         r#"
         <section class="admin">
-          <form method="post" action="/pairs">
+          <form method="post" action="/tokens">
             <label>Password
               {password_input}
             </label>
-            <label>Token A
-              <input name="token0" placeholder="0x..." required>
+            <label>Token
+              <input name="token_address" placeholder="0x..." required>
             </label>
-            <label>Token B
-              <input name="token1" placeholder="0x..." required>
-            </label>
-            <button type="submit">Discover Pools</button>
+            <button type="submit">Add Token + Discover Anchor Pairs</button>
           </form>
           {rediscover_all_form}
         </section>
         <section class="card">
-          <h2>Token Search Defaults</h2>
+          <h2>Tokens</h2>
           <div class="card-body">{}</div>
         </section>
         <section class="card">
@@ -927,7 +1176,7 @@ async fn render_registry_response(
 
     Ok(Html(render_page(
         "Registry",
-        "Add token pairs and inspect discovered pools.",
+        "Add tokens, configure funding anchors, and inspect discovered pools.",
         auth_password,
         flash,
         &content,
@@ -999,33 +1248,118 @@ async fn fetch_enabled_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
 async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDefaultRow>> {
     Ok(sqlx::query_as::<_, TokenSearchDefaultRow>(
         r#"
-        WITH tokens AS (
-            SELECT chain_id, token0 AS token_address, split_part(symbol, '/', 1) AS symbol
-            FROM token_pairs
+        WITH token_set AS (
+            SELECT chain_id, token_address, symbol, enabled
+            FROM tokens
             UNION
-            SELECT chain_id, token1 AS token_address, split_part(symbol, '/', 2) AS symbol
+            SELECT chain_id, token0 AS token_address, split_part(symbol, '/', 1) AS symbol, TRUE AS enabled
             FROM token_pairs
+            WHERE enabled = TRUE
+            UNION
+            SELECT chain_id, token1 AS token_address, split_part(symbol, '/', 2) AS symbol, TRUE AS enabled
+            FROM token_pairs
+            WHERE enabled = TRUE
+            UNION
+            SELECT chain_id, token_address, token_address AS symbol, TRUE AS enabled
+            FROM token_search_defaults
         )
         SELECT
-            tokens.chain_id,
-            MIN(tokens.symbol) AS symbol,
-            tokens.token_address,
+            token_set.chain_id,
+            MIN(token_set.symbol) AS symbol,
+            token_set.token_address,
+            BOOL_OR(token_set.enabled) AS enabled,
             cfg.search_amounts,
             cfg.min_profit
-        FROM tokens
+        FROM token_set
         LEFT JOIN token_search_defaults cfg
-          ON cfg.chain_id = tokens.chain_id
-         AND cfg.token_address = tokens.token_address
+          ON cfg.chain_id = token_set.chain_id
+         AND cfg.token_address = token_set.token_address
         GROUP BY
-            tokens.chain_id,
-            tokens.token_address,
+            token_set.chain_id,
+            token_set.token_address,
             cfg.search_amounts,
             cfg.min_profit
-        ORDER BY MIN(tokens.symbol), tokens.token_address
+        ORDER BY
+            (cfg.search_amounts IS NOT NULL AND cfg.min_profit IS NOT NULL) DESC,
+            MIN(token_set.symbol),
+            token_set.token_address
         "#,
     )
     .fetch_all(pool)
     .await?)
+}
+
+async fn fetch_funding_anchors(pool: &PgPool) -> Result<Vec<Address>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT token_address
+        FROM token_search_defaults
+        WHERE search_amounts IS NOT NULL
+          AND min_profit IS NOT NULL
+        ORDER BY token_address
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|value| value.parse().map_err(Into::into))
+        .collect()
+}
+
+async fn fetch_enabled_tokens(pool: &PgPool) -> Result<Vec<Address>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        r#"
+        WITH token_set AS (
+            SELECT token_address
+            FROM tokens
+            WHERE enabled = TRUE
+            UNION
+            SELECT token0 AS token_address
+            FROM token_pairs
+            WHERE enabled = TRUE
+            UNION
+            SELECT token1 AS token_address
+            FROM token_pairs
+            WHERE enabled = TRUE
+            UNION
+            SELECT token_address
+            FROM token_search_defaults
+        )
+        SELECT token_address
+        FROM token_set
+        ORDER BY token_address
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|value| value.parse().map_err(Into::into))
+        .collect()
+}
+
+async fn upsert_token_registry(
+    pool: &PgPool,
+    chain_id: u64,
+    token: Address,
+    symbol: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO tokens (chain_id, token_address, symbol, enabled, created_at, updated_at)
+        VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+        ON CONFLICT (chain_id, token_address)
+        DO UPDATE SET
+            symbol = EXCLUDED.symbol,
+            enabled = TRUE,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(i64::try_from(chain_id)?)
+    .bind(address_to_string(token))
+    .bind(symbol)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
@@ -1435,6 +1769,31 @@ fn render_page(
     .search-config-form button {{
       grid-column: span 2;
     }}
+    .bulk-token-form {{
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+    }}
+    .bulk-token-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+    }}
+    .bulk-token-toolbar label {{
+      min-width: 260px;
+    }}
+    .compact-table th,
+    .compact-table td {{
+      padding: 7px 9px;
+      vertical-align: middle;
+    }}
+    .compact-input {{
+      min-width: 210px;
+      padding: 7px 9px;
+      border-radius: 8px;
+      font-size: 12px;
+    }}
     @media (max-width: 720px) {{
       .pair-card-header {{
         display: grid;
@@ -1603,6 +1962,27 @@ fn render_page(
       input.type = visible ? "password" : "text";
       button.textContent = visible ? "show" : "hide";
     }}
+    function promptPasswordSubmit(form, message) {{
+      if (!window.confirm(message)) return false;
+      const password = window.prompt("Monitor password");
+      if (password === null || password.trim() === "") return false;
+      form.querySelector('input[name="password"]').value = password;
+      return true;
+    }}
+    function confirmTokenDefaultsUpdate(form) {{
+      const changes = [];
+      form.querySelectorAll("input[data-old]").forEach((input) => {{
+        const oldValue = input.dataset.old || "";
+        const newValue = input.value.trim();
+        if (oldValue !== newValue) {{
+          changes.push(`${{input.dataset.symbol}} ${{input.dataset.kind}}: "${{oldValue || "-"}}" -> "${{newValue || "-"}}"`);
+        }}
+      }});
+      if (changes.length === 0) {{
+        return window.confirm("No token default changes detected. Submit anyway?");
+      }}
+      return window.confirm(`Update token defaults?\n\n${{changes.join("\n")}}`);
+    }}
   </script>
 </head>
 <body>
@@ -1749,198 +2129,116 @@ fn nav_href(path: &str, auth_password: Option<&str>) -> String {
 }
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
-    let mut html = String::from("<div class=\"pair-card-list\">");
+    let mut html = String::from(
+        "<div class=\"table-scroll\"><table class=\"compact-table\"><thead><tr><th>Created</th><th>Pair</th><th>Enabled</th><th>Token 0</th><th>Token 1</th><th>T0 Effective Amounts</th><th>T0 Effective Min</th><th>T1 Effective Amounts</th><th>T1 Effective Min</th><th>Actions</th></tr></thead><tbody>",
+    );
     for row in rows {
         html.push_str(&format!(
-            r#"<article class="pair-card">
-  <div class="pair-card-header">
-    <div class="pair-card-title">
-      <strong>{symbol}</strong>
-      <span class="pair-card-meta">chain {chain_id} · created {created_at}</span>
-    </div>
-    <div>{enabled}</div>
-  </div>
-  <div class="pair-card-grid">
-    {token0_field}
-    {token1_field}
-    {token0_amounts_field}
-    {token0_profit_field}
-    {token1_amounts_field}
-    {token1_profit_field}
-  </div>
-  {actions}
-</article>"#,
+            "<tr><td>{created_at}</td><td>{symbol}<br><span class=\"muted\">chain {chain_id}</span></td><td>{enabled}</td><td>{token0}</td><td>{token1}</td><td>{token0_amounts}</td><td>{token0_profit}</td><td>{token1_amounts}</td><td>{token1_profit}</td><td>{actions}</td></tr>",
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
             created_at = fmt_ts(row.created_at),
             enabled = monitoring_status(row.enabled),
-            token0_field = pair_field("Token 0", &copyable(&row.token0)),
-            token1_field = pair_field("Token 1", &copyable(&row.token1)),
-            token0_amounts_field = pair_field(
-                "Token 0 Amounts Raw (Effective)",
-                &effective_config_value(
-                    row.token0_search_amounts.as_deref(),
-                    row.token0_default_search_amounts.as_deref(),
-                ),
+            token0 = copyable(&row.token0),
+            token1 = copyable(&row.token1),
+            token0_amounts = effective_config_value(
+                row.token0_search_amounts.as_deref(),
+                row.token0_default_search_amounts.as_deref(),
             ),
-            token0_profit_field = pair_field(
-                "Token 0 Min Profit Raw (Effective)",
-                &effective_config_value(
-                    row.token0_search_amounts
-                        .as_deref()
-                        .and(row.token0_min_profit.as_deref()),
-                    row.token0_default_min_profit.as_deref(),
-                ),
+            token0_profit = effective_config_value(
+                row.token0_search_amounts
+                    .as_deref()
+                    .and(row.token0_min_profit.as_deref()),
+                row.token0_default_min_profit.as_deref(),
             ),
-            token1_amounts_field = pair_field(
-                "Token 1 Amounts Raw (Effective)",
-                &effective_config_value(
-                    row.token1_search_amounts.as_deref(),
-                    row.token1_default_search_amounts.as_deref(),
-                ),
+            token1_amounts = effective_config_value(
+                row.token1_search_amounts.as_deref(),
+                row.token1_default_search_amounts.as_deref(),
             ),
-            token1_profit_field = pair_field(
-                "Token 1 Min Profit Raw (Effective)",
-                &effective_config_value(
-                    row.token1_search_amounts
-                        .as_deref()
-                        .and(row.token1_min_profit.as_deref()),
-                    row.token1_default_min_profit.as_deref(),
-                ),
+            token1_profit = effective_config_value(
+                row.token1_search_amounts
+                    .as_deref()
+                    .and(row.token1_min_profit.as_deref()),
+                row.token1_default_min_profit.as_deref(),
             ),
             actions = render_pair_actions(row),
         ));
     }
     if rows.is_empty() {
-        html.push_str(
-            "<div class=\"pair-card\"><span class=\"muted\">No token pairs yet.</span></div>",
-        );
+        html.push_str("<tr><td colspan=\"10\">No token pairs yet.</td></tr>");
     }
-    html.push_str("</div>");
+    html.push_str("</tbody></table></div>");
     html
 }
 
 fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
-    let mut html = String::from("<div class=\"pair-card-list\">");
+    let token_addresses = rows
+        .iter()
+        .map(|row| row.token_address.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut html = format!(
+        r#"<form method="post" action="/tokens/search-defaults" class="bulk-token-form" onsubmit="return confirmTokenDefaultsUpdate(this)">
+  <div class="bulk-token-toolbar">
+    <label>Password {password_input}</label>
+    <button type="submit">Update Token Defaults</button>
+  </div>
+  <input type="hidden" name="token_addresses" value="{token_addresses}">
+  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Amounts Raw</th><th>Min Profit Raw</th></tr></thead><tbody>"#,
+        password_input = password_input(Some("password"), false),
+        token_addresses = escape(&token_addresses),
+    );
     for row in rows {
+        let token_key = row.token_address.to_lowercase();
+        let anchor = if row.search_amounts.is_some() && row.min_profit.is_some() {
+            "<span class=\"ok\">configured</span>"
+        } else {
+            "<span class=\"muted\">no</span>"
+        };
         html.push_str(&format!(
-            r#"<article class="pair-card">
-  <div class="pair-card-header">
-    <div class="pair-card-title">
-      <strong>{symbol}</strong>
-      <span class="pair-card-meta">chain {chain_id} · applies when a pair direction has no override</span>
-    </div>
-  </div>
-  <div class="pair-card-grid">
-    {token_field}
-    {amounts_field}
-    {profit_field}
-  </div>
-  {form}
-</article>"#,
+            r#"<tr>
+  <td><strong>{symbol}</strong><br><span class="muted">chain {chain_id}</span></td>
+  <td>{token}</td>
+  <td>{enabled}</td>
+  <td>{anchor}</td>
+  <td><input class="compact-input" name="search_amounts_{token_key}" value="{search_amounts}" data-old="{search_amounts}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit}" data-old="{min_profit}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
+</tr>"#,
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
-            token_field = pair_field("Token", &copyable(&row.token_address)),
-            amounts_field = pair_field(
-                "Default Amounts Raw",
-                &config_value(row.search_amounts.as_deref()),
-            ),
-            profit_field = pair_field(
-                "Default Min Profit Raw",
-                &config_value(row.min_profit.as_deref()),
-            ),
-            form = render_token_search_default_form(row),
+            token = copyable(&row.token_address),
+            enabled = monitoring_status(row.enabled),
+            anchor = anchor,
+            token_key = escape(&token_key),
+            search_amounts = escape(row.search_amounts.as_deref().unwrap_or_default()),
+            min_profit = escape(row.min_profit.as_deref().unwrap_or_default()),
         ));
     }
     if rows.is_empty() {
-        html.push_str(
-            "<div class=\"pair-card\"><span class=\"muted\">Add a token pair before configuring token defaults.</span></div>",
-        );
+        html.push_str("<tr><td colspan=\"6\">No tokens yet.</td></tr>");
     }
-    html.push_str("</div>");
+    html.push_str("</tbody></table></div></form>");
     html
 }
 
 fn render_pair_actions(row: &TokenPairRow) -> String {
     format!(
-        r#"<div class="pair-actions">
-  {}
-  <div class="pair-actions-row">{}{}{}</div>
-</div>"#,
-        render_search_config_form(row),
+        r#"<div class="pair-actions-row">{}{}{}</div>"#,
         render_rediscover_form(row),
         render_delete_pair_form(row),
         render_remove_pair_form(row)
     )
 }
 
-fn pair_field(label: &str, value: &str) -> String {
-    format!(
-        r#"<div class="pair-field"><span class="pair-field-label">{}</span><span>{}</span></div>"#,
-        escape(label),
-        value,
-    )
-}
-
-fn render_search_config_form(row: &TokenPairRow) -> String {
-    format!(
-        r#"<form method="post" action="/pairs/search-config" class="search-config-form">
-  {password_input}
-  <input name="token0" type="hidden" value="{token0}">
-  <input name="token1" type="hidden" value="{token1}">
-  <label>Token 0 Amounts Raw Override (blank = inherit)
-    <input name="token0_search_amounts" value="{token0_amounts}" placeholder="10000000,30000000">
-  </label>
-  <label>Token 0 Min Profit Raw Override
-    <input name="token0_min_profit" value="{token0_min_profit}" placeholder="500">
-  </label>
-  <label>Token 1 Amounts Raw Override (blank = inherit)
-    <input name="token1_search_amounts" value="{token1_amounts}" placeholder="10000000000000000">
-  </label>
-  <label>Token 1 Min Profit Raw Override
-    <input name="token1_min_profit" value="{token1_min_profit}" placeholder="500000000000000">
-  </label>
-  <button type="submit">Save Pair Overrides</button>
-</form>"#,
-        password_input = password_input(Some("password"), false),
-        token0 = escape(&row.token0),
-        token1 = escape(&row.token1),
-        token0_amounts = escape(row.token0_search_amounts.as_deref().unwrap_or_default()),
-        token1_amounts = escape(row.token1_search_amounts.as_deref().unwrap_or_default()),
-        token0_min_profit = escape(row.token0_min_profit.as_deref().unwrap_or_default()),
-        token1_min_profit = escape(row.token1_min_profit.as_deref().unwrap_or_default()),
-    )
-}
-
-fn render_token_search_default_form(row: &TokenSearchDefaultRow) -> String {
-    format!(
-        r#"<form method="post" action="/tokens/search-default" class="search-config-form">
-  {password_input}
-  <input name="token_address" type="hidden" value="{token_address}">
-  <label>Default Amounts Raw
-    <input name="search_amounts" value="{search_amounts}" placeholder="10000000,30000000">
-  </label>
-  <label>Default Min Profit Raw
-    <input name="min_profit" value="{min_profit}" placeholder="500">
-  </label>
-  <button type="submit">Save Token Default</button>
-</form>"#,
-        password_input = password_input(Some("password"), false),
-        token_address = escape(&row.token_address),
-        search_amounts = escape(row.search_amounts.as_deref().unwrap_or_default()),
-        min_profit = escape(row.min_profit.as_deref().unwrap_or_default()),
-    )
-}
-
 fn render_rediscover_form(row: &TokenPairRow) -> String {
     format!(
-        r#"<form method="post" action="/pairs/rediscover" class="inline-form">
-  {password_input}
+        r#"<form method="post" action="/pairs/rediscover" class="inline-form" onsubmit="return promptPasswordSubmit(this, 'Discover pools for {symbol}?')">
+  <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button type="submit">Discover Pools</button>
 </form>"#,
-        password_input = password_input(Some("password"), false),
+        symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
     )
@@ -1960,13 +2258,13 @@ fn render_rediscover_all_form() -> String {
 
 fn render_delete_pair_form(row: &TokenPairRow) -> String {
     format!(
-        r#"<form method="post" action="/pairs/delete" class="inline-form">
-  {password_input}
+        r#"<form method="post" action="/pairs/delete" class="inline-form" onsubmit="return promptPasswordSubmit(this, 'Disable pair {symbol}?')">
+  <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button class="delete-btn" type="submit">Disable Pair</button>
 </form>"#,
-        password_input = password_input(Some("password"), false),
+        symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
     )
@@ -1974,13 +2272,13 @@ fn render_delete_pair_form(row: &TokenPairRow) -> String {
 
 fn render_remove_pair_form(row: &TokenPairRow) -> String {
     format!(
-        r#"<form method="post" action="/pairs/remove" class="inline-form" onsubmit="return confirm('Delete this token pair and associated pool registry rows? Historical events and state snapshots will be kept.');">
-  {password_input}
+        r#"<form method="post" action="/pairs/remove" class="inline-form" onsubmit="return promptPasswordSubmit(this, 'Delete pair {symbol} and associated pool registry rows? Historical events and state snapshots will be kept.')">
+  <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
   <button class="danger-btn" type="submit">Delete Pair</button>
 </form>"#,
-        password_input = password_input(Some("password"), false),
+        symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
         token1 = escape(&row.token1),
     )
@@ -2263,6 +2561,59 @@ fn escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn escape_js_string(value: &str) -> String {
+    escape(
+        &value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r"),
+    )
+}
+
+fn address_to_string(address: Address) -> String {
+    format!("{address:#x}")
+}
+
+fn option_display(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn summarize_token_changes(changes: &[TokenUpdateChange]) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+    let mut parts = changes
+        .iter()
+        .take(6)
+        .map(|change| {
+            let anchor_note = if change.became_anchor {
+                "; became funding anchor"
+            } else {
+                ""
+            };
+            format!(
+                "{} {} amounts {} -> {}, min profit {} -> {}{}",
+                change.symbol,
+                change.token_address,
+                option_display(change.old_search_amounts.as_deref()),
+                option_display(change.new_search_amounts.as_deref()),
+                option_display(change.old_min_profit.as_deref()),
+                option_display(change.new_min_profit.as_deref()),
+                anchor_note
+            )
+        })
+        .collect::<Vec<_>>();
+    if changes.len() > 6 {
+        parts.push(format!("+{} more token changes", changes.len() - 6));
+    }
+    format!("updated token defaults: {}", parts.join("; "))
+}
+
 fn url_query_escape(value: &str) -> String {
     value
         .bytes()
@@ -2313,14 +2664,6 @@ fn monitoring_status(enabled: bool) -> String {
     } else {
         "<span class=\"bad\">disabled</span>".into()
     }
-}
-
-fn config_value(value: Option<&str>) -> String {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(escape)
-        .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
 }
 
 fn effective_config_value(override_value: Option<&str>, default_value: Option<&str>) -> String {
@@ -2440,6 +2783,13 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
         .await
         .unwrap_or_else(|_| short_address(token1));
     format!("{symbol0}/{symbol1}")
+}
+
+async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
+    provider
+        .fetch_erc20_symbol(token)
+        .await
+        .unwrap_or_else(|_| short_address(token))
 }
 
 fn short_address(address: Address) -> String {

@@ -730,6 +730,18 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON observed_address_transfers (lower(tx_hash))"#,
         r#"CREATE INDEX IF NOT EXISTS observed_address_transfers_seed_tx_idx
             ON observed_address_transfers (lower(seed_address), lower(tx_hash))"#,
+        r#"CREATE TABLE IF NOT EXISTS tokens (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            token_address TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, token_address)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS tokens_enabled_idx
+            ON tokens (chain_id, enabled, symbol)"#,
         r#"ALTER TABLE simulations
             ADD COLUMN IF NOT EXISTS block_number BIGINT,
             ADD COLUMN IF NOT EXISTS token_in TEXT,
