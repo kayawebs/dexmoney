@@ -58,6 +58,16 @@ pub async fn configure_executor_for_pair(
     token0: Address,
     token1: Address,
 ) -> Result<ExecutorAdminReport> {
+    if !settings.execution_submit_enabled {
+        return Ok(ExecutorAdminReport {
+            skipped_reason: Some(
+                "EXECUTION_SUBMIT_ENABLED=false; registry updated without executor transactions"
+                    .to_string(),
+            ),
+            ..ExecutorAdminReport::default()
+        });
+    }
+
     let Some(executor) = settings
         .executor_contract
         .filter(|address| *address != Address::ZERO)
