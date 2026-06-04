@@ -190,6 +190,8 @@ struct TokenSearchDefaultRow {
     enabled: bool,
     search_amounts: Option<String>,
     min_profit: Option<String>,
+    effective_search_amounts: Option<String>,
+    effective_min_profit: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1269,18 +1271,46 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
             token_set.token_address,
             BOOL_OR(token_set.enabled) AS enabled,
             cfg.search_amounts,
-            cfg.min_profit
+            cfg.min_profit,
+            COALESCE(
+                cfg.search_amounts,
+                MIN(pair_cfg.search_amounts) FILTER (WHERE pair_cfg.search_amounts IS NOT NULL)
+            ) AS effective_search_amounts,
+            COALESCE(
+                cfg.min_profit,
+                MIN(pair_cfg.min_profit) FILTER (WHERE pair_cfg.min_profit IS NOT NULL)
+            ) AS effective_min_profit
         FROM token_set
         LEFT JOIN token_search_defaults cfg
           ON cfg.chain_id = token_set.chain_id
          AND cfg.token_address = token_set.token_address
+        LEFT JOIN LATERAL (
+            SELECT tp.token0_search_amounts AS search_amounts,
+                   tp.token0_min_profit AS min_profit
+            FROM token_pairs tp
+            WHERE tp.enabled = TRUE
+              AND tp.chain_id = token_set.chain_id
+              AND tp.token0 = token_set.token_address
+              AND tp.token0_search_amounts IS NOT NULL
+              AND tp.token0_min_profit IS NOT NULL
+            UNION ALL
+            SELECT tp.token1_search_amounts AS search_amounts,
+                   tp.token1_min_profit AS min_profit
+            FROM token_pairs tp
+            WHERE tp.enabled = TRUE
+              AND tp.chain_id = token_set.chain_id
+              AND tp.token1 = token_set.token_address
+              AND tp.token1_search_amounts IS NOT NULL
+              AND tp.token1_min_profit IS NOT NULL
+        ) pair_cfg ON TRUE
         GROUP BY
             token_set.chain_id,
             token_set.token_address,
             cfg.search_amounts,
             cfg.min_profit
         ORDER BY
-            (cfg.search_amounts IS NOT NULL AND cfg.min_profit IS NOT NULL) DESC,
+            (COALESCE(cfg.search_amounts, MIN(pair_cfg.search_amounts) FILTER (WHERE pair_cfg.search_amounts IS NOT NULL)) IS NOT NULL
+             AND COALESCE(cfg.min_profit, MIN(pair_cfg.min_profit) FILTER (WHERE pair_cfg.min_profit IS NOT NULL)) IS NOT NULL) DESC,
             MIN(token_set.symbol),
             token_set.token_address
         "#,
@@ -1747,12 +1777,18 @@ fn render_page(
     }}
     .pair-actions-row {{
       display: flex;
-      flex-wrap: wrap;
+      flex-direction: column;
       gap: 8px;
+      align-items: stretch;
     }}
     .pair-actions-row .inline-form {{
       min-width: 0;
       margin-right: 0;
+      width: 100%;
+    }}
+    .pair-actions-row .inline-form button {{
+      width: 100%;
+      padding: 7px 9px;
     }}
     .search-config-form {{
       display: grid;
@@ -2184,7 +2220,7 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
     <button type="submit">Update Token Defaults</button>
   </div>
   <input type="hidden" name="token_addresses" value="{token_addresses}">
-  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Amounts Raw</th><th>Min Profit Raw</th></tr></thead><tbody>"#,
+  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Effective Amounts</th><th>Effective Min</th><th>Default Amounts Raw</th><th>Default Min Profit Raw</th></tr></thead><tbody>"#,
         password_input = password_input(Some("password"), false),
         token_addresses = escape(&token_addresses),
     );
@@ -2201,6 +2237,8 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
   <td>{token}</td>
   <td>{enabled}</td>
   <td>{anchor}</td>
+  <td>{effective_amounts}</td>
+  <td>{effective_min_profit}</td>
   <td><input class="compact-input" name="search_amounts_{token_key}" value="{search_amounts}" data-old="{search_amounts}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
   <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit}" data-old="{min_profit}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
 </tr>"#,
@@ -2209,13 +2247,15 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
             token = copyable(&row.token_address),
             enabled = monitoring_status(row.enabled),
             anchor = anchor,
+            effective_amounts = config_value(row.effective_search_amounts.as_deref()),
+            effective_min_profit = config_value(row.effective_min_profit.as_deref()),
             token_key = escape(&token_key),
             search_amounts = escape(row.search_amounts.as_deref().unwrap_or_default()),
             min_profit = escape(row.min_profit.as_deref().unwrap_or_default()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"6\">No tokens yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"8\">No tokens yet.</td></tr>");
     }
     html.push_str("</tbody></table></div></form>");
     html
@@ -2236,7 +2276,7 @@ fn render_rediscover_form(row: &TokenPairRow) -> String {
   <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
-  <button type="submit">Discover Pools</button>
+  <button type="submit">Discover</button>
 </form>"#,
         symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
@@ -2262,7 +2302,7 @@ fn render_delete_pair_form(row: &TokenPairRow) -> String {
   <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
-  <button class="delete-btn" type="submit">Disable Pair</button>
+  <button class="delete-btn" type="submit">Disable</button>
 </form>"#,
         symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
@@ -2276,7 +2316,7 @@ fn render_remove_pair_form(row: &TokenPairRow) -> String {
   <input name="password" type="hidden">
   <input name="token0" type="hidden" value="{token0}">
   <input name="token1" type="hidden" value="{token1}">
-  <button class="danger-btn" type="submit">Delete Pair</button>
+  <button class="danger-btn" type="submit">Delete</button>
 </form>"#,
         symbol = escape_js_string(&row.symbol),
         token0 = escape(&row.token0),
@@ -2664,6 +2704,14 @@ fn monitoring_status(enabled: bool) -> String {
     } else {
         "<span class=\"bad\">disabled</span>".into()
     }
+}
+
+fn config_value(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(escape)
+        .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
 }
 
 fn effective_config_value(override_value: Option<&str>, default_value: Option<&str>) -> String {
