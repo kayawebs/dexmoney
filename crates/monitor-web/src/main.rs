@@ -1322,10 +1322,26 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
 async fn fetch_funding_anchors(pool: &PgPool) -> Result<Vec<Address>> {
     let rows: Vec<String> = sqlx::query_scalar(
         r#"
+        WITH anchors AS (
+            SELECT token_address
+            FROM token_search_defaults
+            WHERE search_amounts IS NOT NULL
+              AND min_profit IS NOT NULL
+            UNION
+            SELECT token0 AS token_address
+            FROM token_pairs
+            WHERE enabled = TRUE
+              AND token0_search_amounts IS NOT NULL
+              AND token0_min_profit IS NOT NULL
+            UNION
+            SELECT token1 AS token_address
+            FROM token_pairs
+            WHERE enabled = TRUE
+              AND token1_search_amounts IS NOT NULL
+              AND token1_min_profit IS NOT NULL
+        )
         SELECT token_address
-        FROM token_search_defaults
-        WHERE search_amounts IS NOT NULL
-          AND min_profit IS NOT NULL
+        FROM anchors
         ORDER BY token_address
         "#,
     )
@@ -2220,13 +2236,14 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
     <button type="submit">Update Token Defaults</button>
   </div>
   <input type="hidden" name="token_addresses" value="{token_addresses}">
-  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Effective Amounts</th><th>Effective Min</th><th>Default Amounts Raw</th><th>Default Min Profit Raw</th></tr></thead><tbody>"#,
+  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Effective Amounts</th><th>Effective Min Profit</th></tr></thead><tbody>"#,
         password_input = password_input(Some("password"), false),
         token_addresses = escape(&token_addresses),
     );
     for row in rows {
         let token_key = row.token_address.to_lowercase();
-        let anchor = if row.search_amounts.is_some() && row.min_profit.is_some() {
+        let anchor = if row.effective_search_amounts.is_some() && row.effective_min_profit.is_some()
+        {
             "<span class=\"ok\">configured</span>"
         } else {
             "<span class=\"muted\">no</span>"
@@ -2237,25 +2254,21 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
   <td>{token}</td>
   <td>{enabled}</td>
   <td>{anchor}</td>
-  <td>{effective_amounts}</td>
-  <td>{effective_min_profit}</td>
-  <td><input class="compact-input" name="search_amounts_{token_key}" value="{search_amounts}" data-old="{search_amounts}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
-  <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit}" data-old="{min_profit}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="search_amounts_{token_key}" value="{effective_amounts_raw}" data-old="{effective_amounts_raw}" data-symbol="{symbol}" data-kind="Effective Amounts" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="min_profit_{token_key}" value="{effective_min_profit_raw}" data-old="{effective_min_profit_raw}" data-symbol="{symbol}" data-kind="Effective Min Profit" placeholder="500"></td>
 </tr>"#,
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
             token = copyable(&row.token_address),
             enabled = monitoring_status(row.enabled),
             anchor = anchor,
-            effective_amounts = config_value(row.effective_search_amounts.as_deref()),
-            effective_min_profit = config_value(row.effective_min_profit.as_deref()),
             token_key = escape(&token_key),
-            search_amounts = escape(row.search_amounts.as_deref().unwrap_or_default()),
-            min_profit = escape(row.min_profit.as_deref().unwrap_or_default()),
+            effective_amounts_raw = escape(row.effective_search_amounts.as_deref().unwrap_or_default()),
+            effective_min_profit_raw = escape(row.effective_min_profit.as_deref().unwrap_or_default()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"8\">No tokens yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"6\">No tokens yet.</td></tr>");
     }
     html.push_str("</tbody></table></div></form>");
     html
@@ -2704,14 +2717,6 @@ fn monitoring_status(enabled: bool) -> String {
     } else {
         "<span class=\"bad\">disabled</span>".into()
     }
-}
-
-fn config_value(value: Option<&str>) -> String {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(escape)
-        .unwrap_or_else(|| "<span class=\"muted\">disabled</span>".into())
 }
 
 fn effective_config_value(override_value: Option<&str>, default_value: Option<&str>) -> String {
