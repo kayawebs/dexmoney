@@ -1,5 +1,6 @@
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
+use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
@@ -7,12 +8,16 @@ use base_arb_common::types::{
     PoolVariant, TickState,
 };
 use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
+const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 
@@ -25,7 +30,7 @@ pub struct MarketDataService<P> {
 
 impl<P> MarketDataService<P>
 where
-    P: PoolStateStore + TickStateStore,
+    P: PoolStateStore + TickStateStore + Clone + Send + Sync + 'static,
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
@@ -34,6 +39,7 @@ where
         self.publish_monitored_states(&monitored_states, "onchain_init")
             .await?;
         self.publish_initialized_ticks(&monitored_states).await?;
+        self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
@@ -284,6 +290,223 @@ where
 
             last_seen_block = latest_block;
         }
+    }
+
+    fn spawn_flashblocks_listener(&self) {
+        if !self.settings.market_data_flashblocks_enabled {
+            info!("Flashblocks pendingLogs listener disabled");
+            return;
+        }
+
+        let service = MarketDataService {
+            settings: self.settings.clone(),
+            provider: self.provider.clone(),
+            pool_store: self.pool_store.clone(),
+            recorder: self.recorder.clone(),
+        };
+        tokio::spawn(async move {
+            service.run_flashblocks_listener().await;
+        });
+    }
+
+    async fn run_flashblocks_listener(&self) {
+        let ws_url = self
+            .settings
+            .base_rpc_flashblocks_ws
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(&self.settings.base_rpc_ws)
+            .to_string();
+        if ws_url.trim().is_empty() {
+            warn!("Flashblocks listener skipped because no websocket URL is configured");
+            return;
+        }
+
+        loop {
+            match self.run_flashblocks_session(&ws_url).await {
+                Ok(()) => {
+                    sleep(FLASHBLOCK_RECONNECT_DELAY).await;
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        reconnect_secs = FLASHBLOCK_RECONNECT_DELAY.as_secs(),
+                        "Flashblocks pendingLogs session stopped; reconnecting"
+                    );
+                    sleep(FLASHBLOCK_RECONNECT_DELAY).await;
+                }
+            }
+        }
+    }
+
+    async fn run_flashblocks_session(&self, ws_url: &str) -> Result<()> {
+        let mut monitored_states = self.load_monitored_states().await?;
+        let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
+        let mut recent_logs = RecentLogCache::new(20_000);
+        let mut fallback_log_index = 0u64;
+
+        let mut subscribed_addresses = address_set(&monitored_states);
+        let addresses = unique_pool_addresses(&monitored_states);
+        if addresses.is_empty() {
+            warn!("Flashblocks pendingLogs listener has no monitored pool addresses");
+            return Ok(());
+        }
+
+        let (mut ws, _) = connect_async(ws_url).await?;
+        let subscribe = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_subscribe",
+            "params": [
+                "pendingLogs",
+                {
+                    "address": addresses,
+                }
+            ]
+        });
+        ws.send(Message::Text(subscribe.to_string())).await?;
+        info!(
+            pools = monitored_states.len(),
+            ws = %ws_url,
+            "Flashblocks pendingLogs listener connected"
+        );
+
+        while let Some(message) = ws.next().await {
+            if Instant::now() >= next_registry_reload {
+                monitored_states = self.reload_if_changed(monitored_states).await?;
+                let next_addresses = address_set(&monitored_states);
+                if next_addresses != subscribed_addresses {
+                    info!("Flashblocks monitored pool set changed; reconnecting subscription");
+                    return Ok(());
+                }
+                subscribed_addresses = next_addresses;
+                next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
+            }
+
+            let message = message?;
+            let text = match message {
+                Message::Text(text) => text,
+                Message::Binary(bytes) => String::from_utf8(bytes)?,
+                Message::Ping(payload) => {
+                    ws.send(Message::Pong(payload)).await?;
+                    continue;
+                }
+                Message::Pong(_) => continue,
+                Message::Close(frame) => {
+                    warn!(?frame, "Flashblocks websocket closed");
+                    return Ok(());
+                }
+                Message::Frame(_) => continue,
+            };
+
+            let value: Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(error = %err, "Flashblocks websocket message was not JSON");
+                    continue;
+                }
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(1) {
+                if let Some(error) = value.get("error") {
+                    anyhow::bail!("Flashblocks pendingLogs subscription failed: {error}");
+                }
+                let subscription = value
+                    .get("result")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string());
+                info!(
+                    subscription = %subscription,
+                    "Flashblocks pendingLogs subscription accepted"
+                );
+                continue;
+            }
+
+            let Some(result) = value
+                .get("params")
+                .and_then(|params| params.get("result"))
+                .cloned()
+            else {
+                debug!(message = %text, "Flashblocks websocket message ignored");
+                continue;
+            };
+
+            fallback_log_index = fallback_log_index.wrapping_add(1);
+            let fallback_block = if result.get("blockNumber").and_then(Value::as_str).is_some() {
+                None
+            } else {
+                Some(self.provider.get_block_number().await?.saturating_add(1))
+            };
+            let event = match self.provider.decode_relevant_log_for_pools(
+                &monitored_states,
+                result,
+                fallback_block,
+                Some(fallback_log_index),
+            ) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(error = %err, "Flashblocks pending log decode failed");
+                    continue;
+                }
+            };
+
+            self.process_flashblock_event(&mut monitored_states, event, &mut recent_logs)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_flashblock_event(
+        &self,
+        monitored_states: &mut [PoolState],
+        event: DexEvent,
+        recent_logs: &mut RecentLogCache,
+    ) -> Result<()> {
+        if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
+            return Ok(());
+        }
+
+        debug!(
+            pool = %event.pool_address,
+            block_number = event.block_number,
+            event_type = %event.event_type,
+            "Flashblocks pending event received"
+        );
+        self.recorder.record_dex_event(event.clone()).await?;
+
+        for state in monitored_states {
+            if state.pool_id.address != event.pool_address {
+                continue;
+            }
+
+            let tick_deltas = super::state_updater::v3_tick_deltas_from_event(state, &event)?;
+            if !tick_deltas.is_empty() {
+                self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
+                    .await?;
+            }
+
+            if super::state_updater::is_v3_liquidity_event(state, &event)? {
+                debug!(
+                    pool = %state.pool_id.address,
+                    block_number = event.block_number,
+                    "Flashblocks V3 liquidity event applied to ticks; pool liquidity refresh waits for sealed block"
+                );
+            } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
+                self.pool_store.set_pool_state(state.clone()).await?;
+                self.recorder
+                    .record_pool_state_with_source(state.clone(), "flashblock")
+                    .await?;
+                debug!(
+                    pool = %state.pool_id.address,
+                    block_number = state.block_number,
+                    "pool state locally updated from Flashblocks pending event"
+                );
+            }
+            break;
+        }
+
+        Ok(())
     }
 
     async fn load_monitored_states(&self) -> Result<Vec<PoolState>> {
@@ -946,7 +1169,7 @@ where
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
 where
-    P: PoolStateStore + TickStateStore,
+    P: PoolStateStore + TickStateStore + Clone + Send + Sync + 'static,
 {
     service.run().await?;
     Ok(())
@@ -1011,6 +1234,17 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
     states
         .iter()
         .map(|state| format!("{:#x}", state.pool_id.address))
+        .collect()
+}
+
+fn unique_pool_addresses(states: &[PoolState]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    states
+        .iter()
+        .filter_map(|state| {
+            let address = format!("{:#x}", state.pool_id.address);
+            seen.insert(address.clone()).then_some(address)
+        })
         .collect()
 }
 

@@ -789,31 +789,31 @@ impl ChainProvider {
             "address": addresses,
         }]);
         let value = self.rpc("eth_getLogs", params).await?;
-        let logs: Vec<RpcLog> = serde_json::from_value(value)?;
+        let logs: Vec<Value> = serde_json::from_value(value)?;
 
         let mut out = Vec::with_capacity(logs.len());
         let mut seen_logs = HashSet::new();
         for log in logs {
-            let log_index = parse_hex_u64(&log.log_index)?;
-            if !seen_logs.insert((log.transaction_hash.clone(), log_index)) {
+            let Some(event) = decode_log_for_pools(pools, log, None, None)? else {
+                continue;
+            };
+            if !seen_logs.insert((event.tx_hash.clone(), event.log_index)) {
                 continue;
             }
-            let raw_data_json = serde_json::to_value(&log)?;
-            let pool_address: Address = log.address.parse()?;
-            let dex = dex_for_pool(pools, pool_address);
-            let event_type = decode_event_type(dex, log.topics.first().map(String::as_str));
-            out.push(DexEvent {
-                block_number: parse_hex_u64(&log.block_number)?,
-                tx_hash: log.transaction_hash,
-                log_index,
-                pool_address,
-                dex,
-                event_type,
-                raw_data_json,
-            });
+            out.push(event);
         }
         out.sort_by_key(|event| (event.block_number, event.log_index));
         Ok(out)
+    }
+
+    pub fn decode_relevant_log_for_pools(
+        &self,
+        pools: &[PoolState],
+        raw_log: Value,
+        fallback_block_number: Option<u64>,
+        fallback_log_index: Option<u64>,
+    ) -> Result<Option<DexEvent>> {
+        decode_log_for_pools(pools, raw_log, fallback_block_number, fallback_log_index)
     }
 
     async fn fetch_aerodrome_state(&self, pool: Address) -> Result<PoolState> {
@@ -1571,11 +1571,11 @@ struct RpcLog {
     topics: Vec<String>,
     data: String,
     #[serde(rename = "blockNumber")]
-    block_number: String,
+    block_number: Option<String>,
     #[serde(rename = "transactionHash")]
-    transaction_hash: String,
+    transaction_hash: Option<String>,
     #[serde(rename = "logIndex")]
-    log_index: String,
+    log_index: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1614,6 +1614,47 @@ fn dex_for_pool(pools: &[PoolState], pool: Address) -> DexKind {
         .find(|state| state.pool_id.address == pool)
         .map(|state| state.dex)
         .unwrap_or(DexKind::UniswapV3)
+}
+
+fn decode_log_for_pools(
+    pools: &[PoolState],
+    raw_log: Value,
+    fallback_block_number: Option<u64>,
+    fallback_log_index: Option<u64>,
+) -> Result<Option<DexEvent>> {
+    let log: RpcLog = serde_json::from_value(raw_log.clone())?;
+    let pool_address: Address = log.address.parse()?;
+    if !pools
+        .iter()
+        .any(|state| state.pool_id.address == pool_address)
+    {
+        return Ok(None);
+    }
+
+    let block_number = match log.block_number.as_deref() {
+        Some(block_number) => parse_hex_u64(block_number)?,
+        None => {
+            fallback_block_number.ok_or_else(|| anyhow::anyhow!("pool log missing blockNumber"))?
+        }
+    };
+    let log_index = match log.log_index.as_deref() {
+        Some(log_index) => parse_hex_u64(log_index)?,
+        None => fallback_log_index.ok_or_else(|| anyhow::anyhow!("pool log missing logIndex"))?,
+    };
+    let tx_hash = log
+        .transaction_hash
+        .unwrap_or_else(|| format!("flashblock:{block_number:x}:{log_index:x}:{pool_address:#x}"));
+    let dex = dex_for_pool(pools, pool_address);
+    let event_type = decode_event_type(dex, log.topics.first().map(String::as_str));
+    Ok(Some(DexEvent {
+        block_number,
+        tx_hash,
+        log_index,
+        pool_address,
+        dex,
+        event_type,
+        raw_data_json: raw_log,
+    }))
 }
 
 fn decode_event_type(dex: DexKind, topic0: Option<&str>) -> String {

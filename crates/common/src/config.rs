@@ -8,6 +8,7 @@ use crate::constants::{DEFAULT_CANDIDATE_TTL_MS, DEFAULT_MAX_POOL_STATE_AGE_MS};
 pub struct Settings {
     pub base_rpc_http: String,
     pub base_rpc_ws: String,
+    pub base_rpc_flashblocks_ws: Option<String>,
     pub postgres_url: String,
     pub redis_url: String,
     pub chain_id: u64,
@@ -37,6 +38,7 @@ pub struct Settings {
     pub max_pool_state_age_ms: i64,
     pub max_price_impact_bps: u64,
     pub pool_active_refresh_interval_secs: u64,
+    pub market_data_flashblocks_enabled: bool,
     pub aerodrome_fee_refresh_interval_secs: u64,
     pub v3_tick_refresh_interval_secs: u64,
     pub v3_tick_bitmap_word_radius: i32,
@@ -62,6 +64,7 @@ impl Settings {
             .set_default("max_pool_state_age_ms", DEFAULT_MAX_POOL_STATE_AGE_MS)?
             .set_default("search_amount_usdc", "10,30,50,100")?
             .set_default("pool_active_refresh_interval_secs", 60u64)?
+            .set_default("market_data_flashblocks_enabled", true)?
             .set_default("aerodrome_fee_refresh_interval_secs", 15u64)?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?
             .set_default("v3_tick_bitmap_word_radius", 8i32)?

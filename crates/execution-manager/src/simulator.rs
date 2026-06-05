@@ -560,6 +560,7 @@ mod tests {
         base_arb_common::config::Settings {
             base_rpc_http: "http://127.0.0.1:8545".into(),
             base_rpc_ws: "ws://127.0.0.1:8546".into(),
+            base_rpc_flashblocks_ws: None,
             postgres_url: "postgres://user:password@localhost:5632/base_arb".into(),
             redis_url: "redis://127.0.0.1:6779".into(),
             chain_id: 8453,
@@ -589,6 +590,7 @@ mod tests {
             max_pool_state_age_ms: 300_000,
             max_price_impact_bps: 50,
             pool_active_refresh_interval_secs: 60,
+            market_data_flashblocks_enabled: true,
             aerodrome_fee_refresh_interval_secs: 15,
             v3_tick_refresh_interval_secs: 60,
             v3_tick_bitmap_word_radius: 8,
