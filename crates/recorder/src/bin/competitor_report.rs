@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
     collect_address_transfer_logs(&store.pool, &provider, &cli, from_block, to_block).await?;
     hydrate_missing_transactions(&store.pool, &provider, &cli).await?;
     hydrate_peer_block_transactions(&store.pool, &provider, &cli).await?;
-    print_report(&store.pool, &cli).await?;
+    print_report(&store.pool, &cli, from_block, to_block).await?;
     Ok(())
 }
 
@@ -728,9 +728,11 @@ async fn upsert_observed_block(pool: &PgPool, block_number: i64, block: &Value) 
     Ok(())
 }
 
-async fn print_report(pool: &PgPool, cli: &Cli) -> Result<()> {
+async fn print_report(pool: &PgPool, cli: &Cli, from_block: u64, to_block: u64) -> Result<()> {
     let address = format!("{:#x}", cli.address).to_ascii_lowercase();
     print_transfer_counterparties(pool, &address).await?;
+    print_profit_pair_distribution(pool, &address, from_block, to_block).await?;
+    print_profit_token_distribution(pool, &address, from_block, to_block).await?;
     print_address_gas_summary(pool, &address).await?;
     print_execution_lanes(pool, &address).await?;
     print_gas_strategy_recommendation(pool, &address).await?;
@@ -1012,6 +1014,180 @@ async fn print_transfer_counterparties(pool: &PgPool, address: &str) -> Result<(
             row.transfers,
             row.first_block,
             row.latest_block,
+        );
+    }
+    println!();
+    Ok(())
+}
+
+async fn print_profit_pair_distribution(
+    pool: &PgPool,
+    address: &str,
+    from_block: u64,
+    to_block: u64,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        WITH deltas AS (
+            SELECT
+                lower(tx_hash) AS tx_hash,
+                lower(token_address) AS token_address,
+                SUM(CASE WHEN direction = 'in' THEN amount::numeric ELSE -amount::numeric END) AS net_amount
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+              AND block_number BETWEEN $2 AND $3
+            GROUP BY lower(tx_hash), lower(token_address)
+            HAVING SUM(CASE WHEN direction = 'in' THEN amount::numeric ELSE -amount::numeric END) <> 0
+        ),
+        labeled AS (
+            SELECT
+                d.tx_hash,
+                d.token_address,
+                COALESCE(t.symbol, left(d.token_address, 10)) AS token_symbol,
+                d.net_amount
+            FROM deltas d
+            LEFT JOIN tokens t ON lower(t.token_address) = d.token_address
+        ),
+        tx_shapes AS (
+            SELECT
+                l.tx_hash,
+                COALESCE(
+                    string_agg(l.token_symbol, '+' ORDER BY l.token_symbol) FILTER (WHERE l.net_amount < 0),
+                    'none'
+                ) AS input_tokens,
+                string_agg(l.token_symbol, '+' ORDER BY l.token_symbol) FILTER (WHERE l.net_amount > 0) AS profit_tokens,
+                COUNT(*) FILTER (WHERE l.net_amount < 0)::bigint AS input_token_count,
+                COUNT(*) FILTER (WHERE l.net_amount > 0)::bigint AS profit_token_count
+            FROM labeled l
+            GROUP BY l.tx_hash
+            HAVING COUNT(*) FILTER (WHERE l.net_amount > 0) > 0
+        ),
+        swap_context AS (
+            SELECT
+                lower(ot.tx_hash) AS tx_hash,
+                string_agg(DISTINCT COALESCE(tp.symbol, lower(log->>'address')), ', ' ORDER BY COALESCE(tp.symbol, lower(log->>'address'))) FILTER (WHERE log->>'address' IS NOT NULL) AS swap_pairs,
+                string_agg(DISTINCT COALESCE(p.dex || ':' || p.variant, 'unknown'), ', ' ORDER BY COALESCE(p.dex || ':' || p.variant, 'unknown')) FILTER (WHERE log->>'address' IS NOT NULL) AS protocols
+            FROM observed_transactions ot
+            CROSS JOIN LATERAL jsonb_array_elements(ot.receipt_json->'logs') AS log
+            LEFT JOIN pools p ON lower(p.pool_address) = lower(log->>'address')
+            LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+            WHERE lower(log->'topics'->>0) = ANY($4)
+            GROUP BY lower(ot.tx_hash)
+        )
+        SELECT
+            s.input_tokens,
+            s.profit_tokens,
+            COUNT(*)::bigint AS txs,
+            MIN(ot.block_number)::bigint AS first_block,
+            MAX(ot.block_number)::bigint AS latest_block,
+            COUNT(*) FILTER (WHERE s.input_token_count = 0)::bigint AS pure_inflow_txs,
+            COUNT(*) FILTER (WHERE s.input_token_count > 0)::bigint AS swap_like_txs,
+            string_agg(DISTINCT sc.swap_pairs, ' | ' ORDER BY sc.swap_pairs) FILTER (WHERE sc.swap_pairs IS NOT NULL) AS swap_pairs,
+            string_agg(DISTINCT sc.protocols, ' | ' ORDER BY sc.protocols) FILTER (WHERE sc.protocols IS NOT NULL) AS protocols
+        FROM tx_shapes s
+        LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = s.tx_hash
+        LEFT JOIN swap_context sc ON sc.tx_hash = s.tx_hash
+        WHERE ot.status IS DISTINCT FROM FALSE
+        GROUP BY s.input_tokens, s.profit_tokens
+        ORDER BY txs DESC, latest_block DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(address)
+    .bind(i64::try_from(from_block)?)
+    .bind(i64::try_from(to_block)?)
+    .bind(vec![
+        UNI_V3_SWAP_TOPIC.to_string(),
+        PANCAKE_V3_SWAP_TOPIC.to_string(),
+        CLASSIC_SWAP_TOPIC.to_string(),
+    ])
+    .fetch_all(pool)
+    .await?;
+
+    println!("== Profit Pair Distribution By Net ERC20 Delta ==");
+    if rows.is_empty() {
+        println!("no profitable net-inflow transaction shapes from cached transfer data");
+        println!();
+        return Ok(());
+    }
+    for row in rows {
+        println!(
+            "{} -> {} txs={} swap_like={} pure_inflow={} blocks={}..{} swaps=[{}] protocols=[{}]",
+            cell_string(&row, "input_tokens").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "profit_tokens").unwrap_or_else(|| "-".into()),
+            cell_i64(&row, "txs").unwrap_or_default(),
+            cell_i64(&row, "swap_like_txs").unwrap_or_default(),
+            cell_i64(&row, "pure_inflow_txs").unwrap_or_default(),
+            cell_i64(&row, "first_block").unwrap_or_default(),
+            cell_i64(&row, "latest_block").unwrap_or_default(),
+            cell_string(&row, "swap_pairs").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "protocols").unwrap_or_else(|| "-".into()),
+        );
+    }
+    println!();
+    Ok(())
+}
+
+async fn print_profit_token_distribution(
+    pool: &PgPool,
+    address: &str,
+    from_block: u64,
+    to_block: u64,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        WITH deltas AS (
+            SELECT
+                lower(tx_hash) AS tx_hash,
+                lower(token_address) AS token_address,
+                SUM(CASE WHEN direction = 'in' THEN amount::numeric ELSE -amount::numeric END) AS net_amount
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+              AND block_number BETWEEN $2 AND $3
+            GROUP BY lower(tx_hash), lower(token_address)
+            HAVING SUM(CASE WHEN direction = 'in' THEN amount::numeric ELSE -amount::numeric END) > 0
+        )
+        SELECT
+            d.token_address,
+            COALESCE(t.symbol, left(d.token_address, 10)) AS token_symbol,
+            COUNT(DISTINCT d.tx_hash)::bigint AS txs,
+            SUM(d.net_amount)::text AS total_profit_raw,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY d.net_amount)::text AS p50_profit_raw,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY d.net_amount)::text AS p90_profit_raw,
+            MIN(ot.block_number)::bigint AS first_block,
+            MAX(ot.block_number)::bigint AS latest_block
+        FROM deltas d
+        LEFT JOIN tokens t ON lower(t.token_address) = d.token_address
+        LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = d.tx_hash
+        WHERE ot.status IS DISTINCT FROM FALSE
+        GROUP BY d.token_address, t.symbol
+        ORDER BY txs DESC, latest_block DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(address)
+    .bind(i64::try_from(from_block)?)
+    .bind(i64::try_from(to_block)?)
+    .fetch_all(pool)
+    .await?;
+
+    println!("== Profit Token Distribution By Net ERC20 Delta ==");
+    if rows.is_empty() {
+        println!("no positive net token deltas from cached transfer data");
+        println!();
+        return Ok(());
+    }
+    for row in rows {
+        println!(
+            "token={} ({}) txs={} total_raw={} p50_raw={} p90_raw={} blocks={}..{}",
+            cell_string(&row, "token_symbol").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "token_address").unwrap_or_else(|| "-".into()),
+            cell_i64(&row, "txs").unwrap_or_default(),
+            cell_string(&row, "total_profit_raw").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "p50_profit_raw").unwrap_or_else(|| "-".into()),
+            cell_string(&row, "p90_profit_raw").unwrap_or_else(|| "-".into()),
+            cell_i64(&row, "first_block").unwrap_or_default(),
+            cell_i64(&row, "latest_block").unwrap_or_default(),
         );
     }
     println!();
