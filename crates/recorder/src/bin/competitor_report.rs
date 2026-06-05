@@ -1,4 +1,13 @@
-use std::{collections::BTreeSet, env, str::FromStr};
+use std::{
+    collections::BTreeSet,
+    env,
+    fmt::Arguments,
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Mutex, OnceLock},
+};
 
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
@@ -17,6 +26,16 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
+static REPORT_OUTPUT: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+macro_rules! println {
+    () => {
+        crate::write_report_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        crate::write_report_line(format_args!($($arg)*))
+    };
+}
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -28,6 +47,7 @@ struct Cli {
     from_block: Option<u64>,
     to_block: Option<u64>,
     log_chunk_blocks: u64,
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, FromRow)]
@@ -84,6 +104,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = parse_args(env::args().skip(1))?;
+    if let Some(path) = cli.output.as_deref() {
+        set_report_output(path)?;
+    }
     let settings = Settings::load()?;
     let store = PostgresStore::connect(&settings.postgres_url).await?;
     ensure_registry_schema(&store.pool).await?;
@@ -95,6 +118,46 @@ async fn main() -> Result<()> {
     hydrate_missing_transactions(&store.pool, &provider, &cli).await?;
     hydrate_peer_block_transactions(&store.pool, &provider, &cli).await?;
     print_report(&store.pool, &cli, from_block, to_block).await?;
+    if let Some(path) = cli.output.as_deref() {
+        flush_report_output()?;
+        std::println!("report written to {}", path.display());
+    }
+    Ok(())
+}
+
+fn set_report_output(path: &Path) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("failed to create report output {}", path.display()))?;
+    let lock = REPORT_OUTPUT.get_or_init(|| Mutex::new(None));
+    *lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("report output mutex poisoned"))? = Some(file);
+    Ok(())
+}
+
+fn write_report_line(args: Arguments<'_>) {
+    let lock = REPORT_OUTPUT.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = lock.lock() else {
+        std::eprintln!("report output mutex poisoned");
+        return;
+    };
+    if let Some(file) = guard.as_mut() {
+        if let Err(err) = writeln!(file, "{args}") {
+            std::eprintln!("failed to write report output: {err}");
+        }
+    } else {
+        std::println!("{args}");
+    }
+}
+
+fn flush_report_output() -> Result<()> {
+    let lock = REPORT_OUTPUT.get_or_init(|| Mutex::new(None));
+    let mut guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("report output mutex poisoned"))?;
+    if let Some(file) = guard.as_mut() {
+        file.flush().context("failed to flush report output")?;
+    }
     Ok(())
 }
 
@@ -110,6 +173,7 @@ where
     let mut from_block = None;
     let mut to_block = None;
     let mut log_chunk_blocks = 2_000_u64;
+    let mut output = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -167,6 +231,11 @@ where
                     .parse()
                     .context("invalid --log-chunk-blocks")?;
             }
+            "--output" => {
+                output = Some(PathBuf::from(
+                    iter.next().context("missing value for --output")?,
+                ));
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -191,12 +260,13 @@ where
         from_block,
         to_block,
         log_chunk_blocks,
+        output,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -p base-arb-recorder --bin competitor_report -- --address <addr> [--days 30] [--from-block N] [--to-block N] [--hydrate-limit 5000] [--hydrate-all] [--hydrate-peer-blocks 50] [--log-chunk-blocks 2000]"
+        "Usage: cargo run -p base-arb-recorder --bin competitor_report -- --address <addr> [--days 30] [--from-block N] [--to-block N] [--hydrate-limit 5000] [--hydrate-all] [--hydrate-peer-blocks 50] [--log-chunk-blocks 2000] [--output report.txt]"
     );
 }
 
