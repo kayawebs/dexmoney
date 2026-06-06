@@ -426,6 +426,92 @@ impl ChainProvider {
         })
     }
 
+    pub async fn resolve_pool_for_trusted_factory(
+        &self,
+        pool: Address,
+        factory: Address,
+        dex: DexKind,
+        variant: PoolVariant,
+    ) -> Result<DiscoveredPool> {
+        let (token0, token1) = self.fetch_pool_tokens(pool).await?;
+        let token0_decimals = self.fetch_token_decimals(token0).await.ok();
+        let token1_decimals = self.fetch_token_decimals(token1).await.ok();
+        let block_number = self.get_block_number().await?;
+
+        match variant {
+            PoolVariant::AerodromeVolatile => {
+                let stable = self.fetch_pool_stable(pool).await.unwrap_or(false);
+                let mut state = self.fetch_aerodrome_pool_state(pool).await?;
+                state.factory_address = Some(factory);
+                state.stable = Some(stable);
+                state.fee_bps = match self
+                    .fetch_aerodrome_classic_fee_bps(factory, pool, stable)
+                    .await
+                {
+                    Ok(fee_bps) => fee_bps,
+                    Err(_) => self
+                        .fetch_classic_pool_fee_bps(pool)
+                        .await
+                        .unwrap_or(state.fee_bps),
+                };
+                Ok(DiscoveredPool {
+                    state,
+                    factory_address: Some(factory),
+                    tick_spacing: None,
+                    stable: Some(stable),
+                    source: "live_factory_discovery".to_string(),
+                })
+            }
+            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+                let (sqrt_price_x96, tick, liquidity) = self.fetch_uniswap_v3_state(pool).await?;
+                let tick_spacing = self.fetch_tick_spacing(pool).await.ok();
+                let fee_pips = match variant {
+                    PoolVariant::AerodromeSlipstream => {
+                        let mut fee = self
+                            .fetch_aerodrome_slipstream_fee_pips(factory, pool)
+                            .await
+                            .ok();
+                        if fee.is_none() {
+                            fee = self.fetch_v3_fee_pips(pool).await.ok();
+                        }
+                        fee
+                    }
+                    _ => self.fetch_v3_fee_pips(pool).await.ok(),
+                };
+                Ok(DiscoveredPool {
+                    state: PoolState {
+                        pool_id: PoolId {
+                            chain_id: self.chain_id,
+                            address: pool,
+                        },
+                        dex,
+                        variant,
+                        factory_address: Some(factory),
+                        token0,
+                        token1,
+                        token0_decimals,
+                        token1_decimals,
+                        fee_bps: fee_pips.unwrap_or_default() / 100,
+                        fee_pips,
+                        stable: None,
+                        reserve0: None,
+                        reserve1: None,
+                        sqrt_price_x96: Some(sqrt_price_x96),
+                        liquidity: Some(liquidity),
+                        tick: Some(tick),
+                        tick_spacing,
+                        block_number,
+                        updated_at: Utc::now(),
+                    },
+                    factory_address: Some(factory),
+                    tick_spacing,
+                    stable: None,
+                    source: "live_factory_discovery".to_string(),
+                })
+            }
+        }
+    }
+
     pub async fn resolve_observed_pool_metadata(
         &self,
         pool: Address,

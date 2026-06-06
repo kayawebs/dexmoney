@@ -14,6 +14,22 @@ use base_arb_common::types::{
     V3LiquidityUpdate,
 };
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FactoryRegistryRecord {
+    pub chain_id: i64,
+    pub factory_address: String,
+    pub dex: String,
+    pub variant: String,
+    pub trusted: bool,
+    pub enabled: bool,
+    pub source: String,
+    pub notes: Option<String>,
+    pub observed_pools: i64,
+    pub first_seen_block: Option<i64>,
+    pub latest_seen_block: Option<i64>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Clone)]
 pub struct PostgresStore {
     pub pool: PgPool,
@@ -51,6 +67,31 @@ impl PostgresStore {
         .await?;
 
         Ok(id)
+    }
+
+    pub async fn upsert_token_registry(
+        &self,
+        chain_id: u64,
+        token: Address,
+        symbol: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (chain_id, token_address, symbol, enabled, created_at, updated_at)
+            VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+            ON CONFLICT (chain_id, token_address)
+            DO UPDATE SET
+                symbol = EXCLUDED.symbol,
+                enabled = TRUE,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(token))
+        .bind(symbol)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn upsert_discovered_pool(
@@ -96,6 +137,107 @@ impl PostgresStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_factory_registry(
+        &self,
+        chain_id: u64,
+        factory_address: Address,
+        dex: &str,
+        variant: &str,
+        trusted: bool,
+        enabled: bool,
+        source: &str,
+        notes: Option<&str>,
+        first_seen_block: Option<i64>,
+        latest_seen_block: Option<i64>,
+        observed_pools_delta: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO factory_registry (
+                chain_id, factory_address, dex, variant, trusted, enabled, source, notes,
+                first_seen_block, latest_seen_block, observed_pools, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,GREATEST($11, 0),NOW(),NOW())
+            ON CONFLICT (chain_id, factory_address)
+            DO UPDATE SET
+                dex = EXCLUDED.dex,
+                variant = EXCLUDED.variant,
+                trusted = EXCLUDED.trusted,
+                enabled = EXCLUDED.enabled,
+                source = EXCLUDED.source,
+                notes = COALESCE(EXCLUDED.notes, factory_registry.notes),
+                first_seen_block = COALESCE(
+                    LEAST(factory_registry.first_seen_block, EXCLUDED.first_seen_block),
+                    factory_registry.first_seen_block,
+                    EXCLUDED.first_seen_block
+                ),
+                latest_seen_block = GREATEST(
+                    COALESCE(factory_registry.latest_seen_block, 0),
+                    COALESCE(EXCLUDED.latest_seen_block, 0)
+                ),
+                observed_pools = factory_registry.observed_pools + GREATEST($11, 0),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(factory_address))
+        .bind(dex)
+        .bind(variant)
+        .bind(trusted)
+        .bind(enabled)
+        .bind(source)
+        .bind(notes)
+        .bind(first_seen_block)
+        .bind(latest_seen_block)
+        .bind(observed_pools_delta)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn trusted_factory_registry(
+        &self,
+        chain_id: u64,
+    ) -> Result<Vec<FactoryRegistryRecord>> {
+        Ok(sqlx::query_as::<_, FactoryRegistryRecord>(
+            r#"
+            SELECT
+                chain_id, factory_address, dex, variant, trusted, enabled, source, notes,
+                observed_pools, first_seen_block, latest_seen_block, updated_at
+            FROM factory_registry
+            WHERE chain_id = $1
+              AND trusted = TRUE
+              AND enabled = TRUE
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn all_factory_registry(
+        &self,
+        chain_id: u64,
+        limit: i64,
+    ) -> Result<Vec<FactoryRegistryRecord>> {
+        Ok(sqlx::query_as::<_, FactoryRegistryRecord>(
+            r#"
+            SELECT
+                chain_id, factory_address, dex, variant, trusted, enabled, source, notes,
+                observed_pools, first_seen_block, latest_seen_block, updated_at
+            FROM factory_registry
+            WHERE chain_id = $1
+            ORDER BY trusted DESC, observed_pools DESC, updated_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -854,6 +996,27 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON observed_pools (chain_id, import_status, txs_30d DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS observed_pools_symbol_idx
             ON observed_pools (chain_id, symbol, txs_30d DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS factory_registry (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            factory_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            trusted BOOLEAN NOT NULL DEFAULT FALSE,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            source TEXT NOT NULL,
+            notes TEXT,
+            observed_pools BIGINT NOT NULL DEFAULT 0,
+            first_seen_block BIGINT,
+            latest_seen_block BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, factory_address)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS factory_registry_trusted_idx
+            ON factory_registry (chain_id, trusted, enabled, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS factory_registry_observed_idx
+            ON factory_registry (chain_id, observed_pools DESC, updated_at DESC)"#,
         r#"ALTER TABLE simulations
             ADD COLUMN IF NOT EXISTS block_number BIGINT,
             ADD COLUMN IF NOT EXISTS token_in TEXT,

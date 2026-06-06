@@ -3,11 +3,15 @@ use anyhow::Result;
 use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
+use base_arb_common::constants::PANCAKE_V3_FACTORY;
 use base_arb_common::types::{
     DexKind, PoolId, PoolRegistryEntry, PoolState, PoolStateValidation, PoolStateWarning,
     PoolVariant, TickState,
 };
-use base_arb_storage::{postgres::PostgresStore, PoolStateStore, RecorderStore, TickStateStore};
+use base_arb_storage::{
+    postgres::{FactoryRegistryRecord, PostgresStore},
+    PoolStateStore, RecorderStore, TickStateStore,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -20,6 +24,22 @@ const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
 const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
+const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
+const AERODROME_CLASSIC_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
+const AERODROME_SLIPSTREAM_FACTORIES: [&str; 2] = [
+    "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A",
+    "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a",
+];
+const V3_POOL_CREATED_TOPIC: &str =
+    "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118";
+const CLASSIC_POOL_CREATED_TOPIC: &str =
+    "0x2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e";
+const CLASSIC_PAIR_CREATED_TOPIC: &str =
+    "0xc4805696c66d7cf352fc1d6bb633ad5ee82f6cb577c453024b6e0eb8306c6fc9";
+const SLIPSTREAM_POOL_CREATED_TOPIC: &str =
+    "0xab0d57f0df537bb25e80245ef7748fa62353808c54d6e528a9dd20887aed9ac2";
+const SLIPSTREAM_POOL_CREATED_WITH_INDEX_TOPIC: &str =
+    "0xb4b64a6a7c41cd0232bfad78d5f845870be74762857744ff02be28578c5f4cb9";
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -34,6 +54,7 @@ where
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
+        self.seed_default_factories().await?;
 
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states, "onchain_init")
@@ -93,6 +114,9 @@ where
                 monitored_states = self.reload_if_changed(monitored_states).await?;
                 next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
             }
+
+            self.discover_live_pool_creations(last_seen_block + 1, latest_block)
+                .await?;
 
             let events = self
                 .provider
@@ -307,6 +331,376 @@ where
         tokio::spawn(async move {
             service.run_flashblocks_listener().await;
         });
+    }
+
+    async fn seed_default_factories(&self) -> Result<()> {
+        let chain_id = self.settings.chain_id;
+        let aerodrome_classic = self
+            .settings
+            .aerodrome_pool_factory
+            .unwrap_or(AERODROME_CLASSIC_FACTORY.parse()?);
+        self.recorder
+            .upsert_factory_registry(
+                chain_id,
+                aerodrome_classic,
+                "Aerodrome",
+                "AerodromeVolatile",
+                true,
+                true,
+                "default_config",
+                Some("official/default Aerodrome Classic factory"),
+                None,
+                None,
+                0,
+            )
+            .await?;
+
+        let uniswap_v3 = self
+            .settings
+            .uniswap_v3_factory
+            .unwrap_or(UNISWAP_V3_FACTORY.parse()?);
+        self.recorder
+            .upsert_factory_registry(
+                chain_id,
+                uniswap_v3,
+                "UniswapV3",
+                "UniswapV3",
+                true,
+                true,
+                "default_config",
+                Some("official/default Uniswap V3 factory"),
+                None,
+                None,
+                0,
+            )
+            .await?;
+
+        let pancake_v3 = self
+            .settings
+            .pancake_v3_factory
+            .unwrap_or(PANCAKE_V3_FACTORY.parse()?);
+        self.recorder
+            .upsert_factory_registry(
+                chain_id,
+                pancake_v3,
+                "PancakeSwap",
+                "PancakeV3",
+                true,
+                true,
+                "default_config",
+                Some("official/default Pancake V3 factory"),
+                None,
+                None,
+                0,
+            )
+            .await?;
+
+        let mut slipstream_factories = Vec::new();
+        if let Some(factory) = self.settings.aerodrome_slipstream_factory {
+            slipstream_factories.push(factory);
+        }
+        for factory in AERODROME_SLIPSTREAM_FACTORIES {
+            let factory = factory.parse()?;
+            if !slipstream_factories.contains(&factory) {
+                slipstream_factories.push(factory);
+            }
+        }
+        for factory in slipstream_factories {
+            self.recorder
+                .upsert_factory_registry(
+                    chain_id,
+                    factory,
+                    "Aerodrome",
+                    "AerodromeSlipstream",
+                    true,
+                    true,
+                    "default_config",
+                    Some("official/default Aerodrome Slipstream factory"),
+                    None,
+                    None,
+                    0,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn discover_live_pool_creations(&self, from_block: u64, to_block: u64) -> Result<()> {
+        if from_block > to_block {
+            return Ok(());
+        }
+        let params = json!([{
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": [[
+                V3_POOL_CREATED_TOPIC,
+                CLASSIC_POOL_CREATED_TOPIC,
+                CLASSIC_PAIR_CREATED_TOPIC,
+                SLIPSTREAM_POOL_CREATED_TOPIC,
+                SLIPSTREAM_POOL_CREATED_WITH_INDEX_TOPIC
+            ]]
+        }]);
+        let logs = match self.provider.get_logs_raw(params).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                warn!(
+                    from_block,
+                    to_block,
+                    error = %err,
+                    "live pool discovery getLogs failed"
+                );
+                return Ok(());
+            }
+        };
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        let trusted = self
+            .recorder
+            .trusted_factory_registry(self.settings.chain_id)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let address = row.factory_address.parse::<Address>().ok()?;
+                let dex = parse_dex_kind(&row.dex).ok()?;
+                let variant = parse_pool_variant(&row.variant).ok()?;
+                Some((address, (dex, variant, row)))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut imported = 0usize;
+        let mut observed_only = 0usize;
+        for raw in logs {
+            match self.process_pool_creation_log(raw, &trusted).await {
+                Ok(LivePoolDiscoveryOutcome::Imported) => imported += 1,
+                Ok(LivePoolDiscoveryOutcome::ObservedOnly) => observed_only += 1,
+                Ok(LivePoolDiscoveryOutcome::Skipped) => {}
+                Err(err) => {
+                    debug!(error = %err, "live pool discovery log skipped");
+                }
+            }
+        }
+        if imported > 0 || observed_only > 0 {
+            info!(
+                imported,
+                observed_only, from_block, to_block, "live pool discovery processed creation logs"
+            );
+        }
+        Ok(())
+    }
+
+    async fn process_pool_creation_log(
+        &self,
+        raw: Value,
+        trusted: &HashMap<Address, (DexKind, PoolVariant, FactoryRegistryRecord)>,
+    ) -> Result<LivePoolDiscoveryOutcome> {
+        let log = parse_creation_log(raw)?;
+        let factory = log.factory;
+        let pool = match self.find_created_pool_address(&log).await? {
+            Some(pool) => pool,
+            None => return Ok(LivePoolDiscoveryOutcome::Skipped),
+        };
+        let metadata = match self
+            .provider
+            .resolve_observed_pool_metadata(pool, &log.topic0)
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.recorder
+                    .upsert_factory_registry(
+                        self.settings.chain_id,
+                        factory,
+                        inferred_dex_for_creation_topic(&log.topic0),
+                        inferred_variant_for_creation_topic(&log.topic0),
+                        false,
+                        true,
+                        "live_pool_discovery",
+                        Some(&format!(
+                            "metadata resolve failed for pool {pool:#x}: {err}"
+                        )),
+                        Some(i64::try_from(log.block_number)?),
+                        Some(i64::try_from(log.block_number)?),
+                        1,
+                    )
+                    .await?;
+                return Ok(LivePoolDiscoveryOutcome::ObservedOnly);
+            }
+        };
+        let symbol = pair_symbol(&self.provider, metadata.token0, metadata.token1).await;
+        let trusted_factory = trusted.get(&factory);
+        if let Some((dex, variant, _row)) = trusted_factory {
+            match self
+                .provider
+                .resolve_pool_for_trusted_factory(pool, factory, *dex, *variant)
+                .await
+            {
+                Ok(discovered) => {
+                    self.recorder
+                        .upsert_token_registry(
+                            self.settings.chain_id,
+                            discovered.state.token0,
+                            symbol.split('/').next().unwrap_or_default(),
+                        )
+                        .await?;
+                    self.recorder
+                        .upsert_token_registry(
+                            self.settings.chain_id,
+                            discovered.state.token1,
+                            symbol.split('/').nth(1).unwrap_or_default(),
+                        )
+                        .await?;
+                    let (token0, token1) =
+                        canonical_pair(discovered.state.token0, discovered.state.token1);
+                    let pair_id = self
+                        .recorder
+                        .upsert_token_pair(self.settings.chain_id, token0, token1, &symbol)
+                        .await?;
+                    self.recorder
+                        .upsert_discovered_pool(pair_id, &discovered)
+                        .await?;
+                    self.recorder
+                        .upsert_observed_pool(
+                            self.settings.chain_id,
+                            pool,
+                            &log.topic0,
+                            "pool-created",
+                            Some(discovered.state.token0),
+                            Some(discovered.state.token1),
+                            Some(&symbol),
+                            Some(factory),
+                            Some(dex_to_string(*dex)),
+                            Some(variant_to_string(*variant)),
+                            Some(discovered.state.fee_bps),
+                            discovered.state.fee_pips,
+                            discovered.tick_spacing,
+                            discovered.stable,
+                            1,
+                            1,
+                            Some(i64::try_from(log.block_number)?),
+                            Some(i64::try_from(log.block_number)?),
+                            "imported",
+                            None,
+                        )
+                        .await?;
+                    self.recorder
+                        .upsert_factory_registry(
+                            self.settings.chain_id,
+                            factory,
+                            dex_to_string(*dex),
+                            variant_to_string(*variant),
+                            true,
+                            true,
+                            "live_pool_discovery",
+                            None,
+                            Some(i64::try_from(log.block_number)?),
+                            Some(i64::try_from(log.block_number)?),
+                            1,
+                        )
+                        .await?;
+                    info!(
+                        pool = %pool,
+                        factory = %factory,
+                        symbol,
+                        dex = ?dex,
+                        variant = ?variant,
+                        "live pool discovery imported trusted factory pool"
+                    );
+                    Ok(LivePoolDiscoveryOutcome::Imported)
+                }
+                Err(err) => {
+                    self.record_observed_only_pool(
+                        &log,
+                        pool,
+                        &metadata,
+                        &symbol,
+                        Some(&format!("trusted factory pool resolve failed: {err}")),
+                    )
+                    .await?;
+                    Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+                }
+            }
+        } else {
+            self.record_observed_only_pool(
+                &log,
+                pool,
+                &metadata,
+                &symbol,
+                Some("factory is not trusted; confirm in monitor-web before enabling"),
+            )
+            .await?;
+            Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+        }
+    }
+
+    async fn find_created_pool_address(&self, log: &CreationLog) -> Result<Option<Address>> {
+        for candidate in data_word_addresses(&log.data) {
+            if candidate == Address::ZERO {
+                continue;
+            }
+            let Ok(metadata) = self
+                .provider
+                .resolve_observed_pool_metadata(candidate, &log.topic0)
+                .await
+            else {
+                continue;
+            };
+            if metadata.factory_address == Some(log.factory) {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn record_observed_only_pool(
+        &self,
+        log: &CreationLog,
+        pool: Address,
+        metadata: &base_arb_chain::provider::ObservedPoolMetadata,
+        symbol: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.recorder
+            .upsert_observed_pool(
+                self.settings.chain_id,
+                pool,
+                &log.topic0,
+                "pool-created",
+                Some(metadata.token0),
+                Some(metadata.token1),
+                Some(symbol),
+                Some(log.factory),
+                None,
+                None,
+                metadata.fee_bps,
+                metadata.fee_pips,
+                metadata.tick_spacing,
+                metadata.stable,
+                1,
+                1,
+                Some(i64::try_from(log.block_number)?),
+                Some(i64::try_from(log.block_number)?),
+                "observed_only",
+                reason,
+            )
+            .await?;
+        self.recorder
+            .upsert_factory_registry(
+                self.settings.chain_id,
+                log.factory,
+                inferred_dex_for_creation_topic(&log.topic0),
+                inferred_variant_for_creation_topic(&log.topic0),
+                false,
+                true,
+                "live_pool_discovery",
+                reason,
+                Some(i64::try_from(log.block_number)?),
+                Some(i64::try_from(log.block_number)?),
+                1,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn run_flashblocks_listener(&self) {
@@ -1355,6 +1749,159 @@ fn value_drift_bps(local: Option<U256>, onchain: Option<U256>) -> u64 {
         .checked_div(onchain)
         .unwrap_or(U256::MAX);
     u64::try_from(bps).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone)]
+struct CreationLog {
+    factory: Address,
+    topic0: String,
+    data: String,
+    block_number: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePoolDiscoveryOutcome {
+    Imported,
+    ObservedOnly,
+    Skipped,
+}
+
+fn parse_creation_log(raw: Value) -> Result<CreationLog> {
+    let factory = raw
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("pool-created log missing address"))?
+        .parse::<Address>()?;
+    let topic0 = raw
+        .get("topics")
+        .and_then(Value::as_array)
+        .and_then(|topics| topics.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("pool-created log missing topic0"))?
+        .to_ascii_lowercase();
+    let data = raw
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("pool-created log missing data"))?
+        .to_string();
+    let block_number = raw
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(parse_hex_u64_local)
+        .ok_or_else(|| anyhow::anyhow!("pool-created log missing blockNumber"))?;
+
+    Ok(CreationLog {
+        factory,
+        topic0,
+        data,
+        block_number,
+    })
+}
+
+fn data_word_addresses(data: &str) -> Vec<Address> {
+    let hex = data.strip_prefix("0x").unwrap_or(data);
+    if hex.len() < 64 {
+        return Vec::new();
+    }
+    hex.as_bytes()
+        .chunks(64)
+        .filter_map(|word| std::str::from_utf8(word).ok())
+        .filter(|word| word.len() == 64)
+        .filter_map(|word| {
+            let address_hex = &word[24..64];
+            if !word[..24].eq_ignore_ascii_case("000000000000000000000000") {
+                return None;
+            }
+            format!("0x{address_hex}").parse::<Address>().ok()
+        })
+        .collect()
+}
+
+fn parse_hex_u64_local(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).ok()
+}
+
+fn canonical_pair(a: Address, b: Address) -> (Address, Address) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address) -> String {
+    let token0_symbol = provider
+        .fetch_erc20_symbol(token0)
+        .await
+        .unwrap_or_else(|_| short_address(token0));
+    let token1_symbol = provider
+        .fetch_erc20_symbol(token1)
+        .await
+        .unwrap_or_else(|_| short_address(token1));
+    format!("{token0_symbol}/{token1_symbol}")
+}
+
+fn short_address(address: Address) -> String {
+    let value = format!("{address:#x}");
+    value.get(0..10).map(ToString::to_string).unwrap_or(value)
+}
+
+fn dex_to_string(dex: DexKind) -> &'static str {
+    match dex {
+        DexKind::Aerodrome => "Aerodrome",
+        DexKind::UniswapV3 => "UniswapV3",
+        DexKind::PancakeSwap => "PancakeSwap",
+    }
+}
+
+fn variant_to_string(variant: PoolVariant) -> &'static str {
+    match variant {
+        PoolVariant::AerodromeVolatile => "AerodromeVolatile",
+        PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
+        PoolVariant::UniswapV3 => "UniswapV3",
+        PoolVariant::PancakeV3 => "PancakeV3",
+    }
+}
+
+fn parse_dex_kind(value: &str) -> Result<DexKind> {
+    match value {
+        "Aerodrome" => Ok(DexKind::Aerodrome),
+        "UniswapV3" => Ok(DexKind::UniswapV3),
+        "PancakeSwap" => Ok(DexKind::PancakeSwap),
+        _ => anyhow::bail!("unknown dex: {value}"),
+    }
+}
+
+fn parse_pool_variant(value: &str) -> Result<PoolVariant> {
+    match value {
+        "AerodromeVolatile" => Ok(PoolVariant::AerodromeVolatile),
+        "AerodromeSlipstream" => Ok(PoolVariant::AerodromeSlipstream),
+        "UniswapV3" => Ok(PoolVariant::UniswapV3),
+        "PancakeV3" => Ok(PoolVariant::PancakeV3),
+        _ => anyhow::bail!("unknown pool variant: {value}"),
+    }
+}
+
+fn inferred_dex_for_creation_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_POOL_CREATED_TOPIC || topic0 == CLASSIC_PAIR_CREATED_TOPIC {
+        "Aerodrome"
+    } else {
+        "UniswapV3"
+    }
+}
+
+fn inferred_variant_for_creation_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_POOL_CREATED_TOPIC || topic0 == CLASSIC_PAIR_CREATED_TOPIC {
+        "AerodromeVolatile"
+    } else if topic0 == SLIPSTREAM_POOL_CREATED_TOPIC
+        || topic0 == SLIPSTREAM_POOL_CREATED_WITH_INDEX_TOPIC
+    {
+        "AerodromeSlipstream"
+    } else {
+        "UniswapV3"
+    }
 }
 
 #[derive(Debug, Clone)]

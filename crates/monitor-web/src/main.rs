@@ -238,6 +238,21 @@ struct ObservedPoolRow {
     import_reason: Option<String>,
 }
 
+#[derive(Debug, FromRow)]
+struct FactoryRegistryRow {
+    updated_at: DateTime<Utc>,
+    factory_address: String,
+    dex: String,
+    variant: String,
+    trusted: bool,
+    enabled: bool,
+    source: String,
+    notes: Option<String>,
+    observed_pools: i64,
+    first_seen_block: Option<i64>,
+    latest_seen_block: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AddTokenForm {
     password: String,
@@ -268,6 +283,17 @@ struct ImportObservedPoolsForm {
     days: Option<i64>,
     min_pool_txs: Option<i64>,
     pool_limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FactoryRegistryForm {
+    password: String,
+    factory_address: String,
+    dex: String,
+    variant: String,
+    trusted: Option<String>,
+    enabled: Option<String>,
+    notes: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,6 +377,7 @@ async fn main() -> Result<()> {
         .route("/pairs/rediscover-all", post(rediscover_all_pairs))
         .route("/registry/reconcile", post(reconcile_registry))
         .route("/registry/import-observed", post(import_observed_pools))
+        .route("/registry/factory", post(update_factory_registry))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/search-config", post(update_pair_search_config))
@@ -828,6 +855,24 @@ async fn import_observed_pools(
                 )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if let Some(factory) = discovered.factory_address {
+                    store
+                        .upsert_factory_registry(
+                            state.settings.chain_id,
+                            factory,
+                            dex_to_string(discovered.state.dex),
+                            variant_to_string(discovered.state.variant),
+                            true,
+                            true,
+                            "observed_import",
+                            Some("resolved through supported registry settings"),
+                            Some(row.first_block),
+                            Some(row.latest_block),
+                            1,
+                        )
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
                 imported += 1;
             }
             Err(err) => {
@@ -869,6 +914,27 @@ async fn import_observed_pools(
                     )
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if let Some(factory) = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.factory_address)
+                {
+                    store
+                        .upsert_factory_registry(
+                            state.settings.chain_id,
+                            factory,
+                            inferred_dex_for_topic(&row.topic0),
+                            inferred_variant_for_topic(&row.topic0),
+                            false,
+                            true,
+                            "observed_import",
+                            Some(&err.to_string()),
+                            Some(row.first_block),
+                            Some(row.latest_block),
+                            1,
+                        )
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
                 observed_only += 1;
             }
         }
@@ -876,6 +942,64 @@ async fn import_observed_pools(
 
     let message = format!(
         "observed pool import: imported {imported}, observed-only {observed_only}, already registered {already_registered}, blocks {from_block}..{to_block}"
+    );
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
+async fn update_factory_registry(
+    State(state): State<AppState>,
+    Form(form): Form<FactoryRegistryForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+    let factory: Address = match form.factory_address.trim().parse() {
+        Ok(factory) => factory,
+        Err(_) => {
+            return render_registry_response(&state.pool, None, Some("invalid factory address"))
+                .await;
+        }
+    };
+    if !factory_variant_is_consistent(&form.dex, &form.variant) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("invalid factory DEX/variant combination"),
+        )
+        .await;
+    }
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+    let notes = form.notes.trim();
+    store
+        .upsert_factory_registry(
+            state.settings.chain_id,
+            factory,
+            form.dex.trim(),
+            form.variant.trim(),
+            form.trusted.is_some(),
+            form.enabled.is_some(),
+            "manual",
+            (!notes.is_empty()).then_some(notes),
+            None,
+            None,
+            0,
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let message = format!(
+        "factory updated: {factory:#x} {} {} trusted={} enabled={}",
+        form.dex.trim(),
+        form.variant.trim(),
+        form.trusted.is_some(),
+        form.enabled.is_some()
     );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
@@ -1397,6 +1521,9 @@ async fn render_registry_response(
     let observed_pools = fetch_observed_pools(pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let factories = fetch_factory_registry(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let content = format!(
         r#"
@@ -1423,6 +1550,10 @@ async fn render_registry_response(
           <div class="card-body">{}</div>
         </section>
         <section class="card">
+          <h2>Factories</h2>
+          <div class="card-body">{}</div>
+        </section>
+        <section class="card">
           <h2>Pool Registry</h2>
           <div class="card-body">{}</div>
         </section>
@@ -1433,6 +1564,7 @@ async fn render_registry_response(
         "#,
         render_token_search_defaults(&token_defaults),
         render_token_pairs_table(&token_pairs),
+        render_factory_registry_table(&factories),
         render_registry_pools_table(&registry_pools),
         render_observed_pools_table(&observed_pools),
         password_input = password_input(None, true),
@@ -1768,6 +1900,30 @@ async fn fetch_observed_pools(pool: &PgPool) -> Result<Vec<ObservedPoolRow>> {
         FROM observed_pools
         ORDER BY updated_at DESC, txs_30d DESC
         LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_factory_registry(pool: &PgPool) -> Result<Vec<FactoryRegistryRow>> {
+    Ok(sqlx::query_as::<_, FactoryRegistryRow>(
+        r#"
+        SELECT
+            updated_at,
+            factory_address,
+            dex,
+            variant,
+            trusted,
+            enabled,
+            source,
+            notes,
+            observed_pools,
+            first_seen_block,
+            latest_seen_block
+        FROM factory_registry
+        ORDER BY trusted DESC, observed_pools DESC, updated_at DESC
+        LIMIT 200
         "#,
     )
     .fetch_all(pool)
@@ -2215,6 +2371,27 @@ fn render_page(
     .pair-actions-row .inline-form button {{
       width: 100%;
       padding: 7px 9px;
+    }}
+    .factory-form {{
+      display: grid;
+      grid-template-columns: minmax(140px, 1fr);
+      gap: 6px;
+      min-width: 220px;
+    }}
+    .factory-form select,
+    .factory-form input {{
+      width: 100%;
+      min-width: 0;
+    }}
+    .compact-check {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .compact-check input {{
+      width: auto;
     }}
     .search-config-form {{
       display: grid;
@@ -2783,6 +2960,66 @@ fn render_remove_pair_form(row: &TokenPairRow) -> String {
     )
 }
 
+fn render_factory_registry_table(rows: &[FactoryRegistryRow]) -> String {
+    let mut html = String::from(
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Factory</th><th>DEX</th><th>Variant</th><th>Trusted</th><th>Enabled</th><th>Observed Pools</th><th>Seen Blocks</th><th>Source</th><th>Notes</th><th>Confirm / Update</th></tr></thead><tbody>",
+    );
+    for row in rows {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            fmt_ts(row.updated_at),
+            copyable(&row.factory_address),
+            escape(&row.dex),
+            escape(&row.variant),
+            bool_label(row.trusted),
+            bool_label(row.enabled),
+            row.observed_pools,
+            seen_blocks(row.first_seen_block, row.latest_seen_block),
+            escape(&row.source),
+            row.notes.as_deref().map(escape).unwrap_or_else(|| "-".into()),
+            render_factory_update_form(row),
+        ));
+    }
+    if rows.is_empty() {
+        html.push_str("<tr><td colspan=\"11\">No factory rows yet. Start market-data or import observed pools.</td></tr>");
+    }
+    html.push_str("</tbody></table></div>");
+    html
+}
+
+fn render_factory_update_form(row: &FactoryRegistryRow) -> String {
+    format!(
+        r#"<form method="post" action="/registry/factory" class="factory-form" onsubmit="return promptPasswordSubmit(this, 'Update factory {factory}? Wrong DEX/variant can make bad pools executable.');">
+  <input name="password" type="hidden">
+  <input name="factory_address" type="hidden" value="{factory}">
+  <select name="dex" aria-label="DEX">
+    {dex_options}
+  </select>
+  <select name="variant" aria-label="Variant">
+    {variant_options}
+  </select>
+  <label class="compact-check"><input type="checkbox" name="trusted" value="1" {trusted}> trusted</label>
+  <label class="compact-check"><input type="checkbox" name="enabled" value="1" {enabled}> enabled</label>
+  <input name="notes" value="{notes}" placeholder="notes">
+  <button type="submit">Confirm</button>
+</form>"#,
+        factory = escape(&row.factory_address),
+        dex_options = render_select_options(&["Aerodrome", "UniswapV3", "PancakeSwap"], &row.dex),
+        variant_options = render_select_options(
+            &[
+                "AerodromeVolatile",
+                "AerodromeSlipstream",
+                "UniswapV3",
+                "PancakeV3"
+            ],
+            &row.variant
+        ),
+        trusted = checked_attr(row.trusted),
+        enabled = checked_attr(row.enabled),
+        notes = row.notes.as_deref().map(escape).unwrap_or_default(),
+    )
+}
+
 fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     let mut html = String::from(
         "<div class=\"table-scroll\"><table><thead><tr><th>Created</th><th>Last Update Time</th><th>Activity</th><th>DEX</th><th>Variant</th><th>Pair</th><th>Pool</th><th>Factory</th><th>Token 0</th><th>Token 1</th><th>Fee BPS</th><th>Pool Mode</th><th>Monitoring</th><th>Source</th></tr></thead><tbody>",
@@ -3095,6 +3332,79 @@ fn escape_js_string(value: &str) -> String {
             .replace('\n', "\\n")
             .replace('\r', "\\r"),
     )
+}
+
+fn render_select_options(options: &[&str], selected: &str) -> String {
+    options
+        .iter()
+        .map(|option| {
+            format!(
+                r#"<option value="{value}" {selected}>{label}</option>"#,
+                value = escape(option),
+                selected = selected_attr(*option == selected),
+                label = escape(option),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn selected_attr(selected: bool) -> &'static str {
+    if selected {
+        "selected"
+    } else {
+        ""
+    }
+}
+
+fn checked_attr(checked: bool) -> &'static str {
+    if checked {
+        "checked"
+    } else {
+        ""
+    }
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn seen_blocks(first: Option<i64>, latest: Option<i64>) -> String {
+    match (first, latest) {
+        (Some(first), Some(latest)) if first == latest => first.to_string(),
+        (Some(first), Some(latest)) => format!("{first}..{latest}"),
+        (Some(first), None) => first.to_string(),
+        (None, Some(latest)) => latest.to_string(),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn factory_variant_is_consistent(dex: &str, variant: &str) -> bool {
+    matches!(
+        (dex.trim(), variant.trim()),
+        ("Aerodrome", "AerodromeVolatile")
+            | ("Aerodrome", "AerodromeSlipstream")
+            | ("UniswapV3", "UniswapV3")
+            | ("PancakeSwap", "PancakeV3")
+    )
+}
+
+fn inferred_dex_for_topic(topic0: &str) -> &'static str {
+    match topic0.to_ascii_lowercase().as_str() {
+        CLASSIC_SWAP_TOPIC => "Aerodrome",
+        _ => "UniswapV3",
+    }
+}
+
+fn inferred_variant_for_topic(topic0: &str) -> &'static str {
+    match topic0.to_ascii_lowercase().as_str() {
+        CLASSIC_SWAP_TOPIC => "AerodromeVolatile",
+        _ => "UniswapV3",
+    }
 }
 
 fn address_to_string(address: Address) -> String {
