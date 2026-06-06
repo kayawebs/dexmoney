@@ -370,6 +370,11 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/registry", get(registry_page))
+        .route("/registry/tokens", get(registry_tokens_page))
+        .route("/registry/pairs", get(registry_pairs_page))
+        .route("/registry/factories", get(registry_factories_page))
+        .route("/registry/pools", get(registry_pools_page))
+        .route("/registry/observed", get(registry_observed_page))
         .route("/activity", get(activity_page))
         .route("/execution", get(execution_page))
         .route("/tokens", post(add_token))
@@ -472,6 +477,146 @@ async fn registry_page(
     }
 
     render_registry_response(&state.pool, auth.password.as_deref(), None).await
+}
+
+async fn registry_tokens_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+    let rows = fetch_token_search_defaults(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = format!(
+        r#"{nav}
+        <section class="card">
+          <h2>Tokens</h2>
+          <div class="card-body">{table}</div>
+        </section>"#,
+        nav = render_registry_nav(auth.password.as_deref(), "tokens"),
+        table = render_token_search_defaults(&rows),
+    );
+    Ok(Html(render_page(
+        "Registry / Tokens",
+        "Funding anchors and token-level search defaults.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn registry_pairs_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+    let rows = fetch_token_pairs(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = format!(
+        r#"{nav}
+        <section class="card">
+          <h2>Token Pairs</h2>
+          <div class="card-body">{table}</div>
+        </section>"#,
+        nav = render_registry_nav(auth.password.as_deref(), "pairs"),
+        table = render_token_pairs_table(&rows),
+    );
+    Ok(Html(render_page(
+        "Registry / Pairs",
+        "Configured token pairs and pool discovery actions.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn registry_factories_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+    let rows = fetch_factory_registry(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = format!(
+        r#"{nav}
+        <section class="card">
+          <h2>Factories</h2>
+          <div class="card-body">{table}</div>
+        </section>"#,
+        nav = render_registry_nav(auth.password.as_deref(), "factories"),
+        table = render_factory_registry_table(&rows),
+    );
+    Ok(Html(render_page(
+        "Registry / Factories",
+        "Trusted factories and observed factory candidates.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn registry_pools_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+    let rows = fetch_registry_pools(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = format!(
+        r#"{nav}
+        <section class="card">
+          <h2>Pool Registry</h2>
+          <div class="card-body">{table}</div>
+        </section>"#,
+        nav = render_registry_nav(auth.password.as_deref(), "pools"),
+        table = render_registry_pools_table(&rows),
+    );
+    Ok(Html(render_page(
+        "Registry / Pools",
+        "Enabled pool registry rows and latest activity.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
+}
+
+async fn registry_observed_page(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthQuery>,
+) -> Result<Html<String>, axum::http::StatusCode> {
+    if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
+        return Ok(Html(render_login()));
+    }
+    let rows = fetch_observed_pools(&state.pool)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let content = format!(
+        r#"{nav}
+        <section class="card">
+          <h2>Observed Pools</h2>
+          <div class="card-body">{table}</div>
+        </section>"#,
+        nav = render_registry_nav(auth.password.as_deref(), "observed"),
+        table = render_observed_pools_table(&rows),
+    );
+    Ok(Html(render_page(
+        "Registry / Observed",
+        "Pools observed from competitor traces and import status.",
+        auth.password.as_deref(),
+        None,
+        &content,
+    )))
 }
 
 async fn activity_page(
@@ -1505,28 +1650,13 @@ fn summarize_discovery(label: &str, summary: TokenPairDiscoverySummary) -> Strin
 }
 
 async fn render_registry_response(
-    pool: &PgPool,
+    _pool: &PgPool,
     auth_password: Option<&str>,
     flash: Option<&str>,
 ) -> Result<Html<String>, StatusCode> {
-    let token_pairs = fetch_token_pairs(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let token_defaults = fetch_token_search_defaults(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let registry_pools = fetch_registry_pools(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let observed_pools = fetch_observed_pools(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let factories = fetch_factory_registry(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     let content = format!(
         r#"
+        {registry_nav}
         <section class="admin">
           <form method="post" action="/tokens">
             <label>Password
@@ -1541,32 +1671,12 @@ async fn render_registry_response(
           {reconcile_form}
           {import_observed_form}
         </section>
-        <section class="card">
-          <h2>Tokens</h2>
-          <div class="card-body">{}</div>
-        </section>
-        <section class="card">
-          <h2>Token Pairs</h2>
-          <div class="card-body">{}</div>
-        </section>
-        <section class="card">
-          <h2>Factories</h2>
-          <div class="card-body">{}</div>
-        </section>
-        <section class="card">
-          <h2>Pool Registry</h2>
-          <div class="card-body">{}</div>
-        </section>
-        <section class="card">
-          <h2>Observed Pools</h2>
-          <div class="card-body">{}</div>
+        <section class="registry-grid">
+          {registry_cards}
         </section>
         "#,
-        render_token_search_defaults(&token_defaults),
-        render_token_pairs_table(&token_pairs),
-        render_factory_registry_table(&factories),
-        render_registry_pools_table(&registry_pools),
-        render_observed_pools_table(&observed_pools),
+        registry_nav = render_registry_nav(auth_password, "home"),
+        registry_cards = render_registry_cards(auth_password),
         password_input = password_input(None, true),
         rediscover_all_form = render_rediscover_all_form(),
         reconcile_form = render_reconcile_form(),
@@ -2287,6 +2397,56 @@ fn render_page(
       gap: 10px;
       align-items: end;
     }}
+    .registry-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 14px;
+    }}
+    .registry-tab {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--text);
+      text-decoration: none;
+      background: rgba(255,255,255,0.03);
+    }}
+    .registry-tab.active,
+    .registry-tab:hover {{
+      border-color: var(--accent);
+      color: var(--accent);
+      background: rgba(74,210,149,0.08);
+    }}
+    .registry-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
+    }}
+    .registry-card-link {{
+      display: grid;
+      gap: 8px;
+      min-height: 118px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      color: var(--text);
+      text-decoration: none;
+      background:
+        linear-gradient(135deg, rgba(34,167,242,0.10), transparent 40%),
+        rgba(22,27,34,0.72);
+    }}
+    .registry-card-link:hover {{
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }}
+    .registry-card-link strong {{
+      font-size: 16px;
+    }}
+    .registry-card-link span {{
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }}
     .inline-form {{
       display: inline-flex;
       align-items: center;
@@ -2515,8 +2675,7 @@ fn render_page(
       border-bottom: 1px solid var(--line);
     }}
     .card-body {{
-      max-height: 450px;
-      overflow-y: auto;
+      overflow: visible;
     }}
     .table-scroll {{
       width: 100%;
@@ -2894,6 +3053,78 @@ fn render_rediscover_all_form() -> String {
 </form>"#,
         password_input = password_input(Some("password"), false),
     )
+}
+
+fn render_registry_nav(auth_password: Option<&str>, active: &str) -> String {
+    let items = [
+        ("home", "Home", "/registry"),
+        ("tokens", "Tokens", "/registry/tokens"),
+        ("pairs", "Pairs", "/registry/pairs"),
+        ("factories", "Factories", "/registry/factories"),
+        ("pools", "Pools", "/registry/pools"),
+        ("observed", "Observed", "/registry/observed"),
+    ];
+    let links = items
+        .iter()
+        .map(|(key, label, path)| {
+            let class = if *key == active {
+                "registry-tab active"
+            } else {
+                "registry-tab"
+            };
+            format!(
+                r#"<a class="{class}" href="{href}">{label}</a>"#,
+                href = nav_href(path, auth_password),
+                label = escape(label),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(r#"<section class="registry-tabs">{links}</section>"#)
+}
+
+fn render_registry_cards(auth_password: Option<&str>) -> String {
+    [
+        (
+            "Tokens",
+            "Funding anchors and token-level default amounts/min profit.",
+            "/registry/tokens",
+        ),
+        (
+            "Pairs",
+            "Token pairs, pair-level config, discover/disable/delete actions.",
+            "/registry/pairs",
+        ),
+        (
+            "Factories",
+            "Trusted factories and unknown factory candidates from discovery/import.",
+            "/registry/factories",
+        ),
+        (
+            "Pools",
+            "Enabled pool registry rows with factory, variant, fee, and activity.",
+            "/registry/pools",
+        ),
+        (
+            "Observed",
+            "Observed competitor pools and import status.",
+            "/registry/observed",
+        ),
+    ]
+    .iter()
+    .map(|(title, description, href)| {
+        format!(
+            r#"<a class="registry-card-link" href="{href}">
+  <strong>{title}</strong>
+  <span>{description}</span>
+</a>"#,
+            href = nav_href(href, auth_password),
+            title = escape(title),
+            description = escape(description),
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("")
 }
 
 fn render_reconcile_form() -> String {
