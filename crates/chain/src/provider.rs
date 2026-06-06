@@ -21,6 +21,10 @@ const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
 const PANCAKE_V3_FEE_TIERS: [u32; 4] = [100, 500, 2500, 10000];
 const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 7] = [1, 10, 50, 100, 200, 500, 2000];
+const PANCAKE_V3_SWAP_TOPIC: &str =
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
+const CLASSIC_SWAP_TOPIC: &str =
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 
 #[derive(Debug, Clone)]
 pub struct ChainProvider {
@@ -28,6 +32,17 @@ pub struct ChainProvider {
     pub ws_url: String,
     pub chain_id: u64,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedPoolMetadata {
+    pub token0: Address,
+    pub token1: Address,
+    pub factory_address: Option<Address>,
+    pub fee_bps: Option<u32>,
+    pub fee_pips: Option<u32>,
+    pub tick_spacing: Option<i32>,
+    pub stable: Option<bool>,
 }
 
 impl ChainProvider {
@@ -291,6 +306,165 @@ impl ChainProvider {
             .await?;
 
         Ok(out)
+    }
+
+    pub async fn resolve_observed_pool_for_registry(
+        &self,
+        settings: &Settings,
+        pool: Address,
+        topic0: &str,
+    ) -> Result<DiscoveredPool> {
+        let topic0 = topic0.to_ascii_lowercase();
+        let metadata = self.resolve_observed_pool_metadata(pool, &topic0).await?;
+        let token0 = metadata.token0;
+        let token1 = metadata.token1;
+        let factory = metadata.factory_address;
+        let block_number = self.get_block_number().await?;
+        let token0_decimals = self.fetch_token_decimals(token0).await.ok();
+        let token1_decimals = self.fetch_token_decimals(token1).await.ok();
+
+        if topic0 == CLASSIC_SWAP_TOPIC {
+            let expected_factory = settings
+                .aerodrome_pool_factory
+                .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
+            if factory != Some(expected_factory) {
+                anyhow::bail!(
+                    "unsupported classic-v2-compatible factory {}; not enabling for execution",
+                    factory
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            }
+            let stable = metadata.stable.unwrap_or(false);
+            let mut state = self.fetch_aerodrome_pool_state(pool).await?;
+            state.factory_address = Some(expected_factory);
+            state.stable = Some(stable);
+            state.fee_bps = self
+                .fetch_aerodrome_classic_fee_bps(expected_factory, pool, stable)
+                .await
+                .unwrap_or(state.fee_bps);
+            return Ok(DiscoveredPool {
+                state,
+                factory_address: Some(expected_factory),
+                tick_spacing: None,
+                stable: Some(stable),
+                source: "observed_pool_import".to_string(),
+            });
+        }
+
+        let (sqrt_price_x96, tick, liquidity) = self.fetch_uniswap_v3_state(pool).await?;
+        let tick_spacing = metadata.tick_spacing;
+        let fee_pips = metadata.fee_pips;
+
+        let pancake_factory: Address = PANCAKE_V3_FACTORY.parse()?;
+        let uniswap_factory = settings
+            .uniswap_v3_factory
+            .unwrap_or(UNISWAP_V3_FACTORY.parse()?);
+        let slipstream_factories = slipstream_factories(settings)?;
+
+        let (dex, variant, source) =
+            if topic0 == PANCAKE_V3_SWAP_TOPIC || factory == Some(pancake_factory) {
+                (
+                    DexKind::PancakeSwap,
+                    PoolVariant::PancakeV3,
+                    "observed_pancake_v3_import",
+                )
+            } else if factory == Some(uniswap_factory) {
+                (
+                    DexKind::UniswapV3,
+                    PoolVariant::UniswapV3,
+                    "observed_uniswap_v3_import",
+                )
+            } else if factory
+                .map(|factory| slipstream_factories.contains(&factory))
+                .unwrap_or(false)
+            {
+                (
+                    DexKind::Aerodrome,
+                    PoolVariant::AerodromeSlipstream,
+                    "observed_slipstream_import",
+                )
+            } else {
+                anyhow::bail!(
+                    "unsupported v3-compatible factory {}; not enabling for execution",
+                    factory
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            };
+
+        let fee_bps = fee_pips.unwrap_or_default() / 100;
+        Ok(DiscoveredPool {
+            state: PoolState {
+                pool_id: PoolId {
+                    chain_id: self.chain_id,
+                    address: pool,
+                },
+                dex,
+                variant,
+                factory_address: factory,
+                token0,
+                token1,
+                token0_decimals,
+                token1_decimals,
+                fee_bps,
+                fee_pips,
+                stable: None,
+                reserve0: None,
+                reserve1: None,
+                sqrt_price_x96: Some(sqrt_price_x96),
+                liquidity: Some(liquidity),
+                tick: Some(tick),
+                tick_spacing,
+                block_number,
+                updated_at: Utc::now(),
+            },
+            factory_address: factory,
+            tick_spacing,
+            stable: None,
+            source: source.to_string(),
+        })
+    }
+
+    pub async fn resolve_observed_pool_metadata(
+        &self,
+        pool: Address,
+        topic0: &str,
+    ) -> Result<ObservedPoolMetadata> {
+        let topic0 = topic0.to_ascii_lowercase();
+        let (token0, token1) = self.fetch_pool_tokens(pool).await?;
+        let factory_address = self.fetch_pool_factory(pool).await.ok();
+        let mut fee_pips = None;
+        let fee_bps;
+        let mut tick_spacing = None;
+        let mut stable = None;
+
+        if topic0 == CLASSIC_SWAP_TOPIC {
+            stable = self.fetch_pool_stable(pool).await.ok();
+            fee_bps = self.fetch_classic_pool_fee_bps(pool).await.ok();
+        } else {
+            fee_pips = self.fetch_v3_fee_pips(pool).await.ok();
+            tick_spacing = self.fetch_tick_spacing(pool).await.ok();
+            if fee_pips.is_none() {
+                if let Some(factory) = factory_address {
+                    fee_pips = self
+                        .fetch_aerodrome_slipstream_fee_pips(factory, pool)
+                        .await
+                        .ok();
+                }
+            }
+            fee_bps = fee_pips.map(|fee| fee / 100);
+        }
+
+        Ok(ObservedPoolMetadata {
+            token0,
+            token1,
+            factory_address,
+            fee_bps,
+            fee_pips,
+            tick_spacing,
+            stable,
+        })
     }
 
     pub async fn fetch_erc20_symbol(&self, token: Address) -> Result<String> {
@@ -1037,6 +1211,30 @@ impl ChainProvider {
             parse_word_address(&token0_words[0])?,
             parse_word_address(&token1_words[0])?,
         ))
+    }
+
+    async fn fetch_pool_factory(&self, pool: Address) -> Result<Address> {
+        let raw = self.eth_call(pool, "0xc45a0155", "factory()").await?;
+        let words = decode_32byte_words(&raw)?;
+        parse_word_address(&words[0])
+    }
+
+    async fn fetch_pool_stable(&self, pool: Address) -> Result<bool> {
+        let raw = self.eth_call(pool, "0x22be3de1", "stable()").await?;
+        let words = decode_32byte_words(&raw)?;
+        Ok(!parse_word_u256(&words[0])?.is_zero())
+    }
+
+    async fn fetch_v3_fee_pips(&self, pool: Address) -> Result<u32> {
+        let raw = self.eth_call(pool, "0xddca3f43", "fee()").await?;
+        decode_fee_pips(&raw)
+    }
+
+    async fn fetch_classic_pool_fee_bps(&self, pool: Address) -> Result<u32> {
+        let raw = self.eth_call(pool, "0x30adf81f", "fee()").await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("classic pool fee too large: {fee}"))
     }
 
     async fn fetch_token_decimals(&self, token: Address) -> Result<u8> {

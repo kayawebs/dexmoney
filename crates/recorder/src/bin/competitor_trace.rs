@@ -128,8 +128,24 @@ async fn main() -> Result<()> {
 
     print_scope(&cli, from_block, to_block)?;
     print_counterparty_ladder(&store.pool, &cli, from_block, to_block).await?;
-    print_seed_pool_coverage(&store.pool, &provider, &settings, &cli, from_block, to_block).await?;
-    print_counterparty_cached_pool_coverage(&store.pool, &provider, &settings, &cli, from_block, to_block).await?;
+    print_seed_pool_coverage(
+        &store.pool,
+        &provider,
+        &settings,
+        &cli,
+        from_block,
+        to_block,
+    )
+    .await?;
+    print_counterparty_cached_pool_coverage(
+        &store.pool,
+        &provider,
+        &settings,
+        &cli,
+        from_block,
+        to_block,
+    )
+    .await?;
     print_next_commands(&store.pool, &cli, from_block, to_block).await?;
 
     if let Some(path) = cli.output.as_deref() {
@@ -333,7 +349,9 @@ async fn print_counterparty_ladder(
 
     println!("== Collector Inbound Counterparties ==");
     if rows.is_empty() {
-        println!("no cached inbound transfers; run competitor_report --hydrate-all for collector first");
+        println!(
+            "no cached inbound transfers; run competitor_report --hydrate-all for collector first"
+        );
         println!();
         return Ok(());
     }
@@ -382,7 +400,13 @@ async fn print_seed_pool_coverage(
         cli.pool_limit,
     )
     .await?;
-    print_pool_hits("== Collector Related Swap Pool Coverage ==", provider, settings, rows).await
+    print_pool_hits(
+        "== Collector Related Swap Pool Coverage ==",
+        provider,
+        settings,
+        rows,
+    )
+    .await
 }
 
 async fn print_counterparty_cached_pool_coverage(
@@ -628,9 +652,10 @@ fn print_pair_summary(hits: &[ResolvedPoolHit]) {
         summary.pools += 1;
         summary.pool_txs_sum += hit.row.txs;
         summary.logs += hit.row.swap_logs;
-        summary
-            .protocols
-            .insert(format!("{}:{}", hit.resolved.inferred_dex, hit.resolved.inferred_variant));
+        summary.protocols.insert(format!(
+            "{}:{}",
+            hit.resolved.inferred_dex, hit.resolved.inferred_variant
+        ));
         match hit.status {
             "ready" => summary.ready_pools += 1,
             "missing_registry" => summary.missing_registry_pools += 1,

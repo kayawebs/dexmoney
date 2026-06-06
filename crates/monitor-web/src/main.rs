@@ -12,7 +12,10 @@ use axum::{
     Router,
 };
 use base_arb_chain::provider::ChainProvider;
-use base_arb_common::config::Settings;
+use base_arb_common::{
+    config::Settings,
+    types::{DexKind, DiscoveredPool, PoolVariant},
+};
 use base_arb_storage::{
     postgres::{ensure_registry_schema, PostgresStore},
     redis::RedisStore,
@@ -20,7 +23,7 @@ use base_arb_storage::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Row};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +44,13 @@ const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
   <path d="M28 32h8" stroke="#4ad295" stroke-width="3" stroke-linecap="round"/>
   <path d="M32 28v8" stroke="#22a7f2" stroke-width="3" stroke-linecap="round"/>
 </svg>"##;
+const UNI_V3_SWAP_TOPIC: &str =
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const PANCAKE_V3_SWAP_TOPIC: &str =
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
+const CLASSIC_SWAP_TOPIC: &str =
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
 
 #[derive(Clone)]
 struct AppState {
@@ -213,6 +223,21 @@ struct PoolRegistryRow {
     source: String,
 }
 
+#[derive(Debug, FromRow)]
+struct ObservedPoolRow {
+    updated_at: DateTime<Utc>,
+    symbol: Option<String>,
+    pool_address: String,
+    family: String,
+    dex: Option<String>,
+    variant: Option<String>,
+    factory_address: Option<String>,
+    txs_30d: i64,
+    logs_30d: i64,
+    import_status: String,
+    import_reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AddTokenForm {
     password: String,
@@ -229,6 +254,20 @@ struct RediscoverPairForm {
 #[derive(Debug, Deserialize)]
 struct RediscoverAllPairsForm {
     password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconcileRegistryForm {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportObservedPoolsForm {
+    password: String,
+    address: String,
+    days: Option<i64>,
+    min_pool_txs: Option<i64>,
+    pool_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +307,18 @@ struct TokenUpdateChange {
     became_anchor: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ObservedPoolCandidate {
+    pool_address: String,
+    topic0: String,
+    family: String,
+    swap_logs: i64,
+    txs: i64,
+    first_block: i64,
+    latest_block: i64,
+    registry_symbol: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
@@ -298,6 +349,8 @@ async fn main() -> Result<()> {
         .route("/tokens", post(add_token))
         .route("/pairs/rediscover", post(rediscover_pair))
         .route("/pairs/rediscover-all", post(rediscover_all_pairs))
+        .route("/registry/reconcile", post(reconcile_registry))
+        .route("/registry/import-observed", post(import_observed_pools))
         .route("/pairs/delete", post(delete_pair))
         .route("/pairs/remove", post(remove_pair))
         .route("/pairs/search-config", post(update_pair_search_config))
@@ -623,6 +676,206 @@ async fn rediscover_all_pairs(
     let message = format!(
         "rediscovered enabled pairs: {succeeded} succeeded, {} failed, {discovered_total} pools discovered; {failure_summary}",
         failed.len()
+    );
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
+async fn reconcile_registry(
+    State(state): State<AppState>,
+    Form(form): Form<ReconcileRegistryForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+
+    let anchors = fetch_funding_anchors(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if anchors.is_empty() {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("no funding anchors configured; set token defaults first"),
+        )
+        .await;
+    }
+
+    let mut total = TokenPairDiscoverySummary::default();
+    for anchor in anchors {
+        let summary = discover_pairs_for_anchor(&state, anchor).await;
+        total.attempted += summary.attempted;
+        total.succeeded += summary.succeeded;
+        total.discovered_pools += summary.discovered_pools;
+        total.skipped += summary.skipped;
+        total.failed.extend(summary.failed);
+    }
+
+    let message = summarize_discovery("registry reconcile", total);
+    render_registry_response(&state.pool, None, Some(&message)).await
+}
+
+async fn import_observed_pools(
+    State(state): State<AppState>,
+    Form(form): Form<ImportObservedPoolsForm>,
+) -> Result<Html<String>, StatusCode> {
+    if !password_matches(state.admin_password.as_deref(), &form.password) {
+        return render_registry_response(
+            &state.pool,
+            None,
+            Some("unauthorized: invalid monitor password"),
+        )
+        .await;
+    }
+    let address: Address = match form.address.trim().parse() {
+        Ok(address) => address,
+        Err(_) => {
+            return render_registry_response(&state.pool, None, Some("invalid observed address"))
+                .await;
+        }
+    };
+    let days = form.days.unwrap_or(30).max(1);
+    let min_pool_txs = form.min_pool_txs.unwrap_or(100).max(1);
+    let pool_limit = form.pool_limit.unwrap_or(200).max(1);
+    let to_block = state
+        .provider
+        .get_block_number()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let from_block =
+        to_block.saturating_sub((days as u64).saturating_mul(APPROX_BASE_BLOCKS_PER_DAY));
+    let rows = fetch_observed_pool_candidates(
+        &state.pool,
+        address,
+        from_block,
+        to_block,
+        min_pool_txs,
+        pool_limit,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut imported = 0usize;
+    let mut observed_only = 0usize;
+    let mut already_registered = 0usize;
+    let store = PostgresStore {
+        pool: (*state.pool).clone(),
+    };
+
+    for row in rows {
+        let pool_address: Address = match row.pool_address.parse() {
+            Ok(address) => address,
+            Err(err) => {
+                observed_only += 1;
+                info!(pool = %row.pool_address, error = %err, "observed pool address parse failed");
+                continue;
+            }
+        };
+        if row.registry_symbol.is_some() {
+            already_registered += 1;
+        }
+        match state
+            .provider
+            .resolve_observed_pool_for_registry(&state.settings, pool_address, &row.topic0)
+            .await
+        {
+            Ok(discovered) => {
+                let symbol = pair_symbol(
+                    &state.provider,
+                    discovered.state.token0,
+                    discovered.state.token1,
+                )
+                .await;
+                upsert_token_registry(
+                    &state.pool,
+                    state.settings.chain_id,
+                    discovered.state.token0,
+                    symbol.split('/').next().unwrap_or_default(),
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                upsert_token_registry(
+                    &state.pool,
+                    state.settings.chain_id,
+                    discovered.state.token1,
+                    symbol.split('/').nth(1).unwrap_or_default(),
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let (token0, token1) =
+                    canonical_pair(discovered.state.token0, discovered.state.token1);
+                let pair_id = store
+                    .upsert_token_pair(state.settings.chain_id, token0, token1, &symbol)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                store
+                    .upsert_discovered_pool(pair_id, &discovered)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                upsert_observed_pool_row(
+                    &store,
+                    state.settings.chain_id,
+                    &row,
+                    pool_address,
+                    Some(&discovered),
+                    Some(&symbol),
+                    "imported",
+                    None,
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                imported += 1;
+            }
+            Err(err) => {
+                let metadata = state
+                    .provider
+                    .resolve_observed_pool_metadata(pool_address, &row.topic0)
+                    .await
+                    .ok();
+                let symbol = match metadata.as_ref() {
+                    Some(metadata) => {
+                        Some(pair_symbol(&state.provider, metadata.token0, metadata.token1).await)
+                    }
+                    None => None,
+                };
+                store
+                    .upsert_observed_pool(
+                        state.settings.chain_id,
+                        pool_address,
+                        &row.topic0,
+                        &row.family,
+                        metadata.as_ref().map(|metadata| metadata.token0),
+                        metadata.as_ref().map(|metadata| metadata.token1),
+                        symbol.as_deref(),
+                        metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.factory_address),
+                        None,
+                        None,
+                        metadata.as_ref().and_then(|metadata| metadata.fee_bps),
+                        metadata.as_ref().and_then(|metadata| metadata.fee_pips),
+                        metadata.as_ref().and_then(|metadata| metadata.tick_spacing),
+                        metadata.as_ref().and_then(|metadata| metadata.stable),
+                        row.txs,
+                        row.swap_logs,
+                        Some(row.first_block),
+                        Some(row.latest_block),
+                        "observed_only",
+                        Some(&err.to_string()),
+                    )
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                observed_only += 1;
+            }
+        }
+    }
+
+    let message = format!(
+        "observed pool import: imported {imported}, observed-only {observed_only}, already registered {already_registered}, blocks {from_block}..{to_block}"
     );
     render_registry_response(&state.pool, None, Some(&message)).await
 }
@@ -1141,6 +1394,9 @@ async fn render_registry_response(
     let registry_pools = fetch_registry_pools(pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let observed_pools = fetch_observed_pools(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let content = format!(
         r#"
@@ -1155,6 +1411,8 @@ async fn render_registry_response(
             <button type="submit">Add Token + Discover Anchor Pairs</button>
           </form>
           {rediscover_all_form}
+          {reconcile_form}
+          {import_observed_form}
         </section>
         <section class="card">
           <h2>Tokens</h2>
@@ -1168,12 +1426,19 @@ async fn render_registry_response(
           <h2>Pool Registry</h2>
           <div class="card-body">{}</div>
         </section>
+        <section class="card">
+          <h2>Observed Pools</h2>
+          <div class="card-body">{}</div>
+        </section>
         "#,
         render_token_search_defaults(&token_defaults),
         render_token_pairs_table(&token_pairs),
         render_registry_pools_table(&registry_pools),
+        render_observed_pools_table(&observed_pools),
         password_input = password_input(None, true),
         rediscover_all_form = render_rediscover_all_form(),
+        reconcile_form = render_reconcile_form(),
+        import_observed_form = render_import_observed_form(),
     );
 
     Ok(Html(render_page(
@@ -1408,6 +1673,44 @@ async fn upsert_token_registry(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn upsert_observed_pool_row(
+    store: &PostgresStore,
+    chain_id: u64,
+    row: &ObservedPoolCandidate,
+    pool_address: Address,
+    discovered: Option<&DiscoveredPool>,
+    symbol: Option<&str>,
+    import_status: &str,
+    import_reason: Option<&str>,
+) -> Result<()> {
+    let state = discovered.map(|discovered| &discovered.state);
+    store
+        .upsert_observed_pool(
+            chain_id,
+            pool_address,
+            &row.topic0,
+            &row.family,
+            state.map(|state| state.token0),
+            state.map(|state| state.token1),
+            symbol,
+            discovered.and_then(|discovered| discovered.factory_address),
+            state.map(|state| dex_to_string(state.dex)),
+            state.map(|state| variant_to_string(state.variant)),
+            state.map(|state| state.fee_bps),
+            state.and_then(|state| state.fee_pips),
+            discovered.and_then(|discovered| discovered.tick_spacing),
+            discovered.and_then(|discovered| discovered.stable),
+            row.txs,
+            row.swap_logs,
+            Some(row.first_block),
+            Some(row.latest_block),
+            import_status,
+            import_reason,
+        )
+        .await
+}
+
 async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
     Ok(sqlx::query_as::<_, PoolRegistryRow>(
         r#"
@@ -1445,6 +1748,113 @@ async fn fetch_registry_pools(pool: &PgPool) -> Result<Vec<PoolRegistryRow>> {
     )
     .fetch_all(pool)
     .await?)
+}
+
+async fn fetch_observed_pools(pool: &PgPool) -> Result<Vec<ObservedPoolRow>> {
+    Ok(sqlx::query_as::<_, ObservedPoolRow>(
+        r#"
+        SELECT
+            updated_at,
+            symbol,
+            pool_address,
+            family,
+            dex,
+            variant,
+            factory_address,
+            txs_30d,
+            logs_30d,
+            import_status,
+            import_reason
+        FROM observed_pools
+        ORDER BY updated_at DESC, txs_30d DESC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_observed_pool_candidates(
+    pool: &PgPool,
+    address: Address,
+    from_block: u64,
+    to_block: u64,
+    min_pool_txs: i64,
+    pool_limit: i64,
+) -> Result<Vec<ObservedPoolCandidate>> {
+    let seed = format!("{address:#x}").to_ascii_lowercase();
+    let rows = sqlx::query(
+        r#"
+        WITH related AS (
+            SELECT DISTINCT lower(tx_hash) AS tx_hash
+            FROM observed_address_transfers
+            WHERE lower(seed_address) = lower($1)
+              AND block_number BETWEEN $2 AND $3
+        ),
+        swap_logs AS (
+            SELECT
+                lower(log->>'address') AS pool_address,
+                lower(log->'topics'->>0) AS topic0,
+                lower(ot.tx_hash) AS tx_hash,
+                ot.block_number
+            FROM observed_transactions ot
+            JOIN related r ON lower(r.tx_hash) = lower(ot.tx_hash)
+            CROSS JOIN LATERAL jsonb_array_elements(ot.receipt_json->'logs') AS log
+            WHERE lower(log->'topics'->>0) = ANY($4)
+              AND ot.block_number BETWEEN $2 AND $3
+        )
+        SELECT
+            sl.pool_address,
+            sl.topic0,
+            CASE sl.topic0
+                WHEN $5 THEN 'v3/slipstream'
+                WHEN $6 THEN 'pancake-v3'
+                WHEN $7 THEN 'classic-v2'
+                ELSE sl.topic0
+            END AS family,
+            COUNT(*)::bigint AS swap_logs,
+            COUNT(DISTINCT sl.tx_hash)::bigint AS txs,
+            MIN(sl.block_number)::bigint AS first_block,
+            MAX(sl.block_number)::bigint AS latest_block,
+            tp.symbol AS registry_symbol
+        FROM swap_logs sl
+        LEFT JOIN pools p ON lower(p.pool_address) = sl.pool_address
+        LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+        GROUP BY sl.pool_address, sl.topic0, tp.symbol
+        HAVING COUNT(DISTINCT sl.tx_hash) >= $8
+        ORDER BY COUNT(DISTINCT sl.tx_hash) DESC, COUNT(*) DESC
+        LIMIT $9
+        "#,
+    )
+    .bind(seed)
+    .bind(i64::try_from(from_block)?)
+    .bind(i64::try_from(to_block)?)
+    .bind(vec![
+        UNI_V3_SWAP_TOPIC.to_string(),
+        PANCAKE_V3_SWAP_TOPIC.to_string(),
+        CLASSIC_SWAP_TOPIC.to_string(),
+    ])
+    .bind(UNI_V3_SWAP_TOPIC)
+    .bind(PANCAKE_V3_SWAP_TOPIC)
+    .bind(CLASSIC_SWAP_TOPIC)
+    .bind(min_pool_txs)
+    .bind(pool_limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ObservedPoolCandidate {
+            pool_address: row.get("pool_address"),
+            topic0: row.get("topic0"),
+            family: row.get("family"),
+            swap_logs: row.get("swap_logs"),
+            txs: row.get("txs"),
+            first_block: row.get("first_block"),
+            latest_block: row.get("latest_block"),
+            registry_symbol: row.get("registry_symbol"),
+        })
+        .collect())
 }
 
 async fn fetch_dex_events(pool: &PgPool) -> Result<Vec<DexEventRow>> {
@@ -2309,6 +2719,42 @@ fn render_rediscover_all_form() -> String {
     )
 }
 
+fn render_reconcile_form() -> String {
+    format!(
+        r#"<form method="post" action="/registry/reconcile" onsubmit="return confirm('Reconcile all funding anchors against enabled tokens? This will call pool factories and update registry rows.');">
+  <label>Password
+    {password_input}
+  </label>
+  <button type="submit">Reconcile Existing Tokens</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
+    )
+}
+
+fn render_import_observed_form() -> String {
+    format!(
+        r#"<form method="post" action="/registry/import-observed" onsubmit="return confirm('Import observed pools from cached competitor transactions? Supported pools will be enabled; unsupported pools are recorded as observed-only.');">
+  <label>Password
+    {password_input}
+  </label>
+  <label>Observed Address
+    <input name="address" placeholder="0x collector or counterparty" required>
+  </label>
+  <label>Days
+    <input name="days" value="30" inputmode="numeric">
+  </label>
+  <label>Min Pool Txs
+    <input name="min_pool_txs" value="100" inputmode="numeric">
+  </label>
+  <label>Pool Limit
+    <input name="pool_limit" value="200" inputmode="numeric">
+  </label>
+  <button type="submit">Import Observed Pools</button>
+</form>"#,
+        password_input = password_input(Some("password"), false),
+    )
+}
+
 fn render_delete_pair_form(row: &TokenPairRow) -> String {
     format!(
         r#"<form method="post" action="/pairs/delete" class="inline-form" onsubmit="return promptPasswordSubmit(this, 'Disable pair {symbol}?')">
@@ -2367,6 +2813,33 @@ fn render_registry_pools_table(rows: &[PoolRegistryRow]) -> String {
     }
     if rows.is_empty() {
         html.push_str("<tr><td colspan=\"14\">No rows yet.</td></tr>");
+    }
+    html.push_str("</tbody></table></div>");
+    html
+}
+
+fn render_observed_pools_table(rows: &[ObservedPoolRow]) -> String {
+    let mut html = String::from(
+        "<div class=\"table-scroll\"><table><thead><tr><th>Updated</th><th>Pair</th><th>Pool</th><th>Family</th><th>DEX</th><th>Variant</th><th>Factory</th><th>Txs 30d</th><th>Logs 30d</th><th>Status</th><th>Reason</th></tr></thead><tbody>",
+    );
+    for row in rows {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            fmt_ts(row.updated_at),
+            row.symbol.as_deref().map(escape).unwrap_or_else(|| "-".into()),
+            copyable(&row.pool_address),
+            escape(&row.family),
+            row.dex.as_deref().map(escape).unwrap_or_else(|| "-".into()),
+            row.variant.as_deref().map(escape).unwrap_or_else(|| "-".into()),
+            copyable_optional(row.factory_address.as_deref()),
+            row.txs_30d,
+            row.logs_30d,
+            escape(&row.import_status),
+            row.import_reason.as_deref().map(escape).unwrap_or_else(|| "-".into()),
+        ));
+    }
+    if rows.is_empty() {
+        html.push_str("<tr><td colspan=\"11\">No observed pool imports yet.</td></tr>");
     }
     html.push_str("</tbody></table></div>");
     html
@@ -2848,4 +3321,21 @@ async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
 fn short_address(address: Address) -> String {
     let value = format!("{address:#x}");
     value.chars().take(8).collect()
+}
+
+fn dex_to_string(dex: DexKind) -> &'static str {
+    match dex {
+        DexKind::Aerodrome => "Aerodrome",
+        DexKind::UniswapV3 => "UniswapV3",
+        DexKind::PancakeSwap => "PancakeSwap",
+    }
+}
+
+fn variant_to_string(variant: PoolVariant) -> &'static str {
+    match variant {
+        PoolVariant::AerodromeVolatile => "AerodromeVolatile",
+        PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
+        PoolVariant::UniswapV3 => "UniswapV3",
+        PoolVariant::PancakeV3 => "PancakeV3",
+    }
 }

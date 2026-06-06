@@ -98,6 +98,88 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_observed_pool(
+        &self,
+        chain_id: u64,
+        pool_address: Address,
+        topic0: &str,
+        family: &str,
+        token0: Option<Address>,
+        token1: Option<Address>,
+        symbol: Option<&str>,
+        factory_address: Option<Address>,
+        dex: Option<&str>,
+        variant: Option<&str>,
+        fee_bps: Option<u32>,
+        fee_pips: Option<u32>,
+        tick_spacing: Option<i32>,
+        stable: Option<bool>,
+        txs_30d: i64,
+        logs_30d: i64,
+        first_block: Option<i64>,
+        latest_block: Option<i64>,
+        import_status: &str,
+        import_reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO observed_pools (
+                chain_id, pool_address, topic0, family, token0, token1, symbol,
+                factory_address, dex, variant, fee_bps, fee_pips, tick_spacing, stable,
+                txs_30d, logs_30d, first_block, latest_block, import_status, import_reason,
+                created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),NOW()
+            )
+            ON CONFLICT (chain_id, pool_address)
+            DO UPDATE SET
+                topic0 = EXCLUDED.topic0,
+                family = EXCLUDED.family,
+                token0 = EXCLUDED.token0,
+                token1 = EXCLUDED.token1,
+                symbol = EXCLUDED.symbol,
+                factory_address = EXCLUDED.factory_address,
+                dex = EXCLUDED.dex,
+                variant = EXCLUDED.variant,
+                fee_bps = EXCLUDED.fee_bps,
+                fee_pips = EXCLUDED.fee_pips,
+                tick_spacing = EXCLUDED.tick_spacing,
+                stable = EXCLUDED.stable,
+                txs_30d = EXCLUDED.txs_30d,
+                logs_30d = EXCLUDED.logs_30d,
+                first_block = EXCLUDED.first_block,
+                latest_block = EXCLUDED.latest_block,
+                import_status = EXCLUDED.import_status,
+                import_reason = EXCLUDED.import_reason,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(pool_address))
+        .bind(topic0.to_ascii_lowercase())
+        .bind(family)
+        .bind(token0.map(address_to_string))
+        .bind(token1.map(address_to_string))
+        .bind(symbol)
+        .bind(factory_address.map(address_to_string))
+        .bind(dex)
+        .bind(variant)
+        .bind(fee_bps.map(i64::from))
+        .bind(fee_pips.map(i64::from))
+        .bind(tick_spacing.map(i64::from))
+        .bind(stable)
+        .bind(txs_30d)
+        .bind(logs_30d)
+        .bind(first_block)
+        .bind(latest_block)
+        .bind(import_status)
+        .bind(import_reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn update_token_pair_search_config(
         &self,
         chain_id: u64,
@@ -742,6 +824,36 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS tokens_enabled_idx
             ON tokens (chain_id, enabled, symbol)"#,
+        r#"CREATE TABLE IF NOT EXISTS observed_pools (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            topic0 TEXT NOT NULL,
+            family TEXT NOT NULL,
+            token0 TEXT,
+            token1 TEXT,
+            symbol TEXT,
+            factory_address TEXT,
+            dex TEXT,
+            variant TEXT,
+            fee_bps BIGINT,
+            fee_pips BIGINT,
+            tick_spacing BIGINT,
+            stable BOOLEAN,
+            txs_30d BIGINT NOT NULL DEFAULT 0,
+            logs_30d BIGINT NOT NULL DEFAULT 0,
+            first_block BIGINT,
+            latest_block BIGINT,
+            import_status TEXT NOT NULL,
+            import_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, pool_address)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS observed_pools_status_idx
+            ON observed_pools (chain_id, import_status, txs_30d DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS observed_pools_symbol_idx
+            ON observed_pools (chain_id, symbol, txs_30d DESC)"#,
         r#"ALTER TABLE simulations
             ADD COLUMN IF NOT EXISTS block_number BIGINT,
             ADD COLUMN IF NOT EXISTS token_in TEXT,
