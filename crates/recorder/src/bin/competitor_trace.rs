@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::Arguments,
     fs::File,
@@ -23,6 +24,13 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
+const AERODROME_CLASSIC_FACTORY: &str = "0x420dd381b31aef6683db6b902084cb0ffece40da";
+const AERODROME_SLIPSTREAM_FACTORIES: [&str; 2] = [
+    "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a",
+    "0xade65c38cd4849adba595a4323a8c7ddfe89716a",
+];
+const PANCAKE_V3_FACTORY: &str = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865";
+const UNISWAP_V3_FACTORY: &str = "0x33128a8fc17869897dce68ed026d694621f6fdfd";
 
 static REPORT_OUTPUT: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
@@ -80,6 +88,26 @@ struct ResolvedPool {
     inferred_dex: String,
     inferred_variant: String,
     resolve_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPoolHit {
+    row: PoolHit,
+    resolved: ResolvedPool,
+    pair: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct PairSummary {
+    pools: usize,
+    pool_txs_sum: i64,
+    logs: i64,
+    ready_pools: usize,
+    missing_registry_pools: usize,
+    missing_state_pools: usize,
+    disabled_pools: usize,
+    protocols: BTreeSet<String>,
 }
 
 #[tokio::main]
@@ -516,6 +544,7 @@ async fn print_pool_hits(
         return Ok(());
     }
 
+    let mut resolved_hits = Vec::with_capacity(rows.len());
     for row in rows {
         let pool_address = Address::from_str(&row.pool_address)
             .with_context(|| format!("invalid pool address {}", row.pool_address))?;
@@ -544,39 +573,98 @@ async fn print_pool_hits(
             (Some(token0), Some(token1)) => format!("{token0}/{token1}"),
             _ => "-".into(),
         };
+        let status = coverage_status(&row);
+        resolved_hits.push(ResolvedPoolHit {
+            row,
+            resolved,
+            pair,
+            status,
+        });
+    }
+
+    print_pair_summary(&resolved_hits);
+    println!("-- Pool Details --");
+
+    for hit in resolved_hits {
         println!(
             "status={} pool={:#x} txs={} logs={} blocks={}..{} family={} pair={} token0={} token1={} factory={} inferred={}:{} fee_pips={} fee_bps={} tick_spacing={} stable={} registry_symbol={} registry={}:{} pair_enabled={} pool_enabled={} state_block={} state_source={} error={}",
-            coverage_status(&row),
-            resolved.pool,
-            row.txs,
-            row.swap_logs,
-            row.first_block,
-            row.latest_block,
-            row.family,
-            pair,
-            fmt_addr(resolved.token0),
-            fmt_addr(resolved.token1),
-            fmt_addr(resolved.factory),
-            resolved.inferred_dex,
-            resolved.inferred_variant,
-            fmt_opt_u32(resolved.fee_pips),
-            fmt_opt_u32(resolved.fee_bps),
-            fmt_opt_i32(resolved.tick_spacing),
-            fmt_opt_bool(resolved.stable),
-            row.registry_symbol.as_deref().unwrap_or("-"),
-            row.registry_dex.as_deref().unwrap_or("-"),
-            row.registry_variant.as_deref().unwrap_or("-"),
-            fmt_opt_bool(row.pair_enabled),
-            fmt_opt_bool(row.pool_enabled),
-            row.latest_state_block
+            hit.status,
+            hit.resolved.pool,
+            hit.row.txs,
+            hit.row.swap_logs,
+            hit.row.first_block,
+            hit.row.latest_block,
+            hit.row.family,
+            hit.pair,
+            fmt_addr(hit.resolved.token0),
+            fmt_addr(hit.resolved.token1),
+            fmt_addr(hit.resolved.factory),
+            hit.resolved.inferred_dex,
+            hit.resolved.inferred_variant,
+            fmt_opt_u32(hit.resolved.fee_pips),
+            fmt_opt_u32(hit.resolved.fee_bps),
+            fmt_opt_i32(hit.resolved.tick_spacing),
+            fmt_opt_bool(hit.resolved.stable),
+            hit.row.registry_symbol.as_deref().unwrap_or("-"),
+            hit.row.registry_dex.as_deref().unwrap_or("-"),
+            hit.row.registry_variant.as_deref().unwrap_or("-"),
+            fmt_opt_bool(hit.row.pair_enabled),
+            fmt_opt_bool(hit.row.pool_enabled),
+            hit.row.latest_state_block
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
-            row.latest_state_source.as_deref().unwrap_or("-"),
-            resolved.resolve_error.as_deref().unwrap_or("-"),
+            hit.row.latest_state_source.as_deref().unwrap_or("-"),
+            hit.resolved.resolve_error.as_deref().unwrap_or("-"),
         );
     }
     println!();
     Ok(())
+}
+
+fn print_pair_summary(hits: &[ResolvedPoolHit]) {
+    let mut summaries = BTreeMap::<String, PairSummary>::new();
+    for hit in hits {
+        let summary = summaries.entry(hit.pair.clone()).or_default();
+        summary.pools += 1;
+        summary.pool_txs_sum += hit.row.txs;
+        summary.logs += hit.row.swap_logs;
+        summary
+            .protocols
+            .insert(format!("{}:{}", hit.resolved.inferred_dex, hit.resolved.inferred_variant));
+        match hit.status {
+            "ready" => summary.ready_pools += 1,
+            "missing_registry" => summary.missing_registry_pools += 1,
+            "missing_state" => summary.missing_state_pools += 1,
+            "disabled" => summary.disabled_pools += 1,
+            _ => {}
+        }
+    }
+
+    let mut summaries = summaries.into_iter().collect::<Vec<_>>();
+    summaries.sort_by(|(_, left), (_, right)| {
+        right
+            .pool_txs_sum
+            .cmp(&left.pool_txs_sum)
+            .then_with(|| right.pools.cmp(&left.pools))
+    });
+
+    println!("-- Pair Summary --");
+    for (pair, summary) in summaries {
+        let protocols = summary.protocols.into_iter().collect::<Vec<_>>().join(",");
+        println!(
+            "pair={} pools={} pool_txs_sum={} logs={} ready={} missing_registry={} missing_state={} disabled={} protocols={}",
+            pair,
+            summary.pools,
+            summary.pool_txs_sum,
+            summary.logs,
+            summary.ready_pools,
+            summary.missing_registry_pools,
+            summary.missing_state_pools,
+            summary.disabled_pools,
+            protocols,
+        );
+    }
+    println!();
 }
 
 async fn print_next_commands(
@@ -689,19 +777,39 @@ async fn resolve_pool(
 }
 
 fn infer_protocol(settings: &Settings, topic0: &str, factory: Option<Address>) -> (String, String) {
-    if topic0 == PANCAKE_V3_SWAP_TOPIC {
+    let factory_hex = factory.map(|address| format!("{address:#x}"));
+    let is_factory = |target: &str| {
+        factory_hex
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(target))
+            .unwrap_or(false)
+    };
+
+    if topic0 == PANCAKE_V3_SWAP_TOPIC || is_factory(PANCAKE_V3_FACTORY) {
         return ("PancakeSwap".into(), "PancakeV3".into());
     }
     if topic0 == CLASSIC_SWAP_TOPIC {
-        return ("Aerodrome".into(), "AerodromeVolatile".into());
+        if is_factory(AERODROME_CLASSIC_FACTORY) {
+            return ("Aerodrome".into(), "AerodromeVolatile".into());
+        }
+        return ("ClassicV2Compatible".into(), "ClassicV2".into());
     }
     if factory == settings.aerodrome_slipstream_factory {
+        return ("Aerodrome".into(), "AerodromeSlipstream".into());
+    }
+    if AERODROME_SLIPSTREAM_FACTORIES
+        .iter()
+        .any(|target| is_factory(target))
+    {
         return ("Aerodrome".into(), "AerodromeSlipstream".into());
     }
     if factory == settings.uniswap_v3_factory {
         return ("UniswapV3".into(), "UniswapV3".into());
     }
-    ("UniswapV3".into(), "UniswapV3".into())
+    if is_factory(UNISWAP_V3_FACTORY) {
+        return ("UniswapV3".into(), "UniswapV3".into());
+    }
+    ("V3Compatible".into(), "V3".into())
 }
 
 async fn call_address(
