@@ -17,6 +17,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
+const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 16;
+const MAX_SIMULATIONS_PER_CYCLE: usize = 4;
 const MIN_CANDIDATE_SEEN_TTL_SECS: u64 = 10;
 
 #[tokio::main]
@@ -84,10 +86,61 @@ where
         eoa_store.set_lane_state(lane.state.clone()).await?;
     }
 
-    let Some(candidate) = pop_fresh_candidate(candidate_store).await? else {
+    let candidates = pop_fresh_candidates(candidate_store).await?;
+    if candidates.is_empty() {
         debug!("no candidate available");
         return Ok(());
     };
+
+    let mut simulated = 0usize;
+    for candidate in candidates {
+        if simulated >= MAX_SIMULATIONS_PER_CYCLE {
+            break;
+        }
+        match handle_candidate(
+            candidate_store,
+            eoa_store,
+            recorder,
+            provider,
+            settings,
+            min_simulated_profit_usdc,
+            operator,
+            wallet.as_ref(),
+            &candidate,
+        )
+        .await?
+        {
+            CandidateAction::Submitted => return Ok(()),
+            CandidateAction::Simulated => simulated += 1,
+            CandidateAction::Skipped => {}
+        }
+    }
+
+    Ok(())
+}
+
+enum CandidateAction {
+    Skipped,
+    Simulated,
+    Submitted,
+}
+
+async fn handle_candidate<C, E, R>(
+    candidate_store: &C,
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    min_simulated_profit_usdc: f64,
+    operator: Address,
+    wallet: Option<&tx_manager::ExecutionWallet>,
+    candidate: &base_arb_common::types::Candidate,
+) -> Result<CandidateAction>
+where
+    C: CandidateStore + FailureStore,
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
     let candidate_seen_key = simulator::candidate_block_seen_key(&candidate);
     let min_profit_failure_key = simulator::min_profit_failure_key(&candidate);
     if candidate_store
@@ -102,7 +155,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous MinProfitNotMet for identical path parameters"
         );
-        return Ok(());
+        return Ok(CandidateAction::Skipped);
     }
     let route_failure_key = simulator::route_failure_key(&candidate);
     if candidate_store.has_failure_key(&route_failure_key).await? {
@@ -114,7 +167,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous structural route failure for identical path parameters"
         );
-        return Ok(());
+        return Ok(CandidateAction::Skipped);
     }
     if candidate_store.has_failure_key(&candidate_seen_key).await? {
         debug!(
@@ -126,7 +179,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous simulation for identical path parameters in same block"
         );
-        return Ok(());
+        return Ok(CandidateAction::Skipped);
     }
     candidate_store
         .mark_failure_key(&candidate_seen_key, candidate_seen_ttl_secs(settings))
@@ -175,7 +228,7 @@ where
                 "cached structural route failure candidate fingerprint"
             );
         }
-        return Ok(());
+        return Ok(CandidateAction::Simulated);
     }
 
     if candidate.is_expired(Utc::now()) {
@@ -186,7 +239,7 @@ where
             expires_at = %candidate.expires_at,
             "candidate expired after simulation; skipping tx submission"
         );
-        return Ok(());
+        return Ok(CandidateAction::Simulated);
     }
 
     if !settings.execution_submit_enabled {
@@ -200,7 +253,7 @@ where
             max_priority_fee_per_gas = ?simulation.max_priority_fee_per_gas,
             "simulation-only mode; skipping tx submission"
         );
-        return Ok(());
+        return Ok(CandidateAction::Simulated);
     }
 
     let Some(wallet) = wallet.as_ref() else {
@@ -234,6 +287,7 @@ where
                     &submission,
                 ))
                 .await?;
+            return Ok(CandidateAction::Submitted);
         }
         Err(err) => {
             warn!(
@@ -262,7 +316,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(CandidateAction::Simulated)
 }
 
 fn configured_wallet(settings: &Settings) -> Result<Option<tx_manager::ExecutionWallet>> {
@@ -306,37 +360,35 @@ fn candidate_seen_ttl_secs(settings: &Settings) -> u64 {
     ttl_from_candidate.saturating_add(MIN_CANDIDATE_SEEN_TTL_SECS)
 }
 
-async fn pop_fresh_candidate<C>(
+async fn pop_fresh_candidates<C>(
     candidate_store: &C,
-) -> Result<Option<base_arb_common::types::Candidate>>
+) -> Result<Vec<base_arb_common::types::Candidate>>
 where
     C: CandidateStore,
 {
     let now = Utc::now();
     let mut expired = 0usize;
+    let mut candidates = Vec::new();
 
     for _ in 0..MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE {
         let Some(candidate) = candidate_store.pop_candidate().await? else {
-            if expired > 0 {
-                info!(expired, "drained expired candidates from queue");
-            }
-            return Ok(None);
+            break;
         };
         if candidate.is_expired(now) {
             expired += 1;
             continue;
         }
-        if expired > 0 {
-            info!(expired, "drained expired candidates from queue");
+        candidates.push(candidate);
+        if candidates.len() >= MAX_CANDIDATE_DRAIN_PER_CYCLE {
+            break;
         }
-        return Ok(Some(candidate));
     }
 
-    info!(
-        expired,
-        "expired candidate drain limit reached; continuing next cycle"
-    );
-    Ok(None)
+    if expired > 0 {
+        info!(expired, "drained expired candidates from queue");
+    }
+    candidates.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+    Ok(candidates)
 }
 
 async fn sync_idle_lane(lane: &mut eoa_lane::EoaLane, provider: &ChainProvider) -> Result<()> {
