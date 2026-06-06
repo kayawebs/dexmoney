@@ -200,8 +200,6 @@ struct TokenSearchDefaultRow {
     enabled: bool,
     search_amounts: Option<String>,
     min_profit: Option<String>,
-    effective_search_amounts: Option<String>,
-    effective_min_profit: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1778,46 +1776,18 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
             token_set.token_address,
             BOOL_OR(token_set.enabled) AS enabled,
             cfg.search_amounts,
-            cfg.min_profit,
-            COALESCE(
-                cfg.search_amounts,
-                MIN(pair_cfg.search_amounts) FILTER (WHERE pair_cfg.search_amounts IS NOT NULL)
-            ) AS effective_search_amounts,
-            COALESCE(
-                cfg.min_profit,
-                MIN(pair_cfg.min_profit) FILTER (WHERE pair_cfg.min_profit IS NOT NULL)
-            ) AS effective_min_profit
+            cfg.min_profit
         FROM token_set
         LEFT JOIN token_search_defaults cfg
           ON cfg.chain_id = token_set.chain_id
          AND cfg.token_address = token_set.token_address
-        LEFT JOIN LATERAL (
-            SELECT tp.token0_search_amounts AS search_amounts,
-                   tp.token0_min_profit AS min_profit
-            FROM token_pairs tp
-            WHERE tp.enabled = TRUE
-              AND tp.chain_id = token_set.chain_id
-              AND tp.token0 = token_set.token_address
-              AND tp.token0_search_amounts IS NOT NULL
-              AND tp.token0_min_profit IS NOT NULL
-            UNION ALL
-            SELECT tp.token1_search_amounts AS search_amounts,
-                   tp.token1_min_profit AS min_profit
-            FROM token_pairs tp
-            WHERE tp.enabled = TRUE
-              AND tp.chain_id = token_set.chain_id
-              AND tp.token1 = token_set.token_address
-              AND tp.token1_search_amounts IS NOT NULL
-              AND tp.token1_min_profit IS NOT NULL
-        ) pair_cfg ON TRUE
         GROUP BY
             token_set.chain_id,
             token_set.token_address,
             cfg.search_amounts,
             cfg.min_profit
         ORDER BY
-            (COALESCE(cfg.search_amounts, MIN(pair_cfg.search_amounts) FILTER (WHERE pair_cfg.search_amounts IS NOT NULL)) IS NOT NULL
-             AND COALESCE(cfg.min_profit, MIN(pair_cfg.min_profit) FILTER (WHERE pair_cfg.min_profit IS NOT NULL)) IS NOT NULL) DESC,
+            (cfg.search_amounts IS NOT NULL AND cfg.min_profit IS NOT NULL) DESC,
             MIN(token_set.symbol),
             token_set.token_address
         "#,
@@ -2779,7 +2749,7 @@ fn render_page(
       if (changes.length === 0) {{
         return window.confirm("No token default changes detected. Submit anyway?");
       }}
-      return window.confirm(`Update token defaults?\n\n${{changes.join("\n")}}`);
+      return window.confirm(`Update token configs?\n\n${{changes.join("\n")}}`);
     }}
   </script>
 </head>
@@ -2928,7 +2898,7 @@ fn nav_href(path: &str, auth_password: Option<&str>) -> String {
 
 fn render_token_pairs_table(rows: &[TokenPairRow]) -> String {
     let mut html = String::from(
-        "<div class=\"table-scroll\"><table class=\"compact-table\"><thead><tr><th>Created</th><th>Pair</th><th>Enabled</th><th>Token 0</th><th>Token 1</th><th>T0 Effective Amounts</th><th>T0 Effective Min</th><th>T1 Effective Amounts</th><th>T1 Effective Min</th><th>Actions</th></tr></thead><tbody>",
+        "<div class=\"table-scroll\"><table class=\"compact-table\"><thead><tr><th>Created</th><th>Pair</th><th>Enabled</th><th>Token 0</th><th>Token 1</th><th>T0 Active Amounts</th><th>T0 Active Min</th><th>T1 Active Amounts</th><th>T1 Active Min</th><th>Actions</th></tr></thead><tbody>",
     );
     for row in rows {
         html.push_str(&format!(
@@ -2979,17 +2949,16 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
         r#"<form method="post" action="/tokens/search-defaults" class="bulk-token-form" onsubmit="return confirmTokenDefaultsUpdate(this)">
   <div class="bulk-token-toolbar">
     <label>Password {password_input}</label>
-    <button type="submit">Update Token Defaults</button>
+    <button type="submit">Update Token Configs</button>
   </div>
   <input type="hidden" name="token_addresses" value="{token_addresses}">
-  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Effective Amounts</th><th>Effective Min Profit</th></tr></thead><tbody>"#,
+  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Amounts Raw</th><th>Min Profit Raw</th></tr></thead><tbody>"#,
         password_input = password_input(Some("password"), false),
         token_addresses = escape(&token_addresses),
     );
     for row in rows {
         let token_key = row.token_address.to_lowercase();
-        let anchor = if row.effective_search_amounts.is_some() && row.effective_min_profit.is_some()
-        {
+        let anchor = if row.search_amounts.is_some() && row.min_profit.is_some() {
             "<span class=\"ok\">configured</span>"
         } else {
             "<span class=\"muted\">no</span>"
@@ -3000,8 +2969,8 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
   <td>{token}</td>
   <td>{enabled}</td>
   <td>{anchor}</td>
-  <td><input class="compact-input" name="search_amounts_{token_key}" value="{effective_amounts_raw}" data-old="{effective_amounts_raw}" data-symbol="{symbol}" data-kind="Effective Amounts" placeholder="10000000,30000000"></td>
-  <td><input class="compact-input" name="min_profit_{token_key}" value="{effective_min_profit_raw}" data-old="{effective_min_profit_raw}" data-symbol="{symbol}" data-kind="Effective Min Profit" placeholder="500"></td>
+  <td><input class="compact-input" name="search_amounts_{token_key}" value="{amounts_raw}" data-old="{amounts_raw}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit_raw}" data-old="{min_profit_raw}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
 </tr>"#,
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
@@ -3009,8 +2978,8 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
             enabled = monitoring_status(row.enabled),
             anchor = anchor,
             token_key = escape(&token_key),
-            effective_amounts_raw = escape(row.effective_search_amounts.as_deref().unwrap_or_default()),
-            effective_min_profit_raw = escape(row.effective_min_profit.as_deref().unwrap_or_default()),
+            amounts_raw = escape(row.search_amounts.as_deref().unwrap_or_default()),
+            min_profit_raw = escape(row.min_profit.as_deref().unwrap_or_default()),
         ));
     }
     if rows.is_empty() {
