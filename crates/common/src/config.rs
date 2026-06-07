@@ -69,7 +69,7 @@ impl Settings {
             .set_default("pool_active_refresh_interval_secs", 60u64)?
             .set_default("pool_active_refresh_batch_size", 25u64)?
             .set_default("market_data_flashblocks_enabled", true)?
-            .set_default("aerodrome_fee_refresh_interval_secs", 15u64)?
+            .set_default("aerodrome_fee_refresh_interval_secs", 3u64)?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 2u64)?

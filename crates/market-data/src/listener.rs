@@ -69,7 +69,7 @@ where
             Duration::from_secs(self.settings.pool_active_refresh_interval_secs.max(10));
         let mut next_active_refresh = Instant::now() + active_refresh_interval;
         let aerodrome_fee_refresh_interval =
-            Duration::from_secs(self.settings.aerodrome_fee_refresh_interval_secs.max(5));
+            Duration::from_secs(self.settings.aerodrome_fee_refresh_interval_secs.max(1));
         let mut next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
         let tick_refresh_interval =
             Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
@@ -95,7 +95,6 @@ where
                         .active_refresh_states(monitored_states, &mut active_refresh_cursor)
                         .await?;
                     next_active_refresh = Instant::now() + active_refresh_interval;
-                    next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                     next_tick_refresh = Instant::now() + tick_refresh_interval;
                 } else if Instant::now() >= next_aerodrome_fee_refresh {
@@ -310,7 +309,6 @@ where
                     .active_refresh_states(monitored_states, &mut active_refresh_cursor)
                     .await?;
                 next_active_refresh = Instant::now() + active_refresh_interval;
-                next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
                 next_tick_refresh = Instant::now() + tick_refresh_interval;
             } else if Instant::now() >= next_aerodrome_fee_refresh {
@@ -1212,21 +1210,6 @@ where
 
             let drift_bps = state_drift_bps(&local, state);
             let message = format!("Aerodrome fee refresh corrected fee drift by {drift_bps} bps");
-            self.recorder
-                .record_pool_state_validation(PoolStateValidation {
-                    pool_address: local.pool_id.address,
-                    dex: local.dex,
-                    variant: local.variant,
-                    block_number,
-                    block_hash: block_hash.clone(),
-                    local_state: local.clone(),
-                    onchain_state: state.clone(),
-                    drift_bps,
-                    passed: false,
-                    message: message.clone(),
-                    created_at: chrono::Utc::now(),
-                })
-                .await?;
             self.recorder
                 .record_pool_state_warning(PoolStateWarning {
                     pool_address: local.pool_id.address,
