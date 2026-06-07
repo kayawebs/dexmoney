@@ -76,6 +76,7 @@ where
         let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
         let mut recent_logs = RecentLogCache::new(20_000);
         let mut pending_validations = VecDeque::new();
+        let mut active_refresh_cursor = 0usize;
         info!(last_seen_block, "market-data synchronized at startup");
 
         let mut ticker = interval(Duration::from_secs(3));
@@ -90,7 +91,9 @@ where
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
                 }
                 if Instant::now() >= next_active_refresh {
-                    monitored_states = self.active_refresh_states(monitored_states).await?;
+                    monitored_states = self
+                        .active_refresh_states(monitored_states, &mut active_refresh_cursor)
+                        .await?;
                     next_active_refresh = Instant::now() + active_refresh_interval;
                     next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -303,7 +306,9 @@ where
                 .await?;
 
             if Instant::now() >= next_active_refresh {
-                monitored_states = self.active_refresh_states(monitored_states).await?;
+                monitored_states = self
+                    .active_refresh_states(monitored_states, &mut active_refresh_cursor)
+                    .await?;
                 next_active_refresh = Instant::now() + active_refresh_interval;
                 next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -1010,19 +1015,37 @@ where
         Ok(())
     }
 
-    async fn active_refresh_states(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
+    async fn active_refresh_states(
+        &self,
+        mut states: Vec<PoolState>,
+        cursor: &mut usize,
+    ) -> Result<Vec<PoolState>> {
         if states.is_empty() {
             return Ok(states);
         }
 
         let block_number = self.provider.get_block_number().await?;
         let block_hash = self.provider.get_block_hash(block_number).await?;
+        let batch_size = self
+            .settings
+            .pool_active_refresh_batch_size
+            .try_into()
+            .unwrap_or(usize::MAX)
+            .clamp(1, states.len());
+        if *cursor >= states.len() {
+            *cursor = 0;
+        }
+        let indices = (0..batch_size)
+            .map(|offset| (*cursor + offset) % states.len())
+            .collect::<Vec<_>>();
+        *cursor = (*cursor + batch_size) % states.len();
         let mut refreshed_pools = HashSet::new();
         let mut refreshed_v3_states = Vec::new();
         let mut drifted = 0usize;
         let mut failed = 0usize;
 
-        for state in &mut states {
+        for index in indices {
+            let state = &mut states[index];
             let local = state.clone();
             let entry = registry_entry_from_state(&local);
             let onchain = self
@@ -1116,7 +1139,12 @@ where
 
         info!(
             refreshed = refreshed_pools.len(),
-            failed, drifted, block_number, "active pool state refresh complete"
+            batch_size,
+            total_pools = states.len(),
+            failed,
+            drifted,
+            block_number,
+            "active pool state refresh complete"
         );
 
         Ok(states)
