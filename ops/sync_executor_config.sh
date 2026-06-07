@@ -4,6 +4,38 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+ARG_DRY_RUN=0
+usage() {
+  cat <<'EOF'
+usage: ops/sync_executor_config.sh [--dry-run]
+
+Sync executor approvals and optional whitelist settings from enabled registry
+tokens/pools/routers.
+
+Options:
+  --dry-run   Print write transactions instead of sending them.
+  -h, --help  Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      ARG_DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
 if [[ -f ".env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -20,6 +52,9 @@ ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
 PANCAKE_V3_ROUTER_DEFAULT="0x1b81D678ffb9C0263b24A97847620C99d213eB14"
 AERODROME_SLIPSTREAM_ROUTER_DEFAULT="0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
 DRY_RUN="${DRY_RUN:-0}"
+if [[ "$ARG_DRY_RUN" == "1" ]]; then
+  DRY_RUN=1
+fi
 
 require_env() {
   local name="$1"
@@ -151,6 +186,7 @@ fi
 
 echo "executor: $EXECUTOR"
 echo "tokens: ${#TOKENS[@]}, pools: ${#POOLS[@]}, routers: ${#ROUTERS[@]}, factories: ${#FACTORIES[@]}"
+echo "dry_run: $DRY_RUN"
 
 if supports_whitelists; then
   for router in "${ROUTERS[@]}"; do
