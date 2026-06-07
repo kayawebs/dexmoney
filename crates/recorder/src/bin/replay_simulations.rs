@@ -394,12 +394,13 @@ fn write_row(
                 for step in &diagnostics.steps {
                     writeln!(
                         writer,
-                        "  - step={} mode={} variant={:?} pool={:#x} source_block={} amount_in={} raw_out={} safe_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} tick={:?} ticks_used={} crossed_ticks={} exhausted={}",
+                        "  - step={} mode={} variant={:?} pool={:#x} source_block={} valid_through_block={} amount_in={} raw_out={} safe_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} tick={:?} ticks_used={} crossed_ticks={} exhausted={}",
                         step.step_no,
                         step.mode,
                         step.variant,
                         step.pool,
                         step.source_block,
+                        step.valid_through_block.max(step.source_block),
                         step.amount_in,
                         step.amount_out_raw,
                         step.amount_out,

@@ -79,6 +79,7 @@ mod tests {
             tick: None,
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         }
     }

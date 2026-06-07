@@ -133,12 +133,13 @@ fn print_recorded_quote_diagnostics(path: &ArbPath) {
     );
     for step in &diagnostics.steps {
         println!(
-            "recorded step {}: mode={} pool={:#x} variant={:?} source_block={} updated_at={} token_in={:#x} token_out={:#x} amount_in={} amount_out_raw={} amount_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?} tick_count={} ticks_used={} crossed_ticks={} exhausted={}",
+            "recorded step {}: mode={} pool={:#x} variant={:?} source_block={} valid_through_block={} updated_at={} token_in={:#x} token_out={:#x} amount_in={} amount_out_raw={} amount_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?} tick_count={} ticks_used={} crossed_ticks={} exhausted={}",
             step.step_no,
             step.mode,
             step.pool,
             step.variant,
             step.source_block,
+            step.valid_through_block.max(step.source_block),
             step.state_updated_at,
             step.token_in,
             step.token_out,
@@ -250,9 +251,10 @@ async fn validate_redis_quotes(
             return Ok(());
         };
         println!(
-            "redis step {step_no}: pool={:#x} source_block={} updated_at={} variant={:?} fee_bps={} fee_pips={:?} stable={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?}",
+            "redis step {step_no}: pool={:#x} source_block={} valid_through_block={} updated_at={} variant={:?} fee_bps={} fee_pips={:?} stable={:?} sqrt={:?} liquidity={:?} tick={:?} reserve0={:?} reserve1={:?}",
             step.pool,
             state.block_number,
+            state.effective_valid_through_block(),
             state.updated_at,
             state.variant,
             state.fee_bps,

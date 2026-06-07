@@ -286,6 +286,13 @@ where
                 }
             }
 
+            let watermarked_pools =
+                advance_valid_through_block(&mut monitored_states, latest_block);
+            if !watermarked_pools.is_empty() {
+                self.publish_validity_watermark(&monitored_states, &watermarked_pools)
+                    .await?;
+            }
+
             if !changed_pools.is_empty() {
                 self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
                     .await?;
@@ -887,6 +894,7 @@ where
                     "Flashblocks V3 liquidity event applied to ticks; pool liquidity refresh waits for sealed block"
                 );
             } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
+                state.valid_through_block = state.valid_through_block.max(event.block_number);
                 self.pool_store.set_pool_state(state.clone()).await?;
                 self.recorder
                     .record_pool_state_with_source(state.clone(), "flashblock")
@@ -989,6 +997,19 @@ where
         Ok(())
     }
 
+    async fn publish_validity_watermark(
+        &self,
+        states: &[PoolState],
+        selected: &HashSet<Address>,
+    ) -> Result<()> {
+        for state in states {
+            if selected.contains(&state.pool_id.address) {
+                self.pool_store.set_pool_state(state.clone()).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn active_refresh_states(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
         if states.is_empty() {
             return Ok(states);
@@ -1082,6 +1103,8 @@ where
             if is_v3_style_state(&onchain) {
                 refreshed_v3_states.push(onchain.clone());
             }
+            let mut onchain = onchain;
+            onchain.valid_through_block = onchain.valid_through_block.max(block_number);
             *state = onchain;
         }
 
@@ -1631,6 +1654,17 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
         .collect()
 }
 
+fn advance_valid_through_block(states: &mut [PoolState], block_number: u64) -> HashSet<Address> {
+    let mut changed = HashSet::new();
+    for state in states {
+        if state.effective_valid_through_block() < block_number {
+            state.valid_through_block = block_number;
+            changed.insert(state.pool_id.address);
+        }
+    }
+    changed
+}
+
 fn unique_pool_addresses(states: &[PoolState]) -> Vec<String> {
     let mut seen = HashSet::new();
     states
@@ -1956,7 +1990,7 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use chrono::Utc;
 
-    use super::{apply_aerodrome_fee, state_drift_bps, AerodromeFee};
+    use super::{advance_valid_through_block, apply_aerodrome_fee, state_drift_bps, AerodromeFee};
     use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
 
     fn pool_state(variant: PoolVariant) -> PoolState {
@@ -1982,6 +2016,7 @@ mod tests {
             tick: Some(1),
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         }
     }
@@ -2024,5 +2059,16 @@ mod tests {
         ));
         assert_eq!(state.fee_pips, Some(85));
         assert_eq!(state.fee_bps, 0);
+    }
+
+    #[test]
+    fn advances_validity_without_changing_source_block() {
+        let mut states = vec![pool_state(PoolVariant::AerodromeVolatile)];
+
+        let changed = advance_valid_through_block(&mut states, 9);
+
+        assert!(changed.contains(&Address::ZERO));
+        assert_eq!(states[0].block_number, 1);
+        assert_eq!(states[0].valid_through_block, 9);
     }
 }

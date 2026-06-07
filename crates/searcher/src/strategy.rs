@@ -365,6 +365,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             tick: None,
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: now,
         },
         PoolState {
@@ -389,6 +390,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             tick: Some(0),
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: now,
         },
     ]
@@ -502,6 +504,7 @@ async fn quote_path(
             pool: pool_state.pool_id.address,
             variant: pool_state.variant,
             source_block: pool_state.block_number,
+            valid_through_block: pool_state.effective_valid_through_block(),
             state_updated_at: pool_state.updated_at,
             token_in: step.token_in,
             token_out: step.token_out,
@@ -542,13 +545,13 @@ async fn quote_path(
         );
         return Ok(None);
     }
-    if let Some(block_lag) = quote_state_block_lag(&diagnostics) {
-        if block_lag > quote_max_state_block_lag {
+    if let Some(validity_gap) = quote_validity_gap(&diagnostics) {
+        if validity_gap > quote_max_state_block_lag {
             debug!(
                 path = %path.name,
-                block_lag,
+                validity_gap,
                 max_block_lag = quote_max_state_block_lag,
-                "quote skipped: path pool states span too many blocks"
+                "quote skipped: path pool states are not valid across a common block"
             );
             return Ok(None);
         }
@@ -557,18 +560,18 @@ async fn quote_path(
     Ok(Some((amount, max_impact, diagnostics)))
 }
 
-fn quote_state_block_lag(diagnostics: &QuoteDiagnostics) -> Option<u64> {
-    let min_block = diagnostics
+fn quote_validity_gap(diagnostics: &QuoteDiagnostics) -> Option<u64> {
+    let quote_block = diagnostics
         .steps
         .iter()
-        .map(|step| step.source_block)
+        .map(|step| step.valid_through_block.max(step.source_block))
         .min()?;
-    let max_block = diagnostics
+    let newest_source = diagnostics
         .steps
         .iter()
         .map(|step| step.source_block)
         .max()?;
-    Some(max_block.saturating_sub(min_block))
+    Some(newest_source.saturating_sub(quote_block))
 }
 
 fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPath {
@@ -780,10 +783,13 @@ fn short_token(token: Address) -> String {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, U256};
-    use base_arb_common::types::{PoolId, TickState, TokenPairSearchConfig};
+    use base_arb_common::types::{
+        PoolId, PoolVariant, QuoteDiagnostics, QuoteStepDiagnostics, TickState,
+        TokenPairSearchConfig,
+    };
     use chrono::Utc;
 
-    use super::{demo_pool_states, is_supported_config_pool, SearchEngine};
+    use super::{demo_pool_states, is_supported_config_pool, quote_validity_gap, SearchEngine};
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
@@ -856,5 +862,54 @@ mod tests {
         pool_states[classic].token0_decimals = Some(6);
         pool_states[classic].token1_decimals = Some(18);
         assert!(is_supported_config_pool(&pool_states[classic], &config));
+    }
+
+    #[test]
+    fn quote_validity_uses_common_valid_block_not_source_block_age() {
+        let pool = address!("1111111111111111111111111111111111111111");
+        let token = address!("4200000000000000000000000000000000000006");
+        let step = |source_block, valid_through_block| QuoteStepDiagnostics {
+            step_no: 1,
+            mode: "test".into(),
+            pool,
+            variant: PoolVariant::UniswapV3,
+            source_block,
+            valid_through_block,
+            state_updated_at: Utc::now(),
+            token_in: token,
+            token_out: token,
+            amount_in: U256::ONE,
+            amount_out_raw: U256::ONE,
+            amount_out: U256::ONE,
+            fee_bps: 1,
+            fee_pips: Some(100),
+            stable: None,
+            tick_spacing: None,
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            reserve0: None,
+            reserve1: None,
+            tick_count: 0,
+            ticks_used: 0,
+            crossed_ticks: 0,
+            tick_range_exhausted: false,
+        };
+        let diagnostics = QuoteDiagnostics {
+            modes: Vec::new(),
+            ticks_used: 0,
+            crossed_ticks: 0,
+            tick_range_exhausted: false,
+            v3_pools_without_ticks: 0,
+            steps: vec![step(100, 130), step(130, 130)],
+        };
+
+        assert_eq!(quote_validity_gap(&diagnostics), Some(0));
+
+        let stale = QuoteDiagnostics {
+            steps: vec![step(100, 100), step(130, 130)],
+            ..diagnostics
+        };
+        assert_eq!(quote_validity_gap(&stale), Some(30));
     }
 }

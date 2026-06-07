@@ -57,6 +57,8 @@ pub struct PoolState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_spacing: Option<i32>,
     pub block_number: u64,
+    #[serde(default)]
+    pub valid_through_block: u64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -144,6 +146,10 @@ pub struct PoolStateValidation {
 }
 
 impl PoolState {
+    pub fn effective_valid_through_block(&self) -> u64 {
+        self.valid_through_block.max(self.block_number)
+    }
+
     pub fn is_stale(&self, now: DateTime<Utc>, max_age_ms: i64) -> bool {
         now.signed_duration_since(self.updated_at)
             .num_milliseconds()
@@ -194,6 +200,8 @@ pub struct QuoteStepDiagnostics {
     pub pool: Address,
     pub variant: PoolVariant,
     pub source_block: u64,
+    #[serde(default)]
+    pub valid_through_block: u64,
     pub state_updated_at: DateTime<Utc>,
     pub token_in: Address,
     pub token_out: Address,

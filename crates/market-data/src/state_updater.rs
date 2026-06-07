@@ -68,6 +68,7 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     }
 
     state.block_number = event.block_number;
+    state.valid_through_block = state.valid_through_block.max(event.block_number);
     state.updated_at = Utc::now();
     Ok(true)
 }
@@ -247,6 +248,7 @@ mod tests {
             tick: None,
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         };
         let event = DexEvent {
@@ -295,6 +297,7 @@ mod tests {
             tick: Some(3),
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         };
         let event = DexEvent {
@@ -351,6 +354,7 @@ mod tests {
             tick: None,
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         };
         let event = DexEvent {
@@ -548,6 +552,7 @@ mod tests {
             tick,
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         }
     }

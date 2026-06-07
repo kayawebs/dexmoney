@@ -623,6 +623,7 @@ mod tests {
             tick: Some(0),
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         };
         let quoter = UniswapV3CurrentTickQuoter;
@@ -668,6 +669,7 @@ mod tests {
             tick: Some(0),
             tick_spacing: None,
             block_number: 1,
+            valid_through_block: 1,
             updated_at: Utc::now(),
         };
         let ticks = vec![TickState {

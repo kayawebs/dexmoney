@@ -112,6 +112,7 @@ impl ChainProvider {
                     tick: Some(tick),
                     tick_spacing: None,
                     block_number: self.get_block_number().await?,
+                    valid_through_block: 0,
                     updated_at: now,
                 });
             }
@@ -201,6 +202,7 @@ impl ChainProvider {
                     tick: Some(tick),
                     tick_spacing: entry.tick_spacing,
                     block_number: block_number.unwrap_or(self.get_block_number().await?),
+                    valid_through_block: block_number.unwrap_or(0),
                     updated_at: Utc::now(),
                 })
             }
@@ -281,6 +283,7 @@ impl ChainProvider {
                     tick: Some(tick),
                     tick_spacing: entry.tick_spacing,
                     block_number,
+                    valid_through_block: block_number,
                     updated_at: Utc::now(),
                 })
             }
@@ -417,6 +420,7 @@ impl ChainProvider {
                 tick: Some(tick),
                 tick_spacing,
                 block_number,
+                valid_through_block: block_number,
                 updated_at: Utc::now(),
             },
             factory_address: factory,
@@ -501,6 +505,7 @@ impl ChainProvider {
                         tick: Some(tick),
                         tick_spacing,
                         block_number,
+                        valid_through_block: block_number,
                         updated_at: Utc::now(),
                     },
                     factory_address: Some(factory),
@@ -913,6 +918,7 @@ impl ChainProvider {
                             tick: Some(tick),
                             tick_spacing: None,
                             block_number: self.get_block_number().await?,
+                            valid_through_block: 0,
                             updated_at: Utc::now(),
                         },
                         factory_address: Some(factory),
@@ -997,6 +1003,7 @@ impl ChainProvider {
                             tick: Some(tick),
                             tick_spacing: None,
                             block_number: self.get_block_number().await?,
+                            valid_through_block: 0,
                             updated_at: Utc::now(),
                         },
                         factory_address: Some(factory),
@@ -1141,6 +1148,7 @@ impl ChainProvider {
                 tick: None,
                 tick_spacing: None,
                 block_number,
+                valid_through_block: block_number,
                 updated_at: Utc::now(),
             }),
             Err(reserve_err) => {
@@ -1175,6 +1183,7 @@ impl ChainProvider {
                     tick: Some(tick),
                     tick_spacing: None,
                     block_number,
+                    valid_through_block: block_number,
                     updated_at: Utc::now(),
                 })
             }
@@ -1219,6 +1228,7 @@ impl ChainProvider {
                 tick: None,
                 tick_spacing: None,
                 block_number,
+                valid_through_block: block_number,
                 updated_at: Utc::now(),
             }),
             Err(reserve_err) => {
@@ -1253,6 +1263,7 @@ impl ChainProvider {
                     tick: Some(tick),
                     tick_spacing: None,
                     block_number,
+                    valid_through_block: block_number,
                     updated_at: Utc::now(),
                 })
             }
