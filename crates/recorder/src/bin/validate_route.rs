@@ -769,7 +769,7 @@ fn executor_dex_kind(step: &SwapStep) -> Result<u8> {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => Ok(1),
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => Ok(2),
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
-            Ok(2)
+            Ok(3)
         }
         _ => bail!("dex and pool variant mismatch"),
     }

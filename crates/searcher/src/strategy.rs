@@ -24,6 +24,7 @@ pub struct SearchEngine {
     pub whitelist_paths: Vec<String>,
     pub candidate_ttl_ms: i64,
     pub v3_quote_safety_bps: u64,
+    pub quote_max_state_block_lag: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,6 +137,7 @@ impl SearchEngine {
             whitelist_paths: vec![name1, name2],
             candidate_ttl_ms,
             v3_quote_safety_bps: 0,
+            quote_max_state_block_lag: 1,
         }
     }
 
@@ -168,6 +170,7 @@ impl SearchEngine {
                     &search_path.path,
                     *amount_in,
                     self.v3_quote_safety_bps,
+                    self.quote_max_state_block_lag,
                 )
                 .await
                 {
@@ -295,6 +298,7 @@ pub fn engine_from_settings(
         whitelist_paths: Vec::new(),
         candidate_ttl_ms,
         v3_quote_safety_bps: settings.v3_quote_safety_bps,
+        quote_max_state_block_lag: settings.quote_max_state_block_lag,
     })
 }
 
@@ -396,6 +400,7 @@ async fn quote_path(
     path: &ArbPath,
     amount_in: U256,
     v3_quote_safety_bps: u64,
+    quote_max_state_block_lag: u64,
 ) -> anyhow::Result<Option<(U256, u64, QuoteDiagnostics)>> {
     let aero_stable = AerodromeStableQuoter;
     let aero_volatile = AerodromeVolatileQuoter;
@@ -537,8 +542,33 @@ async fn quote_path(
         );
         return Ok(None);
     }
+    if let Some(block_lag) = quote_state_block_lag(&diagnostics) {
+        if block_lag > quote_max_state_block_lag {
+            debug!(
+                path = %path.name,
+                block_lag,
+                max_block_lag = quote_max_state_block_lag,
+                "quote skipped: path pool states span too many blocks"
+            );
+            return Ok(None);
+        }
+    }
 
     Ok(Some((amount, max_impact, diagnostics)))
+}
+
+fn quote_state_block_lag(diagnostics: &QuoteDiagnostics) -> Option<u64> {
+    let min_block = diagnostics
+        .steps
+        .iter()
+        .map(|step| step.source_block)
+        .min()?;
+    let max_block = diagnostics
+        .steps
+        .iter()
+        .map(|step| step.source_block)
+        .max()?;
+    Some(max_block.saturating_sub(min_block))
 }
 
 fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPath {

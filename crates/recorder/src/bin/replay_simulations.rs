@@ -662,13 +662,27 @@ fn build_router_step_calldata(
                 amount_in,
             ))
         }
-        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) => {
+        (DexKind::UniswapV3, _) => {
             let fee = step
                 .fee_bps
                 .unwrap_or_default()
                 .checked_mul(100)
                 .context("fee overflow")?;
-            Ok(encode_exact_input_single_uint24(
+            Ok(encode_exact_input_single_uint24_no_deadline(
+                step.token_in,
+                step.token_out,
+                fee,
+                recipient,
+                amount_in,
+            ))
+        }
+        (DexKind::PancakeSwap, _) => {
+            let fee = step
+                .fee_bps
+                .unwrap_or_default()
+                .checked_mul(100)
+                .context("fee overflow")?;
+            Ok(encode_exact_input_single_uint24_with_deadline(
                 step.token_in,
                 step.token_out,
                 fee,
@@ -779,7 +793,7 @@ fn executor_dex_kind(step: &SwapStep) -> Result<u8> {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => Ok(1),
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => Ok(2),
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
-            Ok(2)
+            Ok(3)
         }
         _ => bail!("dex and pool variant mismatch"),
     }
@@ -816,7 +830,28 @@ fn encode_factory_get_pool_int24(token_in: Address, token_out: Address, spacing:
     out
 }
 
-fn encode_exact_input_single_uint24(
+fn encode_exact_input_single_uint24_no_deadline(
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    recipient: Address,
+    amount_in: U256,
+) -> Vec<u8> {
+    let mut out =
+        keccak256(b"exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))")
+            [..4]
+            .to_vec();
+    out.extend(encode_address(token_in));
+    out.extend(encode_address(token_out));
+    out.extend(encode_u256(U256::from(fee)));
+    out.extend(encode_address(recipient));
+    out.extend(encode_u256(amount_in));
+    out.extend(encode_u256(U256::ZERO));
+    out.extend(encode_u256(U256::ZERO));
+    out
+}
+
+fn encode_exact_input_single_uint24_with_deadline(
     token_in: Address,
     token_out: Address,
     fee: u32,

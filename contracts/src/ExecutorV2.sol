@@ -35,6 +35,20 @@ interface IV3RouterV2 {
         address tokenOut;
         uint24 fee;
         address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+interface IPancakeV3RouterV2 {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
         uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
@@ -71,7 +85,8 @@ contract ExecutorV2 {
     enum DexKind {
         AerodromeClassic,
         AerodromeSlipstream,
-        UniswapV3
+        UniswapV3,
+        PancakeV3
     }
 
     struct SwapStep {
@@ -222,6 +237,19 @@ contract ExecutorV2 {
                         tokenOut: step.tokenOut,
                         fee: step.fee,
                         recipient: address(this),
+                        amountIn: amountIn,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
+        } else if (step.dex == DexKind.PancakeV3) {
+            amountOut = IPancakeV3RouterV2(step.router)
+                .exactInputSingle(
+                    IPancakeV3RouterV2.ExactInputSingleParams({
+                        tokenIn: step.tokenIn,
+                        tokenOut: step.tokenOut,
+                        fee: step.fee,
+                        recipient: address(this),
                         deadline: deadline,
                         amountIn: amountIn,
                         amountOutMinimum: 0,
@@ -242,7 +270,7 @@ contract ExecutorV2 {
         } else if (step.dex == DexKind.AerodromeSlipstream) {
             expectedPool =
                 ISlipstreamFactoryV2(step.factory).getPool(step.tokenIn, step.tokenOut, _decodeTickSpacing(step.fee));
-        } else if (step.dex == DexKind.UniswapV3) {
+        } else if (step.dex == DexKind.UniswapV3 || step.dex == DexKind.PancakeV3) {
             expectedPool = IV3FactoryV2(step.factory).getPool(step.tokenIn, step.tokenOut, step.fee);
         } else {
             revert UnsupportedDex();

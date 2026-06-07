@@ -31,6 +31,20 @@ interface IUniswapV3Router {
         address tokenOut;
         uint24 fee;
         address recipient;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+interface IPancakeV3Router {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
         uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
@@ -44,7 +58,8 @@ contract Executor {
     enum DexKind {
         AerodromeClassic,
         AerodromeSlipstream,
-        UniswapV3
+        UniswapV3,
+        PancakeV3
     }
 
     struct SwapStep {
@@ -217,6 +232,19 @@ contract Executor {
             amountOut = IUniswapV3Router(step.router)
                 .exactInputSingle(
                     IUniswapV3Router.ExactInputSingleParams({
+                        tokenIn: step.tokenIn,
+                        tokenOut: step.tokenOut,
+                        fee: step.fee,
+                        recipient: address(this),
+                        amountIn: amountIn,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
+        } else if (step.dex == DexKind.PancakeV3) {
+            amountOut = IPancakeV3Router(step.router)
+                .exactInputSingle(
+                    IPancakeV3Router.ExactInputSingleParams({
                         tokenIn: step.tokenIn,
                         tokenOut: step.tokenOut,
                         fee: step.fee,
