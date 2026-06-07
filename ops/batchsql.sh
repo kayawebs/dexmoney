@@ -209,6 +209,13 @@ SELECT
   max(created_at) AS latest_opportunity
 FROM opp;
 
+WITH opp AS (
+  SELECT o.*
+  FROM opportunities o
+  LEFT JOIN simulations s ON s.opportunity_id = o.id
+  WHERE o.created_at >= now() - :'interval'::interval
+    AND s.id IS NULL
+)
 SELECT
   COALESCE(
     (
