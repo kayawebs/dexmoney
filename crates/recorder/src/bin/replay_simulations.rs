@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     writeln!(writer)?;
 
     let mut summary = BTreeMap::<String, usize>::new();
+    let mut path_summary = BTreeMap::<(String, String), usize>::new();
     for (idx, row) in rows.iter().enumerate() {
         let result = replay_row(row, &settings, &provider).await;
         write_row(&mut writer, idx + 1, row, &result)?;
@@ -100,12 +101,23 @@ async fn main() -> Result<()> {
             .map(|value| value.classification.clone())
             .unwrap_or_else(|err| format!("replay_error: {}", compact_err(err)));
         *summary.entry(key).or_default() += 1;
+        let path_name = decode_path_name(row).unwrap_or_else(|| "<decode-error>".into());
+        let classification = result
+            .as_ref()
+            .map(|value| value.classification.clone())
+            .unwrap_or_else(|err| format!("replay_error: {}", compact_err(err)));
+        *path_summary.entry((classification, path_name)).or_default() += 1;
     }
 
     writeln!(writer)?;
     writeln!(writer, "== Summary ==")?;
     for (classification, n) in summary {
         writeln!(writer, "{classification}\t{n}")?;
+    }
+    writeln!(writer)?;
+    writeln!(writer, "== Path Summary ==")?;
+    for ((classification, path_name), n) in path_summary {
+        writeln!(writer, "{classification}\t{n}\t{path_name}")?;
     }
     writer.flush()?;
 
@@ -361,9 +373,49 @@ fn write_row(
     row: &ReplayRow,
     result: &Result<ReplayResult>,
 ) -> Result<()> {
+    let path = serde_json::from_value::<ArbPath>(row.path_json.clone()).ok();
     writeln!(writer, "== Replay {idx} ==")?;
     writeln!(writer, "opportunity_id: {}", row.opportunity_id)?;
     writeln!(writer, "simulation_id: {}", row.simulation_id)?;
+    if let Some(path) = &path {
+        writeln!(writer, "path_name: {}", path.name)?;
+        if let Some(diagnostics) = &path.diagnostics {
+            writeln!(writer, "modes: {:?}", diagnostics.modes)?;
+            writeln!(
+                writer,
+                "diagnostics: ticks_used={} crossed_ticks={} exhausted={} v3_without_ticks={}",
+                diagnostics.ticks_used,
+                diagnostics.crossed_ticks,
+                diagnostics.tick_range_exhausted,
+                diagnostics.v3_pools_without_ticks
+            )?;
+            if !diagnostics.steps.is_empty() {
+                writeln!(writer, "recorded_steps:")?;
+                for step in &diagnostics.steps {
+                    writeln!(
+                        writer,
+                        "  - step={} mode={} variant={:?} pool={:#x} source_block={} amount_in={} raw_out={} safe_out={} fee_bps={} fee_pips={:?} stable={:?} tick_spacing={:?} tick={:?} ticks_used={} crossed_ticks={} exhausted={}",
+                        step.step_no,
+                        step.mode,
+                        step.variant,
+                        step.pool,
+                        step.source_block,
+                        step.amount_in,
+                        step.amount_out_raw,
+                        step.amount_out,
+                        step.fee_bps,
+                        step.fee_pips,
+                        step.stable,
+                        step.tick_spacing,
+                        step.tick,
+                        step.ticks_used,
+                        step.crossed_ticks,
+                        step.tick_range_exhausted
+                    )?;
+                }
+            }
+        }
+    }
     writeln!(writer, "opportunity_at: {}", row.opportunity_at)?;
     writeln!(writer, "simulation_at: {}", row.simulation_at)?;
     writeln!(writer, "opportunity_block: {}", row.opportunity_block)?;
@@ -416,6 +468,12 @@ fn write_row(
     }
     writeln!(writer)?;
     Ok(())
+}
+
+fn decode_path_name(row: &ReplayRow) -> Option<String> {
+    serde_json::from_value::<ArbPath>(row.path_json.clone())
+        .ok()
+        .map(|path| path.name)
 }
 
 async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
