@@ -91,6 +91,7 @@ where
         debug!("no candidate available");
         return Ok(());
     };
+    let current_block = provider.get_block_number().await?;
 
     let mut simulated = 0usize;
     for candidate in candidates {
@@ -107,6 +108,7 @@ where
             operator,
             wallet.as_ref(),
             &candidate,
+            current_block,
         )
         .await?
         {
@@ -135,12 +137,27 @@ async fn handle_candidate<C, E, R>(
     operator: Address,
     wallet: Option<&tx_manager::ExecutionWallet>,
     candidate: &base_arb_common::types::Candidate,
+    current_block: u64,
 ) -> Result<CandidateAction>
 where
     C: CandidateStore + FailureStore,
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
+    let block_lag = current_block.saturating_sub(candidate.block_number);
+    if block_lag > settings.execution_max_candidate_lag_blocks {
+        debug!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            candidate_block = candidate.block_number,
+            current_block,
+            block_lag,
+            max_lag_blocks = settings.execution_max_candidate_lag_blocks,
+            "candidate skipped because it is too far behind current block"
+        );
+        return Ok(CandidateAction::Skipped);
+    }
+
     let candidate_seen_key = simulator::candidate_block_seen_key(&candidate);
     let min_profit_failure_key = simulator::min_profit_failure_key(&candidate);
     if candidate_store

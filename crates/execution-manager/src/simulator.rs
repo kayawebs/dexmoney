@@ -17,18 +17,22 @@ pub async fn simulate(
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
 ) -> SimulationResult {
+    let observed_block = provider.get_block_number().await.ok();
     match simulate_inner(
         provider,
         settings,
         operator,
         candidate,
         min_simulated_profit_usdc,
+        observed_block,
     )
     .await
     {
         Ok(result) => result,
         Err(err) => {
             let raw_error = format!("{err:#}");
+            let calldata = build_simulation_calldata(settings, candidate, candidate.min_profit)
+                .unwrap_or_default();
             SimulationResult {
                 id: uuid::Uuid::new_v4(),
                 opportunity_id: candidate.id,
@@ -40,7 +44,7 @@ pub async fn simulate(
                 min_profit: Some(candidate.min_profit),
                 simulated_profit: U256::ZERO,
                 gas_estimate: None,
-                block_number: None,
+                block_number: observed_block,
                 base_fee_per_gas: None,
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -48,7 +52,7 @@ pub async fn simulate(
                 gas_cost_expected: None,
                 net_simulated_profit: None,
                 revert_reason: Some(format_revert_reason(&raw_error)),
-                calldata: Vec::new(),
+                calldata,
             }
         }
     }
@@ -60,6 +64,7 @@ async fn simulate_inner(
     operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
+    observed_block: Option<u64>,
 ) -> Result<SimulationResult> {
     if candidate.is_expired(Utc::now()) {
         anyhow::bail!("candidate expired");
@@ -75,8 +80,7 @@ async fn simulate_inner(
         .executor_contract
         .filter(|address| *address != Address::ZERO)
         .context("EXECUTOR_CONTRACT is not configured")?;
-    let deadline = U256::from((Utc::now().timestamp() + EXECUTOR_DEADLINE_SECS) as u64);
-    let calldata = build_execute_calldata(candidate, min_profit_units, deadline, settings)?;
+    let calldata = build_simulation_calldata(settings, candidate, min_profit_units)?;
     let data = format!("0x{}", hex::encode(&calldata));
 
     let raw_result = provider
@@ -105,7 +109,7 @@ async fn simulate_inner(
     } else {
         simulated_profit >= min_profit_units
     };
-    let block_number = provider.get_block_number().await.ok();
+    let block_number = provider.get_block_number().await.ok().or(observed_block);
 
     Ok(SimulationResult {
         id: uuid::Uuid::new_v4(),
@@ -136,6 +140,15 @@ async fn simulate_inner(
         },
         calldata,
     })
+}
+
+fn build_simulation_calldata(
+    settings: &Settings,
+    candidate: &Candidate,
+    min_profit: U256,
+) -> Result<Vec<u8>> {
+    let deadline = U256::from((Utc::now().timestamp() + EXECUTOR_DEADLINE_SECS) as u64);
+    build_execute_calldata(candidate, min_profit, deadline, settings)
 }
 
 struct SimulationFeeSuggestion {
