@@ -44,6 +44,7 @@ struct ReplayRow {
     path_json: serde_json::Value,
     simulation_id: Uuid,
     simulation_at: DateTime<Utc>,
+    simulation_block: Option<i64>,
     simulation_success: bool,
     simulation_revert_reason: Option<String>,
 }
@@ -52,9 +53,11 @@ struct ReplayRow {
 struct ReplayResult {
     original_reason: String,
     historical_result: String,
+    historical_zero_min_result: Option<String>,
     classification: String,
     profit: Option<U256>,
     structural_notes: Vec<String>,
+    router_probe_notes: Vec<String>,
 }
 
 #[tokio::main]
@@ -161,14 +164,55 @@ async fn replay_row(
         }
         Err(err) => (format_revert_reason(&format!("{err:#}")), None),
     };
-    let classification = classify(&original_reason, &historical_result, &structural_notes);
+    let historical_zero_min_result = if historical_result.contains("MinProfitNotMet")
+        || historical_result.contains("router/no-revert-data")
+    {
+        let zero_min_calldata =
+            build_execute_calldata(&path, token_in, amount_in, U256::ZERO, deadline, settings)?;
+        let zero_min_data = format!("0x{}", hex::encode(zero_min_calldata));
+        let zero_min_call = provider
+            .eth_call_from_at_block(
+                Some(operator),
+                executor,
+                &zero_min_data,
+                "historical Executor executeWithOwnFunds minProfit=0",
+                Some(u64::try_from(row.opportunity_block).context("negative opportunity block")?),
+            )
+            .await;
+        Some(match zero_min_call {
+            Ok(raw) => format!(
+                "success profit={}",
+                decode_uint256_result(&raw)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("raw={raw}"))
+            ),
+            Err(err) => format_revert_reason(&format!("{err:#}")),
+        })
+    } else {
+        None
+    };
+    let router_probe_notes = if historical_result.contains("router/no-revert-data") {
+        router_step1_probe(&path, amount_in, settings, provider, row.opportunity_block)
+            .await
+            .unwrap_or_else(|err| vec![format!("router_probe_error: {err:#}")])
+    } else {
+        Vec::new()
+    };
+    let classification = classify(
+        &original_reason,
+        &historical_result,
+        historical_zero_min_result.as_deref(),
+        &structural_notes,
+    );
 
     Ok(ReplayResult {
         original_reason,
         historical_result,
+        historical_zero_min_result,
         classification,
         profit,
         structural_notes,
+        router_probe_notes,
     })
 }
 
@@ -224,7 +268,58 @@ async fn structural_checks(
     Ok(notes)
 }
 
-fn classify(original: &str, historical: &str, structural_notes: &[String]) -> String {
+async fn router_step1_probe(
+    path: &ArbPath,
+    amount_in: U256,
+    settings: &Settings,
+    provider: &ChainProvider,
+    block_number: i64,
+) -> Result<Vec<String>> {
+    let mut notes = Vec::new();
+    let Some(step) = path.steps.first() else {
+        return Ok(vec!["no step1".into()]);
+    };
+    let Some(router) = router_for_step(step, settings) else {
+        return Ok(vec!["step1 router missing".into()]);
+    };
+    let Some(executor) = settings
+        .executor_contract
+        .filter(|address| *address != Address::ZERO)
+    else {
+        return Ok(vec!["executor missing".into()]);
+    };
+    let deadline = U256::from((Utc::now().timestamp() as u64).saturating_add(REPLAY_DEADLINE_SECS));
+    let calldata = build_router_step_calldata(step, amount_in, executor, deadline, settings)?;
+    let raw = provider
+        .eth_call_from_at_block(
+            Some(executor),
+            router,
+            &format!("0x{}", hex::encode(calldata)),
+            "router step1 probe",
+            Some(u64::try_from(block_number).context("negative block number")?),
+        )
+        .await;
+    match raw {
+        Ok(raw) => notes.push(format!(
+            "step1 router probe ok output={}",
+            decode_router_amount_out(&raw)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| format!("raw={raw}"))
+        )),
+        Err(err) => notes.push(format!(
+            "step1 router probe failed: {}",
+            format_revert_reason(&format!("{err:#}"))
+        )),
+    }
+    Ok(notes)
+}
+
+fn classify(
+    original: &str,
+    historical: &str,
+    historical_zero_min: Option<&str>,
+    structural_notes: &[String],
+) -> String {
     if structural_notes.iter().any(|note| {
         note.contains("factory mismatch")
             || note.contains("router missing")
@@ -239,6 +334,11 @@ fn classify(original: &str, historical: &str, structural_notes: &[String]) -> St
         } else {
             "historical_success".into()
         };
+    }
+    if let Some(zero_min) = historical_zero_min {
+        if zero_min.starts_with("success") {
+            return "historical_positive_below_min_profit".into();
+        }
     }
     if historical.contains("MinProfitNotMet") {
         return "historical_min_profit_not_met".into();
@@ -267,12 +367,29 @@ fn write_row(
     writeln!(writer, "opportunity_at: {}", row.opportunity_at)?;
     writeln!(writer, "simulation_at: {}", row.simulation_at)?;
     writeln!(writer, "opportunity_block: {}", row.opportunity_block)?;
+    writeln!(
+        writer,
+        "simulation_block: {}",
+        row.simulation_block
+            .map(|block| block.to_string())
+            .unwrap_or_else(|| "-".into())
+    )?;
+    writeln!(
+        writer,
+        "simulation_block_delta: {}",
+        row.simulation_block
+            .map(|block| (block - row.opportunity_block).to_string())
+            .unwrap_or_else(|| "-".into())
+    )?;
     writeln!(writer, "expected_profit: {}", row.expected_profit)?;
     writeln!(writer, "min_profit: {}", row.min_profit)?;
     match result {
         Ok(result) => {
             writeln!(writer, "original_reason: {}", result.original_reason)?;
             writeln!(writer, "historical_result: {}", result.historical_result)?;
+            if let Some(zero_min) = &result.historical_zero_min_result {
+                writeln!(writer, "historical_zero_min_result: {zero_min}")?;
+            }
             writeln!(
                 writer,
                 "historical_profit: {}",
@@ -285,6 +402,12 @@ fn write_row(
             writeln!(writer, "structural_notes:")?;
             for note in &result.structural_notes {
                 writeln!(writer, "  - {note}")?;
+            }
+            if !result.router_probe_notes.is_empty() {
+                writeln!(writer, "router_probe_notes:")?;
+                for note in &result.router_probe_notes {
+                    writeln!(writer, "  - {note}")?;
+                }
             }
         }
         Err(err) => {
@@ -310,6 +433,7 @@ async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
             o.path_json,
             s.id AS simulation_id,
             s.created_at AS simulation_at,
+            s.block_number AS simulation_block,
             s.success AS simulation_success,
             s.revert_reason AS simulation_revert_reason
         FROM simulations s
@@ -447,6 +571,58 @@ fn build_execute_calldata(
     Ok(out)
 }
 
+fn build_router_step_calldata(
+    step: &SwapStep,
+    amount_in: U256,
+    recipient: Address,
+    deadline: U256,
+    settings: &Settings,
+) -> Result<Vec<u8>> {
+    match (step.dex, step.variant) {
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
+            let factory = factory_for_step(step, settings)?.unwrap_or(Address::ZERO);
+            Ok(encode_classic_swap_exact_tokens_for_tokens(
+                amount_in,
+                step.token_in,
+                step.token_out,
+                classic_stable_flag(step),
+                factory,
+                recipient,
+                deadline,
+            ))
+        }
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
+            let spacing = step
+                .tick_spacing
+                .context("tick_spacing is required for Aerodrome Slipstream router probe")?;
+            Ok(encode_exact_input_single_int24(
+                step.token_in,
+                step.token_out,
+                spacing,
+                recipient,
+                deadline,
+                amount_in,
+            ))
+        }
+        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) => {
+            let fee = step
+                .fee_bps
+                .unwrap_or_default()
+                .checked_mul(100)
+                .context("fee overflow")?;
+            Ok(encode_exact_input_single_uint24(
+                step.token_in,
+                step.token_out,
+                fee,
+                recipient,
+                deadline,
+                amount_in,
+            ))
+        }
+        _ => bail!("unsupported dex/variant for router probe"),
+    }
+}
+
 fn encode_executor_steps(path: &ArbPath, settings: &Settings) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend(encode_u256(U256::from(path.steps.len())));
@@ -582,6 +758,78 @@ fn encode_factory_get_pool_int24(token_in: Address, token_out: Address, spacing:
     out
 }
 
+fn encode_exact_input_single_uint24(
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    recipient: Address,
+    deadline: U256,
+    amount_in: U256,
+) -> Vec<u8> {
+    let mut out = keccak256(
+        b"exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))",
+    )[..4]
+        .to_vec();
+    out.extend(encode_address(token_in));
+    out.extend(encode_address(token_out));
+    out.extend(encode_u256(U256::from(fee)));
+    out.extend(encode_address(recipient));
+    out.extend(encode_u256(deadline));
+    out.extend(encode_u256(amount_in));
+    out.extend(encode_u256(U256::ZERO));
+    out.extend(encode_u256(U256::ZERO));
+    out
+}
+
+fn encode_exact_input_single_int24(
+    token_in: Address,
+    token_out: Address,
+    tick_spacing: i32,
+    recipient: Address,
+    deadline: U256,
+    amount_in: U256,
+) -> Vec<u8> {
+    let mut out = keccak256(
+        b"exactInputSingle((address,address,int24,address,uint256,uint256,uint256,uint160))",
+    )[..4]
+        .to_vec();
+    out.extend(encode_address(token_in));
+    out.extend(encode_address(token_out));
+    out.extend(encode_i24(tick_spacing));
+    out.extend(encode_address(recipient));
+    out.extend(encode_u256(deadline));
+    out.extend(encode_u256(amount_in));
+    out.extend(encode_u256(U256::ZERO));
+    out.extend(encode_u256(U256::ZERO));
+    out
+}
+
+fn encode_classic_swap_exact_tokens_for_tokens(
+    amount_in: U256,
+    token_in: Address,
+    token_out: Address,
+    stable: bool,
+    factory: Address,
+    recipient: Address,
+    deadline: U256,
+) -> Vec<u8> {
+    let mut out =
+        keccak256(b"swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)")
+            [..4]
+            .to_vec();
+    out.extend(encode_u256(amount_in));
+    out.extend(encode_u256(U256::ZERO));
+    out.extend(encode_u256(U256::from(160u64)));
+    out.extend(encode_address(recipient));
+    out.extend(encode_u256(deadline));
+    out.extend(encode_u256(U256::from(1u64)));
+    out.extend(encode_address(token_in));
+    out.extend(encode_address(token_out));
+    out.extend(encode_bool(stable));
+    out.extend(encode_address(factory));
+    out
+}
+
 fn encode_address(address: Address) -> Vec<u8> {
     let mut out = vec![0u8; 12];
     out.extend_from_slice(address.as_slice());
@@ -629,6 +877,21 @@ fn decode_uint256_result(raw: &str) -> Option<U256> {
         return None;
     }
     U256::from_str_radix(&clean[0..64], 16).ok()
+}
+
+fn decode_router_amount_out(raw: &str) -> Option<U256> {
+    let clean = raw.trim_start_matches("0x");
+    if clean.len() < 64 {
+        return None;
+    }
+    let first = U256::from_str_radix(&clean[0..64], 16).ok()?;
+    if clean.len() >= 128 && first == U256::from(32u64) {
+        let len = U256::from_str_radix(&clean[64..128], 16).ok()?;
+        if len >= U256::from(1u64) && clean.len() >= 192 {
+            return U256::from_str_radix(&clean[128..192], 16).ok();
+        }
+    }
+    Some(first)
 }
 
 fn parse_u256_decimal(value: &str) -> Result<U256> {
