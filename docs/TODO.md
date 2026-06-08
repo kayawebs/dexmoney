@@ -19,12 +19,12 @@
 
 ## Current: Pool Discovery / Graph Completeness
 
-- [ ] Build a live global swap-log observer:
+- [x] Build a live global swap-log observer:
   - Scan new blocks for supported swap topics without filtering by known pool addresses.
   - Resolve `log.address` as a candidate pool with `token0/token1/factory/fee/tickSpacing/stable` probes.
   - Auto-import pools from trusted executable factories into `tokens`, `token_pairs`, and `pools`.
   - Store unsupported or untrusted pools in `observed_pools` for analysis and later promotion.
-- [ ] Add historical factory backfill:
+- [x] Add historical factory backfill:
   - Scan trusted factory `PoolCreated` / `PairCreated` events over historical block ranges.
   - Resolve and import all old pools that are executable by the current routers/executors.
   - Keep the live observer and historical backfill on the same pool-classification code path.

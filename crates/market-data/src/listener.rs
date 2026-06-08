@@ -956,7 +956,7 @@ where
     }
 
     async fn find_created_pool_address(&self, log: &CreationLog) -> Result<Option<Address>> {
-        for candidate in data_word_addresses(&log.data) {
+        for candidate in creation_log_candidate_addresses(log) {
             if candidate == Address::ZERO {
                 continue;
             }
@@ -2234,6 +2234,7 @@ fn value_drift_bps(local: Option<U256>, onchain: Option<U256>) -> u64 {
 struct CreationLog {
     factory: Address,
     topic0: String,
+    topics: Vec<String>,
     data: String,
     block_number: u64,
 }
@@ -2265,6 +2266,17 @@ fn parse_creation_log(raw: Value) -> Result<CreationLog> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("pool-created log missing topic0"))?
         .to_ascii_lowercase();
+    let topics = raw
+        .get("topics")
+        .and_then(Value::as_array)
+        .map(|topics| {
+            topics
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let data = raw
         .get("data")
         .and_then(Value::as_str)
@@ -2279,9 +2291,30 @@ fn parse_creation_log(raw: Value) -> Result<CreationLog> {
     Ok(CreationLog {
         factory,
         topic0,
+        topics,
         data,
         block_number,
     })
+}
+
+fn creation_log_candidate_addresses(log: &CreationLog) -> Vec<Address> {
+    let mut out = topic_word_addresses(&log.topics);
+    out.extend(data_word_addresses(&log.data));
+    out
+}
+
+fn topic_word_addresses(topics: &[String]) -> Vec<Address> {
+    topics
+        .iter()
+        .skip(1)
+        .filter_map(|topic| {
+            let hex = topic.strip_prefix("0x").unwrap_or(topic);
+            if hex.len() != 64 || !hex[..24].eq_ignore_ascii_case("000000000000000000000000") {
+                return None;
+            }
+            format!("0x{}", &hex[24..64]).parse::<Address>().ok()
+        })
+        .collect()
 }
 
 fn parse_swap_log(raw: Value) -> Result<SwapObservationLog> {
