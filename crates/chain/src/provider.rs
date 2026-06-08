@@ -330,28 +330,31 @@ impl ChainProvider {
             let expected_factory = settings
                 .aerodrome_pool_factory
                 .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
-            if factory != Some(expected_factory) {
-                anyhow::bail!(
-                    "unsupported classic-v2-compatible factory {}; not enabling for execution",
-                    factory
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "-".to_string())
-                );
-            }
+            let classic_factory = factory.unwrap_or(expected_factory);
             let stable = metadata.stable.unwrap_or(false);
             let mut state = self.fetch_aerodrome_pool_state(pool).await?;
-            state.factory_address = Some(expected_factory);
+            state.factory_address = Some(classic_factory);
             state.stable = Some(stable);
-            state.fee_bps = self
-                .fetch_aerodrome_classic_fee_bps(expected_factory, pool, stable)
+            state.fee_bps = match self
+                .fetch_aerodrome_classic_fee_bps(classic_factory, pool, stable)
                 .await
-                .unwrap_or(state.fee_bps);
+            {
+                Ok(fee_bps) => fee_bps,
+                Err(_) => self
+                    .fetch_classic_pool_fee_bps(pool)
+                    .await
+                    .unwrap_or(state.fee_bps),
+            };
             return Ok(DiscoveredPool {
                 state,
-                factory_address: Some(expected_factory),
+                factory_address: Some(classic_factory),
                 tick_spacing: None,
                 stable: Some(stable),
-                source: "observed_pool_import".to_string(),
+                source: if classic_factory == expected_factory {
+                    "observed_pool_import".to_string()
+                } else {
+                    "observed_classic_v2_compatible_import".to_string()
+                },
             });
         }
 

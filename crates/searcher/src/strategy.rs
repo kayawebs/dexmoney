@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, U256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
@@ -215,7 +215,7 @@ impl SearchEngine {
                         .unwrap_or(0);
                     let candidate = build_candidate(
                         block_number,
-                        "pair-two-pool-cycle".into(),
+                        search_path.strategy.clone(),
                         search_path.path.steps[0].token_in,
                         *amount_in,
                         expected_amount_out,
@@ -248,6 +248,7 @@ impl SearchEngine {
                     path,
                     amount_sizes: self.amount_sizes.clone(),
                     min_profit: self.min_expected_profit,
+                    strategy: "static-path".into(),
                 })
                 .collect();
         }
@@ -273,8 +274,85 @@ impl SearchEngine {
                 }
             }
         }
+        self.add_three_pool_cycle_paths(pool_states, &mut paths);
 
         paths
+    }
+
+    fn add_three_pool_cycle_paths(&self, pool_states: &[PoolState], paths: &mut Vec<SearchPath>) {
+        let anchors = anchor_search_configs(&self.pair_configs);
+        if anchors.is_empty() {
+            return;
+        }
+
+        let mut edges_by_token: HashMap<Address, Vec<PoolEdge<'_>>> = HashMap::new();
+        for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
+            edges_by_token
+                .entry(state.token0)
+                .or_default()
+                .push(PoolEdge {
+                    state,
+                    token_in: state.token0,
+                    token_out: state.token1,
+                });
+            edges_by_token
+                .entry(state.token1)
+                .or_default()
+                .push(PoolEdge {
+                    state,
+                    token_in: state.token1,
+                    token_out: state.token0,
+                });
+        }
+
+        let mut seen = HashSet::new();
+        for anchor in anchors {
+            let Some(first_edges) = edges_by_token.get(&anchor.token) else {
+                continue;
+            };
+            for first in first_edges {
+                let Some(second_edges) = edges_by_token.get(&first.token_out) else {
+                    continue;
+                };
+                for second in second_edges {
+                    if second.state.pool_id.address == first.state.pool_id.address {
+                        continue;
+                    }
+                    if second.token_out == anchor.token {
+                        continue;
+                    }
+                    let Some(third_edges) = edges_by_token.get(&second.token_out) else {
+                        continue;
+                    };
+                    for third in third_edges {
+                        if third.token_out != anchor.token {
+                            continue;
+                        }
+                        if third.state.pool_id.address == first.state.pool_id.address
+                            || third.state.pool_id.address == second.state.pool_id.address
+                        {
+                            continue;
+                        }
+                        let fingerprint = format!(
+                            "{:#x}|{:#x}|{:#x}|{:#x}",
+                            anchor.token,
+                            first.state.pool_id.address,
+                            second.state.pool_id.address,
+                            third.state.pool_id.address
+                        );
+                        if !seen.insert(fingerprint) {
+                            continue;
+                        }
+                        paths.push(build_three_pool_search_path(
+                            anchor.clone(),
+                            first,
+                            second,
+                            third,
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -307,6 +385,20 @@ struct SearchPath {
     path: ArbPath,
     amount_sizes: Vec<U256>,
     min_profit: U256,
+    strategy: String,
+}
+
+#[derive(Clone)]
+struct AnchorSearchConfig {
+    token: Address,
+    amount_sizes: Vec<U256>,
+    min_profit: U256,
+}
+
+struct PoolEdge<'a> {
+    state: &'a PoolState,
+    token_in: Address,
+    token_out: Address,
 }
 
 fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
@@ -692,34 +784,104 @@ fn build_search_path(
         path: ArbPath {
             name,
             steps: vec![
-                SwapStep {
-                    dex: first.dex,
-                    variant: Some(first.variant),
-                    factory_address: first.factory_address,
-                    pool: first.pool_id.address,
-                    token_in,
-                    token_out: token_mid,
-                    fee_bps: Some(first.fee_bps),
-                    stable: first.stable,
-                    tick_spacing: first.tick_spacing,
-                },
-                SwapStep {
-                    dex: second.dex,
-                    variant: Some(second.variant),
-                    factory_address: second.factory_address,
-                    pool: second.pool_id.address,
-                    token_in: token_mid,
-                    token_out: token_in,
-                    fee_bps: Some(second.fee_bps),
-                    stable: second.stable,
-                    tick_spacing: second.tick_spacing,
-                },
+                swap_step_from_pool(first, token_in, token_mid),
+                swap_step_from_pool(second, token_mid, token_in),
             ],
             diagnostics: None,
         },
         amount_sizes,
         min_profit,
+        strategy: "pair-two-pool-cycle".into(),
     }
+}
+
+fn build_three_pool_search_path(
+    anchor: AnchorSearchConfig,
+    first: &PoolEdge<'_>,
+    second: &PoolEdge<'_>,
+    third: &PoolEdge<'_>,
+) -> SearchPath {
+    let name = format!(
+        "cycle3-{}-{}-{}-{}",
+        short_token(anchor.token),
+        pool_label(first.state),
+        pool_label(second.state),
+        pool_label(third.state)
+    );
+    SearchPath {
+        path: ArbPath {
+            name,
+            steps: vec![
+                swap_step_from_pool(first.state, first.token_in, first.token_out),
+                swap_step_from_pool(second.state, second.token_in, second.token_out),
+                swap_step_from_pool(third.state, third.token_in, third.token_out),
+            ],
+            diagnostics: None,
+        },
+        amount_sizes: anchor.amount_sizes,
+        min_profit: anchor.min_profit,
+        strategy: "token-three-pool-cycle".into(),
+    }
+}
+
+fn swap_step_from_pool(state: &PoolState, token_in: Address, token_out: Address) -> SwapStep {
+    SwapStep {
+        dex: state.dex,
+        variant: Some(state.variant),
+        factory_address: state.factory_address,
+        pool: state.pool_id.address,
+        token_in,
+        token_out,
+        fee_bps: Some(state.fee_bps),
+        stable: state.stable,
+        tick_spacing: state.tick_spacing,
+    }
+}
+
+fn anchor_search_configs(configs: &[TokenPairSearchConfig]) -> Vec<AnchorSearchConfig> {
+    let mut by_token: HashMap<Address, AnchorSearchConfig> = HashMap::new();
+    for config in configs {
+        if !config.token0_search_amounts.is_empty() {
+            merge_anchor_config(
+                &mut by_token,
+                config.token0,
+                &config.token0_search_amounts,
+                config.token0_min_profit,
+            );
+        }
+        if !config.token1_search_amounts.is_empty() {
+            merge_anchor_config(
+                &mut by_token,
+                config.token1,
+                &config.token1_search_amounts,
+                config.token1_min_profit,
+            );
+        }
+    }
+    by_token.into_values().collect()
+}
+
+fn merge_anchor_config(
+    by_token: &mut HashMap<Address, AnchorSearchConfig>,
+    token: Address,
+    amounts: &[U256],
+    min_profit: U256,
+) {
+    by_token
+        .entry(token)
+        .and_modify(|existing| {
+            for amount in amounts {
+                if !existing.amount_sizes.contains(amount) {
+                    existing.amount_sizes.push(*amount);
+                }
+            }
+            existing.min_profit = existing.min_profit.min(min_profit);
+        })
+        .or_insert_with(|| AnchorSearchConfig {
+            token,
+            amount_sizes: amounts.to_vec(),
+            min_profit,
+        });
 }
 
 fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -> bool {
@@ -728,6 +890,10 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
     if !has_pair {
         return false;
     }
+    is_supported_pool(state)
+}
+
+fn is_supported_pool(state: &PoolState) -> bool {
     match state.variant {
         PoolVariant::AerodromeVolatile => {
             if state.stable.unwrap_or(false)
@@ -789,7 +955,9 @@ mod tests {
     };
     use chrono::Utc;
 
-    use super::{demo_pool_states, is_supported_config_pool, quote_validity_gap, SearchEngine};
+    use super::{
+        demo_pool_states, is_supported_config_pool, quote_validity_gap, SearchEngine, SearchPath,
+    };
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
@@ -862,6 +1030,95 @@ mod tests {
         pool_states[classic].token0_decimals = Some(6);
         pool_states[classic].token1_decimals = Some(18);
         assert!(is_supported_config_pool(&pool_states[classic], &config));
+    }
+
+    #[test]
+    fn dynamic_paths_include_anchor_three_pool_cycles() {
+        let weth = address!("4200000000000000000000000000000000000006");
+        let cb_btc = address!("cbb7c0000ab88b473b1f5afd9ef808440eed33bf");
+        let sol = address!("311935cd80b76769bf2ecc9d8ab7635b2139cf82");
+        let jito_sol = address!("97be14dd8f994a5364573bc035d85309e7cb34de");
+        let config = TokenPairSearchConfig {
+            chain_id: 8453,
+            token0: weth,
+            token1: cb_btc,
+            symbol: "WETH/cbBTC".into(),
+            token0_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
+            token1_search_amounts: Vec::new(),
+            token0_min_profit: U256::from(1_000_000_000_000u64),
+            token1_min_profit: U256::ZERO,
+        };
+        let engine = SearchEngine {
+            amount_sizes: Vec::new(),
+            paths: Vec::new(),
+            pair_configs: vec![config],
+            min_expected_profit: U256::ONE,
+            max_price_impact_bps: 10_000,
+            whitelist_paths: Vec::new(),
+            candidate_ttl_ms: 500,
+            v3_quote_safety_bps: 0,
+            quote_max_state_block_lag: 0,
+        };
+        let states = vec![
+            test_v3_pool(
+                address!("1111111111111111111111111111111111111111"),
+                weth,
+                sol,
+            ),
+            test_v3_pool(
+                address!("2222222222222222222222222222222222222222"),
+                sol,
+                jito_sol,
+            ),
+            test_v3_pool(
+                address!("3333333333333333333333333333333333333333"),
+                jito_sol,
+                weth,
+            ),
+        ];
+
+        let paths = engine.paths_for_pool_states(&states);
+
+        assert!(paths.iter().any(is_weth_three_pool_cycle));
+    }
+
+    fn is_weth_three_pool_cycle(path: &SearchPath) -> bool {
+        path.strategy == "token-three-pool-cycle"
+            && path.path.steps.len() == 3
+            && path.path.steps[0].token_in == address!("4200000000000000000000000000000000000006")
+            && path.path.steps[2].token_out == address!("4200000000000000000000000000000000000006")
+    }
+
+    fn test_v3_pool(
+        pool: alloy_primitives::Address,
+        token0: alloy_primitives::Address,
+        token1: alloy_primitives::Address,
+    ) -> base_arb_common::types::PoolState {
+        base_arb_common::types::PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: pool,
+            },
+            dex: base_arb_common::types::DexKind::UniswapV3,
+            variant: PoolVariant::UniswapV3,
+            factory_address: None,
+            token0,
+            token1,
+            token0_decimals: Some(18),
+            token1_decimals: Some(18),
+            fee_bps: 1,
+            fee_pips: Some(100),
+            stable: None,
+            reserve0: None,
+            reserve1: None,
+            sqrt_price_x96: Some(U256::from(79_228_162_514_264_337_593_543_950_336u128)),
+            liquidity: Some(U256::from(1_000_000_000u64)),
+            tick: Some(0),
+            tick_spacing: Some(1),
+            block_number: 1,
+            valid_through_block: 1,
+            updated_at: Utc::now(),
+        }
     }
 
     #[test]

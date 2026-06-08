@@ -174,7 +174,7 @@ contract ExecutorV2 {
         uint256 deadline
     ) external onlyOperator whenNotPaused returns (uint256 profit) {
         if (block.timestamp > deadline) revert DeadlineExpired();
-        if (steps.length != 2) revert InvalidStepCount();
+        if (steps.length < 2 || steps.length > 4) revert InvalidStepCount();
 
         uint256 balanceBefore = IERC20V2(tokenIn).balanceOf(address(this));
         if (balanceBefore < amountIn) revert InsufficientBalance();
@@ -182,7 +182,7 @@ contract ExecutorV2 {
         address currentToken = tokenIn;
         uint256 currentAmount = amountIn;
 
-        for (uint256 i = 0; i < 2; i++) {
+        for (uint256 i = 0; i < steps.length; i++) {
             SwapStep calldata step = steps[i];
             if (step.tokenIn != currentToken) revert InvalidPath();
             currentAmount = _swap(step, currentAmount, deadline);

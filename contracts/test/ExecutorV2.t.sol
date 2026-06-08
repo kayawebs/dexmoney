@@ -84,9 +84,12 @@ contract ExecutorV2Test is Test {
     ExecutorV2 internal executor;
     MockERC20V2 internal usdc;
     MockERC20V2 internal weth;
+    MockERC20V2 internal dai;
     MockSlipstreamRouterV2 internal slipstreamRouter;
     MockV3RouterV2 internal v3Router;
+    MockV3RouterV2 internal v3Router2;
     MockV3FactoryV2 internal v3Factory;
+    MockV3FactoryV2 internal v3Factory2;
 
     address internal owner = address(0xA11CE);
     address internal operator = address(0xB0B);
@@ -99,22 +102,30 @@ contract ExecutorV2Test is Test {
 
         usdc = new MockERC20V2();
         weth = new MockERC20V2();
+        dai = new MockERC20V2();
         slipstreamRouter = new MockSlipstreamRouterV2();
         v3Router = new MockV3RouterV2();
+        v3Router2 = new MockV3RouterV2();
         v3Factory = new MockV3FactoryV2();
+        v3Factory2 = new MockV3FactoryV2();
 
         usdc.mint(address(executor), 1_000_000);
         weth.mint(address(slipstreamRouter), 1_000_000);
+        dai.mint(address(v3Router), 1_000_000);
         usdc.mint(address(v3Router), 1_000_000);
+        usdc.mint(address(v3Router2), 1_000_000);
 
         slipstreamRouter.setAmountOut(100);
         v3Router.setAmountOut(100_001);
+        v3Router2.setAmountOut(100_001);
         v3Factory.setPool(v3Pool);
+        v3Factory2.setPool(address(0x4444));
 
         vm.startPrank(owner);
         executor.setOperator(operator, true);
         executor.approveToken(address(usdc), address(slipstreamRouter), type(uint256).max);
         executor.approveToken(address(weth), address(v3Router), type(uint256).max);
+        executor.approveToken(address(dai), address(v3Router2), type(uint256).max);
         vm.stopPrank();
     }
 
@@ -151,6 +162,46 @@ contract ExecutorV2Test is Test {
         assertEq(usdc.balanceOf(address(executor)), 1_000_001);
         assertEq(usdc.allowance(address(executor), address(slipstreamRouter)), type(uint256).max);
         assertEq(weth.allowance(address(executor), address(v3Router)), type(uint256).max);
+    }
+
+    function testExecutesThreeStepCycle() public {
+        ExecutorV2.SwapStep[] memory steps = new ExecutorV2.SwapStep[](3);
+        steps[0] = ExecutorV2.SwapStep({
+            dex: ExecutorV2.DexKind.AerodromeSlipstream,
+            router: address(slipstreamRouter),
+            pool: slipstreamPool,
+            tokenIn: address(usdc),
+            tokenOut: address(weth),
+            fee: 100,
+            stable: false,
+            factory: address(0)
+        });
+        steps[1] = ExecutorV2.SwapStep({
+            dex: ExecutorV2.DexKind.UniswapV3,
+            router: address(v3Router),
+            pool: v3Pool,
+            tokenIn: address(weth),
+            tokenOut: address(dai),
+            fee: 500,
+            stable: false,
+            factory: address(v3Factory)
+        });
+        steps[2] = ExecutorV2.SwapStep({
+            dex: ExecutorV2.DexKind.UniswapV3,
+            router: address(v3Router2),
+            pool: address(0x4444),
+            tokenIn: address(dai),
+            tokenOut: address(usdc),
+            fee: 500,
+            stable: false,
+            factory: address(v3Factory2)
+        });
+
+        vm.prank(operator);
+        uint256 profit = executor.executeWithOwnFunds(address(usdc), 100_000, steps, 1, block.timestamp + 1);
+
+        assertEq(profit, 1);
+        assertEq(usdc.balanceOf(address(executor)), 1_000_001);
     }
 
     function testRejectsZeroSlipstreamTickSpacing() public {
