@@ -28,8 +28,16 @@
   - Scan trusted factory `PoolCreated` / `PairCreated` events over historical block ranges.
   - Resolve and import all old pools that are executable by the current routers/executors.
   - Keep the live observer and historical backfill on the same pool-classification code path.
-- [ ] Add automatic factory classification:
-  - Probe factory/pool ABI shape and bytecode/codehash for known V2/V3-compatible families.
+- [x] Add automatic observed-pool classification:
+  - Probe observed pool ABI shape, `factory()`, token metadata, fee/tick/stable fields, and readable pool state.
+  - Promote pools into `pools` only when the factory is already known executable by configured routers.
+  - Keep unknown V2/V3-compatible factories as classified observed-only until router/executor support is proven.
+- [x] Add historical global swap-log backfill:
+  - Scan historical supported swap topics without an address filter.
+  - Aggregate active pools by frequency and latest activity.
+  - Import trusted-factory pools and store unknown-factory pools in `observed_pools`.
+- [ ] Add automatic factory execution proof:
+  - Probe factory/router ABI shape and bytecode/codehash for known V2/V3-compatible families.
   - Promote factories to trusted only when pool state reads and executor/router dry-run succeed.
   - Keep quote-only factories separate from executable factories.
 - [ ] Generate paths from the active pool graph:
