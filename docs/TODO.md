@@ -17,6 +17,26 @@
 - [ ] If the deployed Slipstream fee module formula is stable and based only on locally available inputs, implement and test local fee evaluation; otherwise document RPC refresh as required input to exact quotes.
 - [ ] Add fork/replay tests that compare each supported local path quote with contract output across recorded profitable and `MinProfitNotMet` candidates.
 
+## Current: Pool Discovery / Graph Completeness
+
+- [ ] Build a live global swap-log observer:
+  - Scan new blocks for supported swap topics without filtering by known pool addresses.
+  - Resolve `log.address` as a candidate pool with `token0/token1/factory/fee/tickSpacing/stable` probes.
+  - Auto-import pools from trusted executable factories into `tokens`, `token_pairs`, and `pools`.
+  - Store unsupported or untrusted pools in `observed_pools` for analysis and later promotion.
+- [ ] Add historical factory backfill:
+  - Scan trusted factory `PoolCreated` / `PairCreated` events over historical block ranges.
+  - Resolve and import all old pools that are executable by the current routers/executors.
+  - Keep the live observer and historical backfill on the same pool-classification code path.
+- [ ] Add automatic factory classification:
+  - Probe factory/pool ABI shape and bytecode/codehash for known V2/V3-compatible families.
+  - Promote factories to trusted only when pool state reads and executor/router dry-run succeed.
+  - Keep quote-only factories separate from executable factories.
+- [ ] Generate paths from the active pool graph:
+  - Treat configured funded tokens as anchors.
+  - Generate 2/3/4-hop cycles from active pools around anchors.
+  - Rank graph edges by recent swap frequency, liquidity/state freshness, and quote reliability.
+
 ## Immediate
 
 - Replace demo `market-data` bootstrap with real Base RPC/WS initialization.

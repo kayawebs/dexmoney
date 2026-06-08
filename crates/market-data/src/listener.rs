@@ -40,6 +40,11 @@ const SLIPSTREAM_POOL_CREATED_TOPIC: &str =
     "0xab0d57f0df537bb25e80245ef7748fa62353808c54d6e528a9dd20887aed9ac2";
 const SLIPSTREAM_POOL_CREATED_WITH_INDEX_TOPIC: &str =
     "0xb4b64a6a7c41cd0232bfad78d5f845870be74762857744ff02be28578c5f4cb9";
+const V3_SWAP_TOPIC: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const PANCAKE_V3_SWAP_TOPIC: &str =
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
+const CLASSIC_SWAP_TOPIC: &str =
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -75,6 +80,7 @@ where
             Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
         let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
         let mut recent_logs = RecentLogCache::new(20_000);
+        let mut globally_observed_pools = HashSet::new();
         let mut pending_validations = VecDeque::new();
         let mut active_refresh_cursor = 0usize;
         info!(last_seen_block, "market-data synchronized at startup");
@@ -119,6 +125,12 @@ where
 
             self.discover_live_pool_creations(last_seen_block + 1, latest_block)
                 .await?;
+            self.discover_global_swap_pools(
+                last_seen_block + 1,
+                latest_block,
+                &mut globally_observed_pools,
+            )
+            .await?;
 
             let events = self
                 .provider
@@ -512,6 +524,293 @@ where
         Ok(())
     }
 
+    async fn discover_global_swap_pools(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        seen_pools: &mut HashSet<Address>,
+    ) -> Result<()> {
+        if !self.settings.market_data_global_pool_discovery_enabled || from_block > to_block {
+            return Ok(());
+        }
+        let params = json!([{
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": [[
+                V3_SWAP_TOPIC,
+                PANCAKE_V3_SWAP_TOPIC,
+                CLASSIC_SWAP_TOPIC
+            ]]
+        }]);
+        let logs = match self.provider.get_logs_raw(params).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                warn!(
+                    from_block,
+                    to_block,
+                    error = %err,
+                    "global swap pool discovery getLogs failed"
+                );
+                return Ok(());
+            }
+        };
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        let trusted = self
+            .recorder
+            .trusted_factory_registry(self.settings.chain_id)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let address = row.factory_address.parse::<Address>().ok()?;
+                let dex = parse_dex_kind(&row.dex).ok()?;
+                let variant = parse_pool_variant(&row.variant).ok()?;
+                Some((address, (dex, variant, row)))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut imported = 0usize;
+        let mut observed_only = 0usize;
+        let mut skipped = 0usize;
+        for raw in logs {
+            let log = match parse_swap_log(raw) {
+                Ok(log) => log,
+                Err(err) => {
+                    debug!(error = %err, "global swap discovery log skipped");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if !seen_pools.insert(log.pool) {
+                continue;
+            }
+            match self.process_observed_swap_pool(&log, &trusted).await {
+                Ok(LivePoolDiscoveryOutcome::Imported) => imported += 1,
+                Ok(LivePoolDiscoveryOutcome::ObservedOnly) => observed_only += 1,
+                Ok(LivePoolDiscoveryOutcome::Skipped) => skipped += 1,
+                Err(err) => {
+                    debug!(
+                        pool = %log.pool,
+                        topic0 = %log.topic0,
+                        error = %err,
+                        "global swap discovery pool skipped"
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+
+        if imported > 0 || observed_only > 0 {
+            info!(
+                imported,
+                observed_only,
+                skipped,
+                from_block,
+                to_block,
+                "global swap pool discovery processed swap logs"
+            );
+        }
+        Ok(())
+    }
+
+    async fn process_observed_swap_pool(
+        &self,
+        log: &SwapObservationLog,
+        trusted: &HashMap<Address, (DexKind, PoolVariant, FactoryRegistryRecord)>,
+    ) -> Result<LivePoolDiscoveryOutcome> {
+        let metadata = match self
+            .provider
+            .resolve_observed_pool_metadata(log.pool, &log.topic0)
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                debug!(
+                    pool = %log.pool,
+                    topic0 = %log.topic0,
+                    error = %err,
+                    "global swap discovery metadata resolve failed"
+                );
+                return Ok(LivePoolDiscoveryOutcome::Skipped);
+            }
+        };
+        let symbol = pair_symbol(&self.provider, metadata.token0, metadata.token1).await;
+        let Some(factory) = metadata.factory_address else {
+            self.recorder
+                .upsert_observed_pool(
+                    self.settings.chain_id,
+                    log.pool,
+                    &log.topic0,
+                    swap_family_for_topic(&log.topic0),
+                    Some(metadata.token0),
+                    Some(metadata.token1),
+                    Some(&symbol),
+                    None,
+                    None,
+                    None,
+                    metadata.fee_bps,
+                    metadata.fee_pips,
+                    metadata.tick_spacing,
+                    metadata.stable,
+                    1,
+                    1,
+                    Some(i64::try_from(log.block_number)?),
+                    Some(i64::try_from(log.block_number)?),
+                    "observed_only",
+                    Some("pool factory() unavailable; cannot prove executor support"),
+                )
+                .await?;
+            return Ok(LivePoolDiscoveryOutcome::ObservedOnly);
+        };
+
+        if let Some((dex, variant, _row)) = trusted.get(&factory) {
+            match self
+                .provider
+                .resolve_pool_for_trusted_factory(log.pool, factory, *dex, *variant)
+                .await
+            {
+                Ok(discovered) => {
+                    self.import_discovered_pool(
+                        log.pool,
+                        &log.topic0,
+                        "swap-log",
+                        log.block_number,
+                        &symbol,
+                        *dex,
+                        *variant,
+                        factory,
+                        discovered,
+                    )
+                    .await?;
+                    return Ok(LivePoolDiscoveryOutcome::Imported);
+                }
+                Err(err) => {
+                    self.record_observed_swap_only_pool(
+                        log,
+                        &metadata,
+                        &symbol,
+                        Some(factory),
+                        Some(&format!("trusted factory pool resolve failed: {err}")),
+                    )
+                    .await?;
+                    return Ok(LivePoolDiscoveryOutcome::ObservedOnly);
+                }
+            }
+        }
+
+        self.record_observed_swap_only_pool(
+            log,
+            &metadata,
+            &symbol,
+            Some(factory),
+            Some("factory is not trusted; auto-classification pending"),
+        )
+        .await?;
+        self.recorder
+            .upsert_factory_registry(
+                self.settings.chain_id,
+                factory,
+                inferred_dex_for_swap_topic(&log.topic0),
+                inferred_variant_for_swap_topic(&log.topic0),
+                false,
+                true,
+                "global_swap_discovery",
+                Some("observed from global swap logs; not trusted for execution"),
+                Some(i64::try_from(log.block_number)?),
+                Some(i64::try_from(log.block_number)?),
+                1,
+            )
+            .await?;
+        Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn import_discovered_pool(
+        &self,
+        pool: Address,
+        topic0: &str,
+        family: &str,
+        block_number: u64,
+        symbol: &str,
+        dex: DexKind,
+        variant: PoolVariant,
+        factory: Address,
+        discovered: base_arb_common::types::DiscoveredPool,
+    ) -> Result<()> {
+        self.recorder
+            .upsert_token_registry(
+                self.settings.chain_id,
+                discovered.state.token0,
+                symbol.split('/').next().unwrap_or_default(),
+            )
+            .await?;
+        self.recorder
+            .upsert_token_registry(
+                self.settings.chain_id,
+                discovered.state.token1,
+                symbol.split('/').nth(1).unwrap_or_default(),
+            )
+            .await?;
+        let (token0, token1) = canonical_pair(discovered.state.token0, discovered.state.token1);
+        let pair_id = self
+            .recorder
+            .upsert_token_pair(self.settings.chain_id, token0, token1, symbol)
+            .await?;
+        self.recorder
+            .upsert_discovered_pool(pair_id, &discovered)
+            .await?;
+        self.recorder
+            .upsert_observed_pool(
+                self.settings.chain_id,
+                pool,
+                topic0,
+                family,
+                Some(discovered.state.token0),
+                Some(discovered.state.token1),
+                Some(symbol),
+                Some(factory),
+                Some(dex_to_string(dex)),
+                Some(variant_to_string(variant)),
+                Some(discovered.state.fee_bps),
+                discovered.state.fee_pips,
+                discovered.tick_spacing,
+                discovered.stable,
+                1,
+                1,
+                Some(i64::try_from(block_number)?),
+                Some(i64::try_from(block_number)?),
+                "imported",
+                None,
+            )
+            .await?;
+        self.recorder
+            .upsert_factory_registry(
+                self.settings.chain_id,
+                factory,
+                dex_to_string(dex),
+                variant_to_string(variant),
+                true,
+                true,
+                "global_swap_discovery",
+                None,
+                Some(i64::try_from(block_number)?),
+                Some(i64::try_from(block_number)?),
+                1,
+            )
+            .await?;
+        info!(
+            pool = %pool,
+            factory = %factory,
+            symbol,
+            dex = ?dex,
+            variant = ?variant,
+            "global swap discovery imported trusted factory pool"
+        );
+        Ok(())
+    }
+
     async fn process_pool_creation_log(
         &self,
         raw: Value,
@@ -720,6 +1019,41 @@ where
                 Some(i64::try_from(log.block_number)?),
                 Some(i64::try_from(log.block_number)?),
                 1,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn record_observed_swap_only_pool(
+        &self,
+        log: &SwapObservationLog,
+        metadata: &base_arb_chain::provider::ObservedPoolMetadata,
+        symbol: &str,
+        factory: Option<Address>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.recorder
+            .upsert_observed_pool(
+                self.settings.chain_id,
+                log.pool,
+                &log.topic0,
+                "swap-log",
+                Some(metadata.token0),
+                Some(metadata.token1),
+                Some(symbol),
+                factory,
+                None,
+                None,
+                metadata.fee_bps,
+                metadata.fee_pips,
+                metadata.tick_spacing,
+                metadata.stable,
+                1,
+                1,
+                Some(i64::try_from(log.block_number)?),
+                Some(i64::try_from(log.block_number)?),
+                "observed_only",
+                reason,
             )
             .await?;
         Ok(())
@@ -1904,6 +2238,13 @@ struct CreationLog {
     block_number: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SwapObservationLog {
+    pool: Address,
+    topic0: String,
+    block_number: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LivePoolDiscoveryOutcome {
     Imported,
@@ -1939,6 +2280,32 @@ fn parse_creation_log(raw: Value) -> Result<CreationLog> {
         factory,
         topic0,
         data,
+        block_number,
+    })
+}
+
+fn parse_swap_log(raw: Value) -> Result<SwapObservationLog> {
+    let pool = raw
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("swap log missing address"))?
+        .parse::<Address>()?;
+    let topic0 = raw
+        .get("topics")
+        .and_then(Value::as_array)
+        .and_then(|topics| topics.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("swap log missing topic0"))?
+        .to_ascii_lowercase();
+    let block_number = raw
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(parse_hex_u64_local)
+        .ok_or_else(|| anyhow::anyhow!("swap log missing blockNumber"))?;
+
+    Ok(SwapObservationLog {
+        pool,
+        topic0,
         block_number,
     })
 }
@@ -2046,6 +2413,39 @@ fn inferred_variant_for_creation_topic(topic0: &str) -> &'static str {
         "AerodromeSlipstream"
     } else {
         "UniswapV3"
+    }
+}
+
+fn inferred_dex_for_swap_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_SWAP_TOPIC {
+        "Aerodrome"
+    } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
+        "PancakeSwap"
+    } else {
+        "UniswapV3"
+    }
+}
+
+fn inferred_variant_for_swap_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_SWAP_TOPIC {
+        "AerodromeVolatile"
+    } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
+        "PancakeV3"
+    } else {
+        "UniswapV3"
+    }
+}
+
+fn swap_family_for_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_SWAP_TOPIC {
+        "classic-v2"
+    } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
+        "pancake-v3"
+    } else {
+        "v3/slipstream"
     }
 }
 
