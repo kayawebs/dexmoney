@@ -93,6 +93,105 @@ WHERE created_at >= now() - :'interval'::interval
 ORDER BY table_name;
 SQL
 
+run_query "1b. hourly opportunity/simulation/tx funnel" <<'SQL'
+WITH opp AS (
+  SELECT date_trunc('hour', created_at) AS hour, count(*) AS opportunities, max(created_at) AS latest_opportunity
+  FROM opportunities
+  WHERE created_at >= now() - :'interval'::interval
+  GROUP BY 1
+),
+sim AS (
+  SELECT date_trunc('hour', created_at) AS hour, count(*) AS simulations, max(created_at) AS latest_simulation
+  FROM simulations
+  WHERE created_at >= now() - :'interval'::interval
+  GROUP BY 1
+),
+tx AS (
+  SELECT date_trunc('hour', created_at) AS hour, count(*) AS transactions, max(created_at) AS latest_tx
+  FROM transactions
+  WHERE created_at >= now() - :'interval'::interval
+  GROUP BY 1
+)
+SELECT
+  COALESCE(opp.hour, sim.hour, tx.hour) AS hour,
+  COALESCE(opp.opportunities, 0) AS opportunities,
+  COALESCE(sim.simulations, 0) AS simulations,
+  COALESCE(tx.transactions, 0) AS transactions,
+  opp.latest_opportunity,
+  sim.latest_simulation,
+  tx.latest_tx
+FROM opp
+FULL JOIN sim ON sim.hour = opp.hour
+FULL JOIN tx ON tx.hour = COALESCE(opp.hour, sim.hour)
+ORDER BY hour DESC;
+SQL
+
+run_query "1c. latest opportunities by path signature" <<'SQL'
+WITH opp AS (
+  SELECT
+    o.*,
+    COALESCE(
+      (
+        SELECT string_agg(
+          COALESCE(step->>'dex', '') || ':' ||
+          COALESCE(step->>'variant', '') || ':' ||
+          right(COALESCE(step->>'pool', step->>'pool_address', ''), 6),
+          ' -> '
+          ORDER BY ord
+        )
+        FROM jsonb_array_elements(o.path_json->'steps') WITH ORDINALITY AS x(step, ord)
+      ),
+      'unknown'
+    ) AS path_signature
+  FROM opportunities o
+  WHERE o.created_at >= now() - :'interval'::interval
+)
+SELECT
+  path_signature,
+  count(*) AS opportunities,
+  count(s.id) AS simulations,
+  count(*) FILTER (WHERE s.success) AS sim_success,
+  count(*) FILTER (WHERE s.revert_reason ILIKE '%MinProfitNotMet%') AS min_profit_not_met,
+  count(*) FILTER (WHERE s.revert_reason ILIKE '%net simulated profit below threshold after gas%') AS below_gas,
+  count(*) FILTER (WHERE s.revert_reason ILIKE '%router/no-revert-data%') AS router_no_revert_data,
+  min(opp.expected_profit::numeric) AS min_expected_profit,
+  max(opp.expected_profit::numeric) AS max_expected_profit,
+  max(opp.created_at) AS latest_opportunity,
+  max(s.created_at) AS latest_simulation
+FROM opp
+LEFT JOIN simulations s ON s.opportunity_id = opp.id
+GROUP BY 1
+ORDER BY opportunities DESC, latest_opportunity DESC
+LIMIT 80;
+
+SELECT
+  o.created_at,
+  o.id,
+  o.block_number,
+  o.token_in,
+  o.amount_in,
+  o.expected_profit,
+  o.min_profit,
+  o.status,
+  COALESCE(
+    (
+      SELECT string_agg(
+        COALESCE(step->>'dex', '') || ':' ||
+        COALESCE(step->>'variant', '') || ':' ||
+        right(COALESCE(step->>'pool', step->>'pool_address', ''), 6),
+        ' -> '
+        ORDER BY ord
+      )
+      FROM jsonb_array_elements(o.path_json->'steps') WITH ORDINALITY AS x(step, ord)
+    ),
+    'unknown'
+  ) AS path_signature
+FROM opportunities o
+WHERE o.created_at >= now() - :'interval'::interval
+ORDER BY o.created_at DESC
+LIMIT 50;
+SQL
+
 run_query "2. simulation reason summary" <<'SQL'
 SELECT
   COALESCE(
@@ -371,7 +470,138 @@ GROUP BY 1
 ORDER BY latest_pool_count DESC;
 SQL
 
-run_query "10. actionable notes" <<'SQL'
+run_query "10. enabled pair readiness and funding anchors" <<'SQL'
+WITH latest_states AS (
+  SELECT DISTINCT ON (lower(pool_address))
+    lower(pool_address) AS pool_address,
+    block_number,
+    updated_at,
+    reserve0,
+    reserve1,
+    sqrt_price_x96,
+    liquidity,
+    tick
+  FROM pool_states
+  ORDER BY lower(pool_address), block_number DESC, updated_at DESC
+),
+ready_pools AS (
+  SELECT
+    p.token_pair_id,
+    count(*) FILTER (
+      WHERE p.enabled
+        AND ls.pool_address IS NOT NULL
+        AND (
+          (ls.reserve0 IS NOT NULL AND ls.reserve1 IS NOT NULL)
+          OR (ls.sqrt_price_x96 IS NOT NULL AND ls.liquidity IS NOT NULL AND ls.tick IS NOT NULL)
+        )
+    ) AS ready_pools,
+    max(ls.updated_at) AS latest_state
+  FROM pools p
+  LEFT JOIN latest_states ls ON ls.pool_address = lower(p.pool_address)
+  GROUP BY p.token_pair_id
+)
+SELECT
+  tp.symbol,
+  tp.enabled AS pair_enabled,
+  t0.symbol AS token0_symbol,
+  d0.search_amounts AS token0_default_amounts,
+  d0.min_profit AS token0_default_min,
+  tp.token0_search_amounts AS token0_pair_amounts,
+  tp.token0_min_profit AS token0_pair_min,
+  t1.symbol AS token1_symbol,
+  d1.search_amounts AS token1_default_amounts,
+  d1.min_profit AS token1_default_min,
+  tp.token1_search_amounts AS token1_pair_amounts,
+  tp.token1_min_profit AS token1_pair_min,
+  count(p.id) FILTER (WHERE p.enabled) AS enabled_pools,
+  COALESCE(rp.ready_pools, 0) AS ready_pools,
+  GREATEST(COALESCE(rp.ready_pools, 0) * (COALESCE(rp.ready_pools, 0) - 1), 0) AS ordered_two_pool_paths,
+  rp.latest_state
+FROM token_pairs tp
+LEFT JOIN tokens t0 ON t0.chain_id = tp.chain_id AND lower(t0.token_address) = lower(tp.token0)
+LEFT JOIN tokens t1 ON t1.chain_id = tp.chain_id AND lower(t1.token_address) = lower(tp.token1)
+LEFT JOIN token_search_defaults d0 ON d0.chain_id = tp.chain_id AND lower(d0.token_address) = lower(tp.token0)
+LEFT JOIN token_search_defaults d1 ON d1.chain_id = tp.chain_id AND lower(d1.token_address) = lower(tp.token1)
+LEFT JOIN pools p ON p.token_pair_id = tp.id
+LEFT JOIN ready_pools rp ON rp.token_pair_id = tp.id
+WHERE tp.enabled
+GROUP BY
+  tp.id, tp.symbol, tp.enabled,
+  t0.symbol, d0.search_amounts, d0.min_profit, tp.token0_search_amounts, tp.token0_min_profit,
+  t1.symbol, d1.search_amounts, d1.min_profit, tp.token1_search_amounts, tp.token1_min_profit,
+  rp.ready_pools, rp.latest_state
+ORDER BY ordered_two_pool_paths DESC, ready_pools DESC, tp.symbol;
+SQL
+
+run_query "11. recent market-data validation drift" <<'SQL'
+SELECT
+  count(*) AS failed,
+  count(*) FILTER (WHERE drift_bps <= 1) AS le_1_bps,
+  count(*) FILTER (WHERE drift_bps BETWEEN 2 AND 5) AS bps_2_5,
+  count(*) FILTER (WHERE drift_bps BETWEEN 6 AND 25) AS bps_6_25,
+  count(*) FILTER (WHERE drift_bps > 25) AS gt_25_bps,
+  max(drift_bps) AS max_drift_bps
+FROM pool_state_validations
+WHERE created_at >= now() - :'interval'::interval
+  AND NOT passed;
+
+WITH v AS (
+  SELECT
+    v.created_at,
+    lower(v.pool_address) AS pool,
+    tp.symbol,
+    v.dex,
+    v.variant,
+    v.drift_bps,
+    (v.local_state_json->>'valid_through_block')::bigint AS local_valid,
+    (v.onchain_state_json->>'block_number')::bigint AS onchain_block,
+    v.local_state_json,
+    v.onchain_state_json
+  FROM pool_state_validations v
+  LEFT JOIN pools p ON lower(p.pool_address) = lower(v.pool_address)
+  LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
+  WHERE v.created_at >= now() - :'interval'::interval
+    AND NOT v.passed
+)
+SELECT
+  symbol,
+  dex,
+  variant,
+  count(*) AS failed,
+  max(drift_bps) AS max_drift_bps,
+  count(*) FILTER (WHERE local_valid < onchain_block) AS stale_at_check,
+  count(*) FILTER (
+    WHERE local_state_json->>'fee_pips' IS DISTINCT FROM onchain_state_json->>'fee_pips'
+       OR local_state_json->>'fee_bps' IS DISTINCT FROM onchain_state_json->>'fee_bps'
+  ) AS fee_mismatch,
+  count(*) FILTER (
+    WHERE local_state_json->>'sqrt_price_x96' IS DISTINCT FROM onchain_state_json->>'sqrt_price_x96'
+  ) AS sqrt_mismatch,
+  count(*) FILTER (
+    WHERE local_state_json->>'liquidity' IS DISTINCT FROM onchain_state_json->>'liquidity'
+  ) AS liquidity_mismatch,
+  count(*) FILTER (
+    WHERE local_state_json->>'tick' IS DISTINCT FROM onchain_state_json->>'tick'
+  ) AS tick_mismatch
+FROM v
+GROUP BY 1, 2, 3
+ORDER BY max_drift_bps DESC NULLS LAST, failed DESC
+LIMIT 50;
+
+SELECT
+  date_trunc('minute', created_at) AS minute,
+  count(*) AS corrections,
+  max(drift_bps) AS max_drift_bps,
+  percentile_cont(0.9) WITHIN GROUP (ORDER BY drift_bps) AS p90_drift_bps
+FROM pool_state_warnings
+WHERE created_at >= now() - :'interval'::interval
+  AND message LIKE 'Aerodrome fee refresh corrected fee drift%'
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 60;
+SQL
+
+run_query "12. actionable notes" <<'SQL'
 SELECT 'If InsufficientAllowance > 0: run ops/sync_executor_config.sh to approve enabled tokens to enabled routers on the executor contract.' AS note
 UNION ALL
 SELECT 'If sim_success = 0: execution-manager will not submit any tx; fix simulation failures first.'
