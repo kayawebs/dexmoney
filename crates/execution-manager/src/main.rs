@@ -207,16 +207,17 @@ where
             anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
         };
         let approvals = simulator::required_token_approvals(&candidate, settings)?;
-        let missing_approvals = tx_manager::missing_approvals(provider, settings, &approvals)
-            .await
-            .unwrap_or_else(|err| {
-                warn!(
-                    candidate_id = %candidate.id,
-                    error = %err,
-                    "failed to check route allowances; trying route approvals before tx"
-                );
-                approvals
-            });
+        let missing_approvals =
+            tx_manager::missing_approvals(provider, settings, &candidate, &approvals)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(
+                        candidate_id = %candidate.id,
+                        error = %err,
+                        "failed to check route allowances; trying route approvals before tx"
+                    );
+                    approvals
+                });
         if !missing_approvals.is_empty() {
             if candidate.is_expired(Utc::now()) {
                 info!(
@@ -284,6 +285,7 @@ where
                     candidate.id,
                     submission.simulation_id,
                     submission.tx_hash,
+                    submission.executor_contract,
                     submission.nonce,
                     submission.submitted_block,
                     submission.gas_limit,
@@ -422,6 +424,7 @@ where
                 candidate.id,
                 submission.simulation_id,
                 submission.tx_hash,
+                submission.executor_contract,
                 submission.nonce,
                 submission.submitted_block,
                 submission.gas_limit,
@@ -735,6 +738,11 @@ where
     let Some(old_tx_hash) = lane.state.pending_tx else {
         return Ok(());
     };
+    let executor = lane
+        .state
+        .pending_executor_contract
+        .or(settings.executor_contract)
+        .unwrap_or(Address::ZERO);
     let Some(calldata) = recorder.simulation_calldata(simulation_id).await? else {
         warn!(
             simulation_id = %simulation_id,
@@ -747,6 +755,7 @@ where
         provider,
         wallet,
         settings,
+        executor,
         &calldata,
         nonce,
         gas_limit,

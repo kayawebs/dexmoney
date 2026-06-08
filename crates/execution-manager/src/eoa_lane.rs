@@ -16,6 +16,7 @@ impl EoaLane {
                 local_nonce: 0,
                 confirmed_nonce: 0,
                 pending_tx: None,
+                pending_executor_contract: None,
                 pending_opportunity_id: None,
                 pending_simulation_id: None,
                 pending_nonce: None,
@@ -35,6 +36,7 @@ impl EoaLane {
         opportunity_id: Uuid,
         simulation_id: Option<Uuid>,
         tx_hash: B256,
+        executor_contract: Address,
         nonce: u64,
         submitted_block: u64,
         gas_limit: U256,
@@ -42,6 +44,7 @@ impl EoaLane {
         max_priority_fee_per_gas: U256,
     ) {
         self.state.pending_tx = Some(tx_hash);
+        self.state.pending_executor_contract = Some(executor_contract);
         self.state.pending_opportunity_id = Some(opportunity_id);
         self.state.pending_simulation_id = simulation_id;
         self.state.pending_nonce = Some(nonce);
@@ -75,6 +78,7 @@ impl EoaLane {
     pub fn mark_confirmed(&mut self, confirmed_nonce: u64) {
         self.state.confirmed_nonce = confirmed_nonce;
         self.state.pending_tx = None;
+        self.state.pending_executor_contract = None;
         self.state.pending_opportunity_id = None;
         self.state.pending_simulation_id = None;
         self.state.pending_nonce = None;
@@ -125,6 +129,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             Some(uuid::Uuid::new_v4()),
             b256!("0101010101010101010101010101010101010101010101010101010101010101"),
+            address,
             7,
             100,
             alloy_primitives::U256::from(350_000u64),
@@ -136,11 +141,13 @@ mod tests {
         assert_eq!(lane.state.pending_nonce, Some(7));
         assert_eq!(lane.state.pending_submitted_block, Some(100));
         assert_eq!(lane.state.pending_replacement_count, 0);
+        assert_eq!(lane.state.pending_executor_contract, Some(address));
 
         lane.mark_confirmed(1);
         assert_eq!(lane.state.status, EoaLaneStatus::Idle);
         assert_eq!(lane.state.confirmed_nonce, 1);
         assert!(lane.state.pending_tx.is_none());
+        assert!(lane.state.pending_executor_contract.is_none());
         assert!(lane.state.pending_opportunity_id.is_none());
         assert!(lane.state.pending_simulation_id.is_none());
         assert!(lane.state.pending_nonce.is_none());
@@ -162,6 +169,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             Some(uuid::Uuid::new_v4()),
             b256!("0202020202020202020202020202020202020202020202020202020202020202"),
+            address,
             189,
             46575829,
             alloy_primitives::U256::from(475_650u64),

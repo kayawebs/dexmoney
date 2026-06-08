@@ -10,7 +10,7 @@ use ethers_core::types::{
 };
 use ethers_signers::{LocalWallet, Signer};
 
-use crate::simulator::ApprovalRequirement;
+use crate::simulator::{executor_for_candidate, ApprovalRequirement};
 
 const GAS_LIMIT_MULTIPLIER_BPS: u64 = 12_000;
 const LAZY_APPROVAL_FALLBACK_GAS_LIMIT: u64 = 900_000;
@@ -32,6 +32,7 @@ pub struct Submission {
     pub tx_hash: B256,
     pub nonce: u64,
     pub simulation_id: Option<uuid::Uuid>,
+    pub executor_contract: Address,
     pub submitted_block: u64,
     pub gas_limit: U256,
     pub max_fee_per_gas: U256,
@@ -69,10 +70,7 @@ pub async fn submit_candidate(
     simulation: &SimulationResult,
     nonce: u64,
 ) -> Result<Submission> {
-    let executor = settings
-        .executor_contract
-        .filter(|address| *address != Address::ZERO)
-        .context("EXECUTOR_CONTRACT is not configured")?;
+    let executor = executor_for_candidate(settings, candidate)?;
     if simulation.calldata.is_empty() {
         anyhow::bail!("simulation calldata is empty");
     }
@@ -117,6 +115,7 @@ pub async fn submit_candidate(
         tx_hash,
         nonce,
         simulation_id: Some(simulation.id),
+        executor_contract: executor,
         submitted_block,
         gas_limit,
         max_fee_per_gas: fees.max_fee_per_gas,
@@ -127,12 +126,10 @@ pub async fn submit_candidate(
 pub async fn missing_approvals(
     provider: &ChainProvider,
     settings: &Settings,
+    candidate: &Candidate,
     requirements: &[ApprovalRequirement],
 ) -> Result<Vec<ApprovalRequirement>> {
-    let executor = settings
-        .executor_contract
-        .filter(|address| *address != Address::ZERO)
-        .context("EXECUTOR_CONTRACT is not configured")?;
+    let executor = executor_for_candidate(settings, candidate)?;
     let mut missing = Vec::new();
     for requirement in requirements.iter().copied() {
         if requirement.token == Address::ZERO || requirement.spender == Address::ZERO {
@@ -166,16 +163,16 @@ pub async fn submit_calldata_with_lazy_approvals(
     approvals: &[ApprovalRequirement],
     nonce: u64,
 ) -> LazySubmitOutcome {
-    let Some(executor) = settings
-        .executor_contract
-        .filter(|address| *address != Address::ZERO)
-    else {
-        return LazySubmitOutcome {
-            submission: None,
-            approval_tx_hashes: Vec::new(),
-            consumed_nonces: 0,
-            error: Some("EXECUTOR_CONTRACT is not configured".to_string()),
-        };
+    let executor = match executor_for_candidate(settings, candidate) {
+        Ok(executor) => executor,
+        Err(err) => {
+            return LazySubmitOutcome {
+                submission: None,
+                approval_tx_hashes: Vec::new(),
+                consumed_nonces: 0,
+                error: Some(format!("{err:#}")),
+            };
+        }
     };
     if calldata.is_empty() {
         return LazySubmitOutcome {
@@ -323,6 +320,7 @@ pub async fn submit_calldata_with_lazy_approvals(
             tx_hash,
             nonce: next_nonce,
             simulation_id,
+            executor_contract: executor,
             submitted_block,
             gas_limit,
             max_fee_per_gas: fees.max_fee_per_gas,
@@ -338,16 +336,16 @@ pub async fn replace_pending_transaction(
     provider: &ChainProvider,
     wallet: &ExecutionWallet,
     settings: &Settings,
+    executor: Address,
     calldata: &[u8],
     nonce: u64,
     gas_limit: U256,
     previous_max_fee_per_gas: U256,
     previous_max_priority_fee_per_gas: U256,
 ) -> Result<Submission> {
-    let executor = settings
-        .executor_contract
-        .filter(|address| *address != Address::ZERO)
-        .context("EXECUTOR_CONTRACT is not configured")?;
+    if executor == Address::ZERO {
+        anyhow::bail!("pending executor contract is not configured");
+    }
     if calldata.is_empty() {
         anyhow::bail!("replacement calldata is empty");
     }
@@ -389,6 +387,7 @@ pub async fn replace_pending_transaction(
         tx_hash,
         nonce,
         simulation_id: None,
+        executor_contract: executor,
         submitted_block,
         gas_limit,
         max_fee_per_gas,

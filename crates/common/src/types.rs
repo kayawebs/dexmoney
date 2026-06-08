@@ -346,6 +346,8 @@ pub struct EoaLaneState {
     pub confirmed_nonce: u64,
     pub pending_tx: Option<B256>,
     #[serde(default)]
+    pub pending_executor_contract: Option<Address>,
+    #[serde(default)]
     pub pending_opportunity_id: Option<Uuid>,
     #[serde(default)]
     pub pending_simulation_id: Option<Uuid>,

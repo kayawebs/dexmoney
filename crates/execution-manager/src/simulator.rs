@@ -82,10 +82,7 @@ async fn simulate_inner(
         anyhow::bail!("profit below simulated threshold");
     }
 
-    let executor = settings
-        .executor_contract
-        .filter(|address| *address != Address::ZERO)
-        .context("EXECUTOR_CONTRACT is not configured")?;
+    let executor = executor_for_candidate(settings, candidate)?;
     let calldata = build_simulation_calldata(settings, candidate, min_profit_units)?;
     let data = format!("0x{}", hex::encode(&calldata));
 
@@ -154,6 +151,27 @@ pub fn build_live_execution_calldata(
     candidate: &Candidate,
 ) -> Result<Vec<u8>> {
     build_simulation_calldata(settings, candidate, candidate.min_profit)
+}
+
+pub fn executor_for_candidate(settings: &Settings, candidate: &Candidate) -> Result<Address> {
+    let selected = if candidate.path.steps.len() == 2 {
+        settings
+            .executor_contract_2hop
+            .or(settings.executor_contract)
+    } else {
+        settings
+            .executor_contract_multihop
+            .or(settings.executor_contract)
+    };
+    selected
+        .filter(|address| *address != Address::ZERO)
+        .with_context(|| {
+            if candidate.path.steps.len() == 2 {
+                "EXECUTOR_CONTRACT_2HOP or EXECUTOR_CONTRACT is not configured"
+            } else {
+                "EXECUTOR_CONTRACT_MULTIHOP or EXECUTOR_CONTRACT is not configured"
+            }
+        })
 }
 
 struct SimulationFeeSuggestion {
@@ -589,7 +607,8 @@ mod tests {
     use base_arb_common::types::{ArbPath, OpportunityStatus, SwapStep};
 
     use super::{
-        build_execute_calldata, decode_executor_error, decode_uint256_result, router_fee_for_step,
+        build_execute_calldata, decode_executor_error, decode_uint256_result,
+        executor_for_candidate, router_fee_for_step,
     };
 
     fn settings() -> base_arb_common::config::Settings {
@@ -615,6 +634,8 @@ mod tests {
             pancake_v3_factory: None,
             pancake_v3_router: None,
             executor_contract: Some(address!("3333333333333333333333333333333333333333")),
+            executor_contract_2hop: None,
+            executor_contract_multihop: None,
             executor_owner_private_key: None,
             deployer_private_key: None,
             eoa_address_1: Some(address!("4444444444444444444444444444444444444444")),
@@ -645,6 +666,62 @@ mod tests {
             execution_submit_enabled: false,
             monitor_web_password: None,
         }
+    }
+
+    fn candidate_with_step_count(step_count: usize) -> base_arb_common::types::Candidate {
+        let step = SwapStep {
+            dex: base_arb_common::types::DexKind::UniswapV3,
+            variant: Some(base_arb_common::types::PoolVariant::UniswapV3),
+            factory_address: None,
+            pool: address!("5555555555555555555555555555555555555555"),
+            token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            token_out: address!("4200000000000000000000000000000000000006"),
+            fee_bps: Some(5),
+            stable: None,
+            tick_spacing: None,
+        };
+        base_arb_common::types::Candidate {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(1),
+            block_number: 1,
+            strategy: "demo".into(),
+            token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            amount_in: U256::from(1_000_000u64),
+            expected_amount_out: U256::from(1_010_000u64),
+            expected_profit: U256::from(10_000u64),
+            min_profit: U256::from(5_000u64),
+            price_impact_bps: 1,
+            path: ArbPath {
+                name: "demo".into(),
+                steps: vec![step; step_count],
+                diagnostics: None,
+            },
+            status: OpportunityStatus::Created,
+        }
+    }
+
+    #[test]
+    fn selects_executor_by_step_count() {
+        let mut settings = settings();
+        settings.executor_contract = Some(address!("3333333333333333333333333333333333333333"));
+        settings.executor_contract_2hop =
+            Some(address!("2222222222222222222222222222222222222222"));
+        settings.executor_contract_multihop =
+            Some(address!("4444444444444444444444444444444444444444"));
+
+        assert_eq!(
+            executor_for_candidate(&settings, &candidate_with_step_count(2)).unwrap(),
+            address!("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            executor_for_candidate(&settings, &candidate_with_step_count(3)).unwrap(),
+            address!("4444444444444444444444444444444444444444")
+        );
+        assert_eq!(
+            executor_for_candidate(&settings, &candidate_with_step_count(4)).unwrap(),
+            address!("4444444444444444444444444444444444444444")
+        );
     }
 
     #[test]

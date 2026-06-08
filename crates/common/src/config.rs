@@ -27,6 +27,8 @@ pub struct Settings {
     pub pancake_v3_factory: Option<Address>,
     pub pancake_v3_router: Option<Address>,
     pub executor_contract: Option<Address>,
+    pub executor_contract_2hop: Option<Address>,
+    pub executor_contract_multihop: Option<Address>,
     pub executor_owner_private_key: Option<String>,
     pub deployer_private_key: Option<String>,
     pub eoa_address_1: Option<Address>,
