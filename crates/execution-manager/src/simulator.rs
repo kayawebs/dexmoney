@@ -104,11 +104,7 @@ async fn simulate_inner(
     } else {
         None
     };
-    let profit_meets_threshold = if let Some(net_profit) = net_simulated_profit {
-        net_profit >= min_profit_units
-    } else {
-        simulated_profit >= min_profit_units
-    };
+    let profit_meets_threshold = simulated_profit >= min_profit_units;
     let block_number = provider.get_block_number().await.ok().or(observed_block);
 
     Ok(SimulationResult {
@@ -130,11 +126,7 @@ async fn simulate_inner(
         gas_cost_expected: Some(gas_cost_expected),
         net_simulated_profit,
         revert_reason: if !profit_meets_threshold {
-            if net_simulated_profit.is_some() {
-                Some("net simulated profit below threshold after gas".into())
-            } else {
-                Some("simulated profit below threshold".into())
-            }
+            Some("simulated profit below threshold".into())
         } else {
             None
         },
@@ -603,11 +595,13 @@ mod tests {
             max_pool_state_age_ms: 300_000,
             max_price_impact_bps: 50,
             pool_active_refresh_interval_secs: 60,
+            pool_active_refresh_batch_size: 25,
             market_data_flashblocks_enabled: true,
             aerodrome_fee_refresh_interval_secs: 15,
             v3_tick_refresh_interval_secs: 60,
             v3_tick_bitmap_word_radius: 8,
             v3_quote_safety_bps: 2,
+            quote_max_state_block_lag: 0,
             min_profit_failure_ttl_secs: 21_600,
             execution_min_priority_fee_wei: None,
             execution_priority_fee_multiplier_bps: 20_000,
@@ -616,6 +610,7 @@ mod tests {
             execution_replacement_fee_bump_bps: 12_500,
             execution_max_replacements: 3,
             execution_gas_profit_buffer_bps: 15_000,
+            execution_max_candidate_lag_blocks: 1,
             execution_submit_enabled: false,
             monitor_web_password: None,
         }
