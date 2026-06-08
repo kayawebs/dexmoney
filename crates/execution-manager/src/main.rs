@@ -2,7 +2,7 @@ mod eoa_lane;
 mod simulator;
 mod tx_manager;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -201,6 +201,138 @@ where
     candidate_store
         .mark_failure_key(&candidate_seen_key, candidate_seen_ttl_secs(settings))
         .await?;
+
+    if settings.execution_submit_enabled {
+        let Some(wallet) = wallet.as_ref() else {
+            anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+        };
+        let approvals = simulator::required_token_approvals(&candidate, settings)?;
+        let missing_approvals = tx_manager::missing_approvals(provider, settings, &approvals)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    candidate_id = %candidate.id,
+                    error = %err,
+                    "failed to check route allowances; trying route approvals before tx"
+                );
+                approvals
+            });
+        if !missing_approvals.is_empty() {
+            if candidate.is_expired(Utc::now()) {
+                info!(
+                    candidate_id = %candidate.id,
+                    path = %candidate.path.name,
+                    created_at = %candidate.created_at,
+                    expires_at = %candidate.expires_at,
+                    "candidate expired before lazy approval preflight"
+                );
+                return Ok(CandidateAction::Skipped);
+            }
+
+            let mut lane = eoa_store
+                .get_lane_state(wallet.address())
+                .await?
+                .map(|state| eoa_lane::EoaLane { state })
+                .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
+            let nonce = lane.state.local_nonce;
+            let calldata = simulator::build_live_execution_calldata(settings, &candidate)?;
+            let synthetic_simulation = base_arb_common::types::SimulationResult {
+                id: uuid::Uuid::new_v4(),
+                opportunity_id: candidate.id,
+                success: false,
+                path_name: Some(candidate.path.name.clone()),
+                token_in: Some(candidate.token_in),
+                amount_in: Some(candidate.amount_in),
+                expected_profit: Some(candidate.expected_profit),
+                min_profit: Some(candidate.min_profit),
+                simulated_profit: U256::ZERO,
+                gas_estimate: None,
+                block_number: Some(current_block),
+                base_fee_per_gas: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                gas_cost_cap: None,
+                gas_cost_expected: None,
+                net_simulated_profit: None,
+                revert_reason: Some("lazy approval preflight; simulation skipped".to_string()),
+                calldata: calldata.clone(),
+            };
+            recorder
+                .record_simulation(synthetic_simulation.clone())
+                .await?;
+            let outcome = tx_manager::submit_calldata_with_lazy_approvals(
+                provider,
+                &wallet,
+                settings,
+                &candidate,
+                &calldata,
+                Some(synthetic_simulation.id),
+                None,
+                &missing_approvals,
+                nonce,
+            )
+            .await;
+
+            let approval_txs = outcome.approval_tx_hashes.len();
+            if let Some(submission) = outcome.submission {
+                info!(
+                    candidate_id = %candidate.id,
+                    approval_txs,
+                    "lazy approvals submitted before unsimulated arb tx"
+                );
+                lane.mark_submitted(
+                    candidate.id,
+                    submission.simulation_id,
+                    submission.tx_hash,
+                    submission.nonce,
+                    submission.submitted_block,
+                    submission.gas_limit,
+                    submission.max_fee_per_gas,
+                    submission.max_priority_fee_per_gas,
+                );
+                eoa_store.set_lane_state(lane.state.clone()).await?;
+                recorder
+                    .record_transaction(tx_manager::pending_tx_result(
+                        &candidate,
+                        wallet.address(),
+                        &submission,
+                    ))
+                    .await?;
+                return Ok(CandidateAction::Submitted);
+            }
+
+            if outcome.consumed_nonces > 0 {
+                lane.state.local_nonce = nonce.saturating_add(outcome.consumed_nonces);
+            }
+            warn!(
+                candidate_id = %candidate.id,
+                approval_txs,
+                consumed_nonces = outcome.consumed_nonces,
+                error = ?outcome.error,
+                "lazy approval preflight did not submit arb tx"
+            );
+            lane.mark_cooldown();
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            recorder
+                .record_transaction(TxResult {
+                    opportunity_id: candidate.id,
+                    simulation_id: Some(synthetic_simulation.id),
+                    eoa: wallet.address(),
+                    tx_hash: None,
+                    nonce: nonce.saturating_add(outcome.consumed_nonces),
+                    status: TxStatus::Dropped,
+                    realized_profit: None,
+                    gas_used: None,
+                    effective_gas_price: None,
+                    revert_reason: Some(outcome.error.unwrap_or_else(|| {
+                        "lazy approval preflight failed before arb tx".to_string()
+                    })),
+                    receipt_json: None,
+                })
+                .await?;
+            return Ok(CandidateAction::Simulated);
+        }
+    }
 
     let simulation = simulator::simulate(
         provider,

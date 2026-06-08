@@ -10,6 +10,12 @@ use chrono::Utc;
 
 const EXECUTOR_DEADLINE_SECS: i64 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ApprovalRequirement {
+    pub token: Address,
+    pub spender: Address,
+}
+
 pub async fn simulate(
     provider: &ChainProvider,
     settings: &Settings,
@@ -143,6 +149,13 @@ fn build_simulation_calldata(
     build_execute_calldata(candidate, min_profit, deadline, settings)
 }
 
+pub fn build_live_execution_calldata(
+    settings: &Settings,
+    candidate: &Candidate,
+) -> Result<Vec<u8>> {
+    build_simulation_calldata(settings, candidate, candidate.min_profit)
+}
+
 struct SimulationFeeSuggestion {
     base_fee_per_gas: U256,
     expected_fee_per_gas: U256,
@@ -259,6 +272,24 @@ pub fn is_structural_route_failure(simulation: &SimulationResult) -> bool {
             | Some("Executor revert: InvalidPath")
             | Some("Executor revert: InvalidTickSpacing")
     )
+}
+
+pub fn required_token_approvals(
+    candidate: &Candidate,
+    settings: &Settings,
+) -> Result<Vec<ApprovalRequirement>> {
+    let mut approvals = Vec::new();
+    for step in &candidate.path.steps {
+        let spender = router_for_step(step.dex, step.variant, settings)
+            .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?;
+        approvals.push(ApprovalRequirement {
+            token: step.token_in,
+            spender,
+        });
+    }
+    approvals.sort();
+    approvals.dedup();
+    Ok(approvals)
 }
 
 fn append_step_fingerprint(raw: &mut String, candidate: &Candidate) {

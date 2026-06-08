@@ -10,9 +10,16 @@ use ethers_core::types::{
 };
 use ethers_signers::{LocalWallet, Signer};
 
+use crate::simulator::ApprovalRequirement;
+
 const GAS_LIMIT_MULTIPLIER_BPS: u64 = 12_000;
+const LAZY_APPROVAL_FALLBACK_GAS_LIMIT: u64 = 900_000;
+const APPROVE_TOKEN_SELECTOR: [u8; 4] = [0xda, 0x3e, 0x33, 0x97];
+const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
 const EXECUTED_EVENT_TOPIC: &str =
     "0xe953ae62f4f69be1c6d943cb68d93d288f23ffae7332b84196d46e9e778b23b2";
+const MAX_UINT: U256 = U256::MAX;
+const MIN_EXISTING_ALLOWANCE: u128 = 1_000_000_000_000_000_000u128;
 
 #[derive(Debug, Clone)]
 pub struct ExecutionWallet {
@@ -24,11 +31,19 @@ pub struct ExecutionWallet {
 pub struct Submission {
     pub tx_hash: B256,
     pub nonce: u64,
-    pub simulation_id: uuid::Uuid,
+    pub simulation_id: Option<uuid::Uuid>,
     pub submitted_block: u64,
     pub gas_limit: U256,
     pub max_fee_per_gas: U256,
     pub max_priority_fee_per_gas: U256,
+}
+
+#[derive(Debug, Clone)]
+pub struct LazySubmitOutcome {
+    pub submission: Option<Submission>,
+    pub approval_tx_hashes: Vec<B256>,
+    pub consumed_nonces: u64,
+    pub error: Option<String>,
 }
 
 impl ExecutionWallet {
@@ -101,12 +116,222 @@ pub async fn submit_candidate(
     Ok(Submission {
         tx_hash,
         nonce,
-        simulation_id: simulation.id,
+        simulation_id: Some(simulation.id),
         submitted_block,
         gas_limit,
         max_fee_per_gas: fees.max_fee_per_gas,
         max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
     })
+}
+
+pub async fn missing_approvals(
+    provider: &ChainProvider,
+    settings: &Settings,
+    requirements: &[ApprovalRequirement],
+) -> Result<Vec<ApprovalRequirement>> {
+    let executor = settings
+        .executor_contract
+        .filter(|address| *address != Address::ZERO)
+        .context("EXECUTOR_CONTRACT is not configured")?;
+    let mut missing = Vec::new();
+    for requirement in requirements.iter().copied() {
+        if requirement.token == Address::ZERO || requirement.spender == Address::ZERO {
+            continue;
+        }
+        let data = encode_two_address_call(ERC20_ALLOWANCE_SELECTOR, executor, requirement.spender);
+        let raw = provider
+            .eth_call_from(
+                None,
+                requirement.token,
+                &hex_data(&data),
+                "ERC20 allowance for lazy approval",
+            )
+            .await?;
+        let allowance = decode_u256_result(&raw)?;
+        if allowance < U256::from(MIN_EXISTING_ALLOWANCE) {
+            missing.push(requirement);
+        }
+    }
+    Ok(missing)
+}
+
+pub async fn submit_calldata_with_lazy_approvals(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    candidate: &Candidate,
+    calldata: &[u8],
+    simulation_id: Option<uuid::Uuid>,
+    gas_estimate: Option<U256>,
+    approvals: &[ApprovalRequirement],
+    nonce: u64,
+) -> LazySubmitOutcome {
+    let Some(executor) = settings
+        .executor_contract
+        .filter(|address| *address != Address::ZERO)
+    else {
+        return LazySubmitOutcome {
+            submission: None,
+            approval_tx_hashes: Vec::new(),
+            consumed_nonces: 0,
+            error: Some("EXECUTOR_CONTRACT is not configured".to_string()),
+        };
+    };
+    if calldata.is_empty() {
+        return LazySubmitOutcome {
+            submission: None,
+            approval_tx_hashes: Vec::new(),
+            consumed_nonces: 0,
+            error: Some("simulation calldata is empty".to_string()),
+        };
+    }
+
+    let fees = match aggressive_fee_suggestion(provider, settings).await {
+        Ok(fees) => fees,
+        Err(err) => {
+            return LazySubmitOutcome {
+                submission: None,
+                approval_tx_hashes: Vec::new(),
+                consumed_nonces: 0,
+                error: Some(format!("{err:#}")),
+            };
+        }
+    };
+
+    let mut approval_tx_hashes = Vec::new();
+    let mut consumed_nonces = 0u64;
+    let mut next_nonce = nonce;
+    for approval in approvals {
+        let calldata = encode_approve_token_call(approval.token, approval.spender, MAX_UINT);
+        let data_hex = hex_data(&calldata);
+        let estimated_gas = match provider
+            .estimate_gas(wallet.address, executor, &data_hex)
+            .await
+            .context("failed to estimate lazy approval tx gas")
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return LazySubmitOutcome {
+                    submission: None,
+                    approval_tx_hashes,
+                    consumed_nonces,
+                    error: Some(format!("{err:#}")),
+                };
+            }
+        };
+        let gas_limit = bump_gas_limit(estimated_gas);
+        let tx_hash = match sign_and_send(
+            provider,
+            wallet,
+            settings,
+            executor,
+            &calldata,
+            next_nonce,
+            gas_limit,
+            fees.max_fee_per_gas,
+            fees.max_priority_fee_per_gas,
+        )
+        .await
+        {
+            Ok(tx_hash) => tx_hash,
+            Err(err) => {
+                return LazySubmitOutcome {
+                    submission: None,
+                    approval_tx_hashes,
+                    consumed_nonces,
+                    error: Some(format!("{err:#}")),
+                };
+            }
+        };
+        tracing::info!(
+            candidate_id = %candidate.id,
+            token = %approval.token,
+            spender = %approval.spender,
+            tx_hash = %tx_hash,
+            nonce = next_nonce,
+            gas_limit = %gas_limit,
+            max_fee_per_gas = %fees.max_fee_per_gas,
+            max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
+            "lazy approval tx submitted"
+        );
+        approval_tx_hashes.push(tx_hash);
+        consumed_nonces = consumed_nonces.saturating_add(1);
+        next_nonce = next_nonce.saturating_add(1);
+    }
+
+    if candidate.is_expired(Utc::now()) {
+        return LazySubmitOutcome {
+            submission: None,
+            approval_tx_hashes,
+            consumed_nonces,
+            error: Some("candidate expired after lazy approvals".to_string()),
+        };
+    }
+
+    let gas_limit = gas_estimate
+        .map(bump_gas_limit)
+        .unwrap_or_else(|| U256::from(LAZY_APPROVAL_FALLBACK_GAS_LIMIT));
+    let submitted_block = match provider.get_block_number().await {
+        Ok(block) => block,
+        Err(err) => {
+            return LazySubmitOutcome {
+                submission: None,
+                approval_tx_hashes,
+                consumed_nonces,
+                error: Some(format!("{err:#}")),
+            };
+        }
+    };
+    let tx_hash = match sign_and_send(
+        provider,
+        wallet,
+        settings,
+        executor,
+        calldata,
+        next_nonce,
+        gas_limit,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    )
+    .await
+    {
+        Ok(tx_hash) => tx_hash,
+        Err(err) => {
+            return LazySubmitOutcome {
+                submission: None,
+                approval_tx_hashes,
+                consumed_nonces,
+                error: Some(format!("{err:#}")),
+            };
+        }
+    };
+
+    tracing::info!(
+        candidate_id = %candidate.id,
+        tx_hash = %tx_hash,
+        nonce = next_nonce,
+        approval_txs = approval_tx_hashes.len(),
+        gas_limit = %gas_limit,
+        max_fee_per_gas = %fees.max_fee_per_gas,
+        max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
+        submitted_block,
+        "tx submitted after lazy approvals"
+    );
+
+    LazySubmitOutcome {
+        submission: Some(Submission {
+            tx_hash,
+            nonce: next_nonce,
+            simulation_id,
+            submitted_block,
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        }),
+        approval_tx_hashes,
+        consumed_nonces: consumed_nonces.saturating_add(1),
+        error: None,
+    }
 }
 
 pub async fn replace_pending_transaction(
@@ -163,7 +388,7 @@ pub async fn replace_pending_transaction(
     Ok(Submission {
         tx_hash,
         nonce,
-        simulation_id: uuid::Uuid::nil(),
+        simulation_id: None,
         submitted_block,
         gas_limit,
         max_fee_per_gas,
@@ -202,7 +427,7 @@ async fn sign_and_send(
 pub fn pending_tx_result(candidate: &Candidate, eoa: Address, submission: &Submission) -> TxResult {
     TxResult {
         opportunity_id: candidate.id,
-        simulation_id: Some(submission.simulation_id),
+        simulation_id: submission.simulation_id,
         eoa,
         tx_hash: Some(submission.tx_hash),
         nonce: submission.nonce,
@@ -405,4 +630,43 @@ fn ethers_address_to_alloy(address: ethers_core::types::Address) -> Address {
 
 fn alloy_u256_to_ethers(value: U256) -> Result<EthersU256> {
     EthersU256::from_dec_str(&value.to_string()).context("failed to convert U256")
+}
+
+fn encode_approve_token_call(token: Address, spender: Address, amount: U256) -> Vec<u8> {
+    let mut out = Vec::with_capacity(100);
+    out.extend(APPROVE_TOKEN_SELECTOR);
+    out.extend(encode_address(token));
+    out.extend(encode_address(spender));
+    out.extend(encode_u256(amount));
+    out
+}
+
+fn encode_two_address_call(selector: [u8; 4], first: Address, second: Address) -> Vec<u8> {
+    let mut out = Vec::with_capacity(68);
+    out.extend(selector);
+    out.extend(encode_address(first));
+    out.extend(encode_address(second));
+    out
+}
+
+fn encode_address(address: Address) -> [u8; 32] {
+    let mut out = [0_u8; 32];
+    out[12..].copy_from_slice(address.as_slice());
+    out
+}
+
+fn encode_u256(value: U256) -> [u8; 32] {
+    value.to_be_bytes()
+}
+
+fn hex_data(data: &[u8]) -> String {
+    format!("0x{}", hex::encode(data))
+}
+
+fn decode_u256_result(raw: &str) -> Result<U256> {
+    let clean = raw.trim_start_matches("0x");
+    if clean.len() < 64 {
+        anyhow::bail!("eth_call returned short u256 result");
+    }
+    U256::from_str_radix(&clean[clean.len() - 64..], 16).map_err(Into::into)
 }

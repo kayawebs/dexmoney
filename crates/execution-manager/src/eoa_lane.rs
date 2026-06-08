@@ -33,7 +33,7 @@ impl EoaLane {
     pub fn mark_submitted(
         &mut self,
         opportunity_id: Uuid,
-        simulation_id: Uuid,
+        simulation_id: Option<Uuid>,
         tx_hash: B256,
         nonce: u64,
         submitted_block: u64,
@@ -43,7 +43,7 @@ impl EoaLane {
     ) {
         self.state.pending_tx = Some(tx_hash);
         self.state.pending_opportunity_id = Some(opportunity_id);
-        self.state.pending_simulation_id = Some(simulation_id);
+        self.state.pending_simulation_id = simulation_id;
         self.state.pending_nonce = Some(nonce);
         self.state.pending_submitted_block = Some(submitted_block);
         self.state.pending_replacement_count = 0;
@@ -123,7 +123,7 @@ mod tests {
 
         lane.mark_submitted(
             uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
+            Some(uuid::Uuid::new_v4()),
             b256!("0101010101010101010101010101010101010101010101010101010101010101"),
             7,
             100,
@@ -160,7 +160,7 @@ mod tests {
 
         lane.mark_submitted(
             uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
+            Some(uuid::Uuid::new_v4()),
             b256!("0202020202020202020202020202020202020202020202020202020202020202"),
             189,
             46575829,
