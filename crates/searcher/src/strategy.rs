@@ -15,6 +15,8 @@ use tracing::debug;
 
 use crate::opportunity::build_candidate;
 
+const MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR: usize = 2_000;
+
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
     pub paths: Vec<ArbPath>,
@@ -275,6 +277,7 @@ impl SearchEngine {
             }
         }
         self.add_three_pool_cycle_paths(pool_states, &mut paths);
+        self.add_four_pool_cycle_paths(pool_states, &mut paths);
 
         paths
     }
@@ -285,26 +288,7 @@ impl SearchEngine {
             return;
         }
 
-        let mut edges_by_token: HashMap<Address, Vec<PoolEdge<'_>>> = HashMap::new();
-        for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
-            edges_by_token
-                .entry(state.token0)
-                .or_default()
-                .push(PoolEdge {
-                    state,
-                    token_in: state.token0,
-                    token_out: state.token1,
-                });
-            edges_by_token
-                .entry(state.token1)
-                .or_default()
-                .push(PoolEdge {
-                    state,
-                    token_in: state.token1,
-                    token_out: state.token0,
-                });
-        }
-
+        let edges_by_token = pool_edges_by_token(pool_states);
         let mut seen = HashSet::new();
         for anchor in anchors {
             let Some(first_edges) = edges_by_token.get(&anchor.token) else {
@@ -354,6 +338,87 @@ impl SearchEngine {
             }
         }
     }
+
+    fn add_four_pool_cycle_paths(&self, pool_states: &[PoolState], paths: &mut Vec<SearchPath>) {
+        let anchors = anchor_search_configs(&self.pair_configs);
+        if anchors.is_empty() {
+            return;
+        }
+
+        let edges_by_token = pool_edges_by_token(pool_states);
+        let mut seen = HashSet::new();
+        for anchor in anchors {
+            let mut anchor_paths = 0usize;
+            let Some(first_edges) = edges_by_token.get(&anchor.token) else {
+                continue;
+            };
+            'anchor: for first in first_edges {
+                if first.token_out == anchor.token {
+                    continue;
+                }
+                let Some(second_edges) = edges_by_token.get(&first.token_out) else {
+                    continue;
+                };
+                for second in second_edges {
+                    if second.state.pool_id.address == first.state.pool_id.address
+                        || second.token_out == anchor.token
+                        || second.token_out == first.token_out
+                    {
+                        continue;
+                    }
+                    let Some(third_edges) = edges_by_token.get(&second.token_out) else {
+                        continue;
+                    };
+                    for third in third_edges {
+                        if third.state.pool_id.address == first.state.pool_id.address
+                            || third.state.pool_id.address == second.state.pool_id.address
+                            || third.token_out == anchor.token
+                            || third.token_out == first.token_out
+                            || third.token_out == second.token_out
+                        {
+                            continue;
+                        }
+                        let Some(fourth_edges) = edges_by_token.get(&third.token_out) else {
+                            continue;
+                        };
+                        for fourth in fourth_edges {
+                            if fourth.token_out != anchor.token {
+                                continue;
+                            }
+                            if fourth.state.pool_id.address == first.state.pool_id.address
+                                || fourth.state.pool_id.address == second.state.pool_id.address
+                                || fourth.state.pool_id.address == third.state.pool_id.address
+                            {
+                                continue;
+                            }
+                            let fingerprint = format!(
+                                "{:#x}|{:#x}|{:#x}|{:#x}|{:#x}",
+                                anchor.token,
+                                first.state.pool_id.address,
+                                second.state.pool_id.address,
+                                third.state.pool_id.address,
+                                fourth.state.pool_id.address
+                            );
+                            if !seen.insert(fingerprint) {
+                                continue;
+                            }
+                            paths.push(build_four_pool_search_path(
+                                anchor.clone(),
+                                first,
+                                second,
+                                third,
+                                fourth,
+                            ));
+                            anchor_paths += 1;
+                            if anchor_paths >= MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR {
+                                break 'anchor;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn usdc_to_units(usdc: f64) -> U256 {
@@ -395,10 +460,37 @@ struct AnchorSearchConfig {
     min_profit: U256,
 }
 
+#[derive(Clone, Copy)]
 struct PoolEdge<'a> {
     state: &'a PoolState,
     token_in: Address,
     token_out: Address,
+}
+
+fn pool_edges_by_token(pool_states: &[PoolState]) -> HashMap<Address, Vec<PoolEdge<'_>>> {
+    let mut edges_by_token: HashMap<Address, Vec<PoolEdge<'_>>> = HashMap::new();
+    for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
+        edges_by_token
+            .entry(state.token0)
+            .or_default()
+            .push(PoolEdge {
+                state,
+                token_in: state.token0,
+                token_out: state.token1,
+            });
+        edges_by_token
+            .entry(state.token1)
+            .or_default()
+            .push(PoolEdge {
+                state,
+                token_in: state.token1,
+                token_out: state.token0,
+            });
+    }
+    for edges in edges_by_token.values_mut() {
+        edges.sort_by_key(|edge| (edge.token_out, edge.state.pool_id.address));
+    }
+    edges_by_token
 }
 
 fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
@@ -824,6 +916,38 @@ fn build_three_pool_search_path(
     }
 }
 
+fn build_four_pool_search_path(
+    anchor: AnchorSearchConfig,
+    first: &PoolEdge<'_>,
+    second: &PoolEdge<'_>,
+    third: &PoolEdge<'_>,
+    fourth: &PoolEdge<'_>,
+) -> SearchPath {
+    let name = format!(
+        "cycle4-{}-{}-{}-{}-{}",
+        short_token(anchor.token),
+        pool_label(first.state),
+        pool_label(second.state),
+        pool_label(third.state),
+        pool_label(fourth.state)
+    );
+    SearchPath {
+        path: ArbPath {
+            name,
+            steps: vec![
+                swap_step_from_pool(first.state, first.token_in, first.token_out),
+                swap_step_from_pool(second.state, second.token_in, second.token_out),
+                swap_step_from_pool(third.state, third.token_in, third.token_out),
+                swap_step_from_pool(fourth.state, fourth.token_in, fourth.token_out),
+            ],
+            diagnostics: None,
+        },
+        amount_sizes: anchor.amount_sizes,
+        min_profit: anchor.min_profit,
+        strategy: "token-four-pool-cycle".into(),
+    }
+}
+
 fn swap_step_from_pool(state: &PoolState, token_in: Address, token_out: Address) -> SwapStep {
     SwapStep {
         dex: state.dex,
@@ -1082,11 +1206,74 @@ mod tests {
         assert!(paths.iter().any(is_weth_three_pool_cycle));
     }
 
+    #[test]
+    fn dynamic_paths_include_anchor_four_pool_cycles() {
+        let weth = address!("4200000000000000000000000000000000000006");
+        let cb_btc = address!("cbb7c0000ab88b473b1f5afd9ef808440eed33bf");
+        let sol = address!("311935cd80b76769bf2ecc9d8ab7635b2139cf82");
+        let jito_sol = address!("97be14dd8f994a5364573bc035d85309e7cb34de");
+        let usdc = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+        let config = TokenPairSearchConfig {
+            chain_id: 8453,
+            token0: weth,
+            token1: cb_btc,
+            symbol: "WETH/cbBTC".into(),
+            token0_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
+            token1_search_amounts: Vec::new(),
+            token0_min_profit: U256::from(1_000_000_000_000u64),
+            token1_min_profit: U256::ZERO,
+        };
+        let engine = SearchEngine {
+            amount_sizes: Vec::new(),
+            paths: Vec::new(),
+            pair_configs: vec![config],
+            min_expected_profit: U256::ONE,
+            max_price_impact_bps: 10_000,
+            whitelist_paths: Vec::new(),
+            candidate_ttl_ms: 500,
+            v3_quote_safety_bps: 0,
+            quote_max_state_block_lag: 0,
+        };
+        let states = vec![
+            test_v3_pool(
+                address!("1111111111111111111111111111111111111111"),
+                weth,
+                sol,
+            ),
+            test_v3_pool(
+                address!("2222222222222222222222222222222222222222"),
+                sol,
+                jito_sol,
+            ),
+            test_v3_pool(
+                address!("3333333333333333333333333333333333333333"),
+                jito_sol,
+                usdc,
+            ),
+            test_v3_pool(
+                address!("4444444444444444444444444444444444444444"),
+                usdc,
+                weth,
+            ),
+        ];
+
+        let paths = engine.paths_for_pool_states(&states);
+
+        assert!(paths.iter().any(is_weth_four_pool_cycle));
+    }
+
     fn is_weth_three_pool_cycle(path: &SearchPath) -> bool {
         path.strategy == "token-three-pool-cycle"
             && path.path.steps.len() == 3
             && path.path.steps[0].token_in == address!("4200000000000000000000000000000000000006")
             && path.path.steps[2].token_out == address!("4200000000000000000000000000000000000006")
+    }
+
+    fn is_weth_four_pool_cycle(path: &SearchPath) -> bool {
+        path.strategy == "token-four-pool-cycle"
+            && path.path.steps.len() == 4
+            && path.path.steps[0].token_in == address!("4200000000000000000000000000000000000006")
+            && path.path.steps[3].token_out == address!("4200000000000000000000000000000000000006")
     }
 
     fn test_v3_pool(

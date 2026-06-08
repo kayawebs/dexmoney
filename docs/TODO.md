@@ -40,10 +40,10 @@
   - Probe factory/router ABI shape and bytecode/codehash for known V2/V3-compatible families.
   - Promote factories to trusted only when pool state reads and executor/router dry-run succeed.
   - Keep quote-only factories separate from executable factories.
-- [ ] Generate paths from the active pool graph:
+- [x] Generate paths from the active pool graph:
   - Treat configured funded tokens as anchors.
   - Generate 2/3/4-hop cycles from active pools around anchors.
-  - Rank graph edges by recent swap frequency, liquidity/state freshness, and quote reliability.
+- [ ] Rank graph edges by recent swap frequency, liquidity/state freshness, and quote reliability before path generation.
 
 ## Immediate
 
