@@ -104,8 +104,12 @@ pub struct TokenPairSearchConfig {
     pub symbol: String,
     pub token0_search_amounts: Vec<U256>,
     pub token1_search_amounts: Vec<U256>,
+    pub token0_multihop_search_amounts: Vec<U256>,
+    pub token1_multihop_search_amounts: Vec<U256>,
     pub token0_min_profit: U256,
     pub token1_min_profit: U256,
+    pub token0_multihop_min_profit: U256,
+    pub token1_multihop_min_profit: U256,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

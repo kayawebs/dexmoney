@@ -200,6 +200,10 @@ struct TokenSearchDefaultRow {
     enabled: bool,
     search_amounts: Option<String>,
     min_profit: Option<String>,
+    two_hop_search_amounts: Option<String>,
+    two_hop_min_profit: Option<String>,
+    multihop_search_amounts: Option<String>,
+    multihop_min_profit: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -316,6 +320,7 @@ struct SearchConfigForm {
 struct TokenSearchDefaultForm {
     password: String,
     token_address: String,
+    executor_scope: Option<String>,
     search_amounts: String,
     min_profit: String,
 }
@@ -324,6 +329,7 @@ struct TokenSearchDefaultForm {
 struct TokenUpdateChange {
     symbol: String,
     token_address: String,
+    scope: String,
     old_search_amounts: Option<String>,
     new_search_amounts: Option<String>,
     old_min_profit: Option<String>,
@@ -1328,6 +1334,7 @@ async fn update_token_search_default(
         .update_token_search_default(
             state.settings.chain_id,
             token_address,
+            form.executor_scope.as_deref().unwrap_or("all"),
             search_amounts.as_deref(),
             min_profit.as_deref(),
         )
@@ -1383,62 +1390,88 @@ async fn update_token_search_defaults(
             .token_address
             .parse()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let raw_amounts = form
-            .get(&format!("search_amounts_{token_address}"))
-            .map(String::as_str)
-            .unwrap_or_default();
-        let raw_min_profit = form
-            .get(&format!("min_profit_{token_address}"))
-            .map(String::as_str)
-            .unwrap_or_default();
-        let search_amounts =
-            normalize_raw_amount_list(raw_amounts).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let min_profit =
-            normalize_raw_amount(raw_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
-        if search_amounts.is_some() != min_profit.is_some() {
-            return render_registry_response(
-                &state.pool,
-                None,
-                Some("token default amounts raw and min profit raw must be set together"),
-            )
-            .await;
-        }
+        for (scope, amount_prefix, profit_prefix, old_amounts, old_profit) in [
+            (
+                "all",
+                "search_amounts",
+                "min_profit",
+                row.search_amounts.clone(),
+                row.min_profit.clone(),
+            ),
+            (
+                "two_hop",
+                "two_hop_search_amounts",
+                "two_hop_min_profit",
+                row.two_hop_search_amounts.clone(),
+                row.two_hop_min_profit.clone(),
+            ),
+            (
+                "multihop",
+                "multihop_search_amounts",
+                "multihop_min_profit",
+                row.multihop_search_amounts.clone(),
+                row.multihop_min_profit.clone(),
+            ),
+        ] {
+            let raw_amounts = form
+                .get(&format!("{amount_prefix}_{token_address}"))
+                .map(String::as_str)
+                .unwrap_or_default();
+            let raw_min_profit = form
+                .get(&format!("{profit_prefix}_{token_address}"))
+                .map(String::as_str)
+                .unwrap_or_default();
+            let search_amounts =
+                normalize_raw_amount_list(raw_amounts).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let min_profit =
+                normalize_raw_amount(raw_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if search_amounts.is_some() != min_profit.is_some() {
+                return render_registry_response(
+                    &state.pool,
+                    None,
+                    Some("token default amounts raw and min profit raw must be set together"),
+                )
+                .await;
+            }
 
-        if search_amounts == row.search_amounts && min_profit == row.min_profit {
-            continue;
-        }
+            if search_amounts == old_amounts && min_profit == old_profit {
+                continue;
+            }
 
-        let was_anchor = row.search_amounts.is_some() && row.min_profit.is_some();
-        let became_anchor = !was_anchor && search_amounts.is_some() && min_profit.is_some();
-        store
-            .update_token_search_default(
-                state.settings.chain_id,
-                token,
-                search_amounts.as_deref(),
-                min_profit.as_deref(),
-            )
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        upsert_token_registry(&state.pool, state.settings.chain_id, token, &row.symbol)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let was_anchor = old_amounts.is_some() && old_profit.is_some();
+            let became_anchor = !was_anchor && search_amounts.is_some() && min_profit.is_some();
+            store
+                .update_token_search_default(
+                    state.settings.chain_id,
+                    token,
+                    scope,
+                    search_amounts.as_deref(),
+                    min_profit.as_deref(),
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            upsert_token_registry(&state.pool, state.settings.chain_id, token, &row.symbol)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let change = TokenUpdateChange {
-            symbol: row.symbol.clone(),
-            token_address: row.token_address.clone(),
-            old_search_amounts: row.search_amounts.clone(),
-            new_search_amounts: search_amounts.clone(),
-            old_min_profit: row.min_profit.clone(),
-            new_min_profit: min_profit.clone(),
-            became_anchor,
-        };
-        if became_anchor {
-            discovery_results.push((
-                row.symbol.clone(),
-                discover_pairs_for_anchor(&state, token).await,
-            ));
+            let change = TokenUpdateChange {
+                symbol: row.symbol.clone(),
+                token_address: row.token_address.clone(),
+                scope: scope.to_string(),
+                old_search_amounts: old_amounts,
+                new_search_amounts: search_amounts.clone(),
+                old_min_profit: old_profit,
+                new_min_profit: min_profit.clone(),
+                became_anchor,
+            };
+            if became_anchor {
+                discovery_results.push((
+                    row.symbol.clone(),
+                    discover_pairs_for_anchor(&state, token).await,
+                ));
+            }
+            changes.push(change);
         }
-        changes.push(change);
     }
 
     let mut message = summarize_token_changes(&changes);
@@ -1710,9 +1743,13 @@ async fn fetch_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
             d1.min_profit AS token1_default_min_profit
         FROM token_pairs tp
         LEFT JOIN token_search_defaults d0
-          ON d0.chain_id = tp.chain_id AND d0.token_address = tp.token0
+          ON d0.chain_id = tp.chain_id
+         AND d0.token_address = tp.token0
+         AND d0.executor_scope = 'all'
         LEFT JOIN token_search_defaults d1
-          ON d1.chain_id = tp.chain_id AND d1.token_address = tp.token1
+          ON d1.chain_id = tp.chain_id
+         AND d1.token_address = tp.token1
+         AND d1.executor_scope = 'all'
         ORDER BY tp.created_at DESC
         LIMIT 50
         "#,
@@ -1741,9 +1778,13 @@ async fn fetch_enabled_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
             d1.min_profit AS token1_default_min_profit
         FROM token_pairs tp
         LEFT JOIN token_search_defaults d0
-          ON d0.chain_id = tp.chain_id AND d0.token_address = tp.token0
+          ON d0.chain_id = tp.chain_id
+         AND d0.token_address = tp.token0
+         AND d0.executor_scope = 'all'
         LEFT JOIN token_search_defaults d1
-          ON d1.chain_id = tp.chain_id AND d1.token_address = tp.token1
+          ON d1.chain_id = tp.chain_id
+         AND d1.token_address = tp.token1
+         AND d1.executor_scope = 'all'
         WHERE tp.enabled = TRUE
         ORDER BY tp.created_at DESC
         "#,
@@ -1775,19 +1816,40 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
             MIN(token_set.symbol) AS symbol,
             token_set.token_address,
             BOOL_OR(token_set.enabled) AS enabled,
-            cfg.search_amounts,
-            cfg.min_profit
+            cfg_all.search_amounts,
+            cfg_all.min_profit,
+            cfg_two_hop.search_amounts AS two_hop_search_amounts,
+            cfg_two_hop.min_profit AS two_hop_min_profit,
+            cfg_multihop.search_amounts AS multihop_search_amounts,
+            cfg_multihop.min_profit AS multihop_min_profit
         FROM token_set
-        LEFT JOIN token_search_defaults cfg
-          ON cfg.chain_id = token_set.chain_id
-         AND cfg.token_address = token_set.token_address
+        LEFT JOIN token_search_defaults cfg_all
+          ON cfg_all.chain_id = token_set.chain_id
+         AND cfg_all.token_address = token_set.token_address
+         AND cfg_all.executor_scope = 'all'
+        LEFT JOIN token_search_defaults cfg_two_hop
+          ON cfg_two_hop.chain_id = token_set.chain_id
+         AND cfg_two_hop.token_address = token_set.token_address
+         AND cfg_two_hop.executor_scope = 'two_hop'
+        LEFT JOIN token_search_defaults cfg_multihop
+          ON cfg_multihop.chain_id = token_set.chain_id
+         AND cfg_multihop.token_address = token_set.token_address
+         AND cfg_multihop.executor_scope = 'multihop'
         GROUP BY
             token_set.chain_id,
             token_set.token_address,
-            cfg.search_amounts,
-            cfg.min_profit
+            cfg_all.search_amounts,
+            cfg_all.min_profit,
+            cfg_two_hop.search_amounts,
+            cfg_two_hop.min_profit,
+            cfg_multihop.search_amounts,
+            cfg_multihop.min_profit
         ORDER BY
-            (cfg.search_amounts IS NOT NULL AND cfg.min_profit IS NOT NULL) DESC,
+            (
+                (cfg_all.search_amounts IS NOT NULL AND cfg_all.min_profit IS NOT NULL)
+                OR (cfg_two_hop.search_amounts IS NOT NULL AND cfg_two_hop.min_profit IS NOT NULL)
+                OR (cfg_multihop.search_amounts IS NOT NULL AND cfg_multihop.min_profit IS NOT NULL)
+            ) DESC,
             MIN(token_set.symbol),
             token_set.token_address
         "#,
@@ -2952,13 +3014,16 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
     <button type="submit">Update Token Configs</button>
   </div>
   <input type="hidden" name="token_addresses" value="{token_addresses}">
-  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>Amounts Raw</th><th>Min Profit Raw</th></tr></thead><tbody>"#,
+  <div class="table-scroll"><table class="compact-table"><thead><tr><th>Token</th><th>Address</th><th>Enabled</th><th>Funding Anchor</th><th>All Amounts</th><th>All Min</th><th>2-Hop Amounts</th><th>2-Hop Min</th><th>Multi Amounts</th><th>Multi Min</th></tr></thead><tbody>"#,
         password_input = password_input(Some("password"), false),
         token_addresses = escape(&token_addresses),
     );
     for row in rows {
         let token_key = row.token_address.to_lowercase();
-        let anchor = if row.search_amounts.is_some() && row.min_profit.is_some() {
+        let anchor = if row.search_amounts.is_some()
+            || row.two_hop_search_amounts.is_some()
+            || row.multihop_search_amounts.is_some()
+        {
             "<span class=\"ok\">configured</span>"
         } else {
             "<span class=\"muted\">no</span>"
@@ -2971,6 +3036,10 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
   <td>{anchor}</td>
   <td><input class="compact-input" name="search_amounts_{token_key}" value="{amounts_raw}" data-old="{amounts_raw}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
   <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit_raw}" data-old="{min_profit_raw}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="two_hop_search_amounts_{token_key}" value="{two_hop_amounts_raw}" data-old="{two_hop_amounts_raw}" data-symbol="{symbol}" data-kind="2-Hop Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="two_hop_min_profit_{token_key}" value="{two_hop_min_profit_raw}" data-old="{two_hop_min_profit_raw}" data-symbol="{symbol}" data-kind="2-Hop Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="multihop_search_amounts_{token_key}" value="{multihop_amounts_raw}" data-old="{multihop_amounts_raw}" data-symbol="{symbol}" data-kind="Multi Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="multihop_min_profit_{token_key}" value="{multihop_min_profit_raw}" data-old="{multihop_min_profit_raw}" data-symbol="{symbol}" data-kind="Multi Min Profit Raw" placeholder="500"></td>
 </tr>"#,
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
@@ -2980,10 +3049,14 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
             token_key = escape(&token_key),
             amounts_raw = escape(row.search_amounts.as_deref().unwrap_or_default()),
             min_profit_raw = escape(row.min_profit.as_deref().unwrap_or_default()),
+            two_hop_amounts_raw = escape(row.two_hop_search_amounts.as_deref().unwrap_or_default()),
+            two_hop_min_profit_raw = escape(row.two_hop_min_profit.as_deref().unwrap_or_default()),
+            multihop_amounts_raw = escape(row.multihop_search_amounts.as_deref().unwrap_or_default()),
+            multihop_min_profit_raw = escape(row.multihop_min_profit.as_deref().unwrap_or_default()),
         ));
     }
     if rows.is_empty() {
-        html.push_str("<tr><td colspan=\"6\">No tokens yet.</td></tr>");
+        html.push_str("<tr><td colspan=\"10\">No tokens yet.</td></tr>");
     }
     html.push_str("</tbody></table></div></form>");
     html
@@ -3633,9 +3706,10 @@ fn summarize_token_changes(changes: &[TokenUpdateChange]) -> String {
                 ""
             };
             format!(
-                "{} {} amounts {} -> {}, min profit {} -> {}{}",
+                "{} {} [{}] amounts {} -> {}, min profit {} -> {}{}",
                 change.symbol,
                 change.token_address,
+                change.scope,
                 option_display(change.old_search_amounts.as_deref()),
                 option_display(change.new_search_amounts.as_deref()),
                 option_display(change.old_min_profit.as_deref()),

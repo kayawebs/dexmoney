@@ -360,19 +360,21 @@ impl PostgresStore {
         &self,
         chain_id: u64,
         token_address: Address,
+        executor_scope: &str,
         search_amounts: Option<&str>,
         min_profit: Option<&str>,
     ) -> Result<()> {
         let chain_id = i64::try_from(chain_id)?;
         let token_address = address_to_string(token_address);
+        let executor_scope = normalize_executor_scope(executor_scope)?;
         match (search_amounts, min_profit) {
             (Some(search_amounts), Some(min_profit)) => {
                 sqlx::query(
                     r#"
                     INSERT INTO token_search_defaults (
-                        chain_id, token_address, search_amounts, min_profit, created_at, updated_at
-                    ) VALUES ($1,$2,$3,$4,NOW(),NOW())
-                    ON CONFLICT (chain_id, token_address)
+                        chain_id, token_address, executor_scope, search_amounts, min_profit, created_at, updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
+                    ON CONFLICT (chain_id, token_address, executor_scope)
                     DO UPDATE SET
                         search_amounts = EXCLUDED.search_amounts,
                         min_profit = EXCLUDED.min_profit,
@@ -381,6 +383,7 @@ impl PostgresStore {
                 )
                 .bind(chain_id)
                 .bind(token_address)
+                .bind(executor_scope)
                 .bind(search_amounts)
                 .bind(min_profit)
                 .execute(&self.pool)
@@ -390,11 +393,12 @@ impl PostgresStore {
                 sqlx::query(
                     r#"
                     DELETE FROM token_search_defaults
-                    WHERE chain_id = $1 AND token_address = $2
+                    WHERE chain_id = $1 AND token_address = $2 AND executor_scope = $3
                     "#,
                 )
                 .bind(chain_id)
                 .bind(token_address)
+                .bind(executor_scope)
                 .execute(&self.pool)
                 .await?;
             }
@@ -517,38 +521,80 @@ impl PostgresStore {
                 CASE
                     WHEN NULLIF(BTRIM(tp.token0_search_amounts), '') IS NOT NULL
                         THEN tp.token0_search_amounts
-                    ELSE token0_default.search_amounts
+                    ELSE COALESCE(token0_two_hop_default.search_amounts, token0_default.search_amounts)
                 END AS token0_search_amounts,
                 CASE
                     WHEN NULLIF(BTRIM(tp.token1_search_amounts), '') IS NOT NULL
                         THEN tp.token1_search_amounts
-                    ELSE token1_default.search_amounts
+                    ELSE COALESCE(token1_two_hop_default.search_amounts, token1_default.search_amounts)
                 END AS token1_search_amounts,
                 CASE
                     WHEN NULLIF(BTRIM(tp.token0_search_amounts), '') IS NOT NULL
+                        THEN tp.token0_search_amounts
+                    ELSE COALESCE(token0_multihop_default.search_amounts, token0_default.search_amounts)
+                END AS token0_multihop_search_amounts,
+                CASE
+                    WHEN NULLIF(BTRIM(tp.token1_search_amounts), '') IS NOT NULL
+                        THEN tp.token1_search_amounts
+                    ELSE COALESCE(token1_multihop_default.search_amounts, token1_default.search_amounts)
+                END AS token1_multihop_search_amounts,
+                CASE
+                    WHEN NULLIF(BTRIM(tp.token0_search_amounts), '') IS NOT NULL
                         THEN tp.token0_min_profit
-                    ELSE token0_default.min_profit
+                    ELSE COALESCE(token0_two_hop_default.min_profit, token0_default.min_profit)
                 END AS token0_min_profit,
                 CASE
                     WHEN NULLIF(BTRIM(tp.token1_search_amounts), '') IS NOT NULL
                         THEN tp.token1_min_profit
-                    ELSE token1_default.min_profit
-                END AS token1_min_profit
+                    ELSE COALESCE(token1_two_hop_default.min_profit, token1_default.min_profit)
+                END AS token1_min_profit,
+                CASE
+                    WHEN NULLIF(BTRIM(tp.token0_search_amounts), '') IS NOT NULL
+                        THEN tp.token0_min_profit
+                    ELSE COALESCE(token0_multihop_default.min_profit, token0_default.min_profit)
+                END AS token0_multihop_min_profit,
+                CASE
+                    WHEN NULLIF(BTRIM(tp.token1_search_amounts), '') IS NOT NULL
+                        THEN tp.token1_min_profit
+                    ELSE COALESCE(token1_multihop_default.min_profit, token1_default.min_profit)
+                END AS token1_multihop_min_profit
             FROM token_pairs tp
             LEFT JOIN token_search_defaults token0_default
               ON token0_default.chain_id = tp.chain_id
              AND token0_default.token_address = tp.token0
+             AND token0_default.executor_scope = 'all'
+            LEFT JOIN token_search_defaults token0_two_hop_default
+              ON token0_two_hop_default.chain_id = tp.chain_id
+             AND token0_two_hop_default.token_address = tp.token0
+             AND token0_two_hop_default.executor_scope = 'two_hop'
+            LEFT JOIN token_search_defaults token0_multihop_default
+              ON token0_multihop_default.chain_id = tp.chain_id
+             AND token0_multihop_default.token_address = tp.token0
+             AND token0_multihop_default.executor_scope = 'multihop'
             LEFT JOIN token_search_defaults token1_default
               ON token1_default.chain_id = tp.chain_id
              AND token1_default.token_address = tp.token1
+             AND token1_default.executor_scope = 'all'
+            LEFT JOIN token_search_defaults token1_two_hop_default
+              ON token1_two_hop_default.chain_id = tp.chain_id
+             AND token1_two_hop_default.token_address = tp.token1
+             AND token1_two_hop_default.executor_scope = 'two_hop'
+            LEFT JOIN token_search_defaults token1_multihop_default
+              ON token1_multihop_default.chain_id = tp.chain_id
+             AND token1_multihop_default.token_address = tp.token1
+             AND token1_multihop_default.executor_scope = 'multihop'
             WHERE tp.enabled = TRUE
               AND (
                 COALESCE(
                     NULLIF(BTRIM(tp.token0_search_amounts), ''),
+                    NULLIF(BTRIM(token0_two_hop_default.search_amounts), ''),
+                    NULLIF(BTRIM(token0_multihop_default.search_amounts), ''),
                     NULLIF(BTRIM(token0_default.search_amounts), '')
                 ) IS NOT NULL
                 OR COALESCE(
                     NULLIF(BTRIM(tp.token1_search_amounts), ''),
+                    NULLIF(BTRIM(token1_two_hop_default.search_amounts), ''),
+                    NULLIF(BTRIM(token1_multihop_default.search_amounts), ''),
                     NULLIF(BTRIM(token1_default.search_amounts), '')
                 ) IS NOT NULL
               )
@@ -793,12 +839,19 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS token_search_defaults (
             chain_id BIGINT NOT NULL,
             token_address TEXT NOT NULL,
+            executor_scope TEXT NOT NULL DEFAULT 'all',
             search_amounts TEXT NOT NULL,
             min_profit TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (chain_id, token_address)
+            PRIMARY KEY (chain_id, token_address, executor_scope)
         )"#,
+        r#"ALTER TABLE token_search_defaults
+            ADD COLUMN IF NOT EXISTS executor_scope TEXT NOT NULL DEFAULT 'all'"#,
+        r#"ALTER TABLE token_search_defaults
+            DROP CONSTRAINT IF EXISTS token_search_defaults_pkey"#,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS token_search_defaults_scope_unique_idx
+            ON token_search_defaults (chain_id, token_address, executor_scope)"#,
         r#"CREATE TABLE IF NOT EXISTS pools (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             token_pair_id UUID REFERENCES token_pairs(id),
@@ -1062,8 +1115,12 @@ struct TokenPairSearchConfigRow {
     symbol: String,
     token0_search_amounts: Option<String>,
     token1_search_amounts: Option<String>,
+    token0_multihop_search_amounts: Option<String>,
+    token1_multihop_search_amounts: Option<String>,
     token0_min_profit: Option<String>,
     token1_min_profit: Option<String>,
+    token0_multihop_min_profit: Option<String>,
+    token1_multihop_min_profit: Option<String>,
 }
 
 impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
@@ -1096,10 +1153,24 @@ impl TryFrom<TokenPairSearchConfigRow> for TokenPairSearchConfig {
             symbol: row.symbol,
             token0_search_amounts: parse_raw_amount_list(row.token0_search_amounts.as_deref())?,
             token1_search_amounts: parse_raw_amount_list(row.token1_search_amounts.as_deref())?,
+            token0_multihop_search_amounts: parse_raw_amount_list(
+                row.token0_multihop_search_amounts.as_deref(),
+            )?,
+            token1_multihop_search_amounts: parse_raw_amount_list(
+                row.token1_multihop_search_amounts.as_deref(),
+            )?,
             token0_min_profit: parse_raw_amount(row.token0_min_profit.as_deref())?
                 .unwrap_or(U256::from(1u64)),
             token1_min_profit: parse_raw_amount(row.token1_min_profit.as_deref())?
                 .unwrap_or(U256::from(1u64)),
+            token0_multihop_min_profit: parse_raw_amount(
+                row.token0_multihop_min_profit.as_deref(),
+            )?
+            .unwrap_or(U256::from(1u64)),
+            token1_multihop_min_profit: parse_raw_amount(
+                row.token1_multihop_min_profit.as_deref(),
+            )?
+            .unwrap_or(U256::from(1u64)),
         })
     }
 }
@@ -1134,6 +1205,15 @@ fn parse_raw_amount(raw: Option<&str>) -> Result<Option<U256>> {
         return Ok(None);
     };
     Ok(Some(U256::from_str_radix(raw, 10)?))
+}
+
+fn normalize_executor_scope(scope: &str) -> Result<&'static str> {
+    match scope.trim() {
+        "" | "all" => Ok("all"),
+        "two_hop" | "2hop" | "2-hop" => Ok("two_hop"),
+        "multihop" | "multi_hop" | "multi-hop" => Ok("multihop"),
+        other => anyhow::bail!("invalid executor scope: {other}"),
+    }
 }
 
 #[async_trait]

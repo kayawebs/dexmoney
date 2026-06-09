@@ -965,20 +965,20 @@ fn swap_step_from_pool(state: &PoolState, token_in: Address, token_out: Address)
 fn anchor_search_configs(configs: &[TokenPairSearchConfig]) -> Vec<AnchorSearchConfig> {
     let mut by_token: HashMap<Address, AnchorSearchConfig> = HashMap::new();
     for config in configs {
-        if !config.token0_search_amounts.is_empty() {
+        if !config.token0_multihop_search_amounts.is_empty() {
             merge_anchor_config(
                 &mut by_token,
                 config.token0,
-                &config.token0_search_amounts,
-                config.token0_min_profit,
+                &config.token0_multihop_search_amounts,
+                config.token0_multihop_min_profit,
             );
         }
-        if !config.token1_search_amounts.is_empty() {
+        if !config.token1_multihop_search_amounts.is_empty() {
             merge_anchor_config(
                 &mut by_token,
                 config.token1,
-                &config.token1_search_amounts,
-                config.token1_min_profit,
+                &config.token1_multihop_search_amounts,
+                config.token1_multihop_min_profit,
             );
         }
     }
@@ -1140,8 +1140,12 @@ mod tests {
             symbol: "USDC/WETH".into(),
             token0_search_amounts: vec![U256::from(1u64)],
             token1_search_amounts: Vec::new(),
+            token0_multihop_search_amounts: vec![U256::from(1u64)],
+            token1_multihop_search_amounts: Vec::new(),
             token0_min_profit: U256::from(1u64),
             token1_min_profit: U256::ZERO,
+            token0_multihop_min_profit: U256::from(1u64),
+            token1_multihop_min_profit: U256::ZERO,
         };
 
         pool_states[classic].stable = Some(false);
@@ -1169,8 +1173,12 @@ mod tests {
             symbol: "WETH/cbBTC".into(),
             token0_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
             token1_search_amounts: Vec::new(),
+            token0_multihop_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
+            token1_multihop_search_amounts: Vec::new(),
             token0_min_profit: U256::from(1_000_000_000_000u64),
             token1_min_profit: U256::ZERO,
+            token0_multihop_min_profit: U256::from(1_000_000_000_000u64),
+            token1_multihop_min_profit: U256::ZERO,
         };
         let engine = SearchEngine {
             amount_sizes: Vec::new(),
@@ -1220,8 +1228,12 @@ mod tests {
             symbol: "WETH/cbBTC".into(),
             token0_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
             token1_search_amounts: Vec::new(),
+            token0_multihop_search_amounts: vec![U256::from(10_000_000_000_000_000u64)],
+            token1_multihop_search_amounts: Vec::new(),
             token0_min_profit: U256::from(1_000_000_000_000u64),
             token1_min_profit: U256::ZERO,
+            token0_multihop_min_profit: U256::from(1_000_000_000_000u64),
+            token1_multihop_min_profit: U256::ZERO,
         };
         let engine = SearchEngine {
             amount_sizes: Vec::new(),
