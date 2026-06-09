@@ -79,7 +79,7 @@ impl Settings {
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 2u64)?
             .set_default("quote_max_state_block_lag", 0u64)?
-            .set_default("searcher_full_scan_interval_secs", 30u64)?
+            .set_default("searcher_full_scan_interval_secs", 300u64)?
             .set_default("min_profit_failure_ttl_secs", 21_600u64)?
             .set_default("execution_min_priority_fee_wei", "4300000")?
             .set_default("execution_priority_fee_multiplier_bps", 10_000u64)?

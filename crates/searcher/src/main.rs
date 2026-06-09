@@ -220,7 +220,6 @@ impl SearchRuntime {
             .unwrap_or(true);
 
         if first_cycle || full_scan_due {
-            self.last_full_scan = Some(now);
             SearchCycleMode::Full {
                 changed_pools: changed_pools.len(),
             }
@@ -304,6 +303,7 @@ where
     };
     match cycle_mode {
         SearchCycleMode::Full { changed_pools } => {
+            runtime.last_full_scan = Some(Instant::now());
             cycle_stats.full_scans = 1;
             cycle_stats.changed_pools = changed_pools as u64;
         }
