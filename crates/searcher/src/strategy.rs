@@ -25,6 +25,7 @@ pub struct SearchEngine {
     pub candidate_ttl_ms: i64,
     pub v3_quote_safety_bps: u64,
     pub quote_max_state_block_lag: u64,
+    pub multihop_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -199,6 +200,7 @@ impl SearchEngine {
             candidate_ttl_ms,
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 1,
+            multihop_enabled: false,
         }
     }
 
@@ -482,8 +484,10 @@ impl SearchEngine {
                 }
             }
         }
-        self.add_three_pool_cycle_paths(pool_states, &mut paths);
-        self.add_four_pool_cycle_paths(pool_states, &mut paths);
+        if self.multihop_enabled {
+            self.add_three_pool_cycle_paths(pool_states, &mut paths);
+            self.add_four_pool_cycle_paths(pool_states, &mut paths);
+        }
 
         paths
     }
@@ -648,6 +652,7 @@ pub fn engine_from_settings(
         candidate_ttl_ms,
         v3_quote_safety_bps: settings.v3_quote_safety_bps,
         quote_max_state_block_lag: settings.quote_max_state_block_lag,
+        multihop_enabled: settings.searcher_multihop_enabled,
     })
 }
 
@@ -1473,6 +1478,7 @@ mod tests {
             candidate_ttl_ms: 500,
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
+            multihop_enabled: true,
         };
         let states = vec![
             test_v3_pool(
@@ -1528,6 +1534,7 @@ mod tests {
             candidate_ttl_ms: 500,
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
+            multihop_enabled: true,
         };
         let states = vec![
             test_v3_pool(

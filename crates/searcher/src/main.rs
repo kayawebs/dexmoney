@@ -264,6 +264,7 @@ where
                 .as_ref()
                 .map(|index| index.total_paths())
                 .unwrap_or_default(),
+            multihop_enabled = engine.multihop_enabled,
             "searcher path index rebuilt"
         );
     }
