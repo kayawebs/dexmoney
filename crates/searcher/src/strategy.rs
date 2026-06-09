@@ -245,13 +245,13 @@ impl SearchEngine {
             ..SearchStats::default()
         };
         let mut out = Vec::new();
+        let quote_context = QuoteContext::new(pool_states, tick_states);
 
         for search_path in &paths {
             for amount_in in &search_path.amount_sizes {
                 stats.quote_attempts += 1;
                 let quote = match quote_path(
-                    pool_states,
-                    tick_states,
+                    &quote_context,
                     &search_path.path,
                     *amount_in,
                     self.v3_quote_safety_bps,
@@ -304,12 +304,8 @@ impl SearchEngine {
                         .path
                         .steps
                         .iter()
-                        .filter_map(|step| {
-                            pool_states
-                                .iter()
-                                .find(|state| state.pool_id.address == step.pool)
-                                .map(|state| state.block_number)
-                        })
+                        .filter_map(|step| quote_context.pool_state(step.pool))
+                        .map(|state| state.block_number)
                         .max()
                         .unwrap_or(0);
                     let candidate = build_candidate(
@@ -351,14 +347,14 @@ impl SearchEngine {
             ..SearchStats::default()
         };
         let mut out = Vec::new();
+        let quote_context = QuoteContext::new(pool_states, tick_states);
 
         for index in path_indices {
             let search_path = &path_index.paths[index];
             for amount_in in &search_path.amount_sizes {
                 stats.quote_attempts += 1;
                 let quote = match quote_path(
-                    pool_states,
-                    tick_states,
+                    &quote_context,
                     &search_path.path,
                     *amount_in,
                     self.v3_quote_safety_bps,
@@ -410,12 +406,8 @@ impl SearchEngine {
                     .path
                     .steps
                     .iter()
-                    .filter_map(|step| {
-                        pool_states
-                            .iter()
-                            .find(|state| state.pool_id.address == step.pool)
-                            .map(|state| state.block_number)
-                    })
+                    .filter_map(|step| quote_context.pool_state(step.pool))
+                    .map(|state| state.block_number)
                     .max()
                     .unwrap_or(0);
                 let candidate = build_candidate(
@@ -659,6 +651,39 @@ pub fn engine_from_settings(
     })
 }
 
+struct QuoteContext<'a> {
+    pool_states: HashMap<Address, &'a PoolState>,
+    tick_states: HashMap<Address, Vec<TickState>>,
+}
+
+impl<'a> QuoteContext<'a> {
+    fn new(pool_states: &'a [PoolState], tick_states: &[TickState]) -> Self {
+        let pool_states = pool_states
+            .iter()
+            .map(|state| (state.pool_id.address, state))
+            .collect::<HashMap<_, _>>();
+        let mut ticks_by_pool: HashMap<Address, Vec<TickState>> = HashMap::new();
+        for tick in tick_states {
+            ticks_by_pool
+                .entry(tick.pool_id.address)
+                .or_default()
+                .push(tick.clone());
+        }
+        Self {
+            pool_states,
+            tick_states: ticks_by_pool,
+        }
+    }
+
+    fn pool_state(&self, pool: Address) -> Option<&'a PoolState> {
+        self.pool_states.get(&pool).copied()
+    }
+
+    fn pool_ticks(&self, pool: Address) -> Option<&[TickState]> {
+        self.tick_states.get(&pool).map(Vec::as_slice)
+    }
+}
+
 #[derive(Clone)]
 struct SearchPath {
     path: ArbPath,
@@ -844,8 +869,7 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
 }
 
 async fn quote_path(
-    pool_states: &[PoolState],
-    tick_states: &[TickState],
+    context: &QuoteContext<'_>,
     path: &ArbPath,
     amount_in: U256,
     v3_quote_safety_bps: u64,
@@ -865,10 +889,7 @@ async fn quote_path(
     };
 
     for (step_index, step) in path.steps.iter().enumerate() {
-        let pool_state = match pool_states
-            .iter()
-            .find(|state| state.pool_id.address == step.pool)
-        {
+        let pool_state = match context.pool_state(step.pool) {
             Some(state) => state,
             None => {
                 return Err(QuoteSkip::new(
@@ -910,11 +931,9 @@ async fn quote_path(
                 }
             }
             PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
-                let pool_ticks = tick_states
-                    .iter()
-                    .filter(|tick| tick.pool_id.address == pool_state.pool_id.address)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let pool_ticks = context
+                    .pool_ticks(pool_state.pool_id.address)
+                    .unwrap_or_default();
                 tick_count = pool_ticks.len() as u32;
                 if pool_ticks.is_empty() {
                     return Err(QuoteSkip::new(
