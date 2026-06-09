@@ -1345,7 +1345,17 @@ where
                 );
                 continue;
             }
-            changed_pools.push(state.pool_id.address);
+            let previous = self
+                .pool_store
+                .get_pool_state(state.pool_id.address)
+                .await?;
+            if previous
+                .as_ref()
+                .map(|previous| quote_relevant_pool_state_changed(previous, state))
+                .unwrap_or(true)
+            {
+                changed_pools.push(state.pool_id.address);
+            }
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder
                 .record_pool_state_with_source(state.clone(), source)
@@ -2052,6 +2062,25 @@ where
 {
     service.run().await?;
     Ok(())
+}
+
+fn quote_relevant_pool_state_changed(previous: &PoolState, next: &PoolState) -> bool {
+    previous.dex != next.dex
+        || previous.variant != next.variant
+        || previous.factory_address != next.factory_address
+        || previous.token0 != next.token0
+        || previous.token1 != next.token1
+        || previous.token0_decimals != next.token0_decimals
+        || previous.token1_decimals != next.token1_decimals
+        || previous.fee_bps != next.fee_bps
+        || previous.fee_pips != next.fee_pips
+        || previous.stable != next.stable
+        || previous.reserve0 != next.reserve0
+        || previous.reserve1 != next.reserve1
+        || previous.sqrt_price_x96 != next.sqrt_price_x96
+        || previous.liquidity != next.liquidity
+        || previous.tick != next.tick
+        || previous.tick_spacing != next.tick_spacing
 }
 
 fn is_v3_style_state(state: &PoolState) -> bool {
