@@ -1225,6 +1225,17 @@ where
         );
         self.recorder.record_dex_event(event.clone()).await?;
 
+        // A flashblock event advances the pending-block view for every monitored
+        // pool: pools without a relevant log are unchanged through this pending
+        // block, while the event pool is updated below. Without this watermark,
+        // multi-pool quotes mix a pending state with sealed-block states and are
+        // rejected as having no common valid block.
+        let watermarked_pools = advance_valid_through_block(monitored_states, event.block_number);
+        if !watermarked_pools.is_empty() {
+            self.publish_validity_watermark(monitored_states, &watermarked_pools)
+                .await?;
+        }
+
         for state in monitored_states {
             if state.pool_id.address != event.pool_address {
                 continue;
