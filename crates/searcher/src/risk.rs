@@ -1,12 +1,10 @@
-use chrono::Utc;
-
 use base_arb_common::errors::{ArbBotError, Result};
 use base_arb_common::types::{Candidate, PoolState};
 
 pub fn validate_candidate(
     candidate: &Candidate,
     pool_states: &[PoolState],
-    max_pool_age_ms: i64,
+    _max_pool_age_ms: i64,
     min_expected_profit: alloy_primitives::U256,
     max_price_impact_bps: u64,
     whitelist_paths: &[String],
@@ -28,17 +26,12 @@ pub fn validate_candidate(
         return Err(ArbBotError::RiskGate("path_not_whitelisted".into()));
     }
 
-    let now = Utc::now();
     if candidate.path.steps.iter().any(|step| {
-        match pool_states
+        !pool_states
             .iter()
-            .find(|state| state.pool_id.address == step.pool)
-        {
-            Some(state) => state.is_stale(now, max_pool_age_ms),
-            None => true,
-        }
+            .any(|state| state.pool_id.address == step.pool)
     }) {
-        return Err(ArbBotError::RiskGate("pool_state_stale".into()));
+        return Err(ArbBotError::RiskGate("pool_state_missing".into()));
     }
 
     Ok(())

@@ -221,6 +221,7 @@ impl SearchEngine {
             .await
     }
 
+    #[cfg(test)]
     pub async fn search_with_stats_for_changed_pools(
         &self,
         pool_states: &[PoolState],
@@ -336,27 +337,121 @@ impl SearchEngine {
         Ok((out, stats))
     }
 
-    pub fn path_pool_addresses_for_changed_pools(
+    pub(crate) async fn search_with_stats_for_path_index(
         &self,
         pool_states: &[PoolState],
-        changed_pools: Option<&HashSet<Address>>,
-    ) -> HashSet<Address> {
-        let paths = self.paths_for_pool_states(pool_states);
-        paths
-            .into_iter()
-            .filter(|search_path| {
-                changed_pools
-                    .map(|changed_pools| {
-                        search_path
-                            .path
-                            .steps
+        tick_states: &[TickState],
+        path_index: &PathIndex,
+        changed_pools: &HashSet<Address>,
+    ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
+        let path_indices = path_index.path_indices_for_changed_pools(changed_pools);
+        let mut stats = SearchStats {
+            total_paths: path_index.total_paths(),
+            paths: path_indices.len(),
+            ..SearchStats::default()
+        };
+        let mut out = Vec::new();
+
+        for index in path_indices {
+            let search_path = &path_index.paths[index];
+            for amount_in in &search_path.amount_sizes {
+                stats.quote_attempts += 1;
+                let quote = match quote_path(
+                    pool_states,
+                    tick_states,
+                    &search_path.path,
+                    *amount_in,
+                    self.v3_quote_safety_bps,
+                    self.quote_max_state_block_lag,
+                )
+                .await
+                {
+                    Ok(Some(quote)) => {
+                        stats.quote_successes += 1;
+                        quote
+                    }
+                    Ok(None) => {
+                        stats.record_quote_skip(QuoteSkipReason::QuoteError);
+                        continue;
+                    }
+                    Err(err) => {
+                        stats.record_quote_skip(err.reason);
+                        debug!(
+                            path = %search_path.path.name,
+                            amount_in = %amount_in,
+                            reason = ?err.reason,
+                            error = %err.message,
+                            "quote skipped"
+                        );
+                        continue;
+                    }
+                };
+                let (expected_amount_out, price_impact_bps, diagnostics) = quote;
+                let expected_profit = expected_amount_out.saturating_sub(*amount_in);
+                stats.best_profit_before_impact =
+                    stats.best_profit_before_impact.max(expected_profit);
+                if price_impact_bps > self.max_price_impact_bps {
+                    stats.price_impact_rejected += 1;
+                    stats.best_profit_rejected_by_impact =
+                        stats.best_profit_rejected_by_impact.max(expected_profit);
+                    continue;
+                }
+                stats.best_profit = stats.best_profit.max(expected_profit);
+                let required_profit = if search_path.min_profit.is_zero() {
+                    self.min_expected_profit
+                } else {
+                    search_path.min_profit
+                };
+                if expected_profit < required_profit {
+                    stats.min_profit_rejected += 1;
+                    continue;
+                }
+                let block_number = search_path
+                    .path
+                    .steps
+                    .iter()
+                    .filter_map(|step| {
+                        pool_states
                             .iter()
-                            .any(|step| changed_pools.contains(&step.pool))
+                            .find(|state| state.pool_id.address == step.pool)
+                            .map(|state| state.block_number)
                     })
-                    .unwrap_or(true)
-            })
-            .flat_map(|search_path| search_path.path.steps.into_iter().map(|step| step.pool))
-            .collect()
+                    .max()
+                    .unwrap_or(0);
+                let candidate = build_candidate(
+                    block_number,
+                    search_path.strategy.clone(),
+                    search_path.path.steps[0].token_in,
+                    *amount_in,
+                    expected_amount_out,
+                    expected_profit,
+                    self.min_expected_profit,
+                    price_impact_bps,
+                    path_with_diagnostics(&search_path.path, diagnostics),
+                    self.candidate_ttl_ms,
+                );
+                let candidate = Candidate {
+                    min_profit: search_path.min_profit,
+                    ..candidate
+                };
+                stats.candidates_emitted += 1;
+                out.push(candidate);
+            }
+        }
+
+        Ok((out, stats))
+    }
+
+    pub(crate) fn build_path_index(&self, pool_states: &[PoolState]) -> PathIndex {
+        PathIndex::new(self.paths_for_pool_states(pool_states))
+    }
+
+    pub(crate) fn path_pool_addresses_for_path_index(
+        &self,
+        path_index: &PathIndex,
+        changed_pools: &HashSet<Address>,
+    ) -> HashSet<Address> {
+        path_index.path_pools_for_changed_pools(changed_pools)
     }
 
     fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {
@@ -570,6 +665,55 @@ struct SearchPath {
     amount_sizes: Vec<U256>,
     min_profit: U256,
     strategy: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct PathIndex {
+    paths: Vec<SearchPath>,
+    pool_to_paths: HashMap<Address, Vec<usize>>,
+}
+
+impl PathIndex {
+    fn new(paths: Vec<SearchPath>) -> Self {
+        let mut pool_to_paths: HashMap<Address, Vec<usize>> = HashMap::new();
+        for (index, path) in paths.iter().enumerate() {
+            for step in &path.path.steps {
+                pool_to_paths.entry(step.pool).or_default().push(index);
+            }
+        }
+        Self {
+            paths,
+            pool_to_paths,
+        }
+    }
+
+    pub(crate) fn total_paths(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn path_indices_for_changed_pools(&self, changed_pools: &HashSet<Address>) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut indices = Vec::new();
+        for pool in changed_pools {
+            let Some(pool_paths) = self.pool_to_paths.get(pool) else {
+                continue;
+            };
+            for index in pool_paths {
+                if seen.insert(*index) {
+                    indices.push(*index);
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+
+    fn path_pools_for_changed_pools(&self, changed_pools: &HashSet<Address>) -> HashSet<Address> {
+        self.path_indices_for_changed_pools(changed_pools)
+            .into_iter()
+            .flat_map(|index| self.paths[index].path.steps.iter().map(|step| step.pool))
+            .collect()
+    }
 }
 
 #[derive(Clone)]

@@ -6,7 +6,7 @@ use alloy_primitives::Address;
 use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
-use base_arb_common::types::PoolState;
+use base_arb_common::types::{DexKind, PoolState, PoolVariant};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
@@ -146,7 +146,36 @@ impl SearchCycleStats {
 #[derive(Default)]
 struct SearchRuntime {
     pool_states: HashMap<Address, PoolState>,
+    pool_topology: HashMap<Address, PoolTopology>,
+    path_index: Option<strategy::PathIndex>,
     bootstrapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoolTopology {
+    dex: DexKind,
+    variant: PoolVariant,
+    token0: Address,
+    token1: Address,
+    fee_bps: u32,
+    fee_pips: Option<u32>,
+    stable: Option<bool>,
+    tick_spacing: Option<i32>,
+}
+
+impl From<&PoolState> for PoolTopology {
+    fn from(state: &PoolState) -> Self {
+        Self {
+            dex: state.dex,
+            variant: state.variant,
+            token0: state.token0,
+            token1: state.token1,
+            fee_bps: state.fee_bps,
+            fee_pips: state.fee_pips,
+            stable: state.stable,
+            tick_spacing: state.tick_spacing,
+        }
+    }
 }
 
 async fn run_search_cycle<P, C, R>(
@@ -175,6 +204,9 @@ where
     )?;
     if !runtime.bootstrapped {
         for state in pool_store.all_pool_states().await? {
+            runtime
+                .pool_topology
+                .insert(state.pool_id.address, PoolTopology::from(&state));
             runtime.pool_states.insert(state.pool_id.address, state);
         }
         runtime.bootstrapped = true;
@@ -199,12 +231,21 @@ where
         });
     }
 
+    let mut rebuild_path_index = runtime.path_index.is_none();
     for pool in &changed_pools {
         match pool_store.get_pool_state(*pool).await? {
             Some(state) => {
+                let topology = PoolTopology::from(&state);
+                if runtime.pool_topology.get(pool) != Some(&topology) {
+                    rebuild_path_index = true;
+                    runtime.pool_topology.insert(*pool, topology);
+                }
                 runtime.pool_states.insert(*pool, state);
             }
             None => {
+                if runtime.pool_topology.remove(pool).is_some() {
+                    rebuild_path_index = true;
+                }
                 runtime.pool_states.remove(pool);
             }
         }
@@ -215,9 +256,22 @@ where
         debug!("no pool states available in searcher cache");
         return Ok(SearchCycleStats::default());
     }
-    let changed_filter = Some(&changed_pools);
+    if rebuild_path_index {
+        runtime.path_index = Some(engine.build_path_index(&pool_states));
+        info!(
+            total_paths = runtime
+                .path_index
+                .as_ref()
+                .map(|index| index.total_paths())
+                .unwrap_or_default(),
+            "searcher path index rebuilt"
+        );
+    }
+    let Some(path_index) = runtime.path_index.as_ref() else {
+        return Ok(SearchCycleStats::default());
+    };
     let mut tick_states = Vec::new();
-    let path_pools = engine.path_pool_addresses_for_changed_pools(&pool_states, changed_filter);
+    let path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
     for state in &pool_states {
         if !path_pools.contains(&state.pool_id.address) {
             continue;
@@ -232,7 +286,7 @@ where
         }
     }
     let (candidates, search_stats) = engine
-        .search_with_stats_for_changed_pools(&pool_states, &tick_states, changed_filter)
+        .search_with_stats_for_path_index(&pool_states, &tick_states, path_index, &changed_pools)
         .await?;
     let mut cycle_stats = SearchCycleStats {
         search: search_stats,
