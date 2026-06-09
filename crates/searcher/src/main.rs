@@ -2,13 +2,16 @@ mod opportunity;
 mod risk;
 mod strategy;
 
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
+use base_arb_common::types::{PoolState, PoolVariant};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolStateStore, RecorderStore, TickStateStore,
 };
+use std::collections::{HashMap, HashSet};
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
@@ -27,10 +30,14 @@ async fn main() -> Result<()> {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut aggregate = SearchCycleStats::default();
     let mut last_summary = Instant::now();
+    let mut runtime = SearchRuntime::new(Duration::from_secs(
+        settings.searcher_full_scan_interval_secs,
+    ));
 
     loop {
         ticker.tick().await;
         let stats = run_search_cycle(
+            &mut runtime,
             &redis,
             &redis,
             &postgres,
@@ -44,6 +51,14 @@ async fn main() -> Result<()> {
         aggregate.merge(&stats);
         if last_summary.elapsed() >= Duration::from_secs(30) {
             info!(
+                cycles = aggregate.cycles,
+                total_cycle_ms = aggregate.total_cycle_ms,
+                max_cycle_ms = aggregate.max_cycle_ms,
+                full_scans = aggregate.full_scans,
+                incremental_scans = aggregate.incremental_scans,
+                changed_pools = aggregate.changed_pools,
+                path_pools = aggregate.path_pools,
+                total_paths = aggregate.search.total_paths,
                 paths = aggregate.search.paths,
                 quote_attempts = aggregate.search.quote_attempts,
                 quote_successes = aggregate.search.quote_successes,
@@ -78,6 +93,13 @@ async fn main() -> Result<()> {
 #[derive(Default)]
 struct SearchCycleStats {
     search: strategy::SearchStats,
+    cycles: u64,
+    total_cycle_ms: u64,
+    max_cycle_ms: u64,
+    changed_pools: u64,
+    path_pools: u64,
+    full_scans: u64,
+    incremental_scans: u64,
     risk_rejected: u64,
     risk_expected_profit_rejected: u64,
     risk_price_impact_rejected: u64,
@@ -90,6 +112,13 @@ struct SearchCycleStats {
 impl SearchCycleStats {
     fn merge(&mut self, other: &SearchCycleStats) {
         self.search.merge(&other.search);
+        self.cycles += other.cycles;
+        self.total_cycle_ms += other.total_cycle_ms;
+        self.max_cycle_ms = self.max_cycle_ms.max(other.max_cycle_ms);
+        self.changed_pools += other.changed_pools;
+        self.path_pools += other.path_pools;
+        self.full_scans += other.full_scans;
+        self.incremental_scans += other.incremental_scans;
         self.risk_rejected += other.risk_rejected;
         self.risk_expected_profit_rejected += other.risk_expected_profit_rejected;
         self.risk_price_impact_rejected += other.risk_price_impact_rejected;
@@ -116,7 +145,98 @@ impl SearchCycleStats {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PoolFingerprint {
+    dex: base_arb_common::types::DexKind,
+    variant: PoolVariant,
+    token0: Address,
+    token1: Address,
+    fee_bps: u32,
+    fee_pips: Option<u32>,
+    stable: Option<bool>,
+    reserve0: Option<U256>,
+    reserve1: Option<U256>,
+    sqrt_price_x96: Option<U256>,
+    liquidity: Option<U256>,
+    tick: Option<i32>,
+    tick_spacing: Option<i32>,
+}
+
+impl From<&PoolState> for PoolFingerprint {
+    fn from(state: &PoolState) -> Self {
+        Self {
+            dex: state.dex,
+            variant: state.variant,
+            token0: state.token0,
+            token1: state.token1,
+            fee_bps: state.fee_bps,
+            fee_pips: state.fee_pips,
+            stable: state.stable,
+            reserve0: state.reserve0,
+            reserve1: state.reserve1,
+            sqrt_price_x96: state.sqrt_price_x96,
+            liquidity: state.liquidity,
+            tick: state.tick,
+            tick_spacing: state.tick_spacing,
+        }
+    }
+}
+
+struct SearchRuntime {
+    pool_fingerprints: HashMap<Address, PoolFingerprint>,
+    full_scan_interval: Duration,
+    last_full_scan: Option<Instant>,
+}
+
+impl SearchRuntime {
+    fn new(full_scan_interval: Duration) -> Self {
+        Self {
+            pool_fingerprints: HashMap::new(),
+            full_scan_interval,
+            last_full_scan: None,
+        }
+    }
+
+    fn classify_cycle(&mut self, pool_states: &[PoolState]) -> SearchCycleMode {
+        let mut changed_pools = HashSet::new();
+        let first_cycle = self.pool_fingerprints.is_empty();
+
+        for state in pool_states {
+            let fingerprint = PoolFingerprint::from(state);
+            match self.pool_fingerprints.get(&state.pool_id.address) {
+                Some(previous) if previous == &fingerprint => {}
+                _ => {
+                    changed_pools.insert(state.pool_id.address);
+                }
+            }
+            self.pool_fingerprints
+                .insert(state.pool_id.address, fingerprint);
+        }
+
+        let now = Instant::now();
+        let full_scan_due = self
+            .last_full_scan
+            .map(|last| now.duration_since(last) >= self.full_scan_interval)
+            .unwrap_or(true);
+
+        if first_cycle || full_scan_due {
+            self.last_full_scan = Some(now);
+            SearchCycleMode::Full {
+                changed_pools: changed_pools.len(),
+            }
+        } else {
+            SearchCycleMode::Incremental { changed_pools }
+        }
+    }
+}
+
+enum SearchCycleMode {
+    Full { changed_pools: usize },
+    Incremental { changed_pools: HashSet<Address> },
+}
+
 async fn run_search_cycle<P, C, R>(
+    runtime: &mut SearchRuntime,
     pool_store: &P,
     candidate_store: &C,
     recorder: &R,
@@ -131,6 +251,7 @@ where
     C: CandidateStore,
     R: RecorderStore + PairSearchConfigStore,
 {
+    let cycle_started = Instant::now();
     let engine = strategy::engine_from_settings(
         settings,
         candidate_ttl_ms,
@@ -143,8 +264,26 @@ where
         debug!("no pool states available in redis");
         return Ok(SearchCycleStats::default());
     }
+    let cycle_mode = runtime.classify_cycle(&pool_states);
+    let changed_filter = match &cycle_mode {
+        SearchCycleMode::Full { .. } => None,
+        SearchCycleMode::Incremental { changed_pools } if changed_pools.is_empty() => {
+            return Ok(SearchCycleStats {
+                cycles: 1,
+                total_cycle_ms: cycle_started.elapsed().as_millis() as u64,
+                max_cycle_ms: cycle_started.elapsed().as_millis() as u64,
+                incremental_scans: 1,
+                ..SearchCycleStats::default()
+            });
+        }
+        SearchCycleMode::Incremental { changed_pools } => Some(changed_pools),
+    };
     let mut tick_states = Vec::new();
+    let path_pools = engine.path_pool_addresses_for_changed_pools(&pool_states, changed_filter);
     for state in &pool_states {
+        if !path_pools.contains(&state.pool_id.address) {
+            continue;
+        }
         if matches!(
             state.variant,
             base_arb_common::types::PoolVariant::AerodromeSlipstream
@@ -154,11 +293,25 @@ where
             tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
         }
     }
-    let (candidates, search_stats) = engine.search_with_stats(&pool_states, &tick_states).await?;
+    let (candidates, search_stats) = engine
+        .search_with_stats_for_changed_pools(&pool_states, &tick_states, changed_filter)
+        .await?;
     let mut cycle_stats = SearchCycleStats {
         search: search_stats,
+        cycles: 1,
+        path_pools: path_pools.len() as u64,
         ..SearchCycleStats::default()
     };
+    match cycle_mode {
+        SearchCycleMode::Full { changed_pools } => {
+            cycle_stats.full_scans = 1;
+            cycle_stats.changed_pools = changed_pools as u64;
+        }
+        SearchCycleMode::Incremental { changed_pools } => {
+            cycle_stats.incremental_scans = 1;
+            cycle_stats.changed_pools = changed_pools.len() as u64;
+        }
+    }
 
     for candidate in candidates {
         debug!(candidate_id = %candidate.id, "quote generated");
@@ -182,6 +335,10 @@ where
             }
         }
     }
+
+    let elapsed_ms = cycle_started.elapsed().as_millis() as u64;
+    cycle_stats.total_cycle_ms = elapsed_ms;
+    cycle_stats.max_cycle_ms = elapsed_ms;
 
     Ok(cycle_stats)
 }

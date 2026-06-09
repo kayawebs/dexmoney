@@ -29,6 +29,7 @@ pub struct SearchEngine {
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchStats {
+    pub total_paths: usize,
     pub paths: usize,
     pub quote_attempts: u64,
     pub quote_successes: u64,
@@ -48,6 +49,7 @@ pub struct SearchStats {
 
 impl SearchStats {
     pub fn merge(&mut self, other: &SearchStats) {
+        self.total_paths += other.total_paths;
         self.paths += other.paths;
         self.quote_attempts += other.quote_attempts;
         self.quote_successes += other.quote_successes;
@@ -202,6 +204,7 @@ impl SearchEngine {
         }
     }
 
+    #[cfg(test)]
     pub async fn search(
         &self,
         pool_states: &[PoolState],
@@ -210,13 +213,35 @@ impl SearchEngine {
         Ok(self.search_with_stats(pool_states, tick_states).await?.0)
     }
 
+    #[cfg(test)]
     pub async fn search_with_stats(
         &self,
         pool_states: &[PoolState],
         tick_states: &[TickState],
     ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
-        let paths = self.paths_for_pool_states(pool_states);
+        self.search_with_stats_for_changed_pools(pool_states, tick_states, None)
+            .await
+    }
+
+    pub async fn search_with_stats_for_changed_pools(
+        &self,
+        pool_states: &[PoolState],
+        tick_states: &[TickState],
+        changed_pools: Option<&HashSet<Address>>,
+    ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
+        let mut paths = self.paths_for_pool_states(pool_states);
+        let total_paths = paths.len();
+        if let Some(changed_pools) = changed_pools {
+            paths.retain(|search_path| {
+                search_path
+                    .path
+                    .steps
+                    .iter()
+                    .any(|step| changed_pools.contains(&step.pool))
+            });
+        }
         let mut stats = SearchStats {
+            total_paths,
             paths: paths.len(),
             ..SearchStats::default()
         };
@@ -311,6 +336,29 @@ impl SearchEngine {
         }
 
         Ok((out, stats))
+    }
+
+    pub fn path_pool_addresses_for_changed_pools(
+        &self,
+        pool_states: &[PoolState],
+        changed_pools: Option<&HashSet<Address>>,
+    ) -> HashSet<Address> {
+        let paths = self.paths_for_pool_states(pool_states);
+        paths
+            .into_iter()
+            .filter(|search_path| {
+                changed_pools
+                    .map(|changed_pools| {
+                        search_path
+                            .path
+                            .steps
+                            .iter()
+                            .any(|step| changed_pools.contains(&step.pool))
+                    })
+                    .unwrap_or(true)
+            })
+            .flat_map(|search_path| search_path.path.steps.into_iter().map(|step| step.pool))
+            .collect()
     }
 
     fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {
