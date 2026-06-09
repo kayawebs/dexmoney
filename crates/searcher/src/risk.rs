@@ -18,14 +18,14 @@ pub fn validate_candidate(
     };
     if candidate.expected_profit < required_profit {
         return Err(ArbBotError::RiskGate(
-            "expected profit below threshold".into(),
+            "expected_profit_below_threshold".into(),
         ));
     }
     if candidate.price_impact_bps > max_price_impact_bps {
-        return Err(ArbBotError::RiskGate("price impact too high".into()));
+        return Err(ArbBotError::RiskGate("price_impact_too_high".into()));
     }
     if !whitelist_paths.is_empty() && !whitelist_paths.contains(&candidate.path.name) {
-        return Err(ArbBotError::RiskGate("path not whitelisted".into()));
+        return Err(ArbBotError::RiskGate("path_not_whitelisted".into()));
     }
 
     let now = Utc::now();
@@ -38,7 +38,7 @@ pub fn validate_candidate(
             None => true,
         }
     }) {
-        return Err(ArbBotError::RiskGate("pool state stale".into()));
+        return Err(ArbBotError::RiskGate("pool_state_stale".into()));
     }
 
     Ok(())

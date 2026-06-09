@@ -36,7 +36,10 @@ pub struct SearchStats {
     pub quote_successes: u64,
     pub quote_skipped: u64,
     pub price_impact_rejected: u64,
+    pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
+    pub best_profit_before_impact: U256,
+    pub best_profit_rejected_by_impact: U256,
     pub best_profit: U256,
 }
 
@@ -47,7 +50,14 @@ impl SearchStats {
         self.quote_successes += other.quote_successes;
         self.quote_skipped += other.quote_skipped;
         self.price_impact_rejected += other.price_impact_rejected;
+        self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
+        self.best_profit_before_impact = self
+            .best_profit_before_impact
+            .max(other.best_profit_before_impact);
+        self.best_profit_rejected_by_impact = self
+            .best_profit_rejected_by_impact
+            .max(other.best_profit_rejected_by_impact);
         self.best_profit = self.best_profit.max(other.best_profit);
     }
 }
@@ -197,12 +207,25 @@ impl SearchEngine {
                 };
                 let (expected_amount_out, price_impact_bps, diagnostics) = quote;
                 {
+                    let expected_profit = expected_amount_out.saturating_sub(*amount_in);
+                    stats.best_profit_before_impact =
+                        stats.best_profit_before_impact.max(expected_profit);
                     if price_impact_bps > self.max_price_impact_bps {
                         stats.price_impact_rejected += 1;
+                        stats.best_profit_rejected_by_impact =
+                            stats.best_profit_rejected_by_impact.max(expected_profit);
                         continue;
                     }
-                    let expected_profit = expected_amount_out.saturating_sub(*amount_in);
                     stats.best_profit = stats.best_profit.max(expected_profit);
+                    let required_profit = if search_path.min_profit.is_zero() {
+                        self.min_expected_profit
+                    } else {
+                        search_path.min_profit
+                    };
+                    if expected_profit < required_profit {
+                        stats.min_profit_rejected += 1;
+                        continue;
+                    }
                     let block_number = search_path
                         .path
                         .steps
@@ -1085,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
-        let engine = SearchEngine::new(500, 10_000, U256::from(1u64));
+        let engine = SearchEngine::new(500, 10_000, U256::ZERO);
         let pool_states = demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
         let uni_pool = pool_states
             .iter()

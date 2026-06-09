@@ -4,6 +4,7 @@ mod strategy;
 
 use anyhow::Result;
 use base_arb_common::config::Settings;
+use base_arb_common::errors::ArbBotError;
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolStateStore, RecorderStore, TickStateStore,
@@ -48,10 +49,18 @@ async fn main() -> Result<()> {
                 quote_successes = aggregate.search.quote_successes,
                 quote_skipped = aggregate.search.quote_skipped,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
+                min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
                 risk_rejected = aggregate.risk_rejected,
+                risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
+                risk_price_impact_rejected = aggregate.risk_price_impact_rejected,
+                risk_path_not_whitelisted = aggregate.risk_path_not_whitelisted,
+                risk_pool_state_stale = aggregate.risk_pool_state_stale,
+                risk_other_rejected = aggregate.risk_other_rejected,
                 opportunities_created = aggregate.opportunities_created,
-                best_profit = %aggregate.search.best_profit,
+                best_profit_before_impact = %aggregate.search.best_profit_before_impact,
+                best_profit_rejected_by_impact = %aggregate.search.best_profit_rejected_by_impact,
+                best_profit_after_impact = %aggregate.search.best_profit,
                 "searcher cycle summary"
             );
             aggregate = SearchCycleStats::default();
@@ -64,6 +73,11 @@ async fn main() -> Result<()> {
 struct SearchCycleStats {
     search: strategy::SearchStats,
     risk_rejected: u64,
+    risk_expected_profit_rejected: u64,
+    risk_price_impact_rejected: u64,
+    risk_path_not_whitelisted: u64,
+    risk_pool_state_stale: u64,
+    risk_other_rejected: u64,
     opportunities_created: u64,
 }
 
@@ -71,7 +85,28 @@ impl SearchCycleStats {
     fn merge(&mut self, other: &SearchCycleStats) {
         self.search.merge(&other.search);
         self.risk_rejected += other.risk_rejected;
+        self.risk_expected_profit_rejected += other.risk_expected_profit_rejected;
+        self.risk_price_impact_rejected += other.risk_price_impact_rejected;
+        self.risk_path_not_whitelisted += other.risk_path_not_whitelisted;
+        self.risk_pool_state_stale += other.risk_pool_state_stale;
+        self.risk_other_rejected += other.risk_other_rejected;
         self.opportunities_created += other.opportunities_created;
+    }
+
+    fn record_risk_rejection(&mut self, err: &ArbBotError) {
+        self.risk_rejected += 1;
+        let message = err.to_string();
+        if message.contains("expected_profit_below_threshold") {
+            self.risk_expected_profit_rejected += 1;
+        } else if message.contains("price_impact_too_high") {
+            self.risk_price_impact_rejected += 1;
+        } else if message.contains("path_not_whitelisted") {
+            self.risk_path_not_whitelisted += 1;
+        } else if message.contains("pool_state_stale") {
+            self.risk_pool_state_stale += 1;
+        } else {
+            self.risk_other_rejected += 1;
+        }
     }
 }
 
@@ -136,7 +171,7 @@ where
                 debug!(candidate_id = %candidate.id, "candidate created");
             }
             Err(err) => {
-                cycle_stats.risk_rejected += 1;
+                cycle_stats.record_risk_rejection(&err);
                 debug!(candidate_id = %candidate.id, reason = %err, "candidate rejected");
             }
         }
