@@ -1381,13 +1381,28 @@ impl ChainProvider {
         let factory = entry
             .factory_address
             .unwrap_or(AERODROME_POOL_FACTORY.parse()?);
-        self.fetch_aerodrome_classic_fee_bps_at_block(
-            factory,
-            entry.pool_address,
-            entry.stable.unwrap_or(false),
-            block_number,
-        )
-        .await
+        match self
+            .fetch_aerodrome_classic_fee_bps_at_block(
+                factory,
+                entry.pool_address,
+                entry.stable.unwrap_or(false),
+                block_number,
+            )
+            .await
+        {
+            Ok(fee_bps) => Ok(fee_bps),
+            Err(err) if entry.fee_bps > 0 => {
+                debug!(
+                    pool = %entry.pool_address,
+                    factory = %factory,
+                    fee_bps = entry.fee_bps,
+                    error = %err,
+                    "using registry Aerodrome Classic fee after onchain fee lookup failed"
+                );
+                Ok(entry.fee_bps)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn fetch_aerodrome_classic_fee_bps(
@@ -1439,13 +1454,28 @@ impl ChainProvider {
         entry: &PoolRegistryEntry,
         block_hash: &str,
     ) -> Result<u32> {
-        self.fetch_aerodrome_classic_fee_bps_at_block_hash(
-            entry.factory_address,
-            entry.pool_address,
-            entry.stable.unwrap_or(false),
-            block_hash,
-        )
-        .await
+        match self
+            .fetch_aerodrome_classic_fee_bps_at_block_hash(
+                entry.factory_address,
+                entry.pool_address,
+                entry.stable.unwrap_or(false),
+                block_hash,
+            )
+            .await
+        {
+            Ok(fee_bps) => Ok(fee_bps),
+            Err(err) if entry.fee_bps > 0 => {
+                debug!(
+                    pool = %entry.pool_address,
+                    factory = ?entry.factory_address,
+                    fee_bps = entry.fee_bps,
+                    error = %err,
+                    "using registry Aerodrome Classic fee after block-hash fee lookup failed"
+                );
+                Ok(entry.fee_bps)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn fetch_aerodrome_classic_fee_bps_at_block_hash(
