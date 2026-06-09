@@ -24,6 +24,12 @@ pub trait PoolStateStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait PoolChangeStore: Send + Sync {
+    async fn mark_changed_pools(&self, pools: Vec<Address>) -> anyhow::Result<()>;
+    async fn drain_changed_pools(&self) -> anyhow::Result<Vec<Address>>;
+}
+
+#[async_trait]
 pub trait TickStateStore: Send + Sync {
     async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()>;
     async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()>;
@@ -104,6 +110,7 @@ pub struct InMemoryStores {
     events: Arc<Mutex<Vec<DexEvent>>>,
     pool_snapshots: Arc<Mutex<Vec<PoolState>>>,
     ticks: Arc<Mutex<BTreeMap<(Address, i32), TickState>>>,
+    changed_pools: Arc<Mutex<VecDeque<Address>>>,
 }
 
 impl InMemoryStores {
@@ -135,6 +142,26 @@ impl PoolStateStore for InMemoryStores {
 
     async fn all_pool_states(&self) -> anyhow::Result<Vec<PoolState>> {
         Ok(self.pool_states.lock().await.values().cloned().collect())
+    }
+}
+
+#[async_trait]
+impl PoolChangeStore for InMemoryStores {
+    async fn mark_changed_pools(&self, pools: Vec<Address>) -> anyhow::Result<()> {
+        let mut changed = self.changed_pools.lock().await;
+        for pool in pools {
+            changed.push_back(pool);
+        }
+        Ok(())
+    }
+
+    async fn drain_changed_pools(&self) -> anyhow::Result<Vec<Address>> {
+        let mut changed = self.changed_pools.lock().await;
+        let mut out = Vec::with_capacity(changed.len());
+        while let Some(pool) = changed.pop_front() {
+            out.push(pool);
+        }
+        Ok(out)
     }
 }
 

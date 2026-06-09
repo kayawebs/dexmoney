@@ -5,7 +5,9 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use tracing::info;
 
-use crate::{CandidateStore, EoaStateStore, FailureStore, PoolStateStore, TickStateStore};
+use crate::{
+    CandidateStore, EoaStateStore, FailureStore, PoolChangeStore, PoolStateStore, TickStateStore,
+};
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
 #[derive(Clone)]
@@ -32,6 +34,10 @@ pub fn tick_state_key(chain_id: u64, pool_address: alloy_primitives::Address, ti
 
 pub fn candidates_key() -> &'static str {
     "candidates:priority"
+}
+
+pub fn changed_pools_key() -> &'static str {
+    "pools:changed"
 }
 
 pub fn eoa_lane_key(address: alloy_primitives::Address) -> String {
@@ -77,6 +83,39 @@ impl PoolStateStore for RedisStore {
             }
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl PoolChangeStore for RedisStore {
+    async fn mark_changed_pools(&self, pools: Vec<Address>) -> Result<()> {
+        if pools.is_empty() {
+            return Ok(());
+        }
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        for pool in pools {
+            pipe.sadd(changed_pools_key(), format!("{pool:#x}"))
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
+    async fn drain_changed_pools(&self) -> Result<Vec<Address>> {
+        let mut manager = self.manager.clone();
+        let values: Vec<String> = redis::cmd("SPOP")
+            .arg(changed_pools_key())
+            .arg(100_000usize)
+            .query_async(&mut manager)
+            .await?;
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        values
+            .into_iter()
+            .map(|value| value.parse().map_err(Into::into))
+            .collect()
     }
 }
 

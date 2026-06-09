@@ -79,7 +79,6 @@ impl SearchStats {
             QuoteSkipReason::TickRangeExhausted => {
                 self.quote_skipped_tick_range_exhausted += 1;
             }
-            QuoteSkipReason::StateBlockGap => self.quote_skipped_state_block_gap += 1,
             QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
         }
     }
@@ -90,7 +89,6 @@ pub enum QuoteSkipReason {
     MissingState,
     MissingTicks,
     TickRangeExhausted,
-    StateBlockGap,
     QuoteError,
 }
 
@@ -707,7 +705,7 @@ async fn quote_path(
     path: &ArbPath,
     amount_in: U256,
     v3_quote_safety_bps: u64,
-    quote_max_state_block_lag: u64,
+    _quote_max_state_block_lag: u64,
 ) -> std::result::Result<Option<(U256, u64, QuoteDiagnostics)>, QuoteSkip> {
     let aero_stable = AerodromeStableQuoter;
     let aero_volatile = AerodromeVolatileQuoter;
@@ -862,24 +860,10 @@ async fn quote_path(
             "V3 quote exhausted known tick range",
         ));
     }
-    if let Some(validity_gap) = quote_validity_gap(&diagnostics) {
-        if validity_gap > quote_max_state_block_lag {
-            debug!(
-                path = %path.name,
-                validity_gap,
-                max_block_lag = quote_max_state_block_lag,
-                "quote skipped: path pool states are not valid across a common block"
-            );
-            return Err(QuoteSkip::new(
-                QuoteSkipReason::StateBlockGap,
-                format!("path pool states are not valid across a common block: {validity_gap}"),
-            ));
-        }
-    }
-
     Ok(Some((amount, max_impact, diagnostics)))
 }
 
+#[cfg(test)]
 fn quote_validity_gap(diagnostics: &QuoteDiagnostics) -> Option<u64> {
     let quote_block = diagnostics
         .steps

@@ -10,7 +10,7 @@ use base_arb_common::types::{
 };
 use base_arb_storage::{
     postgres::{FactoryRegistryRecord, PostgresStore},
-    PoolStateStore, RecorderStore, TickStateStore,
+    PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -55,7 +55,7 @@ pub struct MarketDataService<P> {
 
 impl<P> MarketDataService<P>
 where
-    P: PoolStateStore + TickStateStore + Clone + Send + Sync + 'static,
+    P: PoolStateStore + PoolChangeStore + TickStateStore + Clone + Send + Sync + 'static,
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
@@ -1256,6 +1256,9 @@ where
             } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
                 state.valid_through_block = state.valid_through_block.max(event.block_number);
                 self.pool_store.set_pool_state(state.clone()).await?;
+                self.pool_store
+                    .mark_changed_pools(vec![state.pool_id.address])
+                    .await?;
                 self.recorder
                     .record_pool_state_with_source(state.clone(), "flashblock")
                     .await?;
@@ -1329,6 +1332,7 @@ where
         source: &str,
     ) -> Result<()> {
         let mut seen = HashSet::new();
+        let mut changed_pools = Vec::new();
         for state in states {
             if !selected.contains(&state.pool_id.address) {
                 continue;
@@ -1341,6 +1345,7 @@ where
                 );
                 continue;
             }
+            changed_pools.push(state.pool_id.address);
             self.pool_store.set_pool_state(state.clone()).await?;
             self.recorder
                 .record_pool_state_with_source(state.clone(), source)
@@ -1354,6 +1359,7 @@ where
                 "monitoring pool logs"
             );
         }
+        self.pool_store.mark_changed_pools(changed_pools).await?;
         Ok(())
     }
 
@@ -2042,7 +2048,7 @@ where
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
 where
-    P: PoolStateStore + TickStateStore + Clone + Send + Sync + 'static,
+    P: PoolStateStore + PoolChangeStore + TickStateStore + Clone + Send + Sync + 'static,
 {
     service.run().await?;
     Ok(())
