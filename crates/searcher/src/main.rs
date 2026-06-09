@@ -48,6 +48,12 @@ async fn main() -> Result<()> {
                 quote_attempts = aggregate.search.quote_attempts,
                 quote_successes = aggregate.search.quote_successes,
                 quote_skipped = aggregate.search.quote_skipped,
+                quote_skipped_missing_state = aggregate.search.quote_skipped_missing_state,
+                quote_skipped_missing_ticks = aggregate.search.quote_skipped_missing_ticks,
+                quote_skipped_tick_range_exhausted =
+                    aggregate.search.quote_skipped_tick_range_exhausted,
+                quote_skipped_state_block_gap = aggregate.search.quote_skipped_state_block_gap,
+                quote_skipped_error = aggregate.search.quote_skipped_error,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,

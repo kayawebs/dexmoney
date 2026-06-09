@@ -8,9 +8,7 @@ use base_arb_common::types::{
 };
 use base_arb_dex::aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter};
 use base_arb_dex::quoter::DexQuoter;
-use base_arb_dex::uniswap_v3::{
-    quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in, UniswapV3CurrentTickQuoter,
-};
+use base_arb_dex::uniswap_v3::{quote_exact_in_with_ticks_diagnostics, spot_quote_exact_in};
 use tracing::debug;
 
 use crate::opportunity::build_candidate;
@@ -35,6 +33,11 @@ pub struct SearchStats {
     pub quote_attempts: u64,
     pub quote_successes: u64,
     pub quote_skipped: u64,
+    pub quote_skipped_missing_state: u64,
+    pub quote_skipped_missing_ticks: u64,
+    pub quote_skipped_tick_range_exhausted: u64,
+    pub quote_skipped_state_block_gap: u64,
+    pub quote_skipped_error: u64,
     pub price_impact_rejected: u64,
     pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
@@ -49,6 +52,11 @@ impl SearchStats {
         self.quote_attempts += other.quote_attempts;
         self.quote_successes += other.quote_successes;
         self.quote_skipped += other.quote_skipped;
+        self.quote_skipped_missing_state += other.quote_skipped_missing_state;
+        self.quote_skipped_missing_ticks += other.quote_skipped_missing_ticks;
+        self.quote_skipped_tick_range_exhausted += other.quote_skipped_tick_range_exhausted;
+        self.quote_skipped_state_block_gap += other.quote_skipped_state_block_gap;
+        self.quote_skipped_error += other.quote_skipped_error;
         self.price_impact_rejected += other.price_impact_rejected;
         self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
@@ -59,6 +67,47 @@ impl SearchStats {
             .best_profit_rejected_by_impact
             .max(other.best_profit_rejected_by_impact);
         self.best_profit = self.best_profit.max(other.best_profit);
+    }
+
+    fn record_quote_skip(&mut self, reason: QuoteSkipReason) {
+        self.quote_skipped += 1;
+        match reason {
+            QuoteSkipReason::MissingState => self.quote_skipped_missing_state += 1,
+            QuoteSkipReason::MissingTicks => self.quote_skipped_missing_ticks += 1,
+            QuoteSkipReason::TickRangeExhausted => {
+                self.quote_skipped_tick_range_exhausted += 1;
+            }
+            QuoteSkipReason::StateBlockGap => self.quote_skipped_state_block_gap += 1,
+            QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum QuoteSkipReason {
+    MissingState,
+    MissingTicks,
+    TickRangeExhausted,
+    StateBlockGap,
+    QuoteError,
+}
+
+#[derive(Debug)]
+pub struct QuoteSkip {
+    reason: QuoteSkipReason,
+    message: String,
+}
+
+impl QuoteSkip {
+    fn new(reason: QuoteSkipReason, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+
+    fn quote_error(message: impl Into<String>) -> Self {
+        Self::new(QuoteSkipReason::QuoteError, message)
     }
 }
 
@@ -191,15 +240,16 @@ impl SearchEngine {
                         quote
                     }
                     Ok(None) => {
-                        stats.quote_skipped += 1;
+                        stats.record_quote_skip(QuoteSkipReason::QuoteError);
                         continue;
                     }
                     Err(err) => {
-                        stats.quote_skipped += 1;
+                        stats.record_quote_skip(err.reason);
                         debug!(
                             path = %search_path.path.name,
                             amount_in = %amount_in,
-                            error = %err,
+                            reason = ?err.reason,
+                            error = %err.message,
                             "quote skipped"
                         );
                         continue;
@@ -610,10 +660,9 @@ async fn quote_path(
     amount_in: U256,
     v3_quote_safety_bps: u64,
     quote_max_state_block_lag: u64,
-) -> anyhow::Result<Option<(U256, u64, QuoteDiagnostics)>> {
+) -> std::result::Result<Option<(U256, u64, QuoteDiagnostics)>, QuoteSkip> {
     let aero_stable = AerodromeStableQuoter;
     let aero_volatile = AerodromeVolatileQuoter;
-    let uni = UniswapV3CurrentTickQuoter;
     let mut amount = amount_in;
     let mut max_impact = 0u64;
     let mut diagnostics = QuoteDiagnostics {
@@ -631,7 +680,12 @@ async fn quote_path(
             .find(|state| state.pool_id.address == step.pool)
         {
             Some(state) => state,
-            None => return Ok(None),
+            None => {
+                return Err(QuoteSkip::new(
+                    QuoteSkipReason::MissingState,
+                    format!("pool state missing for {:#x}", step.pool),
+                ));
+            }
         };
 
         let amount_before = amount;
@@ -652,7 +706,7 @@ async fn quote_path(
                             diagnostics.modes.push(mode.clone());
                             quote
                         })
-                        .map_err(anyhow::Error::from)?
+                        .map_err(|err| QuoteSkip::quote_error(err.to_string()))?
                 } else {
                     aero_volatile
                         .quote_exact_in(pool_state, step.token_in, amount)
@@ -662,7 +716,7 @@ async fn quote_path(
                             diagnostics.modes.push(mode.clone());
                             quote
                         })
-                        .map_err(anyhow::Error::from)?
+                        .map_err(|err| QuoteSkip::quote_error(err.to_string()))?
                 }
             }
             PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
@@ -673,12 +727,13 @@ async fn quote_path(
                     .collect::<Vec<_>>();
                 tick_count = pool_ticks.len() as u32;
                 if pool_ticks.is_empty() {
-                    mode = "v3_current_tick_fallback".into();
-                    diagnostics.modes.push(mode.clone());
-                    diagnostics.v3_pools_without_ticks += 1;
-                    uni.quote_exact_in(pool_state, step.token_in, amount)
-                        .await
-                        .map_err(anyhow::Error::from)?
+                    return Err(QuoteSkip::new(
+                        QuoteSkipReason::MissingTicks,
+                        format!(
+                            "initialized tick data missing for {:#x}",
+                            pool_state.pool_id.address
+                        ),
+                    ));
                 } else {
                     let (quote, v3_diagnostics) = quote_exact_in_with_ticks_diagnostics(
                         pool_state,
@@ -686,7 +741,7 @@ async fn quote_path(
                         step.token_in,
                         amount,
                     )
-                    .map_err(anyhow::Error::from)?;
+                    .map_err(|err| QuoteSkip::quote_error(err.to_string()))?;
                     mode = "v3_cross_tick".into();
                     diagnostics.modes.push(mode.clone());
                     step_ticks_used = v3_diagnostics.ticks_used;
@@ -701,7 +756,8 @@ async fn quote_path(
         };
         let amount_out_raw = quote.amount_out;
         if is_v3_style_variant(pool_state.variant) && v3_quote_safety_bps > 0 {
-            quote.amount_out = apply_quote_haircut(quote.amount_out, v3_quote_safety_bps)?;
+            quote.amount_out = apply_quote_haircut(quote.amount_out, v3_quote_safety_bps)
+                .map_err(|err| QuoteSkip::quote_error(err.to_string()))?;
         }
 
         amount = quote.amount_out;
@@ -741,7 +797,10 @@ async fn quote_path(
             missing_v3_tick_pools = diagnostics.v3_pools_without_ticks,
             "quote skipped: V3 initialized tick data unavailable"
         );
-        return Ok(None);
+        return Err(QuoteSkip::new(
+            QuoteSkipReason::MissingTicks,
+            "V3 initialized tick data unavailable",
+        ));
     }
     if diagnostics.tick_range_exhausted {
         debug!(
@@ -750,7 +809,10 @@ async fn quote_path(
             crossed_ticks = diagnostics.crossed_ticks,
             "quote skipped: V3 quote exhausted known tick range"
         );
-        return Ok(None);
+        return Err(QuoteSkip::new(
+            QuoteSkipReason::TickRangeExhausted,
+            "V3 quote exhausted known tick range",
+        ));
     }
     if let Some(validity_gap) = quote_validity_gap(&diagnostics) {
         if validity_gap > quote_max_state_block_lag {
@@ -760,7 +822,10 @@ async fn quote_path(
                 max_block_lag = quote_max_state_block_lag,
                 "quote skipped: path pool states are not valid across a common block"
             );
-            return Ok(None);
+            return Err(QuoteSkip::new(
+                QuoteSkipReason::StateBlockGap,
+                format!("path pool states are not valid across a common block: {validity_gap}"),
+            ));
         }
     }
 
