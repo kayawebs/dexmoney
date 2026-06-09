@@ -1337,6 +1337,32 @@ impl ChainProvider {
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("classic pool fee too large: {fee}"))
     }
 
+    async fn fetch_classic_pool_fee_bps_at_block(
+        &self,
+        pool: Address,
+        block_number: Option<u64>,
+    ) -> Result<u32> {
+        let raw = self
+            .eth_call_at_block(pool, "0x30adf81f", "fee()", block_number)
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("classic pool fee too large: {fee}"))
+    }
+
+    async fn fetch_classic_pool_fee_bps_at_block_hash(
+        &self,
+        pool: Address,
+        block_hash: &str,
+    ) -> Result<u32> {
+        let raw = self
+            .eth_call_at_block_hash(pool, "0x30adf81f", "fee()", block_hash)
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        let fee = parse_word_u256(&words[0])?;
+        u32::try_from(fee).map_err(|_| anyhow::anyhow!("classic pool fee too large: {fee}"))
+    }
+
     async fn fetch_token_decimals(&self, token: Address) -> Result<u8> {
         let raw = self.eth_call(token, "0x313ce567", "decimals()").await?;
         let words = decode_32byte_words(&raw)?;
@@ -1382,16 +1408,29 @@ impl ChainProvider {
         block_number: Option<u64>,
     ) -> Result<u32> {
         let data = encode_get_fee(pool, stable);
-        let raw = self
+        let fee = match self
             .eth_call_at_block(
                 factory,
                 &data,
                 "Aerodrome factory getFee(address,bool)",
                 block_number,
             )
-            .await?;
-        let words = decode_32byte_words(&raw)?;
-        let fee = parse_word_u256(&words[0])?;
+            .await
+        {
+            Ok(raw) => {
+                let words = decode_32byte_words(&raw)?;
+                parse_word_u256(&words[0])?
+            }
+            Err(factory_err) => self
+                .fetch_classic_pool_fee_bps_at_block(pool, block_number)
+                .await
+                .map_err(|pool_err| {
+                    anyhow::anyhow!(
+                        "factory getFee failed ({factory_err}); pool fee() fallback failed ({pool_err})"
+                    )
+                })
+                .map(|fee| U256::from(u64::from(fee)))?,
+        };
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
     }
 
@@ -1418,16 +1457,29 @@ impl ChainProvider {
     ) -> Result<u32> {
         let factory = factory.unwrap_or(AERODROME_POOL_FACTORY.parse()?);
         let data = encode_get_fee(pool, stable);
-        let raw = self
+        let fee = match self
             .eth_call_at_block_hash(
                 factory,
                 &data,
                 "Aerodrome factory getFee(address,bool)",
                 block_hash,
             )
-            .await?;
-        let words = decode_32byte_words(&raw)?;
-        let fee = parse_word_u256(&words[0])?;
+            .await
+        {
+            Ok(raw) => {
+                let words = decode_32byte_words(&raw)?;
+                parse_word_u256(&words[0])?
+            }
+            Err(factory_err) => self
+                .fetch_classic_pool_fee_bps_at_block_hash(pool, block_hash)
+                .await
+                .map_err(|pool_err| {
+                    anyhow::anyhow!(
+                        "factory getFee failed ({factory_err}); pool fee() fallback failed ({pool_err})"
+                    )
+                })
+                .map(|fee| U256::from(u64::from(fee)))?,
+        };
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("Aerodrome fee too large: {fee}"))
     }
 
