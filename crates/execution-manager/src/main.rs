@@ -84,37 +84,61 @@ where
 {
     let fund_wallet = configured_fund_wallet(settings)?;
     let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
-    let mut selected_wallet = None;
+    let candidates = pop_fresh_candidates(candidate_store).await?;
+    if candidates.is_empty() {
+        if settings.execution_submit_enabled {
+            let Some(fund_wallet) = fund_wallet.as_ref() else {
+                anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+            };
+            prepare_eoa_pool(
+                eoa_store,
+                recorder,
+                provider,
+                settings,
+                fund_wallet,
+                &worker_wallets,
+                circuit_breaker,
+            )
+            .await?;
+        }
+        debug!("no candidate available");
+        return Ok(());
+    };
 
-    if settings.execution_submit_enabled {
+    let selected_wallet = if settings.execution_submit_enabled {
         let Some(fund_wallet) = fund_wallet.as_ref() else {
             anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
         };
-
-        selected_wallet = prepare_eoa_pool(
-            eoa_store,
-            recorder,
-            provider,
-            settings,
-            fund_wallet,
-            &worker_wallets,
-            circuit_breaker,
-        )
-        .await?;
-        if selected_wallet.is_none() || circuit_breaker.is_halted(settings) {
+        if circuit_breaker.is_halted(settings) {
             return Ok(());
         }
-    }
+        let cached = select_cached_ready_worker(eoa_store, settings, &worker_wallets).await?;
+        match cached {
+            Some(wallet) => Some(wallet),
+            None => {
+                let prepared = prepare_eoa_pool(
+                    eoa_store,
+                    recorder,
+                    provider,
+                    settings,
+                    fund_wallet,
+                    &worker_wallets,
+                    circuit_breaker,
+                )
+                .await?;
+                if prepared.is_none() || circuit_breaker.is_halted(settings) {
+                    return Ok(());
+                }
+                prepared
+            }
+        }
+    } else {
+        None
+    };
     let operator = selected_wallet
         .as_ref()
         .map(tx_manager::ExecutionWallet::address)
         .unwrap_or(operator_address(settings, fund_wallet.as_ref())?);
-
-    let candidates = pop_fresh_candidates(candidate_store).await?;
-    if candidates.is_empty() {
-        debug!("no candidate available");
-        return Ok(());
-    };
     if let Some(wallet) = selected_wallet.as_ref() {
         info!(
             worker = %wallet.address(),
@@ -173,6 +197,36 @@ where
     );
 
     Ok(())
+}
+
+async fn select_cached_ready_worker<E>(
+    eoa_store: &E,
+    settings: &Settings,
+    worker_wallets: &[tx_manager::ExecutionWallet],
+) -> Result<Option<tx_manager::ExecutionWallet>>
+where
+    E: EoaStateStore,
+{
+    let worker_min_balance = parse_config_u256(
+        settings.execution_worker_min_balance_wei.as_deref(),
+        "execution_worker_min_balance_wei",
+    )?;
+    for worker in worker_wallets {
+        let Some(state) = eoa_store.get_lane_state(worker.address()).await? else {
+            continue;
+        };
+        if state.status == EoaLaneStatus::Idle && state.eth_balance >= worker_min_balance {
+            debug!(
+                worker = %worker.address(),
+                balance = %state.eth_balance,
+                local_nonce = state.local_nonce,
+                confirmed_nonce = state.confirmed_nonce,
+                "selected cached ready execution worker EOA"
+            );
+            return Ok(Some(worker.clone()));
+        }
+    }
+    Ok(None)
 }
 
 enum CandidateAction {
