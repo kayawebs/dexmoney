@@ -316,19 +316,76 @@ GROUP BY eoa
 ORDER BY latest DESC;
 SQL
 
+run_sql "6. PoolMismatch structural route diagnostics" <<'SQL'
+WITH pool_mismatch AS (
+  SELECT
+    s.created_at,
+    s.opportunity_id,
+    s.path_name,
+    s.revert_reason,
+    o.path_json
+  FROM simulations s
+  JOIN opportunities o ON o.id = s.opportunity_id
+  WHERE s.created_at >= now() - :'interval'::interval
+    AND s.revert_reason ILIKE '%PoolMismatch%'
+)
+SELECT
+  path_name,
+  count(*) AS n,
+  max(created_at) AS latest,
+  min(created_at) AS first_seen,
+  max(revert_reason) AS sample_revert_reason
+FROM pool_mismatch
+GROUP BY path_name
+ORDER BY n DESC, latest DESC
+LIMIT 50;
+
+WITH pool_mismatch AS (
+  SELECT
+    s.created_at,
+    s.opportunity_id,
+    s.path_name,
+    s.revert_reason,
+    o.path_json
+  FROM simulations s
+  JOIN opportunities o ON o.id = s.opportunity_id
+  WHERE s.created_at >= now() - :'interval'::interval
+    AND s.revert_reason ILIKE '%PoolMismatch%'
+)
+SELECT
+  pm.created_at,
+  pm.opportunity_id,
+  pm.path_name,
+  x.ord AS step_no,
+  x.step->>'dex' AS dex,
+  x.step->>'variant' AS variant,
+  COALESCE(x.step->>'pool', x.step->>'pool_address') AS pool,
+  COALESCE(x.step->>'factory', x.step->>'factory_address') AS factory,
+  x.step->>'token_in' AS token_in,
+  x.step->>'token_out' AS token_out,
+  x.step->>'fee_bps' AS fee_bps,
+  x.step->>'fee_pips' AS fee_pips,
+  x.step->>'stable' AS stable,
+  x.step->>'tick_spacing' AS tick_spacing
+FROM pool_mismatch pm
+CROSS JOIN LATERAL jsonb_array_elements(pm.path_json->'steps') WITH ORDINALITY AS x(step, ord)
+ORDER BY pm.created_at DESC, pm.opportunity_id, x.ord
+LIMIT 200;
+SQL
+
 if [[ -n "$RPC_URL" && -n "$TX_HASH" ]]; then
-  run_cmd "6. chain transaction" cast tx "$TX_HASH" --rpc-url "$RPC_URL"
-  run_cmd "7. chain receipt" cast receipt "$TX_HASH" --rpc-url "$RPC_URL"
-  run_cmd "8. chain trace/cast run" cast run "$TX_HASH" --rpc-url "$RPC_URL"
+  run_cmd "7. chain transaction" cast tx "$TX_HASH" --rpc-url "$RPC_URL"
+  run_cmd "8. chain receipt" cast receipt "$TX_HASH" --rpc-url "$RPC_URL"
+  run_cmd "9. chain trace/cast run" cast run "$TX_HASH" --rpc-url "$RPC_URL"
 fi
 
 if [[ -n "${REDIS_URL:-}" ]]; then
-  run_cmd "9. redis candidate queue length" redis-cli -u "$REDIS_URL" ZCARD candidates:priority
-  run_cmd "10. redis top candidates" redis-cli -u "$REDIS_URL" ZREVRANGE candidates:priority 0 20 WITHSCORES
-  run_cmd "11. redis failure key count" bash -lc "redis-cli -u '$REDIS_URL' --scan --pattern 'failures:*' | wc -l"
-  run_cmd "12. redis EOA lane states" bash -lc "redis-cli -u '$REDIS_URL' --scan --pattern 'eoa:*:state' | sort | while read -r k; do echo \"\$k\"; redis-cli -u '$REDIS_URL' GET \"\$k\"; done"
+  run_cmd "10. redis candidate queue length" redis-cli -u "$REDIS_URL" ZCARD candidates:priority
+  run_cmd "11. redis top candidates" redis-cli -u "$REDIS_URL" ZREVRANGE candidates:priority 0 20 WITHSCORES
+  run_cmd "12. redis failure key count" bash -lc "redis-cli -u '$REDIS_URL' --scan --pattern 'failures:*' | wc -l"
+  run_cmd "13. redis EOA lane states" bash -lc "redis-cli -u '$REDIS_URL' --scan --pattern 'eoa:*:state' | sort | while read -r k; do echo \"\$k\"; redis-cli -u '$REDIS_URL' GET \"\$k\"; done"
 fi
 
-run_cmd "13. execution-manager recent logs" bash -lc "sudo docker compose --env-file .env.docker -f docker-compose.apps.yml logs --since '$DOCKER_SINCE' execution-manager | grep -E 'execution worker selected for candidate batch|tx submitted|simulation success/fail|MinProfitNotMet|router/no-revert-data|candidate skipped|candidate expired|circuit breaker|in-flight|confirmed|reverted|executor approval|worker funding|Error|WARN' | tail -500"
+run_cmd "14. execution-manager recent logs" bash -lc "sudo docker compose --env-file .env.docker -f docker-compose.apps.yml logs --since '$DOCKER_SINCE' execution-manager | grep -E 'execution worker selected for candidate batch|tx submitted|unchecked tx submitted|simulation success/fail|MinProfitNotMet|PoolMismatch|router/no-revert-data|candidate skipped|candidate expired|circuit breaker|in-flight|confirmed|reverted|executor approval|lazy approval|worker funding|Error|WARN' | tail -500"
 
 echo "$OUT_FILE"

@@ -13,6 +13,7 @@ use ethers_signers::{LocalWallet, Signer};
 use crate::simulator::{executor_for_candidate, ApprovalRequirement};
 
 const GAS_LIMIT_MULTIPLIER_BPS: u64 = 12_000;
+const UNCHECKED_ARB_FALLBACK_GAS_LIMIT: u64 = 900_000;
 const APPROVE_TOKEN_SELECTOR: [u8; 4] = [0xda, 0x3e, 0x33, 0x97];
 const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
 const EXECUTOR_OPERATORS_SELECTOR: [u8; 4] = [0x13, 0xe7, 0xc9, 0xd8];
@@ -68,24 +69,90 @@ pub async fn submit_candidate(
         anyhow::bail!("simulation calldata is empty");
     }
 
-    let data_hex = format!("0x{}", hex::encode(&simulation.calldata));
-    let estimated_gas = provider
-        .estimate_gas(wallet.address, executor, &data_hex)
-        .await
-        .context("failed to estimate executor tx gas")?;
-    let gas_limit = bump_gas_limit(estimated_gas);
-    let fees = aggressive_fee_suggestion(provider, settings).await?;
+    let gas_limit = simulation
+        .gas_estimate
+        .map(bump_gas_limit)
+        .unwrap_or_else(|| U256::from(UNCHECKED_ARB_FALLBACK_GAS_LIMIT));
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match (
+        simulation.max_fee_per_gas,
+        simulation.max_priority_fee_per_gas,
+    ) {
+        (Some(max_fee_per_gas), Some(max_priority_fee_per_gas)) => {
+            (max_fee_per_gas, max_priority_fee_per_gas)
+        }
+        _ => {
+            let fees = aggressive_fee_suggestion(provider, settings).await?;
+            (fees.max_fee_per_gas, fees.max_priority_fee_per_gas)
+        }
+    };
     if candidate.is_expired(Utc::now()) {
         anyhow::bail!("candidate expired before tx broadcast");
     }
 
-    let submitted_block = provider.get_block_number().await?;
+    let submitted_block = simulation.block_number.unwrap_or(candidate.block_number);
     let tx_hash = sign_and_send(
         provider,
         wallet,
         settings,
         executor,
         &simulation.calldata,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    )
+    .await?;
+
+    tracing::info!(
+        candidate_id = %candidate.id,
+        tx_hash = %tx_hash,
+        nonce,
+        gas_limit = %gas_limit,
+        max_fee_per_gas = %max_fee_per_gas,
+        max_priority_fee_per_gas = %max_priority_fee_per_gas,
+        submitted_block,
+        "tx submitted"
+    );
+
+    Ok(Submission {
+        tx_hash,
+        nonce,
+        simulation_id: Some(simulation.id),
+        executor_contract: executor,
+        submitted_block,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    })
+}
+
+pub async fn submit_candidate_unchecked(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    candidate: &Candidate,
+    simulation_id: Option<uuid::Uuid>,
+    calldata: &[u8],
+    nonce: u64,
+) -> Result<Submission> {
+    let executor = executor_for_candidate(settings, candidate)?;
+    if calldata.is_empty() {
+        anyhow::bail!("unchecked candidate calldata is empty");
+    }
+
+    let gas_limit = U256::from(UNCHECKED_ARB_FALLBACK_GAS_LIMIT);
+    let fees = aggressive_fee_suggestion(provider, settings).await?;
+    if candidate.is_expired(Utc::now()) {
+        anyhow::bail!("candidate expired before unchecked tx broadcast");
+    }
+
+    let submitted_block = candidate.block_number;
+    let tx_hash = sign_and_send(
+        provider,
+        wallet,
+        settings,
+        executor,
+        calldata,
         nonce,
         gas_limit,
         fees.max_fee_per_gas,
@@ -101,13 +168,13 @@ pub async fn submit_candidate(
         max_fee_per_gas = %fees.max_fee_per_gas,
         max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
         submitted_block,
-        "tx submitted"
+        "unchecked tx submitted after lazy approval"
     );
 
     Ok(Submission {
         tx_hash,
         nonce,
-        simulation_id: Some(simulation.id),
+        simulation_id,
         executor_contract: executor,
         submitted_block,
         gas_limit,

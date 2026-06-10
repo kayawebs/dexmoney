@@ -12,6 +12,7 @@ use base_arb_storage::{
     PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
+use std::collections::BTreeMap;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -123,7 +124,9 @@ where
     }
     let current_block = provider.get_block_number().await?;
 
+    let candidate_count = candidates.len();
     let mut simulated = 0usize;
+    let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     for candidate in candidates {
         if simulated >= MAX_SIMULATIONS_PER_CYCLE {
             break;
@@ -144,17 +147,36 @@ where
         )
         .await?
         {
-            CandidateAction::Submitted => return Ok(()),
+            CandidateAction::Submitted => {
+                info!(
+                    candidate_count,
+                    simulated,
+                    skipped = skipped_by_reason.values().sum::<usize>(),
+                    skipped_by_reason = ?skipped_by_reason,
+                    "execution candidate batch summary"
+                );
+                return Ok(());
+            }
             CandidateAction::Simulated => simulated += 1,
-            CandidateAction::Skipped => {}
+            CandidateAction::Skipped(reason) => {
+                *skipped_by_reason.entry(reason).or_insert(0) += 1;
+            }
         }
     }
+
+    info!(
+        candidate_count,
+        simulated,
+        skipped = skipped_by_reason.values().sum::<usize>(),
+        skipped_by_reason = ?skipped_by_reason,
+        "execution candidate batch summary"
+    );
 
     Ok(())
 }
 
 enum CandidateAction {
-    Skipped,
+    Skipped(&'static str),
     Simulated,
     Submitted,
 }
@@ -245,7 +267,7 @@ where
             max_lag_blocks = settings.execution_max_candidate_lag_blocks,
             "candidate skipped because it is too far behind current block"
         );
-        return Ok(CandidateAction::Skipped);
+        return Ok(CandidateAction::Skipped("block_lag"));
     }
 
     let candidate_seen_key = simulator::candidate_block_seen_key(&candidate);
@@ -262,7 +284,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous MinProfitNotMet for identical path parameters"
         );
-        return Ok(CandidateAction::Skipped);
+        return Ok(CandidateAction::Skipped("cached_min_profit"));
     }
     let route_failure_key = simulator::route_failure_key(&candidate);
     if candidate_store.has_failure_key(&route_failure_key).await? {
@@ -274,7 +296,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous structural route failure for identical path parameters"
         );
-        return Ok(CandidateAction::Skipped);
+        return Ok(CandidateAction::Skipped("cached_route_failure"));
     }
     if candidate_store.has_failure_key(&candidate_seen_key).await? {
         debug!(
@@ -286,7 +308,7 @@ where
             expected_profit = %candidate.expected_profit,
             "candidate skipped after previous simulation for identical path parameters in same block"
         );
-        return Ok(CandidateAction::Skipped);
+        return Ok(CandidateAction::Skipped("same_block_seen"));
     }
     candidate_store
         .mark_failure_key(&candidate_seen_key, candidate_seen_ttl_secs(settings))
@@ -309,6 +331,9 @@ where
                     approvals
                 });
         if !missing_approvals.is_empty() {
+            let Some(worker_wallet) = wallet else {
+                anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
+            };
             let Some(fund_wallet) = fund_wallet else {
                 anyhow::bail!("EOA_PRIVATE_KEY_1 is required for executor approval admin txs");
             };
@@ -318,7 +343,7 @@ where
                     path = %candidate.path.name,
                     "candidate skipped because fund/admin EOA has a pending tx"
                 );
-                return Ok(CandidateAction::Skipped);
+                return Ok(CandidateAction::Skipped("admin_pending_approval"));
             }
 
             let executor = simulator::executor_for_candidate(settings, candidate)?;
@@ -376,6 +401,78 @@ where
                             &submission,
                         ))
                         .await?;
+                    let mut lane = eoa_store
+                        .get_lane_state(worker_wallet.address())
+                        .await?
+                        .map(|state| eoa_lane::EoaLane { state })
+                        .unwrap_or_else(|| eoa_lane::EoaLane::new(worker_wallet.address()));
+                    let arb_nonce = lane.state.local_nonce;
+                    match tx_manager::submit_candidate_unchecked(
+                        provider,
+                        worker_wallet,
+                        settings,
+                        &candidate,
+                        Some(synthetic_simulation.id),
+                        &calldata,
+                        arb_nonce,
+                    )
+                    .await
+                    {
+                        Ok(arb_submission) => {
+                            lane.mark_submitted(
+                                candidate.id,
+                                arb_submission.simulation_id,
+                                arb_submission.tx_hash,
+                                arb_submission.executor_contract,
+                                arb_submission.nonce,
+                                arb_submission.submitted_block,
+                                arb_submission.gas_limit,
+                                arb_submission.max_fee_per_gas,
+                                arb_submission.max_priority_fee_per_gas,
+                            );
+                            eoa_store.set_lane_state(lane.state.clone()).await?;
+                            recorder
+                                .record_transaction(tx_manager::pending_tx_result(
+                                    &candidate,
+                                    worker_wallet.address(),
+                                    &arb_submission,
+                                ))
+                                .await?;
+                            info!(
+                                candidate_id = %candidate.id,
+                                approval_tx_hash = %submission.tx_hash,
+                                arb_tx_hash = %arb_submission.tx_hash,
+                                worker = %worker_wallet.address(),
+                                "lazy approval submitted and arb tx fired without waiting"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                candidate_id = %candidate.id,
+                                nonce = arb_nonce,
+                                worker = %worker_wallet.address(),
+                                error = %err,
+                                "lazy approval submitted but follow-up arb tx failed before broadcast"
+                            );
+                            lane.mark_cooldown();
+                            eoa_store.set_lane_state(lane.state.clone()).await?;
+                            recorder
+                                .record_transaction(TxResult {
+                                    opportunity_id: candidate.id,
+                                    simulation_id: Some(synthetic_simulation.id),
+                                    eoa: worker_wallet.address(),
+                                    tx_hash: None,
+                                    nonce: arb_nonce,
+                                    status: TxStatus::Dropped,
+                                    realized_profit: None,
+                                    gas_used: None,
+                                    effective_gas_price: None,
+                                    revert_reason: Some(err.to_string()),
+                                    receipt_json: None,
+                                })
+                                .await?;
+                        }
+                    }
                     return Ok(CandidateAction::Submitted);
                 }
                 Err(err) => {
@@ -478,7 +575,7 @@ where
         return Ok(CandidateAction::Simulated);
     }
     if circuit_breaker.is_halted(settings) {
-        return Ok(CandidateAction::Skipped);
+        return Ok(CandidateAction::Skipped("circuit_breaker"));
     }
 
     let Some(wallet) = wallet.as_ref() else {
