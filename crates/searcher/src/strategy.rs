@@ -342,30 +342,34 @@ impl SearchEngine {
         Ok((out, stats))
     }
 
-    pub(crate) async fn search_with_stats_for_path_index(
+    pub(crate) fn search_paths_for_path_index(
         &self,
-        pool_states: &[PoolState],
-        tick_states: &[TickState],
         path_index: &PathIndex,
         changed_pools: &HashSet<Address>,
         dynamic_paths: &[SearchPath],
-    ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
+    ) -> Vec<SearchPath> {
         let path_indices = path_index.path_indices_for_changed_pools(changed_pools);
+        path_indices
+            .into_iter()
+            .map(|index| path_index.paths[index].clone())
+            .chain(dynamic_paths.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) async fn search_with_stats_for_paths(
+        &self,
+        pool_states: &[PoolState],
+        tick_states: &[TickState],
+        paths: &[SearchPath],
+    ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
         let mut stats = SearchStats {
-            total_paths: path_index.total_paths(),
-            paths: path_indices.len() + dynamic_paths.len(),
-            dynamic_multihop_paths: dynamic_paths.len() as u64,
+            paths: paths.len(),
             ..SearchStats::default()
         };
         let mut out = Vec::new();
         let quote_context = QuoteContext::new(pool_states, tick_states);
 
-        for index in path_indices {
-            let search_path = &path_index.paths[index];
-            self.quote_search_path(search_path, &quote_context, &mut stats, &mut out)
-                .await;
-        }
-        for search_path in dynamic_paths {
+        for search_path in paths {
             self.quote_search_path(search_path, &quote_context, &mut stats, &mut out)
                 .await;
         }

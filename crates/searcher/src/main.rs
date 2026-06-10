@@ -16,6 +16,8 @@ use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+const SEARCHER_PUBLISH_BATCH_PATHS: usize = 256;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -296,29 +298,63 @@ where
             tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
         }
     }
-    let (candidates, search_stats) = engine
-        .search_with_stats_for_path_index(
-            &pool_states,
-            &tick_states,
-            path_index,
-            &changed_pools,
-            &dynamic_paths,
-        )
-        .await?;
     let mut cycle_stats = SearchCycleStats {
-        search: search_stats,
         cycles: 1,
         path_pools: path_pools.len() as u64,
         changed_pool_scans: 1,
         changed_pools: changed_pools.len() as u64,
         ..SearchCycleStats::default()
     };
+    let search_paths =
+        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
+    cycle_stats.search.total_paths = path_index.total_paths();
+    cycle_stats.search.dynamic_multihop_paths = dynamic_paths.len() as u64;
 
+    for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
+        let (candidates, mut search_stats) = engine
+            .search_with_stats_for_paths(&pool_states, &tick_states, path_batch)
+            .await?;
+        search_stats.total_paths = 0;
+        cycle_stats.search.merge(&search_stats);
+        publish_candidates(
+            candidate_store,
+            recorder,
+            &mut cycle_stats,
+            &engine,
+            &pool_states,
+            max_pool_state_age_ms,
+            max_price_impact_bps,
+            candidates,
+        )
+        .await?;
+    }
+
+    let elapsed_ms = cycle_started.elapsed().as_millis() as u64;
+    cycle_stats.total_cycle_ms = elapsed_ms;
+    cycle_stats.max_cycle_ms = elapsed_ms;
+
+    Ok(cycle_stats)
+}
+
+async fn publish_candidates<C, R>(
+    candidate_store: &C,
+    recorder: &R,
+    cycle_stats: &mut SearchCycleStats,
+    engine: &strategy::SearchEngine,
+    pool_states: &[PoolState],
+    max_pool_state_age_ms: i64,
+    max_price_impact_bps: u64,
+    candidates: Vec<base_arb_common::types::Candidate>,
+) -> Result<()>
+where
+    C: CandidateStore,
+    R: RecorderStore,
+{
     for candidate in candidates {
         debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
-            &pool_states,
+            pool_states,
             max_pool_state_age_ms,
             engine.min_expected_profit,
             max_price_impact_bps,
@@ -336,10 +372,5 @@ where
             }
         }
     }
-
-    let elapsed_ms = cycle_started.elapsed().as_millis() as u64;
-    cycle_stats.total_cycle_ms = elapsed_ms;
-    cycle_stats.max_cycle_ms = elapsed_ms;
-
-    Ok(cycle_stats)
+    Ok(())
 }
