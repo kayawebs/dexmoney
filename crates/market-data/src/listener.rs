@@ -146,14 +146,14 @@ where
             let mut classic_fee_refreshes = HashMap::new();
             let mut slipstream_fee_refreshes = HashMap::new();
             for event in &events {
-                if !recent_logs.insert(event.tx_hash.clone(), event.log_index) {
+                let duplicate_log = !recent_logs.insert(event.tx_hash.clone(), event.log_index);
+                if duplicate_log {
                     warn!(
                         tx_hash = %event.tx_hash,
                         log_index = event.log_index,
                         pool = %event.pool_address,
-                        "duplicate event skipped before local state update"
+                        "duplicate event will skip non-idempotent updates"
                     );
-                    continue;
                 }
                 debug!(
                     pool = %event.pool_address,
@@ -161,18 +161,29 @@ where
                     event_type = %event.event_type,
                     "event received"
                 );
-                self.recorder.record_dex_event(event.clone()).await?;
+                if !duplicate_log {
+                    self.recorder.record_dex_event(event.clone()).await?;
+                }
                 for state in &mut monitored_states {
                     if state.pool_id.address != event.pool_address {
                         continue;
                     }
-                    let tick_deltas =
-                        super::state_updater::v3_tick_deltas_from_event(state, event)?;
-                    if !tick_deltas.is_empty() {
-                        self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
+                    if !duplicate_log {
+                        let tick_deltas =
+                            super::state_updater::v3_tick_deltas_from_event(state, event)?;
+                        if !tick_deltas.is_empty() {
+                            self.apply_tick_deltas(
+                                &state.pool_id,
+                                &tick_deltas,
+                                event.block_number,
+                            )
                             .await?;
+                        }
                     }
                     if super::state_updater::is_v3_liquidity_event(state, event)? {
+                        if duplicate_log {
+                            break;
+                        }
                         if self
                             .refresh_v3_state_at_block(state, event.block_number)
                             .await?
