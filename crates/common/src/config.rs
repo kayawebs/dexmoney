@@ -59,6 +59,11 @@ pub struct Settings {
     pub execution_gas_profit_buffer_bps: u64,
     pub execution_max_candidate_lag_blocks: u64,
     pub execution_submit_enabled: bool,
+    pub execution_eoa_pool_size: u64,
+    pub execution_worker_min_balance_wei: Option<String>,
+    pub execution_worker_target_balance_wei: Option<String>,
+    pub execution_failure_rate_min_txs: u64,
+    pub execution_min_success_rate_bps: u64,
     pub monitor_web_password: Option<String>,
 }
 
@@ -90,6 +95,11 @@ impl Settings {
             .set_default("execution_gas_profit_buffer_bps", 15_000u64)?
             .set_default("execution_max_candidate_lag_blocks", 1u64)?
             .set_default("execution_submit_enabled", false)?
+            .set_default("execution_eoa_pool_size", 5u64)?
+            .set_default("execution_worker_min_balance_wei", "200000000000000")?
+            .set_default("execution_worker_target_balance_wei", "500000000000000")?
+            .set_default("execution_failure_rate_min_txs", 10u64)?
+            .set_default("execution_min_success_rate_bps", 2_000u64)?
             .add_source(Environment::default())
             .build()?
             .try_deserialize()

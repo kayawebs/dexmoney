@@ -666,6 +666,11 @@ mod tests {
             execution_gas_profit_buffer_bps: 15_000,
             execution_max_candidate_lag_blocks: 1,
             execution_submit_enabled: false,
+            execution_eoa_pool_size: 5,
+            execution_worker_min_balance_wei: Some("200000000000000".into()),
+            execution_worker_target_balance_wei: Some("500000000000000".into()),
+            execution_failure_rate_min_txs: 10,
+            execution_min_success_rate_bps: 2_000,
             monitor_web_password: None,
         }
     }

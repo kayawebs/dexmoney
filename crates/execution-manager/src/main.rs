@@ -2,8 +2,8 @@ mod eoa_lane;
 mod simulator;
 mod tx_manager;
 
-use alloy_primitives::{Address, U256};
-use anyhow::Result;
+use alloy_primitives::{keccak256, Address, U256};
+use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
@@ -31,9 +31,26 @@ async fn main() -> Result<()> {
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
 
+    if settings.execution_submit_enabled {
+        let fund_wallet = configured_fund_wallet(&settings)?;
+        let worker_wallets = configured_worker_wallets(&settings, fund_wallet.as_ref())?;
+        let workers = worker_wallets
+            .iter()
+            .map(|wallet| wallet.address().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            fund = ?fund_wallet.as_ref().map(tx_manager::ExecutionWallet::address),
+            workers,
+            worker_count = worker_wallets.len(),
+            "execution EOA pool configured"
+        );
+    }
+
     info!("execution-manager initialized");
     let mut ticker = interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut circuit_breaker = ExecutionCircuitBreaker::new(settings.execution_failure_rate_min_txs);
 
     loop {
         ticker.tick().await;
@@ -44,6 +61,7 @@ async fn main() -> Result<()> {
             &provider,
             &settings,
             settings.min_simulated_profit_usdc,
+            &mut circuit_breaker,
         )
         .await?;
     }
@@ -56,35 +74,40 @@ async fn run_execution_cycle<C, E, R>(
     provider: &ChainProvider,
     settings: &Settings,
     min_simulated_profit_usdc: f64,
+    circuit_breaker: &mut ExecutionCircuitBreaker,
 ) -> Result<()>
 where
     C: CandidateStore + FailureStore,
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
-    let wallet = configured_wallet(settings)?;
-    let operator = operator_address(settings, wallet.as_ref())?;
+    let fund_wallet = configured_fund_wallet(settings)?;
+    let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
+    let mut selected_wallet = None;
 
     if settings.execution_submit_enabled {
-        let Some(wallet) = wallet.as_ref() else {
+        let Some(fund_wallet) = fund_wallet.as_ref() else {
             anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
         };
-        let mut lane = eoa_store
-            .get_lane_state(wallet.address())
-            .await?
-            .map(|state| eoa_lane::EoaLane { state })
-            .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
 
-        reconcile_db_pending_transactions(recorder, provider, wallet.address()).await?;
-
-        if lane.state.status == EoaLaneStatus::Pending {
-            handle_pending_lane(&mut lane, eoa_store, recorder, provider, wallet, settings).await?;
+        selected_wallet = prepare_eoa_pool(
+            eoa_store,
+            recorder,
+            provider,
+            settings,
+            fund_wallet,
+            &worker_wallets,
+            circuit_breaker,
+        )
+        .await?;
+        if selected_wallet.is_none() || circuit_breaker.is_halted(settings) {
             return Ok(());
         }
-
-        sync_idle_lane(&mut lane, provider).await?;
-        eoa_store.set_lane_state(lane.state.clone()).await?;
     }
+    let operator = selected_wallet
+        .as_ref()
+        .map(tx_manager::ExecutionWallet::address)
+        .unwrap_or(operator_address(settings, fund_wallet.as_ref())?);
 
     let candidates = pop_fresh_candidates(candidate_store).await?;
     if candidates.is_empty() {
@@ -106,7 +129,9 @@ where
             settings,
             min_simulated_profit_usdc,
             operator,
-            wallet.as_ref(),
+            selected_wallet.as_ref(),
+            fund_wallet.as_ref(),
+            circuit_breaker,
             &candidate,
             current_block,
         )
@@ -127,6 +152,62 @@ enum CandidateAction {
     Submitted,
 }
 
+#[derive(Debug, Clone)]
+struct ExecutionCircuitBreaker {
+    min_txs: u64,
+    arb_receipts: u64,
+    arb_successes: u64,
+    halted: bool,
+}
+
+impl ExecutionCircuitBreaker {
+    fn new(min_txs: u64) -> Self {
+        Self {
+            min_txs,
+            arb_receipts: 0,
+            arb_successes: 0,
+            halted: false,
+        }
+    }
+
+    fn observe_arb_receipt(&mut self, success: bool, settings: &Settings) {
+        self.arb_receipts = self.arb_receipts.saturating_add(1);
+        if success {
+            self.arb_successes = self.arb_successes.saturating_add(1);
+        }
+        if self.arb_receipts < self.min_txs {
+            return;
+        }
+        let success_rate_bps = self
+            .arb_successes
+            .saturating_mul(10_000)
+            .checked_div(self.arb_receipts)
+            .unwrap_or(0);
+        if success_rate_bps < settings.execution_min_success_rate_bps {
+            self.halted = true;
+            warn!(
+                arb_receipts = self.arb_receipts,
+                arb_successes = self.arb_successes,
+                success_rate_bps,
+                min_success_rate_bps = settings.execution_min_success_rate_bps,
+                "execution circuit breaker halted submissions due to low realized success rate"
+            );
+        }
+    }
+
+    fn is_halted(&self, settings: &Settings) -> bool {
+        if self.halted {
+            warn!(
+                arb_receipts = self.arb_receipts,
+                arb_successes = self.arb_successes,
+                min_success_rate_bps = settings.execution_min_success_rate_bps,
+                "execution submissions halted by circuit breaker"
+            );
+        }
+        self.halted
+    }
+}
+
 async fn handle_candidate<C, E, R>(
     candidate_store: &C,
     eoa_store: &E,
@@ -136,6 +217,8 @@ async fn handle_candidate<C, E, R>(
     min_simulated_profit_usdc: f64,
     operator: Address,
     wallet: Option<&tx_manager::ExecutionWallet>,
+    fund_wallet: Option<&tx_manager::ExecutionWallet>,
+    circuit_breaker: &ExecutionCircuitBreaker,
     candidate: &base_arb_common::types::Candidate,
     current_block: u64,
 ) -> Result<CandidateAction>
@@ -203,9 +286,9 @@ where
         .await?;
 
     if settings.execution_submit_enabled {
-        let Some(wallet) = wallet.as_ref() else {
+        if wallet.is_none() {
             anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
-        };
+        }
         let approvals = simulator::required_token_approvals(&candidate, settings)?;
         let missing_approvals =
             tx_manager::missing_approvals(provider, settings, &candidate, &approvals)
@@ -219,23 +302,23 @@ where
                     approvals
                 });
         if !missing_approvals.is_empty() {
-            if candidate.is_expired(Utc::now()) {
-                info!(
+            let Some(fund_wallet) = fund_wallet else {
+                anyhow::bail!("EOA_PRIVATE_KEY_1 is required for executor approval admin txs");
+            };
+            if admin_has_pending_nonce(provider, fund_wallet.address()).await? {
+                debug!(
                     candidate_id = %candidate.id,
                     path = %candidate.path.name,
-                    created_at = %candidate.created_at,
-                    expires_at = %candidate.expires_at,
-                    "candidate expired before lazy approval preflight"
+                    "candidate skipped because fund/admin EOA has a pending tx"
                 );
                 return Ok(CandidateAction::Skipped);
             }
 
-            let mut lane = eoa_store
-                .get_lane_state(wallet.address())
-                .await?
-                .map(|state| eoa_lane::EoaLane { state })
-                .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
-            let nonce = lane.state.local_nonce;
+            let executor = simulator::executor_for_candidate(settings, candidate)?;
+            let nonce = provider
+                .get_transaction_count(fund_wallet.address(), true)
+                .await?;
+            let approval = missing_approvals[0];
             let calldata = simulator::build_live_execution_calldata(settings, &candidate)?;
             let synthetic_simulation = base_arb_common::types::SimulationResult {
                 id: uuid::Uuid::new_v4(),
@@ -261,109 +344,59 @@ where
             recorder
                 .record_simulation(synthetic_simulation.clone())
                 .await?;
-            let outcome = tx_manager::submit_calldata_with_lazy_approvals(
+            match tx_manager::submit_executor_approval(
                 provider,
-                &wallet,
+                fund_wallet,
                 settings,
-                &candidate,
-                &calldata,
-                Some(synthetic_simulation.id),
-                None,
-                &missing_approvals,
+                executor,
+                approval,
                 nonce,
             )
-            .await;
-
-            let approval_txs = outcome.approval_submissions.len();
-            if let Some(submission) = outcome.submission {
-                info!(
-                    candidate_id = %candidate.id,
-                    approval_txs,
-                    "lazy approvals submitted before unsimulated arb tx"
-                );
-                lane.mark_submitted(
-                    candidate.id,
-                    submission.simulation_id,
-                    submission.tx_hash,
-                    submission.executor_contract,
-                    submission.nonce,
-                    submission.submitted_block,
-                    submission.gas_limit,
-                    submission.max_fee_per_gas,
-                    submission.max_priority_fee_per_gas,
-                );
-                eoa_store.set_lane_state(lane.state.clone()).await?;
-                recorder
-                    .record_transaction(tx_manager::pending_tx_result(
-                        &candidate,
-                        wallet.address(),
-                        &submission,
-                    ))
-                    .await?;
-                return Ok(CandidateAction::Submitted);
+            .await
+            {
+                Ok(submission) => {
+                    info!(
+                        candidate_id = %candidate.id,
+                        token = %approval.token,
+                        spender = %approval.spender,
+                        tx_hash = %submission.tx_hash,
+                        "executor approval submitted by fund EOA; current candidate skipped"
+                    );
+                    recorder
+                        .record_transaction(tx_manager::pending_tx_result(
+                            &candidate,
+                            fund_wallet.address(),
+                            &submission,
+                        ))
+                        .await?;
+                    return Ok(CandidateAction::Submitted);
+                }
+                Err(err) => {
+                    warn!(
+                        candidate_id = %candidate.id,
+                        token = %approval.token,
+                        spender = %approval.spender,
+                        error = %err,
+                        "executor approval admin tx failed"
+                    );
+                    recorder
+                        .record_transaction(TxResult {
+                            opportunity_id: candidate.id,
+                            simulation_id: Some(synthetic_simulation.id),
+                            eoa: fund_wallet.address(),
+                            tx_hash: None,
+                            nonce,
+                            status: TxStatus::Dropped,
+                            realized_profit: None,
+                            gas_used: None,
+                            effective_gas_price: None,
+                            revert_reason: Some(err.to_string()),
+                            receipt_json: None,
+                        })
+                        .await?;
+                    return Ok(CandidateAction::Simulated);
+                }
             }
-
-            if let Some(pending_approval) = outcome.approval_submissions.last() {
-                warn!(
-                    candidate_id = %candidate.id,
-                    approval_txs,
-                    tx_hash = %pending_approval.tx_hash,
-                    nonce = pending_approval.nonce,
-                    error = ?outcome.error,
-                    "lazy approval submitted but arb tx was not submitted; parking EOA lane on pending approval"
-                );
-                lane.mark_submitted(
-                    candidate.id,
-                    None,
-                    pending_approval.tx_hash,
-                    pending_approval.executor_contract,
-                    pending_approval.nonce,
-                    pending_approval.submitted_block,
-                    pending_approval.gas_limit,
-                    pending_approval.max_fee_per_gas,
-                    pending_approval.max_priority_fee_per_gas,
-                );
-                eoa_store.set_lane_state(lane.state.clone()).await?;
-                recorder
-                    .record_transaction(tx_manager::pending_tx_result(
-                        &candidate,
-                        wallet.address(),
-                        pending_approval,
-                    ))
-                    .await?;
-                return Ok(CandidateAction::Submitted);
-            }
-
-            if outcome.consumed_nonces > 0 {
-                lane.state.local_nonce = nonce.saturating_add(outcome.consumed_nonces);
-            }
-            warn!(
-                candidate_id = %candidate.id,
-                approval_txs,
-                consumed_nonces = outcome.consumed_nonces,
-                error = ?outcome.error,
-                "lazy approval preflight did not submit arb tx"
-            );
-            lane.mark_cooldown();
-            eoa_store.set_lane_state(lane.state.clone()).await?;
-            recorder
-                .record_transaction(TxResult {
-                    opportunity_id: candidate.id,
-                    simulation_id: Some(synthetic_simulation.id),
-                    eoa: wallet.address(),
-                    tx_hash: None,
-                    nonce: nonce.saturating_add(outcome.consumed_nonces),
-                    status: TxStatus::Dropped,
-                    realized_profit: None,
-                    gas_used: None,
-                    effective_gas_price: None,
-                    revert_reason: Some(outcome.error.unwrap_or_else(|| {
-                        "lazy approval preflight failed before arb tx".to_string()
-                    })),
-                    receipt_json: None,
-                })
-                .await?;
-            return Ok(CandidateAction::Simulated);
         }
     }
 
@@ -437,6 +470,9 @@ where
         );
         return Ok(CandidateAction::Simulated);
     }
+    if circuit_breaker.is_halted(settings) {
+        return Ok(CandidateAction::Skipped);
+    }
 
     let Some(wallet) = wallet.as_ref() else {
         anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
@@ -502,7 +538,7 @@ where
     Ok(CandidateAction::Simulated)
 }
 
-fn configured_wallet(settings: &Settings) -> Result<Option<tx_manager::ExecutionWallet>> {
+fn configured_fund_wallet(settings: &Settings) -> Result<Option<tx_manager::ExecutionWallet>> {
     let Some(private_key) = settings.eoa_private_key_1.as_deref() else {
         return Ok(None);
     };
@@ -520,6 +556,41 @@ fn configured_wallet(settings: &Settings) -> Result<Option<tx_manager::Execution
     Ok(Some(wallet))
 }
 
+fn configured_worker_wallets(
+    settings: &Settings,
+    fund_wallet: Option<&tx_manager::ExecutionWallet>,
+) -> Result<Vec<tx_manager::ExecutionWallet>> {
+    let Some(private_key) = settings.eoa_private_key_1.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if !settings.execution_submit_enabled {
+        return Ok(fund_wallet.cloned().into_iter().collect());
+    }
+
+    let pool_size = settings.execution_eoa_pool_size.max(1);
+    let mut wallets = Vec::with_capacity(pool_size as usize);
+    for index in 0..pool_size {
+        wallets.push(derive_worker_wallet(private_key, settings.chain_id, index)?);
+    }
+    Ok(wallets)
+}
+
+fn derive_worker_wallet(
+    fund_private_key: &str,
+    chain_id: u64,
+    index: u64,
+) -> Result<tx_manager::ExecutionWallet> {
+    for salt in 0u64..128 {
+        let seed = format!("dexmoney-worker-eoa-v1:{fund_private_key}:{index}:{salt}");
+        let digest = keccak256(seed.as_bytes());
+        let private_key = format!("0x{}", hex::encode(digest.as_slice()));
+        if let Ok(wallet) = tx_manager::ExecutionWallet::from_private_key(&private_key, chain_id) {
+            return Ok(wallet);
+        }
+    }
+    anyhow::bail!("failed to derive valid worker EOA private key for index {index}")
+}
+
 fn operator_address(
     settings: &Settings,
     wallet: Option<&tx_manager::ExecutionWallet>,
@@ -531,6 +602,12 @@ fn operator_address(
         return Ok(address);
     }
     anyhow::bail!("EOA_ADDRESS_1 or EOA_PRIVATE_KEY_1 is required for simulation");
+}
+
+fn parse_config_u256(raw: Option<&str>, name: &str) -> Result<U256> {
+    let value = raw.with_context(|| format!("{name} is not configured"))?;
+    U256::from_str_radix(value.trim_start_matches("0x"), 10)
+        .with_context(|| format!("invalid decimal U256 config value for {name}"))
 }
 
 fn candidate_seen_ttl_secs(settings: &Settings) -> u64 {
@@ -574,6 +651,163 @@ where
     Ok(candidates)
 }
 
+async fn prepare_eoa_pool<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    fund_wallet: &tx_manager::ExecutionWallet,
+    worker_wallets: &[tx_manager::ExecutionWallet],
+    circuit_breaker: &mut ExecutionCircuitBreaker,
+) -> Result<Option<tx_manager::ExecutionWallet>>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    reconcile_db_pending_transactions(recorder, provider, fund_wallet.address()).await?;
+
+    for worker in worker_wallets {
+        reconcile_db_pending_transactions(recorder, provider, worker.address()).await?;
+        let mut lane = eoa_store
+            .get_lane_state(worker.address())
+            .await?
+            .map(|state| eoa_lane::EoaLane { state })
+            .unwrap_or_else(|| eoa_lane::EoaLane::new(worker.address()));
+
+        if lane.state.status == EoaLaneStatus::Pending {
+            if let Some(success) =
+                handle_pending_lane(&mut lane, eoa_store, recorder, provider, worker, settings)
+                    .await?
+            {
+                circuit_breaker.observe_arb_receipt(success, settings);
+            }
+            continue;
+        }
+
+        sync_idle_lane(&mut lane, provider).await?;
+        eoa_store.set_lane_state(lane.state.clone()).await?;
+    }
+
+    if circuit_breaker.is_halted(settings) {
+        return Ok(None);
+    }
+
+    let admin_pending = admin_has_pending_nonce(provider, fund_wallet.address()).await?;
+    let worker_min_balance = parse_config_u256(
+        settings.execution_worker_min_balance_wei.as_deref(),
+        "execution_worker_min_balance_wei",
+    )?;
+    let worker_target_balance = parse_config_u256(
+        settings.execution_worker_target_balance_wei.as_deref(),
+        "execution_worker_target_balance_wei",
+    )?
+    .max(worker_min_balance);
+    let executors = configured_executor_contracts(settings);
+
+    for worker in worker_wallets {
+        let lane = eoa_store
+            .get_lane_state(worker.address())
+            .await?
+            .map(|state| eoa_lane::EoaLane { state })
+            .unwrap_or_else(|| eoa_lane::EoaLane::new(worker.address()));
+        if lane.state.status != EoaLaneStatus::Idle {
+            continue;
+        }
+
+        if lane.state.eth_balance < worker_min_balance {
+            if admin_pending {
+                continue;
+            }
+            let top_up = worker_target_balance.saturating_sub(lane.state.eth_balance);
+            if top_up.is_zero() {
+                continue;
+            }
+            let fund_balance = provider.get_balance(fund_wallet.address()).await?;
+            if fund_balance <= top_up {
+                warn!(
+                    fund = %fund_wallet.address(),
+                    worker = %worker.address(),
+                    fund_balance = %fund_balance,
+                    top_up = %top_up,
+                    "fund EOA balance is too low to top up worker"
+                );
+                return Ok(None);
+            }
+            let nonce = provider
+                .get_transaction_count(fund_wallet.address(), true)
+                .await?;
+            tx_manager::submit_value_transfer(
+                provider,
+                fund_wallet,
+                settings,
+                worker.address(),
+                top_up,
+                nonce,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        let mut missing_operator = None;
+        for executor in &executors {
+            if !tx_manager::operator_enabled(provider, *executor, worker.address()).await? {
+                missing_operator = Some(*executor);
+                break;
+            }
+        }
+        if let Some(executor) = missing_operator {
+            if admin_pending {
+                continue;
+            }
+            let nonce = provider
+                .get_transaction_count(fund_wallet.address(), true)
+                .await?;
+            tx_manager::submit_set_operator(
+                provider,
+                fund_wallet,
+                settings,
+                executor,
+                worker.address(),
+                nonce,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        debug!(
+            worker = %worker.address(),
+            balance = %lane.state.eth_balance,
+            "selected execution worker EOA"
+        );
+        return Ok(Some(worker.clone()));
+    }
+
+    Ok(None)
+}
+
+async fn admin_has_pending_nonce(provider: &ChainProvider, address: Address) -> Result<bool> {
+    let confirmed = provider.get_transaction_count(address, false).await?;
+    let pending = provider.get_transaction_count(address, true).await?;
+    Ok(pending > confirmed)
+}
+
+fn configured_executor_contracts(settings: &Settings) -> Vec<Address> {
+    let mut executors = Vec::new();
+    for executor in [
+        settings.executor_contract_2hop,
+        settings.executor_contract_multihop,
+        settings.executor_contract,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if executor != Address::ZERO && !executors.contains(&executor) {
+            executors.push(executor);
+        }
+    }
+    executors
+}
+
 async fn sync_idle_lane(lane: &mut eoa_lane::EoaLane, provider: &ChainProvider) -> Result<()> {
     let confirmed_nonce = provider
         .get_transaction_count(lane.state.address, false)
@@ -595,7 +829,7 @@ async fn handle_pending_lane<E, R>(
     provider: &ChainProvider,
     wallet: &tx_manager::ExecutionWallet,
     settings: &Settings,
-) -> Result<()>
+) -> Result<Option<bool>>
 where
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
@@ -603,19 +837,19 @@ where
     let Some(tx_hash) = lane.state.pending_tx else {
         lane.mark_blocked();
         eoa_store.set_lane_state(lane.state.clone()).await?;
-        return Ok(());
+        return Ok(None);
     };
     let Some(opportunity_id) = lane.state.pending_opportunity_id else {
         warn!(tx_hash = %tx_hash, "pending lane is missing opportunity id");
         lane.mark_blocked();
         eoa_store.set_lane_state(lane.state.clone()).await?;
-        return Ok(());
+        return Ok(None);
     };
     let Some(nonce) = lane.state.pending_nonce else {
         warn!(tx_hash = %tx_hash, "pending lane is missing nonce");
         lane.mark_blocked();
         eoa_store.set_lane_state(lane.state.clone()).await?;
-        return Ok(());
+        return Ok(None);
     };
     let simulation_id = lane.state.pending_simulation_id;
 
@@ -632,11 +866,11 @@ where
         )
         .await?
         {
-            return Ok(());
+            return Ok(None);
         }
         maybe_replace_pending_tx(lane, eoa_store, recorder, provider, wallet, settings).await?;
         debug!(tx_hash = %tx_hash, "pending tx has no receipt yet");
-        return Ok(());
+        return Ok(None);
     };
 
     recorder
@@ -673,7 +907,7 @@ where
         );
     }
 
-    Ok(())
+    Ok(simulation_id.map(|_| receipt.success))
 }
 
 async fn clear_lane_if_pending_nonce_consumed<E, R>(
