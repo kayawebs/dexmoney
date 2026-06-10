@@ -17,7 +17,7 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 512;
+const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = 8;
 const MIN_CANDIDATE_SEEN_TTL_SECS: u64 = 10;
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     }
 
     info!("execution-manager initialized");
-    let mut ticker = interval(Duration::from_millis(500));
+    let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut circuit_breaker = ExecutionCircuitBreaker::new(settings.execution_failure_rate_min_txs);
 
@@ -84,7 +84,10 @@ where
 {
     let fund_wallet = configured_fund_wallet(settings)?;
     let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
-    let candidates = pop_fresh_candidates(candidate_store).await?;
+    let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
+    let current_block = provider.get_block_number().await?;
+    let candidates =
+        pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
     if candidates.is_empty() {
         if settings.execution_submit_enabled {
             let Some(fund_wallet) = fund_wallet.as_ref() else {
@@ -146,8 +149,6 @@ where
             "execution worker selected for candidate batch"
         );
     }
-    let current_block = provider.get_block_number().await?;
-
     let candidate_count = candidates.len();
     let mut simulated = 0usize;
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -168,6 +169,7 @@ where
             circuit_breaker,
             &candidate,
             current_block,
+            max_candidate_lag_blocks,
         )
         .await?
         {
@@ -304,6 +306,7 @@ async fn handle_candidate<C, E, R>(
     circuit_breaker: &ExecutionCircuitBreaker,
     candidate: &base_arb_common::types::Candidate,
     current_block: u64,
+    max_candidate_lag_blocks: u64,
 ) -> Result<CandidateAction>
 where
     C: CandidateStore + FailureStore,
@@ -311,14 +314,14 @@ where
     R: RecorderStore + PendingTransactionStore,
 {
     let block_lag = current_block.saturating_sub(candidate.block_number);
-    if block_lag > settings.execution_max_candidate_lag_blocks {
+    if block_lag > max_candidate_lag_blocks {
         debug!(
             candidate_id = %candidate.id,
             path = %candidate.path.name,
             candidate_block = candidate.block_number,
             current_block,
             block_lag,
-            max_lag_blocks = settings.execution_max_candidate_lag_blocks,
+            max_lag_blocks = max_candidate_lag_blocks,
             "candidate skipped because it is too far behind current block"
         );
         return Ok(CandidateAction::Skipped("block_lag"));
@@ -780,12 +783,15 @@ fn candidate_seen_ttl_secs(settings: &Settings) -> u64 {
 
 async fn pop_fresh_candidates<C>(
     candidate_store: &C,
+    current_block: u64,
+    max_lag_blocks: u64,
 ) -> Result<Vec<base_arb_common::types::Candidate>>
 where
     C: CandidateStore,
 {
     let now = Utc::now();
     let mut expired = 0usize;
+    let mut stale_by_block = 0usize;
     let mut candidates = Vec::new();
 
     for _ in 0..MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE {
@@ -796,6 +802,11 @@ where
             expired += 1;
             continue;
         }
+        let block_lag = current_block.saturating_sub(candidate.block_number);
+        if block_lag > max_lag_blocks {
+            stale_by_block += 1;
+            continue;
+        }
         candidates.push(candidate);
         if candidates.len() >= MAX_CANDIDATE_DRAIN_PER_CYCLE {
             break;
@@ -804,6 +815,12 @@ where
 
     if expired > 0 {
         info!(expired, "drained expired candidates from queue");
+    }
+    if stale_by_block > 0 {
+        info!(
+            stale_by_block,
+            current_block, max_lag_blocks, "drained stale-block candidates from queue"
+        );
     }
     candidates.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
     Ok(candidates)

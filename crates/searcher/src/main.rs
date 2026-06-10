@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let redis = RedisStore::connect(&settings.redis_url).await?;
 
     info!("searcher initialized");
-    let mut ticker = interval(Duration::from_millis(500));
+    let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut aggregate = SearchCycleStats::default();
     let mut last_summary = Instant::now();

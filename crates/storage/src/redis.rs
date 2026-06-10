@@ -169,7 +169,7 @@ impl TickStateStore for RedisStore {
 impl CandidateStore for RedisStore {
     async fn push_candidate(&self, candidate: Candidate) -> Result<()> {
         let mut manager = self.manager.clone();
-        let score = candidate.expected_profit.to::<u128>() as f64;
+        let score = candidate_queue_score(&candidate);
         let member = serde_json::to_string(&candidate)?;
         let _: usize = manager.zadd(candidates_key(), member, score).await?;
         Ok(())
@@ -187,6 +187,11 @@ impl CandidateStore for RedisStore {
         };
         Ok(Some(serde_json::from_str(&payload)?))
     }
+}
+
+fn candidate_queue_score(candidate: &Candidate) -> f64 {
+    let created_rank = candidate.created_at.timestamp_millis().rem_euclid(100_000) as u64;
+    candidate.block_number.saturating_mul(100_000) as f64 + created_rank as f64
 }
 
 #[async_trait]
