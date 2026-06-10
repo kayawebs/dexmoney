@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use alloy_primitives::Address;
 use anyhow::Result;
 use axum::{
-    extract::{Form, Query, State},
+    extract::{DefaultBodyLimit, Form, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -51,6 +51,7 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
+const MONITOR_FORM_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -398,6 +399,7 @@ async fn main() -> Result<()> {
         .route("/favicon.ico", get(favicon))
         .route("/favicon.svg", get(favicon))
         .route("/healthz", get(healthz))
+        .layer(DefaultBodyLimit::max(MONITOR_FORM_BODY_LIMIT_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8085").await?;
@@ -1413,18 +1415,20 @@ async fn update_token_search_defaults(
                 row.multihop_min_profit.clone(),
             ),
         ] {
-            let raw_amounts = form
-                .get(&format!("{amount_prefix}_{token_address}"))
-                .map(String::as_str)
-                .unwrap_or_default();
-            let raw_min_profit = form
-                .get(&format!("{profit_prefix}_{token_address}"))
-                .map(String::as_str)
-                .unwrap_or_default();
-            let search_amounts =
-                normalize_raw_amount_list(raw_amounts).map_err(|_| StatusCode::BAD_REQUEST)?;
-            let min_profit =
-                normalize_raw_amount(raw_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let amount_key = format!("{amount_prefix}_{token_address}");
+            let profit_key = format!("{profit_prefix}_{token_address}");
+            let search_amounts = match form.get(&amount_key) {
+                Some(raw_amounts) => {
+                    normalize_raw_amount_list(raw_amounts).map_err(|_| StatusCode::BAD_REQUEST)?
+                }
+                None => old_amounts.clone(),
+            };
+            let min_profit = match form.get(&profit_key) {
+                Some(raw_min_profit) => {
+                    normalize_raw_amount(raw_min_profit).map_err(|_| StatusCode::BAD_REQUEST)?
+                }
+                None => old_profit.clone(),
+            };
             if search_amounts.is_some() != min_profit.is_some() {
                 return render_registry_response(
                     &state.pool,
@@ -2811,7 +2815,17 @@ fn render_page(
       if (changes.length === 0) {{
         return window.confirm("No token default changes detected. Submit anyway?");
       }}
-      return window.confirm(`Update token configs?\n\n${{changes.join("\n")}}`);
+      if (!window.confirm(`Update token configs?\n\n${{changes.join("\n")}}`)) {{
+        return false;
+      }}
+      form.querySelectorAll("input[data-old]").forEach((input) => {{
+        const oldValue = input.dataset.old || "";
+        const newValue = input.value.trim();
+        if (oldValue === newValue) {{
+          input.disabled = true;
+        }}
+      }});
+      return true;
     }}
   </script>
 </head>
