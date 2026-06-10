@@ -704,6 +704,8 @@ where
     .max(worker_min_balance);
     let executors = configured_executor_contracts(settings);
 
+    let mut ready_worker = None;
+    let mut incomplete_workers = 0u64;
     for worker in worker_wallets {
         let lane = eoa_store
             .get_lane_state(worker.address())
@@ -715,6 +717,7 @@ where
         }
 
         if lane.state.eth_balance < worker_min_balance {
+            incomplete_workers = incomplete_workers.saturating_add(1);
             if admin_pending {
                 continue;
             }
@@ -756,6 +759,7 @@ where
             }
         }
         if let Some(executor) = missing_operator {
+            incomplete_workers = incomplete_workers.saturating_add(1);
             if admin_pending {
                 continue;
             }
@@ -774,9 +778,15 @@ where
             return Ok(None);
         }
 
-        debug!(
+        if ready_worker.is_none() {
+            ready_worker = Some(worker.clone());
+        }
+    }
+
+    if let Some(worker) = ready_worker {
+        info!(
             worker = %worker.address(),
-            balance = %lane.state.eth_balance,
+            incomplete_workers,
             "selected execution worker EOA"
         );
         return Ok(Some(worker.clone()));
