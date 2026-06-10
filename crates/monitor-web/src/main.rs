@@ -2805,11 +2805,13 @@ fn render_page(
     }}
     function confirmTokenDefaultsUpdate(form) {{
       const changes = [];
+      const changedTokens = new Set();
       form.querySelectorAll("input[data-old]").forEach((input) => {{
         const oldValue = input.dataset.old || "";
         const newValue = input.value.trim();
         if (oldValue !== newValue) {{
           changes.push(`${{input.dataset.symbol}} ${{input.dataset.kind}}: "${{oldValue || "-"}}" -> "${{newValue || "-"}}"`);
+          changedTokens.add(input.dataset.token);
         }}
       }});
       if (changes.length === 0) {{
@@ -2825,6 +2827,7 @@ fn render_page(
           input.disabled = true;
         }}
       }});
+      form.querySelector('input[name="token_addresses"]').value = Array.from(changedTokens).join(",");
       return true;
     }}
   </script>
@@ -3048,12 +3051,12 @@ fn render_token_search_defaults(rows: &[TokenSearchDefaultRow]) -> String {
   <td>{token}</td>
   <td>{enabled}</td>
   <td>{anchor}</td>
-  <td><input class="compact-input" name="search_amounts_{token_key}" value="{amounts_raw}" data-old="{amounts_raw}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
-  <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit_raw}" data-old="{min_profit_raw}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
-  <td><input class="compact-input" name="two_hop_search_amounts_{token_key}" value="{two_hop_amounts_raw}" data-old="{two_hop_amounts_raw}" data-symbol="{symbol}" data-kind="2-Hop Amounts Raw" placeholder="10000000,30000000"></td>
-  <td><input class="compact-input" name="two_hop_min_profit_{token_key}" value="{two_hop_min_profit_raw}" data-old="{two_hop_min_profit_raw}" data-symbol="{symbol}" data-kind="2-Hop Min Profit Raw" placeholder="500"></td>
-  <td><input class="compact-input" name="multihop_search_amounts_{token_key}" value="{multihop_amounts_raw}" data-old="{multihop_amounts_raw}" data-symbol="{symbol}" data-kind="Multi Amounts Raw" placeholder="10000000,30000000"></td>
-  <td><input class="compact-input" name="multihop_min_profit_{token_key}" value="{multihop_min_profit_raw}" data-old="{multihop_min_profit_raw}" data-symbol="{symbol}" data-kind="Multi Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="search_amounts_{token_key}" value="{amounts_raw}" data-old="{amounts_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="min_profit_{token_key}" value="{min_profit_raw}" data-old="{min_profit_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="two_hop_search_amounts_{token_key}" value="{two_hop_amounts_raw}" data-old="{two_hop_amounts_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="2-Hop Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="two_hop_min_profit_{token_key}" value="{two_hop_min_profit_raw}" data-old="{two_hop_min_profit_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="2-Hop Min Profit Raw" placeholder="500"></td>
+  <td><input class="compact-input" name="multihop_search_amounts_{token_key}" value="{multihop_amounts_raw}" data-old="{multihop_amounts_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="Multi Amounts Raw" placeholder="10000000,30000000"></td>
+  <td><input class="compact-input" name="multihop_min_profit_{token_key}" value="{multihop_min_profit_raw}" data-old="{multihop_min_profit_raw}" data-token="{token_key}" data-symbol="{symbol}" data-kind="Multi Min Profit Raw" placeholder="500"></td>
 </tr>"#,
             symbol = escape(&row.symbol),
             chain_id = row.chain_id,
