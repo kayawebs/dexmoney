@@ -2,11 +2,11 @@ mod opportunity;
 mod risk;
 mod strategy;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
-use base_arb_common::types::{DexKind, PoolState, PoolVariant};
+use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
                 price_impact_rejected = aggregate.search.price_impact_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
+                candidates_coalesced = aggregate.candidates_coalesced,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
@@ -107,6 +108,7 @@ struct SearchCycleStats {
     risk_path_not_whitelisted: u64,
     risk_pool_state_stale: u64,
     risk_other_rejected: u64,
+    candidates_coalesced: u64,
     opportunities_created: u64,
 }
 
@@ -126,6 +128,7 @@ impl SearchCycleStats {
         self.risk_path_not_whitelisted += other.risk_path_not_whitelisted;
         self.risk_pool_state_stale += other.risk_pool_state_stale;
         self.risk_other_rejected += other.risk_other_rejected;
+        self.candidates_coalesced += other.candidates_coalesced;
         self.opportunities_created += other.opportunities_created;
     }
 
@@ -350,6 +353,10 @@ where
     C: CandidateStore,
     R: RecorderStore,
 {
+    let original_candidate_count = candidates.len();
+    let candidates = coalesce_candidates(candidates);
+    cycle_stats.candidates_coalesced +=
+        original_candidate_count.saturating_sub(candidates.len()) as u64;
     for candidate in candidates {
         debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
@@ -373,4 +380,51 @@ where
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CandidateExecutorScope {
+    TwoHop,
+    MultiHop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CandidateCoalesceKey {
+    block_number: u64,
+    token_in: Address,
+    amount_in: U256,
+    executor_scope: CandidateExecutorScope,
+}
+
+fn coalesce_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut best_by_key: HashMap<CandidateCoalesceKey, Candidate> = HashMap::new();
+    for candidate in candidates {
+        let key = CandidateCoalesceKey {
+            block_number: candidate.block_number,
+            token_in: candidate.token_in,
+            amount_in: candidate.amount_in,
+            executor_scope: candidate_executor_scope(&candidate),
+        };
+        match best_by_key.get_mut(&key) {
+            Some(existing) if existing.expected_profit >= candidate.expected_profit => {}
+            Some(existing) => {
+                *existing = candidate;
+            }
+            None => {
+                best_by_key.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut out = best_by_key.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+    out
+}
+
+fn candidate_executor_scope(candidate: &Candidate) -> CandidateExecutorScope {
+    if candidate.path.steps.len() == 2 {
+        CandidateExecutorScope::TwoHop
+    } else {
+        CandidateExecutorScope::MultiHop
+    }
 }
