@@ -13,7 +13,9 @@ use tracing::debug;
 
 use crate::opportunity::build_candidate;
 
+#[cfg(test)]
 const MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR: usize = 2_000;
+const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 50_000;
 
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
@@ -43,6 +45,7 @@ pub struct SearchStats {
     pub price_impact_rejected: u64,
     pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
+    pub dynamic_multihop_paths: u64,
     pub best_profit_before_impact: U256,
     pub best_profit_rejected_by_impact: U256,
     pub best_profit: U256,
@@ -63,6 +66,7 @@ impl SearchStats {
         self.price_impact_rejected += other.price_impact_rejected;
         self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
+        self.dynamic_multihop_paths += other.dynamic_multihop_paths;
         self.best_profit_before_impact = self
             .best_profit_before_impact
             .max(other.best_profit_before_impact);
@@ -341,11 +345,13 @@ impl SearchEngine {
         tick_states: &[TickState],
         path_index: &PathIndex,
         changed_pools: &HashSet<Address>,
+        dynamic_paths: &[SearchPath],
     ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
         let path_indices = path_index.path_indices_for_changed_pools(changed_pools);
         let mut stats = SearchStats {
             total_paths: path_index.total_paths(),
-            paths: path_indices.len(),
+            paths: path_indices.len() + dynamic_paths.len(),
+            dynamic_multihop_paths: dynamic_paths.len() as u64,
             ..SearchStats::default()
         };
         let mut out = Vec::new();
@@ -353,91 +359,105 @@ impl SearchEngine {
 
         for index in path_indices {
             let search_path = &path_index.paths[index];
-            for amount_in in &search_path.amount_sizes {
-                stats.quote_attempts += 1;
-                let quote = match quote_path(
-                    &quote_context,
-                    &search_path.path,
-                    *amount_in,
-                    self.v3_quote_safety_bps,
-                    self.quote_max_state_block_lag,
-                )
-                .await
-                {
-                    Ok(Some(quote)) => {
-                        stats.quote_successes += 1;
-                        quote
-                    }
-                    Ok(None) => {
-                        stats.record_quote_skip(QuoteSkipReason::QuoteError);
-                        continue;
-                    }
-                    Err(err) => {
-                        stats.record_quote_skip(err.reason);
-                        debug!(
-                            path = %search_path.path.name,
-                            amount_in = %amount_in,
-                            reason = ?err.reason,
-                            error = %err.message,
-                            "quote skipped"
-                        );
-                        continue;
-                    }
-                };
-                let (expected_amount_out, price_impact_bps, diagnostics) = quote;
-                let expected_profit = expected_amount_out.saturating_sub(*amount_in);
-                stats.best_profit_before_impact =
-                    stats.best_profit_before_impact.max(expected_profit);
-                if price_impact_bps > self.max_price_impact_bps {
-                    stats.price_impact_rejected += 1;
-                    stats.best_profit_rejected_by_impact =
-                        stats.best_profit_rejected_by_impact.max(expected_profit);
-                    continue;
-                }
-                stats.best_profit = stats.best_profit.max(expected_profit);
-                let required_profit = if search_path.min_profit.is_zero() {
-                    self.min_expected_profit
-                } else {
-                    search_path.min_profit
-                };
-                if expected_profit < required_profit {
-                    stats.min_profit_rejected += 1;
-                    continue;
-                }
-                let block_number = search_path
-                    .path
-                    .steps
-                    .iter()
-                    .filter_map(|step| quote_context.pool_state(step.pool))
-                    .map(|state| state.block_number)
-                    .max()
-                    .unwrap_or(0);
-                let candidate = build_candidate(
-                    block_number,
-                    search_path.strategy.clone(),
-                    search_path.path.steps[0].token_in,
-                    *amount_in,
-                    expected_amount_out,
-                    expected_profit,
-                    self.min_expected_profit,
-                    price_impact_bps,
-                    path_with_diagnostics(&search_path.path, diagnostics),
-                    self.candidate_ttl_ms,
-                );
-                let candidate = Candidate {
-                    min_profit: search_path.min_profit,
-                    ..candidate
-                };
-                stats.candidates_emitted += 1;
-                out.push(candidate);
-            }
+            self.quote_search_path(search_path, &quote_context, &mut stats, &mut out)
+                .await;
+        }
+        for search_path in dynamic_paths {
+            self.quote_search_path(search_path, &quote_context, &mut stats, &mut out)
+                .await;
         }
 
         Ok((out, stats))
     }
 
+    async fn quote_search_path(
+        &self,
+        search_path: &SearchPath,
+        quote_context: &QuoteContext<'_>,
+        stats: &mut SearchStats,
+        out: &mut Vec<Candidate>,
+    ) {
+        for amount_in in &search_path.amount_sizes {
+            stats.quote_attempts += 1;
+            let quote = match quote_path(
+                quote_context,
+                &search_path.path,
+                *amount_in,
+                self.v3_quote_safety_bps,
+                self.quote_max_state_block_lag,
+            )
+            .await
+            {
+                Ok(Some(quote)) => {
+                    stats.quote_successes += 1;
+                    quote
+                }
+                Ok(None) => {
+                    stats.record_quote_skip(QuoteSkipReason::QuoteError);
+                    continue;
+                }
+                Err(err) => {
+                    stats.record_quote_skip(err.reason);
+                    debug!(
+                        path = %search_path.path.name,
+                        amount_in = %amount_in,
+                        reason = ?err.reason,
+                        error = %err.message,
+                        "quote skipped"
+                    );
+                    continue;
+                }
+            };
+            let (expected_amount_out, price_impact_bps, diagnostics) = quote;
+            let expected_profit = expected_amount_out.saturating_sub(*amount_in);
+            stats.best_profit_before_impact = stats.best_profit_before_impact.max(expected_profit);
+            if price_impact_bps > self.max_price_impact_bps {
+                stats.price_impact_rejected += 1;
+                stats.best_profit_rejected_by_impact =
+                    stats.best_profit_rejected_by_impact.max(expected_profit);
+                continue;
+            }
+            stats.best_profit = stats.best_profit.max(expected_profit);
+            let required_profit = if search_path.min_profit.is_zero() {
+                self.min_expected_profit
+            } else {
+                search_path.min_profit
+            };
+            if expected_profit < required_profit {
+                stats.min_profit_rejected += 1;
+                continue;
+            }
+            let block_number = search_path
+                .path
+                .steps
+                .iter()
+                .filter_map(|step| quote_context.pool_state(step.pool))
+                .map(|state| state.block_number)
+                .max()
+                .unwrap_or(0);
+            let candidate = build_candidate(
+                block_number,
+                search_path.strategy.clone(),
+                search_path.path.steps[0].token_in,
+                *amount_in,
+                expected_amount_out,
+                expected_profit,
+                self.min_expected_profit,
+                price_impact_bps,
+                path_with_diagnostics(&search_path.path, diagnostics),
+                self.candidate_ttl_ms,
+            );
+            let candidate = Candidate {
+                min_profit: search_path.min_profit,
+                ..candidate
+            };
+            stats.candidates_emitted += 1;
+            out.push(candidate);
+        }
+    }
+
     pub(crate) fn build_path_index(&self, pool_states: &[PoolState]) -> PathIndex {
-        PathIndex::new(self.paths_for_pool_states(pool_states))
+        PathIndex::new(self.two_hop_paths_for_pool_states(pool_states))
     }
 
     pub(crate) fn path_pool_addresses_for_path_index(
@@ -448,7 +468,90 @@ impl SearchEngine {
         path_index.path_pools_for_changed_pools(changed_pools)
     }
 
+    pub(crate) fn path_pool_addresses_for_search_paths(
+        &self,
+        paths: &[SearchPath],
+    ) -> HashSet<Address> {
+        paths
+            .iter()
+            .flat_map(|path| path.path.steps.iter().map(|step| step.pool))
+            .collect()
+    }
+
+    pub(crate) fn dynamic_multihop_paths_for_changed_pools(
+        &self,
+        pool_states: &[PoolState],
+        changed_pools: &HashSet<Address>,
+    ) -> Vec<SearchPath> {
+        if !self.multihop_enabled || changed_pools.is_empty() {
+            return Vec::new();
+        }
+        let anchors = anchor_search_configs(&self.pair_configs);
+        if anchors.is_empty() {
+            return Vec::new();
+        }
+
+        let edges_by_token = pool_edges_by_token(pool_states);
+        let changed_edges = pool_states
+            .iter()
+            .filter(|state| changed_pools.contains(&state.pool_id.address))
+            .filter(|state| is_supported_pool(state))
+            .flat_map(|state| {
+                [
+                    PoolEdge {
+                        state,
+                        token_in: state.token0,
+                        token_out: state.token1,
+                    },
+                    PoolEdge {
+                        state,
+                        token_in: state.token1,
+                        token_out: state.token0,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+        for anchor in anchors {
+            for changed_edge in &changed_edges {
+                add_dynamic_cycles_for_changed_edge(
+                    &mut paths,
+                    &mut seen,
+                    &edges_by_token,
+                    &anchor,
+                    changed_edge,
+                    3,
+                );
+                add_dynamic_cycles_for_changed_edge(
+                    &mut paths,
+                    &mut seen,
+                    &edges_by_token,
+                    &anchor,
+                    changed_edge,
+                    4,
+                );
+                if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
+                    paths.truncate(MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN);
+                    return paths;
+                }
+            }
+        }
+        paths
+    }
+
+    #[cfg(test)]
     fn paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {
+        let mut paths = self.two_hop_paths_for_pool_states(pool_states);
+        if self.multihop_enabled {
+            self.add_three_pool_cycle_paths(pool_states, &mut paths);
+            self.add_four_pool_cycle_paths(pool_states, &mut paths);
+        }
+
+        paths
+    }
+
+    fn two_hop_paths_for_pool_states(&self, pool_states: &[PoolState]) -> Vec<SearchPath> {
         if !self.paths.is_empty() {
             return self
                 .paths
@@ -484,14 +587,11 @@ impl SearchEngine {
                 }
             }
         }
-        if self.multihop_enabled {
-            self.add_three_pool_cycle_paths(pool_states, &mut paths);
-            self.add_four_pool_cycle_paths(pool_states, &mut paths);
-        }
 
         paths
     }
 
+    #[cfg(test)]
     fn add_three_pool_cycle_paths(&self, pool_states: &[PoolState], paths: &mut Vec<SearchPath>) {
         let anchors = anchor_search_configs(&self.pair_configs);
         if anchors.is_empty() {
@@ -549,6 +649,7 @@ impl SearchEngine {
         }
     }
 
+    #[cfg(test)]
     fn add_four_pool_cycle_paths(&self, pool_states: &[PoolState], paths: &mut Vec<SearchPath>) {
         let anchors = anchor_search_configs(&self.pair_configs);
         if anchors.is_empty() {
@@ -690,7 +791,7 @@ impl<'a> QuoteContext<'a> {
 }
 
 #[derive(Clone)]
-struct SearchPath {
+pub(crate) struct SearchPath {
     path: ArbPath,
     amount_sizes: Vec<U256>,
     min_profit: U256,
@@ -784,6 +885,157 @@ fn pool_edges_by_token(pool_states: &[PoolState]) -> HashMap<Address, Vec<PoolEd
         edges.sort_by_key(|edge| (edge.token_out, edge.state.pool_id.address));
     }
     edges_by_token
+}
+
+fn add_dynamic_cycles_for_changed_edge<'a>(
+    paths: &mut Vec<SearchPath>,
+    seen: &mut HashSet<String>,
+    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+    anchor: &AnchorSearchConfig,
+    changed_edge: &PoolEdge<'a>,
+    cycle_len: usize,
+) {
+    for changed_position in 0..cycle_len {
+        let prefix_len = changed_position;
+        let suffix_len = cycle_len - changed_position - 1;
+        let prefixes = edge_paths_between(
+            edges_by_token,
+            anchor.token,
+            changed_edge.token_in,
+            prefix_len,
+        );
+        if prefixes.is_empty() {
+            continue;
+        }
+        let suffixes = edge_paths_between(
+            edges_by_token,
+            changed_edge.token_out,
+            anchor.token,
+            suffix_len,
+        );
+        if suffixes.is_empty() {
+            continue;
+        }
+
+        for prefix in &prefixes {
+            for suffix in &suffixes {
+                let mut cycle = Vec::with_capacity(cycle_len);
+                cycle.extend(prefix.iter().copied());
+                cycle.push(*changed_edge);
+                cycle.extend(suffix.iter().copied());
+                if !is_valid_dynamic_cycle(anchor.token, &cycle) {
+                    continue;
+                }
+                let fingerprint = cycle_fingerprint(anchor.token, &cycle);
+                if !seen.insert(fingerprint) {
+                    continue;
+                }
+                paths.push(build_dynamic_multihop_search_path(anchor, &cycle));
+                if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn edge_paths_between<'a>(
+    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+    start: Address,
+    end: Address,
+    edge_count: usize,
+) -> Vec<Vec<PoolEdge<'a>>> {
+    if edge_count == 0 {
+        return if start == end {
+            vec![Vec::new()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut out = Vec::new();
+    let mut current = Vec::with_capacity(edge_count);
+    edge_paths_between_inner(
+        edges_by_token,
+        start,
+        end,
+        edge_count,
+        &mut current,
+        &mut out,
+    );
+    out
+}
+
+fn edge_paths_between_inner<'a>(
+    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+    current_token: Address,
+    end: Address,
+    remaining_edges: usize,
+    current: &mut Vec<PoolEdge<'a>>,
+    out: &mut Vec<Vec<PoolEdge<'a>>>,
+) {
+    if remaining_edges == 0 {
+        if current_token == end {
+            out.push(current.clone());
+        }
+        return;
+    }
+    let Some(edges) = edges_by_token.get(&current_token) else {
+        return;
+    };
+    for edge in edges {
+        if current
+            .iter()
+            .any(|existing| existing.state.pool_id.address == edge.state.pool_id.address)
+        {
+            continue;
+        }
+        current.push(*edge);
+        edge_paths_between_inner(
+            edges_by_token,
+            edge.token_out,
+            end,
+            remaining_edges - 1,
+            current,
+            out,
+        );
+        current.pop();
+    }
+}
+
+fn is_valid_dynamic_cycle(anchor: Address, edges: &[PoolEdge<'_>]) -> bool {
+    if edges.is_empty()
+        || edges.first().map(|edge| edge.token_in) != Some(anchor)
+        || edges.last().map(|edge| edge.token_out) != Some(anchor)
+    {
+        return false;
+    }
+
+    let mut pools = HashSet::new();
+    for edge in edges {
+        if !pools.insert(edge.state.pool_id.address) {
+            return false;
+        }
+    }
+
+    let mut intermediate_tokens = HashSet::new();
+    for edge in edges.iter().take(edges.len() - 1) {
+        if edge.token_out == anchor || !intermediate_tokens.insert(edge.token_out) {
+            return false;
+        }
+    }
+    true
+}
+
+fn cycle_fingerprint(anchor: Address, edges: &[PoolEdge<'_>]) -> String {
+    let mut fingerprint = format!("{anchor:#x}");
+    for edge in edges {
+        fingerprint.push('|');
+        fingerprint.push_str(&format!(
+            "{:#x}:{:#x}->{:#x}",
+            edge.state.pool_id.address, edge.token_in, edge.token_out
+        ));
+    }
+    fingerprint
 }
 
 fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
@@ -1175,6 +1427,7 @@ fn build_search_path(
     }
 }
 
+#[cfg(test)]
 fn build_three_pool_search_path(
     anchor: AnchorSearchConfig,
     first: &PoolEdge<'_>,
@@ -1204,6 +1457,7 @@ fn build_three_pool_search_path(
     }
 }
 
+#[cfg(test)]
 fn build_four_pool_search_path(
     anchor: AnchorSearchConfig,
     first: &PoolEdge<'_>,
@@ -1233,6 +1487,36 @@ fn build_four_pool_search_path(
         amount_sizes: anchor.amount_sizes,
         min_profit: anchor.min_profit,
         strategy: "token-four-pool-cycle".into(),
+    }
+}
+
+fn build_dynamic_multihop_search_path(
+    anchor: &AnchorSearchConfig,
+    edges: &[PoolEdge<'_>],
+) -> SearchPath {
+    let pools = edges
+        .iter()
+        .map(|edge| pool_label(edge.state))
+        .collect::<Vec<_>>()
+        .join("-");
+    let name = format!(
+        "cycle{}-{}-{}",
+        edges.len(),
+        short_token(anchor.token),
+        pools
+    );
+    SearchPath {
+        path: ArbPath {
+            name,
+            steps: edges
+                .iter()
+                .map(|edge| swap_step_from_pool(edge.state, edge.token_in, edge.token_out))
+                .collect(),
+            diagnostics: None,
+        },
+        amount_sizes: anchor.amount_sizes.clone(),
+        min_profit: anchor.min_profit,
+        strategy: format!("token-{}-pool-cycle", edges.len()),
     }
 }
 

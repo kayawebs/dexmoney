@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
                 price_impact_rejected = aggregate.search.price_impact_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
+                dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
                 risk_price_impact_rejected = aggregate.risk_price_impact_rejected,
@@ -272,7 +273,10 @@ where
         return Ok(SearchCycleStats::default());
     };
     let mut tick_states = Vec::new();
-    let path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
+    let dynamic_paths =
+        engine.dynamic_multihop_paths_for_changed_pools(&pool_states, &changed_pools);
+    let mut path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
+    path_pools.extend(engine.path_pool_addresses_for_search_paths(&dynamic_paths));
     for state in &pool_states {
         if !path_pools.contains(&state.pool_id.address) {
             continue;
@@ -287,7 +291,13 @@ where
         }
     }
     let (candidates, search_stats) = engine
-        .search_with_stats_for_path_index(&pool_states, &tick_states, path_index, &changed_pools)
+        .search_with_stats_for_path_index(
+            &pool_states,
+            &tick_states,
+            path_index,
+            &changed_pools,
+            &dynamic_paths,
+        )
         .await?;
     let mut cycle_stats = SearchCycleStats {
         search: search_stats,
