@@ -15,7 +15,9 @@ use crate::opportunity::build_candidate;
 
 #[cfg(test)]
 const MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR: usize = 2_000;
-const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 50_000;
+const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 5_000;
+const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
+const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
@@ -478,9 +480,13 @@ impl SearchEngine {
             .collect()
     }
 
+    pub(crate) fn build_graph_snapshot(&self, pool_states: &[PoolState]) -> GraphSnapshot {
+        GraphSnapshot::new(pool_states)
+    }
+
     pub(crate) fn dynamic_multihop_paths_for_changed_pools(
         &self,
-        pool_states: &[PoolState],
+        graph: &GraphSnapshot,
         changed_pools: &HashSet<Address>,
     ) -> Vec<SearchPath> {
         if !self.multihop_enabled || changed_pools.is_empty() {
@@ -491,49 +497,34 @@ impl SearchEngine {
             return Vec::new();
         }
 
-        let edges_by_token = pool_edges_by_token(pool_states);
-        let changed_edges = pool_states
-            .iter()
-            .filter(|state| changed_pools.contains(&state.pool_id.address))
-            .filter(|state| is_supported_pool(state))
-            .flat_map(|state| {
-                [
-                    PoolEdge {
-                        state,
-                        token_in: state.token0,
-                        token_out: state.token1,
-                    },
-                    PoolEdge {
-                        state,
-                        token_in: state.token1,
-                        token_out: state.token0,
-                    },
-                ]
-            })
-            .collect::<Vec<_>>();
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
         for anchor in anchors {
-            for changed_edge in &changed_edges {
-                add_dynamic_cycles_for_changed_edge(
-                    &mut paths,
-                    &mut seen,
-                    &edges_by_token,
-                    &anchor,
-                    changed_edge,
-                    3,
-                );
-                add_dynamic_cycles_for_changed_edge(
-                    &mut paths,
-                    &mut seen,
-                    &edges_by_token,
-                    &anchor,
-                    changed_edge,
-                    4,
-                );
-                if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
-                    paths.truncate(MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN);
-                    return paths;
+            for changed_pool in changed_pools {
+                let Some(changed_edges) = graph.pool_edges(*changed_pool) else {
+                    continue;
+                };
+                for changed_edge in changed_edges {
+                    add_dynamic_cycles_for_changed_edge(
+                        &mut paths,
+                        &mut seen,
+                        graph,
+                        &anchor,
+                        changed_edge,
+                        3,
+                    );
+                    add_dynamic_cycles_for_changed_edge(
+                        &mut paths,
+                        &mut seen,
+                        graph,
+                        &anchor,
+                        changed_edge,
+                        4,
+                    );
+                    if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
+                        paths.truncate(MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN);
+                        return paths;
+                    }
                 }
             }
         }
@@ -854,6 +845,7 @@ struct AnchorSearchConfig {
     min_profit: U256,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct PoolEdge<'a> {
     state: &'a PoolState,
@@ -861,6 +853,71 @@ struct PoolEdge<'a> {
     token_out: Address,
 }
 
+#[derive(Clone)]
+struct OwnedPoolEdge {
+    state: PoolState,
+    token_in: Address,
+    token_out: Address,
+}
+
+impl OwnedPoolEdge {
+    fn pool(&self) -> Address {
+        self.state.pool_id.address
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GraphSnapshot {
+    edges_by_token: HashMap<Address, Vec<OwnedPoolEdge>>,
+    pool_to_edges: HashMap<Address, Vec<OwnedPoolEdge>>,
+}
+
+impl GraphSnapshot {
+    fn new(pool_states: &[PoolState]) -> Self {
+        let mut edges_by_token: HashMap<Address, Vec<OwnedPoolEdge>> = HashMap::new();
+        let mut pool_to_edges: HashMap<Address, Vec<OwnedPoolEdge>> = HashMap::new();
+        for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
+            let edges = [
+                OwnedPoolEdge {
+                    state: state.clone(),
+                    token_in: state.token0,
+                    token_out: state.token1,
+                },
+                OwnedPoolEdge {
+                    state: state.clone(),
+                    token_in: state.token1,
+                    token_out: state.token0,
+                },
+            ];
+            for edge in edges {
+                edges_by_token
+                    .entry(edge.token_in)
+                    .or_default()
+                    .push(edge.clone());
+                pool_to_edges.entry(edge.pool()).or_default().push(edge);
+            }
+        }
+        for edges in edges_by_token.values_mut() {
+            edges.sort_by_key(|edge| std::cmp::Reverse(pool_depth_score(&edge.state)));
+            edges.truncate(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN);
+            edges.sort_by_key(|edge| (edge.token_out, edge.pool()));
+        }
+        Self {
+            edges_by_token,
+            pool_to_edges,
+        }
+    }
+
+    fn edges_from_token(&self, token: Address) -> Option<&[OwnedPoolEdge]> {
+        self.edges_by_token.get(&token).map(Vec::as_slice)
+    }
+
+    fn pool_edges(&self, pool: Address) -> Option<&[OwnedPoolEdge]> {
+        self.pool_to_edges.get(&pool).map(Vec::as_slice)
+    }
+}
+
+#[cfg(test)]
 fn pool_edges_by_token(pool_states: &[PoolState]) -> HashMap<Address, Vec<PoolEdge<'_>>> {
     let mut edges_by_token: HashMap<Address, Vec<PoolEdge<'_>>> = HashMap::new();
     for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
@@ -887,32 +944,33 @@ fn pool_edges_by_token(pool_states: &[PoolState]) -> HashMap<Address, Vec<PoolEd
     edges_by_token
 }
 
-fn add_dynamic_cycles_for_changed_edge<'a>(
+fn pool_depth_score(state: &PoolState) -> U256 {
+    match state.variant {
+        PoolVariant::AerodromeVolatile => {
+            state.reserve0.unwrap_or_default() + state.reserve1.unwrap_or_default()
+        }
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+            state.liquidity.unwrap_or_default()
+        }
+    }
+}
+
+fn add_dynamic_cycles_for_changed_edge(
     paths: &mut Vec<SearchPath>,
     seen: &mut HashSet<String>,
-    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+    graph: &GraphSnapshot,
     anchor: &AnchorSearchConfig,
-    changed_edge: &PoolEdge<'a>,
+    changed_edge: &OwnedPoolEdge,
     cycle_len: usize,
 ) {
     for changed_position in 0..cycle_len {
         let prefix_len = changed_position;
         let suffix_len = cycle_len - changed_position - 1;
-        let prefixes = edge_paths_between(
-            edges_by_token,
-            anchor.token,
-            changed_edge.token_in,
-            prefix_len,
-        );
+        let prefixes = edge_paths_between(graph, anchor.token, changed_edge.token_in, prefix_len);
         if prefixes.is_empty() {
             continue;
         }
-        let suffixes = edge_paths_between(
-            edges_by_token,
-            changed_edge.token_out,
-            anchor.token,
-            suffix_len,
-        );
+        let suffixes = edge_paths_between(graph, changed_edge.token_out, anchor.token, suffix_len);
         if suffixes.is_empty() {
             continue;
         }
@@ -920,9 +978,9 @@ fn add_dynamic_cycles_for_changed_edge<'a>(
         for prefix in &prefixes {
             for suffix in &suffixes {
                 let mut cycle = Vec::with_capacity(cycle_len);
-                cycle.extend(prefix.iter().copied());
-                cycle.push(*changed_edge);
-                cycle.extend(suffix.iter().copied());
+                cycle.extend(prefix.iter().cloned());
+                cycle.push(changed_edge.clone());
+                cycle.extend(suffix.iter().cloned());
                 if !is_valid_dynamic_cycle(anchor.token, &cycle) {
                     continue;
                 }
@@ -939,12 +997,12 @@ fn add_dynamic_cycles_for_changed_edge<'a>(
     }
 }
 
-fn edge_paths_between<'a>(
-    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+fn edge_paths_between(
+    graph: &GraphSnapshot,
     start: Address,
     end: Address,
     edge_count: usize,
-) -> Vec<Vec<PoolEdge<'a>>> {
+) -> Vec<Vec<OwnedPoolEdge>> {
     if edge_count == 0 {
         return if start == end {
             vec![Vec::new()]
@@ -954,44 +1012,43 @@ fn edge_paths_between<'a>(
     }
     let mut out = Vec::new();
     let mut current = Vec::with_capacity(edge_count);
-    edge_paths_between_inner(
-        edges_by_token,
-        start,
-        end,
-        edge_count,
-        &mut current,
-        &mut out,
-    );
+    edge_paths_between_inner(graph, start, end, edge_count, &mut current, &mut out);
     out
 }
 
-fn edge_paths_between_inner<'a>(
-    edges_by_token: &HashMap<Address, Vec<PoolEdge<'a>>>,
+fn edge_paths_between_inner(
+    graph: &GraphSnapshot,
     current_token: Address,
     end: Address,
     remaining_edges: usize,
-    current: &mut Vec<PoolEdge<'a>>,
-    out: &mut Vec<Vec<PoolEdge<'a>>>,
+    current: &mut Vec<OwnedPoolEdge>,
+    out: &mut Vec<Vec<OwnedPoolEdge>>,
 ) {
+    if out.len() >= MAX_DYNAMIC_SEGMENT_PATHS {
+        return;
+    }
     if remaining_edges == 0 {
         if current_token == end {
             out.push(current.clone());
         }
         return;
     }
-    let Some(edges) = edges_by_token.get(&current_token) else {
+    let Some(edges) = graph.edges_from_token(current_token) else {
         return;
     };
     for edge in edges {
+        if out.len() >= MAX_DYNAMIC_SEGMENT_PATHS {
+            return;
+        }
         if current
             .iter()
-            .any(|existing| existing.state.pool_id.address == edge.state.pool_id.address)
+            .any(|existing| existing.pool() == edge.pool())
         {
             continue;
         }
-        current.push(*edge);
+        current.push(edge.clone());
         edge_paths_between_inner(
-            edges_by_token,
+            graph,
             edge.token_out,
             end,
             remaining_edges - 1,
@@ -1002,7 +1059,7 @@ fn edge_paths_between_inner<'a>(
     }
 }
 
-fn is_valid_dynamic_cycle(anchor: Address, edges: &[PoolEdge<'_>]) -> bool {
+fn is_valid_dynamic_cycle(anchor: Address, edges: &[OwnedPoolEdge]) -> bool {
     if edges.is_empty()
         || edges.first().map(|edge| edge.token_in) != Some(anchor)
         || edges.last().map(|edge| edge.token_out) != Some(anchor)
@@ -1012,7 +1069,7 @@ fn is_valid_dynamic_cycle(anchor: Address, edges: &[PoolEdge<'_>]) -> bool {
 
     let mut pools = HashSet::new();
     for edge in edges {
-        if !pools.insert(edge.state.pool_id.address) {
+        if !pools.insert(edge.pool()) {
             return false;
         }
     }
@@ -1026,13 +1083,15 @@ fn is_valid_dynamic_cycle(anchor: Address, edges: &[PoolEdge<'_>]) -> bool {
     true
 }
 
-fn cycle_fingerprint(anchor: Address, edges: &[PoolEdge<'_>]) -> String {
+fn cycle_fingerprint(anchor: Address, edges: &[OwnedPoolEdge]) -> String {
     let mut fingerprint = format!("{anchor:#x}");
     for edge in edges {
         fingerprint.push('|');
         fingerprint.push_str(&format!(
             "{:#x}:{:#x}->{:#x}",
-            edge.state.pool_id.address, edge.token_in, edge.token_out
+            edge.pool(),
+            edge.token_in,
+            edge.token_out
         ));
     }
     fingerprint
@@ -1492,11 +1551,11 @@ fn build_four_pool_search_path(
 
 fn build_dynamic_multihop_search_path(
     anchor: &AnchorSearchConfig,
-    edges: &[PoolEdge<'_>],
+    edges: &[OwnedPoolEdge],
 ) -> SearchPath {
     let pools = edges
         .iter()
-        .map(|edge| pool_label(edge.state))
+        .map(|edge| pool_label(&edge.state))
         .collect::<Vec<_>>()
         .join("-");
     let name = format!(
@@ -1510,7 +1569,7 @@ fn build_dynamic_multihop_search_path(
             name,
             steps: edges
                 .iter()
-                .map(|edge| swap_step_from_pool(edge.state, edge.token_in, edge.token_out))
+                .map(|edge| swap_step_from_pool(&edge.state, edge.token_in, edge.token_out))
                 .collect(),
             diagnostics: None,
         },

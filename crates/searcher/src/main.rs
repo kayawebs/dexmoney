@@ -149,6 +149,7 @@ struct SearchRuntime {
     pool_states: HashMap<Address, PoolState>,
     pool_topology: HashMap<Address, PoolTopology>,
     path_index: Option<strategy::PathIndex>,
+    graph_snapshot: Option<strategy::GraphSnapshot>,
     bootstrapped: bool,
 }
 
@@ -259,6 +260,7 @@ where
     }
     if rebuild_path_index {
         runtime.path_index = Some(engine.build_path_index(&pool_states));
+        runtime.graph_snapshot = Some(engine.build_graph_snapshot(&pool_states));
         info!(
             total_paths = runtime
                 .path_index
@@ -272,9 +274,12 @@ where
     let Some(path_index) = runtime.path_index.as_ref() else {
         return Ok(SearchCycleStats::default());
     };
+    let Some(graph_snapshot) = runtime.graph_snapshot.as_ref() else {
+        return Ok(SearchCycleStats::default());
+    };
     let mut tick_states = Vec::new();
     let dynamic_paths =
-        engine.dynamic_multihop_paths_for_changed_pools(&pool_states, &changed_pools);
+        engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
     let mut path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
     path_pools.extend(engine.path_pool_addresses_for_search_paths(&dynamic_paths));
     for state in &pool_states {
