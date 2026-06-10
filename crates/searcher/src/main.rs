@@ -197,13 +197,6 @@ where
     R: RecorderStore + PairSearchConfigStore,
 {
     let cycle_started = Instant::now();
-    let engine = strategy::engine_from_settings(
-        settings,
-        candidate_ttl_ms,
-        max_price_impact_bps,
-        strategy::usdc_to_units(min_expected_profit_usdc),
-        recorder.enabled_pair_search_configs().await?,
-    )?;
     if !runtime.bootstrapped {
         for state in pool_store.all_pool_states().await? {
             runtime
@@ -232,6 +225,14 @@ where
             ..SearchCycleStats::default()
         });
     }
+
+    let engine = strategy::engine_from_settings(
+        settings,
+        candidate_ttl_ms,
+        max_price_impact_bps,
+        strategy::usdc_to_units(min_expected_profit_usdc),
+        recorder.enabled_pair_search_configs().await?,
+    )?;
 
     let mut rebuild_path_index = runtime.path_index.is_none();
     for pool in &changed_pools {

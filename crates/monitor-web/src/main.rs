@@ -1378,7 +1378,7 @@ async fn update_token_search_defaults(
         pool: (*state.pool).clone(),
     };
     let mut changes = Vec::new();
-    let mut discovery_results = Vec::new();
+    let mut background_discovery_symbols = Vec::new();
 
     for token_address in token_addresses {
         let token_address = token_address.trim().to_lowercase();
@@ -1469,27 +1469,30 @@ async fn update_token_search_defaults(
                 became_anchor,
             };
             if became_anchor {
-                discovery_results.push((
-                    row.symbol.clone(),
-                    discover_pairs_for_anchor(&state, token).await,
-                ));
+                let state = state.clone();
+                let symbol = row.symbol.clone();
+                background_discovery_symbols.push(symbol.clone());
+                tokio::spawn(async move {
+                    let result = discover_pairs_for_anchor(&state, token).await;
+                    info!(
+                        token = %symbol,
+                        attempted = result.attempted,
+                        discovered_pools = result.discovered_pools,
+                        failed = result.failed.len(),
+                        "background anchor pair discovery completed"
+                    );
+                });
             }
             changes.push(change);
         }
     }
 
     let mut message = summarize_token_changes(&changes);
-    if !discovery_results.is_empty() {
-        let discovery_summary = discovery_results
-            .into_iter()
-            .map(|(symbol, result)| {
-                format!(
-                    "{symbol}: {}",
-                    summarize_discovery("anchor rediscovery", result)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+    if !background_discovery_symbols.is_empty() {
+        let discovery_summary = format!(
+            "background anchor discovery started for {}",
+            background_discovery_symbols.join(", ")
+        );
         if !message.is_empty() {
             message.push_str("; ");
         }
