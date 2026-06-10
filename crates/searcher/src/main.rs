@@ -16,7 +16,7 @@ use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-const SEARCHER_PUBLISH_BATCH_PATHS: usize = 256;
+const SEARCHER_PUBLISH_BATCH_PATHS: usize = 32;
 
 #[tokio::main]
 async fn main() -> Result<()> {

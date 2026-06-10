@@ -17,9 +17,9 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
-const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 16;
-const MAX_SIMULATIONS_PER_CYCLE: usize = 4;
+const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 512;
+const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
+const MAX_SIMULATIONS_PER_CYCLE: usize = 8;
 const MIN_CANDIDATE_SEEN_TTL_SECS: u64 = 10;
 
 #[tokio::main]
