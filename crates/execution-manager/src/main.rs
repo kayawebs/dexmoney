@@ -274,7 +274,7 @@ where
             )
             .await;
 
-            let approval_txs = outcome.approval_tx_hashes.len();
+            let approval_txs = outcome.approval_submissions.len();
             if let Some(submission) = outcome.submission {
                 info!(
                     candidate_id = %candidate.id,
@@ -298,6 +298,37 @@ where
                         &candidate,
                         wallet.address(),
                         &submission,
+                    ))
+                    .await?;
+                return Ok(CandidateAction::Submitted);
+            }
+
+            if let Some(pending_approval) = outcome.approval_submissions.last() {
+                warn!(
+                    candidate_id = %candidate.id,
+                    approval_txs,
+                    tx_hash = %pending_approval.tx_hash,
+                    nonce = pending_approval.nonce,
+                    error = ?outcome.error,
+                    "lazy approval submitted but arb tx was not submitted; parking EOA lane on pending approval"
+                );
+                lane.mark_submitted(
+                    candidate.id,
+                    None,
+                    pending_approval.tx_hash,
+                    pending_approval.executor_contract,
+                    pending_approval.nonce,
+                    pending_approval.submitted_block,
+                    pending_approval.gas_limit,
+                    pending_approval.max_fee_per_gas,
+                    pending_approval.max_priority_fee_per_gas,
+                );
+                eoa_store.set_lane_state(lane.state.clone()).await?;
+                recorder
+                    .record_transaction(tx_manager::pending_tx_result(
+                        &candidate,
+                        wallet.address(),
+                        pending_approval,
                     ))
                     .await?;
                 return Ok(CandidateAction::Submitted);

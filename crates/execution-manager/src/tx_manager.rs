@@ -42,7 +42,7 @@ pub struct Submission {
 #[derive(Debug, Clone)]
 pub struct LazySubmitOutcome {
     pub submission: Option<Submission>,
-    pub approval_tx_hashes: Vec<B256>,
+    pub approval_submissions: Vec<Submission>,
     pub consumed_nonces: u64,
     pub error: Option<String>,
 }
@@ -168,7 +168,7 @@ pub async fn submit_calldata_with_lazy_approvals(
         Err(err) => {
             return LazySubmitOutcome {
                 submission: None,
-                approval_tx_hashes: Vec::new(),
+                approval_submissions: Vec::new(),
                 consumed_nonces: 0,
                 error: Some(format!("{err:#}")),
             };
@@ -177,7 +177,7 @@ pub async fn submit_calldata_with_lazy_approvals(
     if calldata.is_empty() {
         return LazySubmitOutcome {
             submission: None,
-            approval_tx_hashes: Vec::new(),
+            approval_submissions: Vec::new(),
             consumed_nonces: 0,
             error: Some("simulation calldata is empty".to_string()),
         };
@@ -188,14 +188,14 @@ pub async fn submit_calldata_with_lazy_approvals(
         Err(err) => {
             return LazySubmitOutcome {
                 submission: None,
-                approval_tx_hashes: Vec::new(),
+                approval_submissions: Vec::new(),
                 consumed_nonces: 0,
                 error: Some(format!("{err:#}")),
             };
         }
     };
 
-    let mut approval_tx_hashes = Vec::new();
+    let mut approval_submissions = Vec::new();
     let mut consumed_nonces = 0u64;
     let mut next_nonce = nonce;
     for approval in approvals {
@@ -210,7 +210,7 @@ pub async fn submit_calldata_with_lazy_approvals(
             Err(err) => {
                 return LazySubmitOutcome {
                     submission: None,
-                    approval_tx_hashes,
+                    approval_submissions,
                     consumed_nonces,
                     error: Some(format!("{err:#}")),
                 };
@@ -234,7 +234,7 @@ pub async fn submit_calldata_with_lazy_approvals(
             Err(err) => {
                 return LazySubmitOutcome {
                     submission: None,
-                    approval_tx_hashes,
+                    approval_submissions,
                     consumed_nonces,
                     error: Some(format!("{err:#}")),
                 };
@@ -251,7 +251,16 @@ pub async fn submit_calldata_with_lazy_approvals(
             max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
             "lazy approval tx submitted"
         );
-        approval_tx_hashes.push(tx_hash);
+        approval_submissions.push(Submission {
+            tx_hash,
+            nonce: next_nonce,
+            simulation_id: None,
+            executor_contract: executor,
+            submitted_block: provider.get_block_number().await.unwrap_or_default(),
+            gas_limit,
+            max_fee_per_gas: fees.max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        });
         consumed_nonces = consumed_nonces.saturating_add(1);
         next_nonce = next_nonce.saturating_add(1);
     }
@@ -259,7 +268,7 @@ pub async fn submit_calldata_with_lazy_approvals(
     if candidate.is_expired(Utc::now()) {
         return LazySubmitOutcome {
             submission: None,
-            approval_tx_hashes,
+            approval_submissions,
             consumed_nonces,
             error: Some("candidate expired after lazy approvals".to_string()),
         };
@@ -273,7 +282,7 @@ pub async fn submit_calldata_with_lazy_approvals(
         Err(err) => {
             return LazySubmitOutcome {
                 submission: None,
-                approval_tx_hashes,
+                approval_submissions,
                 consumed_nonces,
                 error: Some(format!("{err:#}")),
             };
@@ -296,7 +305,7 @@ pub async fn submit_calldata_with_lazy_approvals(
         Err(err) => {
             return LazySubmitOutcome {
                 submission: None,
-                approval_tx_hashes,
+                approval_submissions,
                 consumed_nonces,
                 error: Some(format!("{err:#}")),
             };
@@ -307,7 +316,7 @@ pub async fn submit_calldata_with_lazy_approvals(
         candidate_id = %candidate.id,
         tx_hash = %tx_hash,
         nonce = next_nonce,
-        approval_txs = approval_tx_hashes.len(),
+        approval_txs = approval_submissions.len(),
         gas_limit = %gas_limit,
         max_fee_per_gas = %fees.max_fee_per_gas,
         max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
@@ -326,7 +335,7 @@ pub async fn submit_calldata_with_lazy_approvals(
             max_fee_per_gas: fees.max_fee_per_gas,
             max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
         }),
-        approval_tx_hashes,
+        approval_submissions,
         consumed_nonces: consumed_nonces.saturating_add(1),
         error: None,
     }

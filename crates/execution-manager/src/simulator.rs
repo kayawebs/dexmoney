@@ -649,6 +649,8 @@ mod tests {
             pool_active_refresh_interval_secs: 60,
             pool_active_refresh_batch_size: 25,
             market_data_flashblocks_enabled: true,
+            market_data_global_pool_discovery_enabled: true,
+            searcher_multihop_enabled: true,
             aerodrome_fee_refresh_interval_secs: 15,
             v3_tick_refresh_interval_secs: 60,
             v3_tick_bitmap_word_radius: 8,
