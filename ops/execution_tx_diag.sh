@@ -21,6 +21,12 @@ fi
 TX_HASH="${1:-}"
 OPPORTUNITY_ID="${2:-}"
 INTERVAL="${INTERVAL:-2 hours}"
+DOCKER_SINCE="${DOCKER_SINCE:-${INTERVAL// hours/h}}"
+DOCKER_SINCE="${DOCKER_SINCE// hour/h}"
+DOCKER_SINCE="${DOCKER_SINCE// minutes/m}"
+DOCKER_SINCE="${DOCKER_SINCE// minute/m}"
+DOCKER_SINCE="${DOCKER_SINCE// seconds/s}"
+DOCKER_SINCE="${DOCKER_SINCE// second/s}"
 OUT_DIR="${OUT_DIR:-reports}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_FILE="$OUT_DIR/execution-tx-diag-$STAMP.txt"
@@ -112,21 +118,26 @@ SQL
 
 run_sql "1. target transaction, simulation, opportunity" <<'SQL'
 WITH target AS (
+  WITH params AS (
+    SELECT NULLIF(:'opportunity_id', '')::uuid AS opportunity_id
+  )
   SELECT DISTINCT
-    COALESCE(t.opportunity_id, NULLIF(:'opportunity_id', '')::uuid) AS opportunity_id,
+    COALESCE(t.opportunity_id, params.opportunity_id) AS opportunity_id,
     t.simulation_id,
     t.tx_hash
   FROM transactions t
+  CROSS JOIN params
   WHERE (:'tx_hash' <> '' AND lower(t.tx_hash) = lower(:'tx_hash'))
-     OR (:'opportunity_id' <> '' AND t.opportunity_id = :'opportunity_id'::uuid)
+     OR (params.opportunity_id IS NOT NULL AND t.opportunity_id = params.opportunity_id)
   UNION
   SELECT DISTINCT
     o.id AS opportunity_id,
     s.id AS simulation_id,
     NULL::text AS tx_hash
   FROM opportunities o
+  CROSS JOIN params
   LEFT JOIN simulations s ON s.opportunity_id = o.id
-  WHERE :'opportunity_id' <> '' AND o.id = :'opportunity_id'::uuid
+  WHERE params.opportunity_id IS NOT NULL AND o.id = params.opportunity_id
 )
 SELECT
   o.id AS opportunity_id,
@@ -174,11 +185,15 @@ SQL
 
 run_sql "2. target path steps" <<'SQL'
 WITH target_opp AS (
+  WITH params AS (
+    SELECT NULLIF(:'opportunity_id', '')::uuid AS opportunity_id
+  )
   SELECT DISTINCT o.*
   FROM opportunities o
+  CROSS JOIN params
   LEFT JOIN transactions t ON t.opportunity_id = o.id
   WHERE (:'tx_hash' <> '' AND lower(t.tx_hash) = lower(:'tx_hash'))
-     OR (:'opportunity_id' <> '' AND o.id = :'opportunity_id'::uuid)
+     OR (params.opportunity_id IS NOT NULL AND o.id = params.opportunity_id)
 )
 SELECT
   o.id AS opportunity_id,
@@ -273,10 +288,10 @@ SELECT
   count(*) FILTER (WHERE s.success) AS sim_success,
   count(*) FILTER (WHERE s.revert_reason ILIKE '%MinProfitNotMet%') AS min_profit_not_met,
   count(*) FILTER (WHERE s.revert_reason ILIKE '%router/no-revert-data%') AS router_no_revert_data,
-  min(expected_profit::numeric) AS min_expected_profit,
-  percentile_cont(0.5) WITHIN GROUP (ORDER BY expected_profit::numeric) AS p50_expected_profit,
-  max(expected_profit::numeric) AS max_expected_profit,
-  max(created_at) AS latest_opportunity
+  min(o.expected_profit::numeric) AS min_expected_profit,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY o.expected_profit::numeric) AS p50_expected_profit,
+  max(o.expected_profit::numeric) AS max_expected_profit,
+  max(o.created_at) AS latest_opportunity
 FROM by_path o
 LEFT JOIN simulations s ON s.opportunity_id = o.id
 LEFT JOIN transactions t ON t.opportunity_id = o.id
@@ -314,6 +329,6 @@ if [[ -n "${REDIS_URL:-}" ]]; then
   run_cmd "12. redis EOA lane states" bash -lc "redis-cli -u '$REDIS_URL' --scan --pattern 'eoa:*:state' | sort | while read -r k; do echo \"\$k\"; redis-cli -u '$REDIS_URL' GET \"\$k\"; done"
 fi
 
-run_cmd "13. execution-manager recent logs" bash -lc "sudo docker compose --env-file .env.docker -f docker-compose.apps.yml logs --since '$INTERVAL' execution-manager | grep -E 'execution worker selected for candidate batch|tx submitted|simulation success/fail|MinProfitNotMet|router/no-revert-data|candidate skipped|candidate expired|circuit breaker|in-flight|confirmed|reverted|executor approval|worker funding|Error|WARN' | tail -500"
+run_cmd "13. execution-manager recent logs" bash -lc "sudo docker compose --env-file .env.docker -f docker-compose.apps.yml logs --since '$DOCKER_SINCE' execution-manager | grep -E 'execution worker selected for candidate batch|tx submitted|simulation success/fail|MinProfitNotMet|router/no-revert-data|candidate skipped|candidate expired|circuit breaker|in-flight|confirmed|reverted|executor approval|worker funding|Error|WARN' | tail -500"
 
 echo "$OUT_FILE"
