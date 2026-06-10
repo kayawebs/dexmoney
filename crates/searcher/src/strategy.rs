@@ -16,6 +16,7 @@ use crate::opportunity::build_candidate;
 #[cfg(test)]
 const MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR: usize = 2_000;
 const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 5_000;
+const MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN: usize = 20_000;
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
 const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 
@@ -497,7 +498,7 @@ impl SearchEngine {
             return Vec::new();
         }
 
-        let mut paths = Vec::new();
+        let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for anchor in anchors {
             for changed_pool in changed_pools {
@@ -506,7 +507,7 @@ impl SearchEngine {
                 };
                 for changed_edge in changed_edges {
                     add_dynamic_cycles_for_changed_edge(
-                        &mut paths,
+                        &mut candidates,
                         &mut seen,
                         graph,
                         &anchor,
@@ -514,21 +515,20 @@ impl SearchEngine {
                         3,
                     );
                     add_dynamic_cycles_for_changed_edge(
-                        &mut paths,
+                        &mut candidates,
                         &mut seen,
                         graph,
                         &anchor,
                         changed_edge,
                         4,
                     );
-                    if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
-                        paths.truncate(MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN);
-                        return paths;
+                    if candidates.len() >= MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN {
+                        return select_dynamic_paths(candidates);
                     }
                 }
             }
         }
-        paths
+        select_dynamic_paths(candidates)
     }
 
     #[cfg(test)]
@@ -866,6 +866,12 @@ impl OwnedPoolEdge {
     }
 }
 
+struct ScoredDynamicPath {
+    path: SearchPath,
+    score_bps: U256,
+    estimated_profit: U256,
+}
+
 #[derive(Clone)]
 pub(crate) struct GraphSnapshot {
     edges_by_token: HashMap<Address, Vec<OwnedPoolEdge>>,
@@ -956,7 +962,7 @@ fn pool_depth_score(state: &PoolState) -> U256 {
 }
 
 fn add_dynamic_cycles_for_changed_edge(
-    paths: &mut Vec<SearchPath>,
+    paths: &mut Vec<ScoredDynamicPath>,
     seen: &mut HashSet<String>,
     graph: &GraphSnapshot,
     anchor: &AnchorSearchConfig,
@@ -988,11 +994,116 @@ fn add_dynamic_cycles_for_changed_edge(
                 if !seen.insert(fingerprint) {
                     continue;
                 }
-                paths.push(build_dynamic_multihop_search_path(anchor, &cycle));
-                if paths.len() >= MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN {
+                let Some(scored_path) = score_dynamic_multihop_path(anchor, &cycle) else {
+                    continue;
+                };
+                paths.push(scored_path);
+                if paths.len() >= MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN {
                     return;
                 }
             }
+        }
+    }
+}
+
+fn select_dynamic_paths(mut paths: Vec<ScoredDynamicPath>) -> Vec<SearchPath> {
+    paths.sort_by(|left, right| {
+        right
+            .score_bps
+            .cmp(&left.score_bps)
+            .then_with(|| right.estimated_profit.cmp(&left.estimated_profit))
+            .then_with(|| left.path.path.name.cmp(&right.path.path.name))
+    });
+    paths
+        .into_iter()
+        .take(MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN)
+        .map(|path| path.path)
+        .collect()
+}
+
+fn score_dynamic_multihop_path(
+    anchor: &AnchorSearchConfig,
+    edges: &[OwnedPoolEdge],
+) -> Option<ScoredDynamicPath> {
+    let mut best_score_bps = U256::ZERO;
+    let mut best_profit = U256::ZERO;
+    for amount_in in anchor.amount_sizes.iter().copied() {
+        if amount_in.is_zero() {
+            continue;
+        }
+        let mut amount = amount_in;
+        for edge in edges {
+            amount = rough_quote_edge_upper_bound(edge, amount)?;
+            if amount.is_zero() {
+                return None;
+            }
+        }
+
+        let estimated_profit = amount.saturating_sub(amount_in);
+        if estimated_profit < anchor.min_profit {
+            continue;
+        }
+        let score_bps = amount
+            .checked_mul(U256::from(10_000u64))
+            .and_then(|value| value.checked_div(amount_in))?;
+        if score_bps > best_score_bps
+            || (score_bps == best_score_bps && estimated_profit > best_profit)
+        {
+            best_score_bps = score_bps;
+            best_profit = estimated_profit;
+        }
+    }
+    if best_score_bps.is_zero() {
+        return None;
+    }
+    Some(ScoredDynamicPath {
+        path: build_dynamic_multihop_search_path(anchor, edges),
+        score_bps: best_score_bps,
+        estimated_profit: best_profit,
+    })
+}
+
+fn rough_quote_edge_upper_bound(edge: &OwnedPoolEdge, amount_in: U256) -> Option<U256> {
+    match edge.state.variant {
+        PoolVariant::AerodromeVolatile => {
+            let reserve0 = edge.state.reserve0?;
+            let reserve1 = edge.state.reserve1?;
+            let (reserve_in, reserve_out) = if edge.token_in == edge.state.token0 {
+                (reserve0, reserve1)
+            } else if edge.token_in == edge.state.token1 {
+                (reserve1, reserve0)
+            } else {
+                return None;
+            };
+            if edge.state.stable.unwrap_or(false) {
+                let decimals0 = edge.state.token0_decimals?;
+                let decimals1 = edge.state.token1_decimals?;
+                let (decimals_in, decimals_out) = if edge.token_in == edge.state.token0 {
+                    (decimals0, decimals1)
+                } else {
+                    (decimals1, decimals0)
+                };
+                AerodromeStableQuoter::quote_amount_out(
+                    reserve_in,
+                    reserve_out,
+                    amount_in,
+                    edge.state.fee_bps,
+                    decimals_in,
+                    decimals_out,
+                )
+                .ok()
+            } else {
+                AerodromeVolatileQuoter::quote_amount_out(
+                    reserve_in,
+                    reserve_out,
+                    amount_in,
+                    edge.state.fee_bps,
+                )
+                .ok()
+            }
+        }
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+            spot_quote_exact_in(&edge.state, edge.token_in, amount_in).ok()
         }
     }
 }
