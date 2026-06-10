@@ -114,6 +114,13 @@ where
         debug!("no candidate available");
         return Ok(());
     };
+    if let Some(wallet) = selected_wallet.as_ref() {
+        info!(
+            worker = %wallet.address(),
+            candidate_count = candidates.len(),
+            "execution worker selected for candidate batch"
+        );
+    }
     let current_block = provider.get_block_number().await?;
 
     let mut simulated = 0usize;
@@ -784,7 +791,7 @@ where
     }
 
     if let Some(worker) = ready_worker {
-        info!(
+        debug!(
             worker = %worker.address(),
             incomplete_workers,
             "selected execution worker EOA"
