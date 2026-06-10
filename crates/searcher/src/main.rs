@@ -54,6 +54,11 @@ async fn main() -> Result<()> {
                 cycles = aggregate.cycles,
                 total_cycle_ms = aggregate.total_cycle_ms,
                 max_cycle_ms = aggregate.max_cycle_ms,
+                state_load_ms = aggregate.state_load_ms,
+                tick_load_ms = aggregate.tick_load_ms,
+                path_build_ms = aggregate.path_build_ms,
+                quote_ms = aggregate.quote_ms,
+                publish_ms = aggregate.publish_ms,
                 idle_cycles = aggregate.idle_cycles,
                 changed_pool_scans = aggregate.changed_pool_scans,
                 changed_pools = aggregate.changed_pools,
@@ -98,6 +103,11 @@ struct SearchCycleStats {
     cycles: u64,
     total_cycle_ms: u64,
     max_cycle_ms: u64,
+    state_load_ms: u64,
+    tick_load_ms: u64,
+    path_build_ms: u64,
+    quote_ms: u64,
+    publish_ms: u64,
     idle_cycles: u64,
     changed_pool_scans: u64,
     changed_pools: u64,
@@ -118,6 +128,11 @@ impl SearchCycleStats {
         self.cycles += other.cycles;
         self.total_cycle_ms += other.total_cycle_ms;
         self.max_cycle_ms = self.max_cycle_ms.max(other.max_cycle_ms);
+        self.state_load_ms += other.state_load_ms;
+        self.tick_load_ms += other.tick_load_ms;
+        self.path_build_ms += other.path_build_ms;
+        self.quote_ms += other.quote_ms;
+        self.publish_ms += other.publish_ms;
         self.idle_cycles += other.idle_cycles;
         self.changed_pool_scans += other.changed_pool_scans;
         self.changed_pools += other.changed_pools;
@@ -239,6 +254,7 @@ where
         recorder.enabled_pair_search_configs().await?,
     )?;
 
+    let state_load_started = Instant::now();
     let mut rebuild_path_index = runtime.path_index.is_none();
     for pool in &changed_pools {
         match pool_store.get_pool_state(*pool).await? {
@@ -258,6 +274,7 @@ where
             }
         }
     }
+    let state_load_ms = state_load_started.elapsed().as_millis() as u64;
 
     let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
     if pool_states.is_empty() {
@@ -283,11 +300,17 @@ where
     let Some(graph_snapshot) = runtime.graph_snapshot.as_ref() else {
         return Ok(SearchCycleStats::default());
     };
-    let mut tick_states = Vec::new();
+    let path_build_started = Instant::now();
     let dynamic_paths =
         engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
     let mut path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
     path_pools.extend(engine.path_pool_addresses_for_search_paths(&dynamic_paths));
+    let search_paths =
+        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
+    let path_build_ms = path_build_started.elapsed().as_millis() as u64;
+
+    let tick_load_started = Instant::now();
+    let mut tick_states = Vec::new();
     for state in &pool_states {
         if !path_pools.contains(&state.pool_id.address) {
             continue;
@@ -301,24 +324,29 @@ where
             tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
         }
     }
+    let tick_load_ms = tick_load_started.elapsed().as_millis() as u64;
     let mut cycle_stats = SearchCycleStats {
         cycles: 1,
+        state_load_ms,
+        tick_load_ms,
+        path_build_ms,
         path_pools: path_pools.len() as u64,
         changed_pool_scans: 1,
         changed_pools: changed_pools.len() as u64,
         ..SearchCycleStats::default()
     };
-    let search_paths =
-        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
     cycle_stats.search.total_paths = path_index.total_paths();
     cycle_stats.search.dynamic_multihop_paths = dynamic_paths.len() as u64;
 
     for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
+        let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
             .search_with_stats_for_paths(&pool_states, &tick_states, path_batch)
             .await?;
+        cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
         search_stats.total_paths = 0;
         cycle_stats.search.merge(&search_stats);
+        let publish_started = Instant::now();
         publish_candidates(
             candidate_store,
             recorder,
@@ -330,6 +358,7 @@ where
             candidates,
         )
         .await?;
+        cycle_stats.publish_ms += publish_started.elapsed().as_millis() as u64;
     }
 
     let elapsed_ms = cycle_started.elapsed().as_millis() as u64;
