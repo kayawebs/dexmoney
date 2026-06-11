@@ -1437,27 +1437,12 @@ async fn quote_path(
     Ok(Some((amount, max_impact, diagnostics)))
 }
 
-#[cfg(test)]
-fn quote_validity_gap(diagnostics: &QuoteDiagnostics) -> Option<u64> {
-    let quote_block = diagnostics
-        .steps
-        .iter()
-        .map(|step| step.valid_through_block.max(step.source_block))
-        .min()?;
-    let newest_source = diagnostics
-        .steps
-        .iter()
-        .map(|step| step.source_block)
-        .max()?;
-    Some(newest_source.saturating_sub(quote_block))
-}
-
 fn candidate_block_number_from_diagnostics(diagnostics: &QuoteDiagnostics) -> u64 {
     diagnostics
         .steps
         .iter()
-        .map(|step| step.valid_through_block.max(step.source_block))
-        .min()
+        .map(|step| step.source_block)
+        .max()
         .unwrap_or(0)
 }
 
@@ -1808,15 +1793,10 @@ fn short_token(token: Address) -> String {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, U256};
-    use base_arb_common::types::{
-        PoolId, PoolVariant, QuoteDiagnostics, QuoteStepDiagnostics, TickState,
-        TokenPairSearchConfig,
-    };
+    use base_arb_common::types::{PoolId, PoolVariant, TickState, TokenPairSearchConfig};
     use chrono::Utc;
 
-    use super::{
-        demo_pool_states, is_supported_config_pool, quote_validity_gap, SearchEngine, SearchPath,
-    };
+    use super::{demo_pool_states, is_supported_config_pool, SearchEngine, SearchPath};
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
@@ -2055,54 +2035,5 @@ mod tests {
             valid_through_block: 1,
             updated_at: Utc::now(),
         }
-    }
-
-    #[test]
-    fn quote_validity_uses_common_valid_block_not_source_block_age() {
-        let pool = address!("1111111111111111111111111111111111111111");
-        let token = address!("4200000000000000000000000000000000000006");
-        let step = |source_block, valid_through_block| QuoteStepDiagnostics {
-            step_no: 1,
-            mode: "test".into(),
-            pool,
-            variant: PoolVariant::UniswapV3,
-            source_block,
-            valid_through_block,
-            state_updated_at: Utc::now(),
-            token_in: token,
-            token_out: token,
-            amount_in: U256::ONE,
-            amount_out_raw: U256::ONE,
-            amount_out: U256::ONE,
-            fee_bps: 1,
-            fee_pips: Some(100),
-            stable: None,
-            tick_spacing: None,
-            sqrt_price_x96: None,
-            liquidity: None,
-            tick: None,
-            reserve0: None,
-            reserve1: None,
-            tick_count: 0,
-            ticks_used: 0,
-            crossed_ticks: 0,
-            tick_range_exhausted: false,
-        };
-        let diagnostics = QuoteDiagnostics {
-            modes: Vec::new(),
-            ticks_used: 0,
-            crossed_ticks: 0,
-            tick_range_exhausted: false,
-            v3_pools_without_ticks: 0,
-            steps: vec![step(100, 130), step(130, 130)],
-        };
-
-        assert_eq!(quote_validity_gap(&diagnostics), Some(0));
-
-        let stale = QuoteDiagnostics {
-            steps: vec![step(100, 100), step(130, 130)],
-            ..diagnostics
-        };
-        assert_eq!(quote_validity_gap(&stale), Some(30));
     }
 }
