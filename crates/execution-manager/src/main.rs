@@ -177,6 +177,8 @@ where
             CandidateAction::Submitted => {
                 info!(
                     candidate_count,
+                    current_block,
+                    max_candidate_lag_blocks,
                     simulated,
                     skipped = skipped_by_reason.values().sum::<usize>(),
                     elapsed_ms = batch_started.elapsed().as_millis() as u64,
@@ -194,6 +196,8 @@ where
 
     info!(
         candidate_count,
+        current_block,
+        max_candidate_lag_blocks,
         simulated,
         skipped = skipped_by_reason.values().sum::<usize>(),
         elapsed_ms = batch_started.elapsed().as_millis() as u64,
@@ -318,14 +322,14 @@ where
 {
     let block_lag = current_block.saturating_sub(candidate.block_number);
     if block_lag > max_candidate_lag_blocks {
-        debug!(
+        warn!(
             candidate_id = %candidate.id,
             path = %candidate.path.name,
             candidate_block = candidate.block_number,
             current_block,
             block_lag,
             max_lag_blocks = max_candidate_lag_blocks,
-            "candidate skipped because it is too far behind current block"
+            "fresh candidate unexpectedly skipped because it is too far behind current block"
         );
         return Ok(CandidateAction::Skipped("block_lag"));
     }
@@ -796,11 +800,17 @@ where
     let mut expired = 0usize;
     let mut stale_by_block = 0usize;
     let mut candidates = Vec::new();
+    let mut popped = 0usize;
+    let mut min_fresh_lag = u64::MAX;
+    let mut max_fresh_lag = 0u64;
+    let mut min_stale_lag = u64::MAX;
+    let mut max_stale_lag = 0u64;
 
     for _ in 0..MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE {
         let Some(candidate) = candidate_store.pop_candidate().await? else {
             break;
         };
+        popped += 1;
         if candidate.is_expired(now) {
             expired += 1;
             continue;
@@ -808,21 +818,51 @@ where
         let block_lag = current_block.saturating_sub(candidate.block_number);
         if block_lag > max_lag_blocks {
             stale_by_block += 1;
+            min_stale_lag = min_stale_lag.min(block_lag);
+            max_stale_lag = max_stale_lag.max(block_lag);
             continue;
         }
+        min_fresh_lag = min_fresh_lag.min(block_lag);
+        max_fresh_lag = max_fresh_lag.max(block_lag);
         candidates.push(candidate);
         if candidates.len() >= MAX_CANDIDATE_DRAIN_PER_CYCLE {
             break;
         }
     }
 
-    if expired > 0 {
-        info!(expired, "drained expired candidates from queue");
-    }
-    if stale_by_block > 0 {
+    if popped > 0 {
+        let min_fresh_lag = if candidates.is_empty() {
+            None
+        } else {
+            Some(min_fresh_lag)
+        };
+        let max_fresh_lag = if candidates.is_empty() {
+            None
+        } else {
+            Some(max_fresh_lag)
+        };
+        let min_stale_lag = if stale_by_block == 0 {
+            None
+        } else {
+            Some(min_stale_lag)
+        };
+        let max_stale_lag = if stale_by_block == 0 {
+            None
+        } else {
+            Some(max_stale_lag)
+        };
         info!(
+            popped,
+            fresh = candidates.len(),
+            expired,
             stale_by_block,
-            current_block, max_lag_blocks, "drained stale-block candidates from queue"
+            current_block,
+            max_lag_blocks,
+            ?min_fresh_lag,
+            ?max_fresh_lag,
+            ?min_stale_lag,
+            ?max_stale_lag,
+            "candidate queue drain summary"
         );
     }
     candidates.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
