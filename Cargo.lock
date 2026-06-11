@@ -3298,6 +3298,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
+ "base-arb-chain",
  "base-arb-common",
  "base-arb-dex",
  "base-arb-storage",

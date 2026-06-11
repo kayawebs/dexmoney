@@ -4,6 +4,7 @@ mod strategy;
 
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
+use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
@@ -27,6 +28,7 @@ async fn main() -> Result<()> {
     let settings = Settings::load()?;
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
+    let provider = ChainProvider::from_settings(&settings);
 
     info!("searcher initialized");
     let mut ticker = interval(Duration::from_millis(100));
@@ -42,6 +44,7 @@ async fn main() -> Result<()> {
             &redis,
             &redis,
             &postgres,
+            &provider,
             &settings,
             settings.candidate_ttl_ms,
             settings.max_pool_state_age_ms,
@@ -67,6 +70,8 @@ async fn main() -> Result<()> {
                 changed_pool_scans = aggregate.changed_pool_scans,
                 changed_pools = aggregate.changed_pools,
                 path_pools = aggregate.path_pools,
+                latest_chain_block = aggregate.latest_chain_block,
+                latest_pool_state_block = aggregate.latest_pool_state_block,
                 total_paths = aggregate.search.total_paths,
                 paths = aggregate.search.paths,
                 quote_attempts = aggregate.search.quote_attempts,
@@ -122,6 +127,8 @@ struct SearchCycleStats {
     changed_pool_scans: u64,
     changed_pools: u64,
     path_pools: u64,
+    latest_chain_block: u64,
+    latest_pool_state_block: u64,
     risk_rejected: u64,
     risk_expected_profit_rejected: u64,
     risk_price_impact_rejected: u64,
@@ -162,6 +169,10 @@ impl SearchCycleStats {
         self.changed_pool_scans += other.changed_pool_scans;
         self.changed_pools += other.changed_pools;
         self.path_pools += other.path_pools;
+        self.latest_chain_block = self.latest_chain_block.max(other.latest_chain_block);
+        self.latest_pool_state_block = self
+            .latest_pool_state_block
+            .max(other.latest_pool_state_block);
         self.risk_rejected += other.risk_rejected;
         self.risk_expected_profit_rejected += other.risk_expected_profit_rejected;
         self.risk_price_impact_rejected += other.risk_price_impact_rejected;
@@ -309,6 +320,7 @@ async fn run_search_cycle<P, C, R>(
     pool_store: &P,
     candidate_store: &C,
     recorder: &R,
+    provider: &ChainProvider,
     settings: &Settings,
     candidate_ttl_ms: i64,
     max_pool_state_age_ms: i64,
@@ -386,11 +398,12 @@ where
         debug!("no pool states available in searcher cache");
         return Ok(SearchCycleStats::default());
     }
-    let latest_known_block = pool_states
+    let latest_pool_state_block = pool_states
         .iter()
         .map(|state| state.block_number)
         .max()
         .unwrap_or(0);
+    let latest_known_block = provider.get_block_number().await?;
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
     let now = Utc::now();
     let active_pool_addresses = active_pool_addresses(&pool_states, now, max_pool_state_age_ms);
@@ -402,7 +415,9 @@ where
     if active_pool_states.is_empty() {
         debug!(
             latest_known_block,
-            max_pool_state_age_ms, "no active pool states available in searcher cache"
+            latest_pool_state_block,
+            max_pool_state_age_ms,
+            "no active pool states available in searcher cache"
         );
         return Ok(SearchCycleStats::default());
     }
@@ -444,6 +459,8 @@ where
         state_load_ms,
         path_build_ms,
         path_pools: path_pools.len() as u64,
+        latest_chain_block: latest_known_block,
+        latest_pool_state_block,
         inactive_pool_filtered_paths: inactive_pool_filtered_paths as u64,
         changed_pool_scans: 1,
         changed_pools: changed_pools.len() as u64,
