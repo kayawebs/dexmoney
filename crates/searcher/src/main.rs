@@ -415,45 +415,9 @@ where
         engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
     let path_build_ms = path_build_started.elapsed().as_millis() as u64;
 
-    let tick_load_started = Instant::now();
-    let mut tick_states = Vec::new();
-    let mut tick_cache_hits = 0u64;
-    let mut tick_cache_misses = 0u64;
-    let mut tick_cache_refreshes = 0u64;
-    for state in &pool_states {
-        if !path_pools.contains(&state.pool_id.address) {
-            continue;
-        }
-        if matches!(
-            state.variant,
-            base_arb_common::types::PoolVariant::AerodromeSlipstream
-                | base_arb_common::types::PoolVariant::UniswapV3
-                | base_arb_common::types::PoolVariant::PancakeV3
-        ) {
-            let pool = state.pool_id.address;
-            let should_refresh =
-                changed_pools.contains(&pool) || !runtime.tick_states.contains_key(&pool);
-            if should_refresh {
-                let loaded_ticks = pool_store.get_pool_ticks(pool).await?;
-                tick_cache_misses += 1;
-                tick_cache_refreshes += 1;
-                runtime.tick_states.insert(pool, loaded_ticks);
-            } else {
-                tick_cache_hits += 1;
-            }
-            if let Some(cached_ticks) = runtime.tick_states.get(&pool) {
-                tick_states.extend(cached_ticks.iter().cloned());
-            }
-        }
-    }
-    let tick_load_ms = tick_load_started.elapsed().as_millis() as u64;
     let mut cycle_stats = SearchCycleStats {
         cycles: 1,
         state_load_ms,
-        tick_load_ms,
-        tick_cache_hits,
-        tick_cache_misses,
-        tick_cache_refreshes,
         path_build_ms,
         path_pools: path_pools.len() as u64,
         changed_pool_scans: 1,
@@ -462,8 +426,24 @@ where
     };
     cycle_stats.search.total_paths = path_index.total_paths();
     cycle_stats.search.dynamic_multihop_paths = dynamic_paths.len() as u64;
+    let mut refreshed_tick_pools = HashSet::new();
 
     for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
+        let batch_path_pools = engine.path_pool_addresses_for_search_paths(path_batch);
+        let tick_load_started = Instant::now();
+        let (tick_states, tick_load_stats) = load_tick_states_for_pools(
+            runtime,
+            pool_store,
+            &changed_pools,
+            &mut refreshed_tick_pools,
+            &batch_path_pools,
+        )
+        .await?;
+        cycle_stats.tick_load_ms += tick_load_started.elapsed().as_millis() as u64;
+        cycle_stats.tick_cache_hits += tick_load_stats.cache_hits;
+        cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
+        cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
+
         let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
             .search_with_stats_for_paths(&pool_states, &tick_states, path_batch)
@@ -493,6 +473,56 @@ where
     cycle_stats.max_cycle_ms = elapsed_ms;
 
     Ok(cycle_stats)
+}
+
+#[derive(Default)]
+struct TickLoadStats {
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_refreshes: u64,
+}
+
+async fn load_tick_states_for_pools<P>(
+    runtime: &mut SearchRuntime,
+    pool_store: &P,
+    changed_pools: &HashSet<Address>,
+    refreshed_tick_pools: &mut HashSet<Address>,
+    path_pools: &HashSet<Address>,
+) -> Result<(Vec<TickState>, TickLoadStats)>
+where
+    P: TickStateStore,
+{
+    let mut tick_states = Vec::new();
+    let mut stats = TickLoadStats::default();
+    for pool in path_pools {
+        let Some(state) = runtime.pool_states.get(pool) else {
+            continue;
+        };
+        if !matches!(
+            state.variant,
+            base_arb_common::types::PoolVariant::AerodromeSlipstream
+                | base_arb_common::types::PoolVariant::UniswapV3
+                | base_arb_common::types::PoolVariant::PancakeV3
+        ) {
+            continue;
+        }
+
+        let should_refresh = !runtime.tick_states.contains_key(pool)
+            || (changed_pools.contains(pool) && !refreshed_tick_pools.contains(pool));
+        if should_refresh {
+            let loaded_ticks = pool_store.get_pool_ticks(*pool).await?;
+            stats.cache_misses += 1;
+            stats.cache_refreshes += 1;
+            runtime.tick_states.insert(*pool, loaded_ticks);
+            refreshed_tick_pools.insert(*pool);
+        } else {
+            stats.cache_hits += 1;
+        }
+        if let Some(cached_ticks) = runtime.tick_states.get(pool) {
+            tick_states.extend(cached_ticks.iter().cloned());
+        }
+    }
+    Ok((tick_states, stats))
 }
 
 async fn publish_candidates<C, R>(
