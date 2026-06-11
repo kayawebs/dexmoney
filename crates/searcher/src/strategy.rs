@@ -309,14 +309,7 @@ impl SearchEngine {
                         stats.min_profit_rejected += 1;
                         continue;
                     }
-                    let block_number = search_path
-                        .path
-                        .steps
-                        .iter()
-                        .filter_map(|step| quote_context.pool_state(step.pool))
-                        .map(|state| state.block_number)
-                        .max()
-                        .unwrap_or(0);
+                    let block_number = candidate_block_number_from_diagnostics(&diagnostics);
                     let candidate = build_candidate(
                         block_number,
                         search_path.strategy.clone(),
@@ -434,14 +427,7 @@ impl SearchEngine {
                 stats.min_profit_rejected += 1;
                 continue;
             }
-            let block_number = search_path
-                .path
-                .steps
-                .iter()
-                .filter_map(|step| quote_context.pool_state(step.pool))
-                .map(|state| state.block_number)
-                .max()
-                .unwrap_or(0);
+            let block_number = candidate_block_number_from_diagnostics(&diagnostics);
             let candidate = build_candidate(
                 block_number,
                 search_path.strategy.clone(),
@@ -1470,6 +1456,15 @@ fn quote_validity_gap(diagnostics: &QuoteDiagnostics) -> Option<u64> {
         .map(|step| step.source_block)
         .max()?;
     Some(newest_source.saturating_sub(quote_block))
+}
+
+fn candidate_block_number_from_diagnostics(diagnostics: &QuoteDiagnostics) -> u64 {
+    diagnostics
+        .steps
+        .iter()
+        .map(|step| step.valid_through_block.max(step.source_block))
+        .min()
+        .unwrap_or(0)
 }
 
 fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPath {

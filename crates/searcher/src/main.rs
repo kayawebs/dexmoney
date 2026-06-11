@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
                 candidates_coalesced = aggregate.candidates_coalesced,
+                stale_publish_rejected = aggregate.stale_publish_rejected,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
@@ -119,6 +120,7 @@ struct SearchCycleStats {
     risk_pool_state_stale: u64,
     risk_other_rejected: u64,
     candidates_coalesced: u64,
+    stale_publish_rejected: u64,
     opportunities_created: u64,
 }
 
@@ -144,6 +146,7 @@ impl SearchCycleStats {
         self.risk_pool_state_stale += other.risk_pool_state_stale;
         self.risk_other_rejected += other.risk_other_rejected;
         self.candidates_coalesced += other.candidates_coalesced;
+        self.stale_publish_rejected += other.stale_publish_rejected;
         self.opportunities_created += other.opportunities_created;
     }
 
@@ -281,6 +284,11 @@ where
         debug!("no pool states available in searcher cache");
         return Ok(SearchCycleStats::default());
     }
+    let latest_known_block = pool_states
+        .iter()
+        .map(|state| state.effective_valid_through_block())
+        .max()
+        .unwrap_or(0);
     if rebuild_path_index {
         runtime.path_index = Some(engine.build_path_index(&pool_states));
         runtime.graph_snapshot = Some(engine.build_graph_snapshot(&pool_states));
@@ -355,6 +363,8 @@ where
             &pool_states,
             max_pool_state_age_ms,
             max_price_impact_bps,
+            latest_known_block,
+            settings.execution_max_candidate_lag_blocks.max(1),
             candidates,
         )
         .await?;
@@ -376,6 +386,8 @@ async fn publish_candidates<C, R>(
     pool_states: &[PoolState],
     max_pool_state_age_ms: i64,
     max_price_impact_bps: u64,
+    latest_known_block: u64,
+    max_candidate_lag_blocks: u64,
     candidates: Vec<base_arb_common::types::Candidate>,
 ) -> Result<()>
 where
@@ -387,6 +399,20 @@ where
     cycle_stats.candidates_coalesced +=
         original_candidate_count.saturating_sub(candidates.len()) as u64;
     for candidate in candidates {
+        let candidate_lag = latest_known_block.saturating_sub(candidate.block_number);
+        if candidate_lag > max_candidate_lag_blocks {
+            cycle_stats.stale_publish_rejected += 1;
+            debug!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                candidate_block = candidate.block_number,
+                latest_known_block,
+                candidate_lag,
+                max_candidate_lag_blocks,
+                "candidate rejected before publish because quote block is stale"
+            );
+            continue;
+        }
         debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
