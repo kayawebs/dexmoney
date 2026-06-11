@@ -8,7 +8,6 @@ license.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 base-arb-common = { path = "../common" }
-base-arb-chain = { path = "../chain" }
 base-arb-dex = { path = "../dex" }
 base-arb-storage = { path = "../storage" }
 chrono.workspace = true

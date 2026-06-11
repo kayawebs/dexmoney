@@ -4,13 +4,12 @@ mod strategy;
 
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
-use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
 use base_arb_storage::{
-    postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
-    PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
+    postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore,
+    PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -28,7 +27,6 @@ async fn main() -> Result<()> {
     let settings = Settings::load()?;
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
-    let provider = ChainProvider::from_settings(&settings);
 
     info!("searcher initialized");
     let mut ticker = interval(Duration::from_millis(100));
@@ -44,7 +42,6 @@ async fn main() -> Result<()> {
             &redis,
             &redis,
             &postgres,
-            &provider,
             &settings,
             settings.candidate_ttl_ms,
             settings.max_pool_state_age_ms,
@@ -320,7 +317,6 @@ async fn run_search_cycle<P, C, R>(
     pool_store: &P,
     candidate_store: &C,
     recorder: &R,
-    provider: &ChainProvider,
     settings: &Settings,
     candidate_ttl_ms: i64,
     max_pool_state_age_ms: i64,
@@ -328,7 +324,7 @@ async fn run_search_cycle<P, C, R>(
     min_expected_profit_usdc: f64,
 ) -> Result<SearchCycleStats>
 where
-    P: PoolStateStore + PoolChangeStore + TickStateStore,
+    P: PoolStateStore + PoolChangeStore + CurrentBlockStore + TickStateStore,
     C: CandidateStore,
     R: RecorderStore + PairSearchConfigStore,
 {
@@ -403,7 +399,10 @@ where
         .map(|state| state.block_number)
         .max()
         .unwrap_or(0);
-    let latest_known_block = provider.get_block_number().await?;
+    let Some(latest_known_block) = pool_store.get_current_block().await? else {
+        debug!("current block not available from market-data");
+        return Ok(SearchCycleStats::default());
+    };
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
     let now = Utc::now();
     let active_pool_addresses = active_pool_addresses(&pool_states, now, max_pool_state_age_ms);

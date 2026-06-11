@@ -6,7 +6,8 @@ use redis::AsyncCommands;
 use tracing::info;
 
 use crate::{
-    CandidateStore, EoaStateStore, FailureStore, PoolChangeStore, PoolStateStore, TickStateStore,
+    CandidateStore, CurrentBlockStore, EoaStateStore, FailureStore, PoolChangeStore,
+    PoolStateStore, TickStateStore,
 };
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
@@ -38,6 +39,10 @@ pub fn candidates_key() -> &'static str {
 
 pub fn changed_pools_key() -> &'static str {
     "pools:changed"
+}
+
+pub fn current_block_key() -> &'static str {
+    "chain:current_block"
 }
 
 pub fn eoa_lane_key(address: alloy_primitives::Address) -> String {
@@ -116,6 +121,20 @@ impl PoolChangeStore for RedisStore {
             .into_iter()
             .map(|value| value.parse().map_err(Into::into))
             .collect()
+    }
+}
+
+#[async_trait]
+impl CurrentBlockStore for RedisStore {
+    async fn set_current_block(&self, block_number: u64) -> Result<()> {
+        let mut manager = self.manager.clone();
+        let _: () = manager.set(current_block_key(), block_number).await?;
+        Ok(())
+    }
+
+    async fn get_current_block(&self) -> Result<Option<u64>> {
+        let mut manager = self.manager.clone();
+        Ok(manager.get(current_block_key()).await?)
     }
 }
 

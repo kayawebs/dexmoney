@@ -30,6 +30,12 @@ pub trait PoolChangeStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait CurrentBlockStore: Send + Sync {
+    async fn set_current_block(&self, block_number: u64) -> anyhow::Result<()>;
+    async fn get_current_block(&self) -> anyhow::Result<Option<u64>>;
+}
+
+#[async_trait]
 pub trait TickStateStore: Send + Sync {
     async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()>;
     async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()>;
@@ -111,6 +117,7 @@ pub struct InMemoryStores {
     pool_snapshots: Arc<Mutex<Vec<PoolState>>>,
     ticks: Arc<Mutex<BTreeMap<(Address, i32), TickState>>>,
     changed_pools: Arc<Mutex<VecDeque<Address>>>,
+    current_block: Arc<Mutex<Option<u64>>>,
 }
 
 impl InMemoryStores {
@@ -162,6 +169,18 @@ impl PoolChangeStore for InMemoryStores {
             out.push(pool);
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl CurrentBlockStore for InMemoryStores {
+    async fn set_current_block(&self, block_number: u64) -> anyhow::Result<()> {
+        *self.current_block.lock().await = Some(block_number);
+        Ok(())
+    }
+
+    async fn get_current_block(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.current_block.lock().await)
     }
 }
 

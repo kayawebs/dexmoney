@@ -10,7 +10,7 @@ use base_arb_common::types::{
 };
 use base_arb_storage::{
     postgres::{FactoryRegistryRecord, PostgresStore},
-    PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
+    CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -55,7 +55,14 @@ pub struct MarketDataService<P> {
 
 impl<P> MarketDataService<P>
 where
-    P: PoolStateStore + PoolChangeStore + TickStateStore + Clone + Send + Sync + 'static,
+    P: PoolStateStore
+        + PoolChangeStore
+        + CurrentBlockStore
+        + TickStateStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
@@ -68,6 +75,7 @@ where
         self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
+        self.pool_store.set_current_block(last_seen_block).await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
         let active_refresh_interval =
@@ -91,6 +99,7 @@ where
         loop {
             ticker.tick().await;
             let latest_block = self.provider.get_block_number().await?;
+            self.pool_store.set_current_block(latest_block).await?;
             if latest_block <= last_seen_block {
                 if Instant::now() >= next_registry_reload {
                     monitored_states = self.reload_if_changed(monitored_states).await?;
@@ -2069,7 +2078,14 @@ where
 
 pub async fn run<P>(service: &MarketDataService<P>) -> Result<()>
 where
-    P: PoolStateStore + PoolChangeStore + TickStateStore + Clone + Send + Sync + 'static,
+    P: PoolStateStore
+        + PoolChangeStore
+        + CurrentBlockStore
+        + TickStateStore
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     service.run().await?;
     Ok(())

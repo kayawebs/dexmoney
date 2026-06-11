@@ -8,8 +8,8 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
 use base_arb_storage::{
-    postgres::PostgresStore, redis::RedisStore, CandidateStore, EoaStateStore, FailureStore,
-    PendingTransactionStore, RecorderStore,
+    postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore, EoaStateStore,
+    FailureStore, PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -78,14 +78,17 @@ async fn run_execution_cycle<C, E, R>(
     circuit_breaker: &mut ExecutionCircuitBreaker,
 ) -> Result<()>
 where
-    C: CandidateStore + FailureStore,
+    C: CandidateStore + CurrentBlockStore + FailureStore,
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
     let fund_wallet = configured_fund_wallet(settings)?;
     let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
-    let current_block = provider.get_block_number().await?;
+    let Some(current_block) = candidate_store.get_current_block().await? else {
+        debug!("current block not available from market-data");
+        return Ok(());
+    };
     let candidates =
         pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
     if candidates.is_empty() {
