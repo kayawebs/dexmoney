@@ -153,9 +153,15 @@ impl TickStateStore for RedisStore {
         let mut manager = self.manager.clone();
         let pattern = format!("ticks:*:{pool}:*");
         let keys: Vec<String> = manager.keys(pattern).await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut out: Vec<TickState> = Vec::with_capacity(keys.len());
-        for key in keys {
-            let value: Option<String> = manager.get(key).await?;
+        let values: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&keys)
+            .query_async(&mut manager)
+            .await?;
+        for value in values {
             if let Some(raw) = value {
                 out.push(serde_json::from_str(&raw)?);
             }

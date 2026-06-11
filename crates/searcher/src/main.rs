@@ -6,7 +6,7 @@ use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::errors::ArbBotError;
-use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant};
+use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, PairSearchConfigStore,
     PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
                 max_cycle_ms = aggregate.max_cycle_ms,
                 state_load_ms = aggregate.state_load_ms,
                 tick_load_ms = aggregate.tick_load_ms,
+                tick_cache_hits = aggregate.tick_cache_hits,
+                tick_cache_misses = aggregate.tick_cache_misses,
+                tick_cache_refreshes = aggregate.tick_cache_refreshes,
                 path_build_ms = aggregate.path_build_ms,
                 quote_ms = aggregate.quote_ms,
                 publish_ms = aggregate.publish_ms,
@@ -106,6 +109,9 @@ struct SearchCycleStats {
     max_cycle_ms: u64,
     state_load_ms: u64,
     tick_load_ms: u64,
+    tick_cache_hits: u64,
+    tick_cache_misses: u64,
+    tick_cache_refreshes: u64,
     path_build_ms: u64,
     quote_ms: u64,
     publish_ms: u64,
@@ -132,6 +138,9 @@ impl SearchCycleStats {
         self.max_cycle_ms = self.max_cycle_ms.max(other.max_cycle_ms);
         self.state_load_ms += other.state_load_ms;
         self.tick_load_ms += other.tick_load_ms;
+        self.tick_cache_hits += other.tick_cache_hits;
+        self.tick_cache_misses += other.tick_cache_misses;
+        self.tick_cache_refreshes += other.tick_cache_refreshes;
         self.path_build_ms += other.path_build_ms;
         self.quote_ms += other.quote_ms;
         self.publish_ms += other.publish_ms;
@@ -170,6 +179,7 @@ impl SearchCycleStats {
 #[derive(Default)]
 struct SearchRuntime {
     pool_states: HashMap<Address, PoolState>,
+    tick_states: HashMap<Address, Vec<TickState>>,
     pool_topology: HashMap<Address, PoolTopology>,
     path_index: Option<strategy::PathIndex>,
     graph_snapshot: Option<strategy::GraphSnapshot>,
@@ -274,6 +284,7 @@ where
                     rebuild_path_index = true;
                 }
                 runtime.pool_states.remove(pool);
+                runtime.tick_states.remove(pool);
             }
         }
     }
@@ -319,6 +330,9 @@ where
 
     let tick_load_started = Instant::now();
     let mut tick_states = Vec::new();
+    let mut tick_cache_hits = 0u64;
+    let mut tick_cache_misses = 0u64;
+    let mut tick_cache_refreshes = 0u64;
     for state in &pool_states {
         if !path_pools.contains(&state.pool_id.address) {
             continue;
@@ -329,7 +343,20 @@ where
                 | base_arb_common::types::PoolVariant::UniswapV3
                 | base_arb_common::types::PoolVariant::PancakeV3
         ) {
-            tick_states.extend(pool_store.get_pool_ticks(state.pool_id.address).await?);
+            let pool = state.pool_id.address;
+            let should_refresh =
+                changed_pools.contains(&pool) || !runtime.tick_states.contains_key(&pool);
+            if should_refresh {
+                let loaded_ticks = pool_store.get_pool_ticks(pool).await?;
+                tick_cache_misses += 1;
+                tick_cache_refreshes += 1;
+                runtime.tick_states.insert(pool, loaded_ticks);
+            } else {
+                tick_cache_hits += 1;
+            }
+            if let Some(cached_ticks) = runtime.tick_states.get(&pool) {
+                tick_states.extend(cached_ticks.iter().cloned());
+            }
         }
     }
     let tick_load_ms = tick_load_started.elapsed().as_millis() as u64;
@@ -337,6 +364,9 @@ where
         cycles: 1,
         state_load_ms,
         tick_load_ms,
+        tick_cache_hits,
+        tick_cache_misses,
+        tick_cache_refreshes,
         path_build_ms,
         path_pools: path_pools.len() as u64,
         changed_pool_scans: 1,
