@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
                 candidates_coalesced = aggregate.candidates_coalesced,
+                stale_pool_filtered_paths = aggregate.stale_pool_filtered_paths,
                 stale_publish_rejected = aggregate.stale_publish_rejected,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 risk_rejected = aggregate.risk_rejected,
@@ -127,6 +128,7 @@ struct SearchCycleStats {
     risk_pool_state_stale: u64,
     risk_other_rejected: u64,
     candidates_coalesced: u64,
+    stale_pool_filtered_paths: u64,
     stale_publish_rejected: u64,
     stale_publish_rejected_by_path: HashMap<String, StalePublishPathStats>,
     opportunities_created: u64,
@@ -166,6 +168,7 @@ impl SearchCycleStats {
         self.risk_pool_state_stale += other.risk_pool_state_stale;
         self.risk_other_rejected += other.risk_other_rejected;
         self.candidates_coalesced += other.candidates_coalesced;
+        self.stale_pool_filtered_paths += other.stale_pool_filtered_paths;
         self.stale_publish_rejected += other.stale_publish_rejected;
         merge_stale_publish_path_stats(
             &mut self.stale_publish_rejected_by_path,
@@ -387,6 +390,21 @@ where
         .map(|state| state.effective_valid_through_block())
         .max()
         .unwrap_or(0);
+    let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
+    let active_pool_addresses =
+        active_pool_addresses(&pool_states, latest_known_block, max_candidate_lag_blocks);
+    let active_pool_states = pool_states
+        .iter()
+        .filter(|state| active_pool_addresses.contains(&state.pool_id.address))
+        .cloned()
+        .collect::<Vec<_>>();
+    if active_pool_states.is_empty() {
+        debug!(
+            latest_known_block,
+            max_candidate_lag_blocks, "no active pool states available in searcher cache"
+        );
+        return Ok(SearchCycleStats::default());
+    }
     if rebuild_path_index {
         runtime.path_index = Some(engine.build_path_index(&pool_states));
         runtime.graph_snapshot = Some(engine.build_graph_snapshot(&pool_states));
@@ -409,10 +427,15 @@ where
     let path_build_started = Instant::now();
     let dynamic_paths =
         engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
-    let mut path_pools = engine.path_pool_addresses_for_path_index(path_index, &changed_pools);
-    path_pools.extend(engine.path_pool_addresses_for_search_paths(&dynamic_paths));
-    let search_paths =
+    let search_paths_raw =
         engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
+    let raw_search_path_count = search_paths_raw.len();
+    let search_paths = search_paths_raw
+        .into_iter()
+        .filter(|path| path.all_pools_in(&active_pool_addresses))
+        .collect::<Vec<_>>();
+    let stale_pool_filtered_paths = raw_search_path_count.saturating_sub(search_paths.len());
+    let path_pools = engine.path_pool_addresses_for_search_paths(&search_paths);
     let path_build_ms = path_build_started.elapsed().as_millis() as u64;
 
     let mut cycle_stats = SearchCycleStats {
@@ -420,6 +443,7 @@ where
         state_load_ms,
         path_build_ms,
         path_pools: path_pools.len() as u64,
+        stale_pool_filtered_paths: stale_pool_filtered_paths as u64,
         changed_pool_scans: 1,
         changed_pools: changed_pools.len() as u64,
         ..SearchCycleStats::default()
@@ -446,7 +470,7 @@ where
 
         let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
-            .search_with_stats_for_paths(&pool_states, &tick_states, path_batch)
+            .search_with_stats_for_paths(&active_pool_states, &tick_states, path_batch)
             .await?;
         cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
         search_stats.total_paths = 0;
@@ -461,7 +485,7 @@ where
             max_pool_state_age_ms,
             max_price_impact_bps,
             latest_known_block,
-            settings.execution_max_candidate_lag_blocks.max(1),
+            max_candidate_lag_blocks,
             candidates,
         )
         .await?;
@@ -473,6 +497,21 @@ where
     cycle_stats.max_cycle_ms = elapsed_ms;
 
     Ok(cycle_stats)
+}
+
+fn active_pool_addresses(
+    pool_states: &[PoolState],
+    latest_known_block: u64,
+    max_candidate_lag_blocks: u64,
+) -> HashSet<Address> {
+    pool_states
+        .iter()
+        .filter(|state| {
+            latest_known_block.saturating_sub(state.effective_valid_through_block())
+                <= max_candidate_lag_blocks
+        })
+        .map(|state| state.pool_id.address)
+        .collect()
 }
 
 #[derive(Default)]

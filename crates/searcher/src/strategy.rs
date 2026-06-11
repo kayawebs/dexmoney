@@ -453,14 +453,6 @@ impl SearchEngine {
         PathIndex::new(self.two_hop_paths_for_pool_states(pool_states))
     }
 
-    pub(crate) fn path_pool_addresses_for_path_index(
-        &self,
-        path_index: &PathIndex,
-        changed_pools: &HashSet<Address>,
-    ) -> HashSet<Address> {
-        path_index.path_pools_for_changed_pools(changed_pools)
-    }
-
     pub(crate) fn path_pool_addresses_for_search_paths(
         &self,
         paths: &[SearchPath],
@@ -779,6 +771,15 @@ pub(crate) struct SearchPath {
     strategy: String,
 }
 
+impl SearchPath {
+    pub(crate) fn all_pools_in(&self, pools: &HashSet<Address>) -> bool {
+        self.path
+            .steps
+            .iter()
+            .all(|step| pools.contains(&step.pool))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PathIndex {
     paths: Vec<SearchPath>,
@@ -818,13 +819,6 @@ impl PathIndex {
         }
         indices.sort_unstable();
         indices
-    }
-
-    fn path_pools_for_changed_pools(&self, changed_pools: &HashSet<Address>) -> HashSet<Address> {
-        self.path_indices_for_changed_pools(changed_pools)
-            .into_iter()
-            .flat_map(|index| self.paths[index].path.steps.iter().map(|step| step.pool))
-            .collect()
     }
 }
 
