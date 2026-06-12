@@ -128,7 +128,10 @@ impl PoolChangeStore for RedisStore {
 impl CurrentBlockStore for RedisStore {
     async fn set_current_block(&self, block_number: u64) -> Result<()> {
         let mut manager = self.manager.clone();
-        let _: () = manager.set(current_block_key(), block_number).await?;
+        let current: Option<u64> = manager.get(current_block_key()).await?;
+        if current.map_or(true, |current| block_number > current) {
+            let _: () = manager.set(current_block_key(), block_number).await?;
+        }
         Ok(())
     }
 

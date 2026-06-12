@@ -1243,6 +1243,9 @@ where
             event_type = %event.event_type,
             "Flashblocks pending event received"
         );
+        self.pool_store
+            .set_current_block(event.block_number)
+            .await?;
         self.recorder.record_dex_event(event.clone()).await?;
 
         // A flashblock event advances the pending-block view for every monitored
@@ -1365,6 +1368,9 @@ where
                 );
                 continue;
             }
+            self.pool_store
+                .set_current_block(state.block_number)
+                .await?;
             let previous = self
                 .pool_store
                 .get_pool_state(state.pool_id.address)

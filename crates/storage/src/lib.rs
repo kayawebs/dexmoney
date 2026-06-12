@@ -175,7 +175,8 @@ impl PoolChangeStore for InMemoryStores {
 #[async_trait]
 impl CurrentBlockStore for InMemoryStores {
     async fn set_current_block(&self, block_number: u64) -> anyhow::Result<()> {
-        *self.current_block.lock().await = Some(block_number);
+        let mut current = self.current_block.lock().await;
+        *current = Some(current.map_or(block_number, |current| current.max(block_number)));
         Ok(())
     }
 
