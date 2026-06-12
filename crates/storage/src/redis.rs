@@ -208,6 +208,27 @@ impl TickStateStore for RedisStore {
         Ok(())
     }
 
+    async fn replace_pool_ticks(&self, pool: Address, tick_states: Vec<TickState>) -> Result<()> {
+        let mut manager = self.manager.clone();
+        let pattern = format!("ticks:*:{pool}:*");
+        let existing_keys: Vec<String> = manager.keys(pattern).await?;
+        let mut pipe = redis::pipe();
+        if !existing_keys.is_empty() {
+            pipe.del(existing_keys).ignore();
+        }
+        for tick_state in tick_states {
+            let key = tick_state_key(
+                tick_state.pool_id.chain_id,
+                tick_state.pool_id.address,
+                tick_state.tick,
+            );
+            let value = serde_json::to_string(&tick_state)?;
+            pipe.set(key, value).ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
     async fn get_pool_ticks(&self, pool: Address) -> Result<Vec<TickState>> {
         let mut manager = self.manager.clone();
         let pattern = format!("ticks:*:{pool}:*");

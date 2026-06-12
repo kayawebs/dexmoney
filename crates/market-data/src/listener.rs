@@ -1824,13 +1824,23 @@ where
                 continue;
             }
             let count = ticks.len();
-            self.pool_store.set_tick_states(ticks).await?;
-            self.pool_store
-                .mark_tick_changed_pools(vec![state.pool_id.address])
+            let existing_ticks = self
+                .pool_store
+                .get_pool_ticks(state.pool_id.address)
                 .await?;
+            let ticks_changed = tick_states_changed(&existing_ticks, &ticks);
+            if ticks_changed {
+                self.pool_store
+                    .replace_pool_ticks(state.pool_id.address, ticks)
+                    .await?;
+                self.pool_store
+                    .mark_tick_changed_pools(vec![state.pool_id.address])
+                    .await?;
+            }
             debug!(
                 pool = %state.pool_id.address,
                 count,
+                ticks_changed,
                 word_radius,
                 "initialized ticks loaded"
             );
@@ -2122,6 +2132,28 @@ fn quote_relevant_pool_state_changed(previous: &PoolState, next: &PoolState) -> 
         || previous.liquidity != next.liquidity
         || previous.tick != next.tick
         || previous.tick_spacing != next.tick_spacing
+}
+
+fn tick_states_changed(previous: &[TickState], next: &[TickState]) -> bool {
+    if previous.len() != next.len() {
+        return true;
+    }
+    let mut previous = previous
+        .iter()
+        .map(tick_state_fingerprint)
+        .collect::<Vec<_>>();
+    let mut next = next.iter().map(tick_state_fingerprint).collect::<Vec<_>>();
+    previous.sort_unstable();
+    next.sort_unstable();
+    previous != next
+}
+
+fn tick_state_fingerprint(tick: &TickState) -> (i32, i128, String) {
+    (
+        tick.tick,
+        tick.liquidity_net,
+        tick.liquidity_gross.to_string(),
+    )
 }
 
 fn is_v3_style_state(state: &PoolState) -> bool {

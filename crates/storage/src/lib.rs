@@ -45,6 +45,11 @@ pub trait CurrentBlockStore: Send + Sync {
 pub trait TickStateStore: Send + Sync {
     async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()>;
     async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()>;
+    async fn replace_pool_ticks(
+        &self,
+        pool: Address,
+        tick_states: Vec<TickState>,
+    ) -> anyhow::Result<()>;
     async fn get_pool_ticks(&self, pool: Address) -> anyhow::Result<Vec<TickState>>;
 }
 
@@ -224,6 +229,19 @@ impl TickStateStore for InMemoryStores {
 
     async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()> {
         let mut ticks = self.ticks.lock().await;
+        for tick_state in tick_states {
+            ticks.insert((tick_state.pool_id.address, tick_state.tick), tick_state);
+        }
+        Ok(())
+    }
+
+    async fn replace_pool_ticks(
+        &self,
+        pool: Address,
+        tick_states: Vec<TickState>,
+    ) -> anyhow::Result<()> {
+        let mut ticks = self.ticks.lock().await;
+        ticks.retain(|(tick_pool, _), _| *tick_pool != pool);
         for tick_state in tick_states {
             ticks.insert((tick_state.pool_id.address, tick_state.tick), tick_state);
         }
