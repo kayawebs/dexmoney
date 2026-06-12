@@ -1397,11 +1397,14 @@ where
         states: &[PoolState],
         selected: &HashSet<Address>,
     ) -> Result<()> {
+        let mut changed_pools = Vec::with_capacity(selected.len());
         for state in states {
             if selected.contains(&state.pool_id.address) {
                 self.pool_store.set_pool_state(state.clone()).await?;
+                changed_pools.push(state.pool_id.address);
             }
         }
+        self.pool_store.mark_changed_pools(changed_pools).await?;
         Ok(())
     }
 
