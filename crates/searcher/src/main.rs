@@ -10,7 +10,8 @@ use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore,
-    PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
+    PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
+    TickStateStore,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -325,7 +326,7 @@ async fn run_search_cycle<P, C, R>(
     min_expected_profit_usdc: f64,
 ) -> Result<SearchCycleStats>
 where
-    P: PoolStateStore + PoolChangeStore + CurrentBlockStore + TickStateStore,
+    P: PoolStateStore + PoolChangeStore + CurrentBlockStore + TickChangeStore + TickStateStore,
     C: CandidateStore,
     R: RecorderStore + PairSearchConfigStore,
 {
@@ -358,6 +359,11 @@ where
             ..SearchCycleStats::default()
         });
     }
+    let tick_changed_pools = pool_store
+        .drain_tick_changed_pools()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
 
     let engine = strategy::engine_from_settings(
         settings,
@@ -476,7 +482,7 @@ where
         let (tick_states, tick_load_stats) = load_tick_states_for_pools(
             runtime,
             pool_store,
-            &changed_pools,
+            &tick_changed_pools,
             &mut refreshed_tick_pools,
             &batch_path_pools,
         )
@@ -586,7 +592,7 @@ struct TickLoadStats {
 async fn load_tick_states_for_pools<P>(
     runtime: &mut SearchRuntime,
     pool_store: &P,
-    changed_pools: &HashSet<Address>,
+    tick_changed_pools: &HashSet<Address>,
     refreshed_tick_pools: &mut HashSet<Address>,
     path_pools: &HashSet<Address>,
 ) -> Result<(Vec<TickState>, TickLoadStats)>
@@ -609,7 +615,7 @@ where
         }
 
         let should_refresh = !runtime.tick_states.contains_key(pool)
-            || (changed_pools.contains(pool) && !refreshed_tick_pools.contains(pool));
+            || (tick_changed_pools.contains(pool) && !refreshed_tick_pools.contains(pool));
         if should_refresh {
             let loaded_ticks = pool_store.get_pool_ticks(*pool).await?;
             stats.cache_misses += 1;

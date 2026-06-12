@@ -12,7 +12,8 @@ use base_arb_common::types::{
 };
 use base_arb_storage::{
     postgres::{FactoryRegistryRecord, PostgresStore},
-    CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickStateStore,
+    CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
+    TickStateStore,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -55,6 +56,7 @@ where
     P: PoolStateStore
         + PoolChangeStore
         + CurrentBlockStore
+        + TickChangeStore
         + TickStateStore
         + Clone
         + Send
@@ -1823,6 +1825,9 @@ where
             }
             let count = ticks.len();
             self.pool_store.set_tick_states(ticks).await?;
+            self.pool_store
+                .mark_tick_changed_pools(vec![state.pool_id.address])
+                .await?;
             debug!(
                 pool = %state.pool_id.address,
                 count,
@@ -1867,7 +1872,12 @@ where
             updates.push(tick_state);
         }
 
-        self.pool_store.set_tick_states(updates).await?;
+        if !updates.is_empty() {
+            self.pool_store.set_tick_states(updates).await?;
+            self.pool_store
+                .mark_tick_changed_pools(vec![pool_id.address])
+                .await?;
+        }
         Ok(())
     }
 
@@ -2084,6 +2094,7 @@ where
     P: PoolStateStore
         + PoolChangeStore
         + CurrentBlockStore
+        + TickChangeStore
         + TickStateStore
         + Clone
         + Send

@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::{
     CandidateStore, CurrentBlockStore, EoaStateStore, FailureStore, PoolChangeStore,
-    PoolStateStore, TickStateStore,
+    PoolStateStore, TickChangeStore, TickStateStore,
 };
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
@@ -39,6 +39,10 @@ pub fn candidates_key() -> &'static str {
 
 pub fn changed_pools_key() -> &'static str {
     "pools:changed"
+}
+
+pub fn changed_tick_pools_key() -> &'static str {
+    "ticks:changed"
 }
 
 pub fn current_block_key() -> &'static str {
@@ -111,6 +115,39 @@ impl PoolChangeStore for RedisStore {
         let mut manager = self.manager.clone();
         let values: Vec<String> = redis::cmd("SPOP")
             .arg(changed_pools_key())
+            .arg(100_000usize)
+            .query_async(&mut manager)
+            .await?;
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        values
+            .into_iter()
+            .map(|value| value.parse().map_err(Into::into))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl TickChangeStore for RedisStore {
+    async fn mark_tick_changed_pools(&self, pools: Vec<Address>) -> Result<()> {
+        if pools.is_empty() {
+            return Ok(());
+        }
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        for pool in pools {
+            pipe.sadd(changed_tick_pools_key(), format!("{pool:#x}"))
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
+    async fn drain_tick_changed_pools(&self) -> Result<Vec<Address>> {
+        let mut manager = self.manager.clone();
+        let values: Vec<String> = redis::cmd("SPOP")
+            .arg(changed_tick_pools_key())
             .arg(100_000usize)
             .query_async(&mut manager)
             .await?;
