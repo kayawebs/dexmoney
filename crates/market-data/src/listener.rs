@@ -1263,17 +1263,11 @@ where
                 continue;
             }
 
-            let tick_deltas = super::state_updater::v3_tick_deltas_from_event(state, &event)?;
-            if !tick_deltas.is_empty() {
-                self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
-                    .await?;
-            }
-
             if super::state_updater::is_v3_liquidity_event(state, &event)? {
                 debug!(
                     pool = %state.pool_id.address,
                     block_number = event.block_number,
-                    "Flashblocks V3 liquidity event applied to ticks; pool liquidity refresh waits for sealed block"
+                    "Flashblocks V3 liquidity event waits for sealed block state/tick refresh"
                 );
             } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
                 state.valid_through_block = state.valid_through_block.max(event.block_number);

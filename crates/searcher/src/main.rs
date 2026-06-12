@@ -345,11 +345,17 @@ where
         );
     }
 
-    let changed_pools = pool_store
+    let mut changed_pools = pool_store
         .drain_changed_pools()
         .await?
         .into_iter()
         .collect::<HashSet<_>>();
+    let tick_changed_pools = pool_store
+        .drain_tick_changed_pools()
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    changed_pools.extend(tick_changed_pools.iter().copied());
     if changed_pools.is_empty() {
         return Ok(SearchCycleStats {
             cycles: 1,
@@ -359,11 +365,6 @@ where
             ..SearchCycleStats::default()
         });
     }
-    let tick_changed_pools = pool_store
-        .drain_tick_changed_pools()
-        .await?
-        .into_iter()
-        .collect::<HashSet<_>>();
 
     let engine = strategy::engine_from_settings(
         settings,
