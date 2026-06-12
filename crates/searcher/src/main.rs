@@ -5,6 +5,7 @@ mod strategy;
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_common::config::Settings;
+use base_arb_common::constants::{AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES};
 use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
 use base_arb_storage::{
@@ -534,14 +535,41 @@ fn is_pool_state_active(state: &PoolState, now: DateTime<Utc>, max_pool_state_ag
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => {
+            if !is_supported_aerodrome_factory(state, &[AERODROME_CLASSIC_FACTORY]) {
+                return false;
+            }
             is_nonzero_u256(state.reserve0) && is_nonzero_u256(state.reserve1)
         }
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+        PoolVariant::AerodromeSlipstream => {
+            if !is_supported_aerodrome_factory(state, &AERODROME_SLIPSTREAM_FACTORIES) {
+                return false;
+            }
+            state.sqrt_price_x96.is_some()
+                && is_nonzero_u256(state.liquidity)
+                && state.tick.is_some()
+        }
+        PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
             state.sqrt_price_x96.is_some()
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
     }
+}
+
+fn is_supported_aerodrome_factory(state: &PoolState, supported: &[&str]) -> bool {
+    let Some(factory) = state.factory_address else {
+        return false;
+    };
+    supported
+        .iter()
+        .any(|expected| address_eq_str(factory, expected))
+}
+
+fn address_eq_str(address: Address, expected: &str) -> bool {
+    expected
+        .parse::<Address>()
+        .map(|expected| address == expected)
+        .unwrap_or(false)
 }
 
 fn is_nonzero_u256(value: Option<U256>) -> bool {

@@ -3,7 +3,9 @@ use anyhow::Result;
 use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::constants::PANCAKE_V3_FACTORY;
+use base_arb_common::constants::{
+    AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, PANCAKE_V3_FACTORY,
+};
 use base_arb_common::types::{
     DexKind, PoolId, PoolRegistryEntry, PoolState, PoolStateValidation, PoolStateWarning,
     PoolVariant, TickState,
@@ -25,11 +27,6 @@ const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
-const AERODROME_CLASSIC_FACTORY: &str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da";
-const AERODROME_SLIPSTREAM_FACTORIES: [&str; 2] = [
-    "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A",
-    "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a",
-];
 const V3_POOL_CREATED_TOPIC: &str =
     "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118";
 const CLASSIC_POOL_CREATED_TOPIC: &str =
@@ -2126,11 +2123,26 @@ fn is_v3_style_state(state: &PoolState) -> bool {
 }
 
 fn is_aerodrome_fee_state(state: &PoolState) -> bool {
-    matches!(
-        (state.dex, state.variant),
-        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
-            | (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-    )
+    if state.dex != DexKind::Aerodrome {
+        return false;
+    }
+    let Some(factory) = state.factory_address else {
+        return false;
+    };
+    match state.variant {
+        PoolVariant::AerodromeVolatile => address_eq_str(factory, AERODROME_CLASSIC_FACTORY),
+        PoolVariant::AerodromeSlipstream => AERODROME_SLIPSTREAM_FACTORIES
+            .iter()
+            .any(|factory_address| address_eq_str(factory, factory_address)),
+        _ => false,
+    }
+}
+
+fn address_eq_str(address: Address, expected: &str) -> bool {
+    expected
+        .parse::<Address>()
+        .map(|expected| address == expected)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy)]
