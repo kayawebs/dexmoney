@@ -44,6 +44,8 @@ pub struct SearchStats {
     pub quote_skipped_missing_ticks: u64,
     pub quote_skipped_tick_range_exhausted: u64,
     pub quote_skipped_state_block_gap: u64,
+    pub max_state_block_gap: u64,
+    pub state_block_gap_sample: Option<String>,
     pub quote_skipped_error: u64,
     pub price_impact_rejected: u64,
     pub min_profit_rejected: u64,
@@ -65,6 +67,10 @@ impl SearchStats {
         self.quote_skipped_missing_ticks += other.quote_skipped_missing_ticks;
         self.quote_skipped_tick_range_exhausted += other.quote_skipped_tick_range_exhausted;
         self.quote_skipped_state_block_gap += other.quote_skipped_state_block_gap;
+        if other.max_state_block_gap > self.max_state_block_gap {
+            self.max_state_block_gap = other.max_state_block_gap;
+            self.state_block_gap_sample = other.state_block_gap_sample.clone();
+        }
         self.quote_skipped_error += other.quote_skipped_error;
         self.price_impact_rejected += other.price_impact_rejected;
         self.min_profit_rejected += other.min_profit_rejected;
@@ -91,6 +97,19 @@ impl SearchStats {
             QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
         }
     }
+
+    fn record_state_block_gap_skip(&mut self, path_name: &str, skip: &QuoteSkip) {
+        let Some(gap) = &skip.state_block_gap else {
+            return;
+        };
+        if gap.gap > self.max_state_block_gap {
+            self.max_state_block_gap = gap.gap;
+            self.state_block_gap_sample = Some(format!(
+                "path={} max_source={} min_valid_through={} max_lag={} gap={}",
+                path_name, gap.max_source_block, gap.min_valid_through_block, gap.max_lag, gap.gap
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +125,15 @@ pub enum QuoteSkipReason {
 pub struct QuoteSkip {
     reason: QuoteSkipReason,
     message: String,
+    state_block_gap: Option<StateBlockGapSkip>,
+}
+
+#[derive(Debug, Clone)]
+struct StateBlockGapSkip {
+    max_source_block: u64,
+    min_valid_through_block: u64,
+    max_lag: u64,
+    gap: u64,
 }
 
 impl QuoteSkip {
@@ -113,11 +141,28 @@ impl QuoteSkip {
         Self {
             reason,
             message: message.into(),
+            state_block_gap: None,
         }
     }
 
     fn quote_error(message: impl Into<String>) -> Self {
         Self::new(QuoteSkipReason::QuoteError, message)
+    }
+
+    fn state_block_gap(max_source_block: u64, min_valid_through_block: u64, max_lag: u64) -> Self {
+        let gap = max_source_block.saturating_sub(min_valid_through_block);
+        Self {
+            reason: QuoteSkipReason::StateBlockGap,
+            message: format!(
+                "path state block gap max_source={max_source_block} min_valid_through={min_valid_through_block} max_lag={max_lag} gap={gap}"
+            ),
+            state_block_gap: Some(StateBlockGapSkip {
+                max_source_block,
+                min_valid_through_block,
+                max_lag,
+                gap,
+            }),
+        }
     }
 }
 
@@ -280,6 +325,7 @@ impl SearchEngine {
                     }
                     Err(err) => {
                         stats.record_quote_skip(err.reason);
+                        stats.record_state_block_gap_skip(&search_path.path.name, &err);
                         debug!(
                             path = %search_path.path.name,
                             amount_in = %amount_in,
@@ -400,6 +446,7 @@ impl SearchEngine {
                 }
                 Err(err) => {
                     stats.record_quote_skip(err.reason);
+                    stats.record_state_block_gap_skip(&search_path.path.name, &err);
                     debug!(
                         path = %search_path.path.name,
                         amount_in = %amount_in,
@@ -1317,12 +1364,10 @@ async fn quote_path(
     if path_max_source_block
         > path_min_valid_through_block.saturating_add(quote_max_state_block_lag)
     {
-        return Err(QuoteSkip::new(
-            QuoteSkipReason::StateBlockGap,
-            format!(
-                "path state block gap max_source={} min_valid_through={} max_lag={}",
-                path_max_source_block, path_min_valid_through_block, quote_max_state_block_lag
-            ),
+        return Err(QuoteSkip::state_block_gap(
+            path_max_source_block,
+            path_min_valid_through_block,
+            quote_max_state_block_lag,
         ));
     }
 
