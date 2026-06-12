@@ -106,7 +106,11 @@ where
                 }
                 if Instant::now() >= next_active_refresh {
                     monitored_states = self
-                        .active_refresh_states(monitored_states, &mut active_refresh_cursor)
+                        .active_refresh_states(
+                            monitored_states,
+                            &mut active_refresh_cursor,
+                            latest_block,
+                        )
                         .await?;
                     next_active_refresh = Instant::now() + active_refresh_interval;
                     next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -349,7 +353,11 @@ where
 
             if Instant::now() >= next_active_refresh {
                 monitored_states = self
-                    .active_refresh_states(monitored_states, &mut active_refresh_cursor)
+                    .active_refresh_states(
+                        monitored_states,
+                        &mut active_refresh_cursor,
+                        latest_block,
+                    )
                     .await?;
                 next_active_refresh = Instant::now() + active_refresh_interval;
                 next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -1412,12 +1420,12 @@ where
         &self,
         mut states: Vec<PoolState>,
         cursor: &mut usize,
+        block_number: u64,
     ) -> Result<Vec<PoolState>> {
         if states.is_empty() {
             return Ok(states);
         }
 
-        let block_number = self.provider.get_block_number().await?;
         let block_hash = self.provider.get_block_hash(block_number).await?;
         let batch_size = self
             .settings
@@ -1525,6 +1533,11 @@ where
         }
 
         if !refreshed_pools.is_empty() {
+            let watermarked_pools = advance_valid_through_block(&mut states, block_number);
+            if !watermarked_pools.is_empty() {
+                self.publish_validity_watermark(&states, &watermarked_pools)
+                    .await?;
+            }
             self.publish_selected_states(&states, &refreshed_pools, "active_refresh")
                 .await?;
             self.publish_initialized_ticks(&refreshed_v3_states).await?;
