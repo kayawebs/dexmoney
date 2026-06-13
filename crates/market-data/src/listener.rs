@@ -26,6 +26,7 @@ const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
 const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
+const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
@@ -74,6 +75,7 @@ where
         self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
+        let mut last_discovered_block = last_seen_block;
         self.pool_store.set_current_block(last_seen_block).await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
@@ -100,6 +102,24 @@ where
             let latest_block = self.provider.get_block_number().await?;
             self.pool_store.set_current_block(latest_block).await?;
             if latest_block <= last_seen_block {
+                if last_discovered_block < latest_block {
+                    let discovery_started = Instant::now();
+                    self.discover_live_pool_creations(last_discovered_block + 1, latest_block)
+                        .await?;
+                    self.discover_global_swap_pools(
+                        last_discovered_block + 1,
+                        latest_block,
+                        &mut globally_observed_pools,
+                    )
+                    .await?;
+                    info!(
+                        from_block = last_discovered_block + 1,
+                        to_block = latest_block,
+                        discovery_ms = discovery_started.elapsed().as_millis() as u64,
+                        "market-data idle pool discovery complete"
+                    );
+                    last_discovered_block = latest_block;
+                }
                 if Instant::now() >= next_registry_reload {
                     monitored_states = self.reload_if_changed(monitored_states).await?;
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
@@ -125,8 +145,12 @@ where
                     self.publish_initialized_ticks(&monitored_states).await?;
                     next_tick_refresh = Instant::now() + tick_refresh_interval;
                 }
-                self.validate_due_snapshots(&mut pending_validations, latest_block)
-                    .await?;
+                self.validate_due_snapshots(
+                    &mut pending_validations,
+                    latest_block,
+                    VALIDATION_MAX_PER_IDLE_TICK,
+                )
+                .await?;
                 continue;
             }
 
@@ -134,15 +158,6 @@ where
                 monitored_states = self.reload_if_changed(monitored_states).await?;
                 next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
             }
-
-            self.discover_live_pool_creations(last_seen_block + 1, latest_block)
-                .await?;
-            self.discover_global_swap_pools(
-                last_seen_block + 1,
-                latest_block,
-                &mut globally_observed_pools,
-            )
-            .await?;
 
             let block_started = Instant::now();
             let fetch_started = Instant::now();
@@ -353,8 +368,6 @@ where
             let publish_ms = publish_started.elapsed().as_millis() as u64;
 
             enqueue_validation_snapshots(&mut pending_validations, validation_snapshots);
-            self.validate_due_snapshots(&mut pending_validations, latest_block)
-                .await?;
             info!(
                 from_block = last_seen_block + 1,
                 to_block = latest_block,
@@ -370,28 +383,6 @@ where
                 total_ms = block_started.elapsed().as_millis() as u64,
                 "market-data sealed block summary"
             );
-
-            if Instant::now() >= next_active_refresh {
-                monitored_states = self
-                    .active_refresh_states(
-                        monitored_states,
-                        &mut active_refresh_cursor,
-                        latest_block,
-                    )
-                    .await?;
-                next_active_refresh = Instant::now() + active_refresh_interval;
-                next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-                next_tick_refresh = Instant::now() + tick_refresh_interval;
-            } else if Instant::now() >= next_aerodrome_fee_refresh {
-                monitored_states = self.refresh_aerodrome_fees(monitored_states).await?;
-                next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
-            } else if Instant::now() >= next_calibration {
-                monitored_states = self.calibrate_states(monitored_states).await?;
-                next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-            } else if Instant::now() >= next_tick_refresh {
-                self.publish_initialized_ticks(&monitored_states).await?;
-                next_tick_refresh = Instant::now() + tick_refresh_interval;
-            }
 
             last_seen_block = latest_block;
         }
@@ -1989,14 +1980,20 @@ where
         &self,
         pending: &mut VecDeque<PendingValidation>,
         latest_block: u64,
+        max_items: usize,
     ) -> Result<()> {
+        let mut processed = 0usize;
         while matches!(
             pending.front(),
             Some(item) if item.state.block_number + VALIDATION_DELAY_BLOCKS <= latest_block
         ) {
+            if processed >= max_items {
+                break;
+            }
             let Some(item) = pending.pop_front() else {
                 break;
             };
+            processed += 1;
             let state = item.state;
             let block_hash = match self.provider.get_block_hash(state.block_number).await {
                 Ok(block_hash) => block_hash,
