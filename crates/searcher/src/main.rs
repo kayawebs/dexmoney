@@ -285,22 +285,23 @@ where
 
     let state_load_started = Instant::now();
     let mut rebuild_path_index = runtime.path_index.is_none();
-    for pool in &changed_pools {
-        match pool_store.get_pool_state(*pool).await? {
+    let changed_pool_addresses = changed_pools.iter().copied().collect::<Vec<_>>();
+    for (pool, state) in pool_store.get_pool_states(&changed_pool_addresses).await? {
+        match state {
             Some(state) => {
                 let topology = PoolTopology::from(&state);
-                if runtime.pool_topology.get(pool) != Some(&topology) {
+                if runtime.pool_topology.get(&pool) != Some(&topology) {
                     rebuild_path_index = true;
-                    runtime.pool_topology.insert(*pool, topology);
+                    runtime.pool_topology.insert(pool, topology);
                 }
-                runtime.pool_states.insert(*pool, state);
+                runtime.pool_states.insert(pool, state);
             }
             None => {
-                if runtime.pool_topology.remove(pool).is_some() {
+                if runtime.pool_topology.remove(&pool).is_some() {
                     rebuild_path_index = true;
                 }
-                runtime.pool_states.remove(pool);
-                runtime.tick_states.remove(pool);
+                runtime.pool_states.remove(&pool);
+                runtime.tick_states.remove(&pool);
             }
         }
     }

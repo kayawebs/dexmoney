@@ -29,6 +29,10 @@ pub fn pool_state_key(chain_id: u64, pool_address: alloy_primitives::Address) ->
     format!("pool:{chain_id}:{pool_address}")
 }
 
+pub fn pool_address_index_key(pool_address: alloy_primitives::Address) -> String {
+    format!("pool_index:{pool_address}")
+}
+
 pub fn tick_state_key(chain_id: u64, pool_address: alloy_primitives::Address, tick: i32) -> String {
     format!("ticks:{chain_id}:{pool_address}:{tick}")
 }
@@ -65,17 +69,29 @@ pub fn failures_key(path_hash: &str) -> String {
 impl PoolStateStore for RedisStore {
     async fn set_pool_state(&self, pool_state: PoolState) -> Result<()> {
         let key = pool_state_key(pool_state.pool_id.chain_id, pool_state.pool_id.address);
+        let index_key = pool_address_index_key(pool_state.pool_id.address);
         let value = serde_json::to_string(&pool_state)?;
         let mut manager = self.manager.clone();
-        let _: () = manager.set(key, value).await?;
+        let mut pipe = redis::pipe();
+        pipe.set(&key, value).ignore();
+        pipe.set(index_key, key).ignore();
+        let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
 
     async fn get_pool_state(&self, address: Address) -> Result<Option<PoolState>> {
         let mut manager = self.manager.clone();
-        let pattern = format!("pool:*:{address}");
-        let keys: Vec<String> = manager.keys(pattern).await?;
-        let Some(key) = keys.into_iter().next() else {
+        let index_key = pool_address_index_key(address);
+        let mut key: Option<String> = manager.get(&index_key).await?;
+        if key.is_none() {
+            let pattern = format!("pool:*:{address}");
+            let keys: Vec<String> = manager.keys(pattern).await?;
+            key = keys.into_iter().next();
+            if let Some(key) = key.as_ref() {
+                let _: () = manager.set(&index_key, key).await?;
+            }
+        }
+        let Some(key) = key else {
             return Ok(None);
         };
         let value: Option<String> = manager.get(key).await?;
@@ -83,6 +99,71 @@ impl PoolStateStore for RedisStore {
             .map(|raw| serde_json::from_str(&raw))
             .transpose()
             .map_err(Into::into)
+    }
+
+    async fn get_pool_states(
+        &self,
+        addresses: &[Address],
+    ) -> Result<Vec<(Address, Option<PoolState>)>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut manager = self.manager.clone();
+        let index_keys = addresses
+            .iter()
+            .map(|address| pool_address_index_key(*address))
+            .collect::<Vec<_>>();
+        let mut pool_keys: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&index_keys)
+            .query_async(&mut manager)
+            .await?;
+
+        let mut missing_indexes = Vec::new();
+        for (idx, key) in pool_keys.iter_mut().enumerate() {
+            if key.is_some() {
+                continue;
+            }
+            let address = addresses[idx];
+            let pattern = format!("pool:*:{address}");
+            let keys: Vec<String> = manager.keys(pattern).await?;
+            if let Some(found) = keys.into_iter().next() {
+                *key = Some(found.clone());
+                missing_indexes.push((idx, found));
+            }
+        }
+        if !missing_indexes.is_empty() {
+            let mut pipe = redis::pipe();
+            for (idx, key) in &missing_indexes {
+                pipe.set(&index_keys[*idx], key).ignore();
+            }
+            let _: () = pipe.query_async(&mut manager).await?;
+        }
+
+        let existing_keys = pool_keys.iter().flatten().cloned().collect::<Vec<_>>();
+        let values: Vec<Option<String>> = if existing_keys.is_empty() {
+            Vec::new()
+        } else {
+            redis::cmd("MGET")
+                .arg(&existing_keys)
+                .query_async(&mut manager)
+                .await?
+        };
+        let mut values_by_key = existing_keys
+            .into_iter()
+            .zip(values.into_iter())
+            .collect::<std::collections::HashMap<_, _>>();
+
+        addresses
+            .iter()
+            .zip(pool_keys.into_iter())
+            .map(|(address, key)| {
+                let state = key
+                    .and_then(|key| values_by_key.remove(&key).flatten())
+                    .map(|raw| serde_json::from_str(&raw))
+                    .transpose()?;
+                Ok((*address, state))
+            })
+            .collect()
     }
 
     async fn all_pool_states(&self) -> Result<Vec<PoolState>> {
@@ -94,6 +175,17 @@ impl PoolStateStore for RedisStore {
             if let Some(raw) = value {
                 out.push(serde_json::from_str(&raw)?);
             }
+        }
+        if !out.is_empty() {
+            let mut pipe = redis::pipe();
+            for state in &out {
+                pipe.set(
+                    pool_address_index_key(state.pool_id.address),
+                    pool_state_key(state.pool_id.chain_id, state.pool_id.address),
+                )
+                .ignore();
+            }
+            let _: () = pipe.query_async(&mut manager).await?;
         }
         Ok(out)
     }

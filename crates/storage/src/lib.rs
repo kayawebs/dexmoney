@@ -20,6 +20,10 @@ use base_arb_common::types::{
 pub trait PoolStateStore: Send + Sync {
     async fn set_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()>;
     async fn get_pool_state(&self, address: Address) -> anyhow::Result<Option<PoolState>>;
+    async fn get_pool_states(
+        &self,
+        addresses: &[Address],
+    ) -> anyhow::Result<Vec<(Address, Option<PoolState>)>>;
     async fn all_pool_states(&self) -> anyhow::Result<Vec<PoolState>>;
 }
 
@@ -158,6 +162,17 @@ impl PoolStateStore for InMemoryStores {
 
     async fn get_pool_state(&self, address: Address) -> anyhow::Result<Option<PoolState>> {
         Ok(self.pool_states.lock().await.get(&address).cloned())
+    }
+
+    async fn get_pool_states(
+        &self,
+        addresses: &[Address],
+    ) -> anyhow::Result<Vec<(Address, Option<PoolState>)>> {
+        let pool_states = self.pool_states.lock().await;
+        Ok(addresses
+            .iter()
+            .map(|address| (*address, pool_states.get(address).cloned()))
+            .collect())
     }
 
     async fn all_pool_states(&self) -> anyhow::Result<Vec<PoolState>> {
