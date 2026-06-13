@@ -273,6 +273,22 @@ impl CandidateStore for RedisStore {
         };
         Ok(Some(serde_json::from_str(&payload)?))
     }
+
+    async fn pop_candidates(&self, limit: usize) -> Result<Vec<Candidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut manager = self.manager.clone();
+        let result: Vec<(String, f64)> = redis::cmd("ZPOPMAX")
+            .arg(candidates_key())
+            .arg(limit)
+            .query_async(&mut manager)
+            .await?;
+        result
+            .into_iter()
+            .map(|(payload, _)| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
 }
 
 fn candidate_queue_score(candidate: &Candidate) -> f64 {

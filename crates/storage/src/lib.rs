@@ -57,6 +57,7 @@ pub trait TickStateStore: Send + Sync {
 pub trait CandidateStore: Send + Sync {
     async fn push_candidate(&self, candidate: Candidate) -> anyhow::Result<()>;
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>>;
+    async fn pop_candidates(&self, limit: usize) -> anyhow::Result<Vec<Candidate>>;
 }
 
 #[async_trait]
@@ -269,6 +270,18 @@ impl CandidateStore for InMemoryStores {
 
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>> {
         Ok(self.candidates.lock().await.pop_front())
+    }
+
+    async fn pop_candidates(&self, limit: usize) -> anyhow::Result<Vec<Candidate>> {
+        let mut candidates = self.candidates.lock().await;
+        let mut out = Vec::with_capacity(limit.min(candidates.len()));
+        while out.len() < limit {
+            let Some(candidate) = candidates.pop_front() else {
+                break;
+            };
+            out.push(candidate);
+        }
+        Ok(out)
     }
 }
 

@@ -80,16 +80,12 @@ async fn main() -> Result<()> {
                 quote_skipped_missing_ticks = aggregate.search.quote_skipped_missing_ticks,
                 quote_skipped_tick_range_exhausted =
                     aggregate.search.quote_skipped_tick_range_exhausted,
-                quote_skipped_state_block_gap = aggregate.search.quote_skipped_state_block_gap,
-                max_state_block_gap = aggregate.search.max_state_block_gap,
-                state_block_gap_sample = ?aggregate.search.state_block_gap_sample,
                 quote_skipped_error = aggregate.search.quote_skipped_error,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
                 candidates_coalesced = aggregate.candidates_coalesced,
                 inactive_pool_filtered_paths = aggregate.inactive_pool_filtered_paths,
-                stale_publish_rejected = aggregate.stale_publish_rejected,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
@@ -103,7 +99,6 @@ async fn main() -> Result<()> {
                 best_profit_after_impact = %aggregate.search.best_profit,
                 "searcher cycle summary"
             );
-            log_stale_publish_rejections(&aggregate);
             aggregate = SearchCycleStats::default();
             last_summary = Instant::now();
         }
@@ -138,18 +133,7 @@ struct SearchCycleStats {
     risk_other_rejected: u64,
     candidates_coalesced: u64,
     inactive_pool_filtered_paths: u64,
-    stale_publish_rejected: u64,
-    stale_publish_rejected_by_path: HashMap<String, StalePublishPathStats>,
     opportunities_created: u64,
-}
-
-#[derive(Clone, Default)]
-struct StalePublishPathStats {
-    count: u64,
-    min_lag: u64,
-    max_lag: u64,
-    min_candidate_block: u64,
-    max_latest_known_block: u64,
 }
 
 impl SearchCycleStats {
@@ -182,11 +166,6 @@ impl SearchCycleStats {
         self.risk_other_rejected += other.risk_other_rejected;
         self.candidates_coalesced += other.candidates_coalesced;
         self.inactive_pool_filtered_paths += other.inactive_pool_filtered_paths;
-        self.stale_publish_rejected += other.stale_publish_rejected;
-        merge_stale_publish_path_stats(
-            &mut self.stale_publish_rejected_by_path,
-            &other.stale_publish_rejected_by_path,
-        );
         self.opportunities_created += other.opportunities_created;
     }
 
@@ -204,78 +183,6 @@ impl SearchCycleStats {
         } else {
             self.risk_other_rejected += 1;
         }
-    }
-}
-
-fn merge_stale_publish_path_stats(
-    target: &mut HashMap<String, StalePublishPathStats>,
-    source: &HashMap<String, StalePublishPathStats>,
-) {
-    for (path, source_stats) in source {
-        let target_stats = target
-            .entry(path.clone())
-            .or_insert_with(|| StalePublishPathStats {
-                min_lag: u64::MAX,
-                ..StalePublishPathStats::default()
-            });
-        target_stats.count += source_stats.count;
-        target_stats.min_lag = target_stats.min_lag.min(source_stats.min_lag);
-        target_stats.max_lag = target_stats.max_lag.max(source_stats.max_lag);
-        target_stats.min_candidate_block = if target_stats.min_candidate_block == 0 {
-            source_stats.min_candidate_block
-        } else {
-            target_stats
-                .min_candidate_block
-                .min(source_stats.min_candidate_block)
-        };
-        target_stats.max_latest_known_block = target_stats
-            .max_latest_known_block
-            .max(source_stats.max_latest_known_block);
-    }
-}
-
-fn record_stale_publish_rejection(
-    stats_by_path: &mut HashMap<String, StalePublishPathStats>,
-    candidate: &Candidate,
-    candidate_lag: u64,
-    latest_known_block: u64,
-) {
-    let stats = stats_by_path
-        .entry(candidate.path.name.clone())
-        .or_insert_with(|| StalePublishPathStats {
-            min_lag: u64::MAX,
-            ..StalePublishPathStats::default()
-        });
-    stats.count += 1;
-    stats.min_lag = stats.min_lag.min(candidate_lag);
-    stats.max_lag = stats.max_lag.max(candidate_lag);
-    stats.min_candidate_block = if stats.min_candidate_block == 0 {
-        candidate.block_number
-    } else {
-        stats.min_candidate_block.min(candidate.block_number)
-    };
-    stats.max_latest_known_block = stats.max_latest_known_block.max(latest_known_block);
-}
-
-fn log_stale_publish_rejections(stats: &SearchCycleStats) {
-    if stats.stale_publish_rejected_by_path.is_empty() {
-        return;
-    }
-    let mut paths = stats
-        .stale_publish_rejected_by_path
-        .iter()
-        .collect::<Vec<_>>();
-    paths.sort_by(|(_, left), (_, right)| right.count.cmp(&left.count));
-    for (path, path_stats) in paths.into_iter().take(10) {
-        info!(
-            path = %path,
-            count = path_stats.count,
-            min_lag = path_stats.min_lag,
-            max_lag = path_stats.max_lag,
-            min_candidate_block = path_stats.min_candidate_block,
-            max_latest_known_block = path_stats.max_latest_known_block,
-            "stale candidate publish rejection by path"
-        );
     }
 }
 
@@ -658,13 +565,6 @@ where
     for candidate in candidates {
         let candidate_lag = latest_known_block.saturating_sub(candidate.block_number);
         if candidate_lag > max_candidate_lag_blocks {
-            cycle_stats.stale_publish_rejected += 1;
-            record_stale_publish_rejection(
-                &mut cycle_stats.stale_publish_rejected_by_path,
-                &candidate,
-                candidate_lag,
-                latest_known_block,
-            );
             debug!(
                 candidate_id = %candidate.id,
                 path = %candidate.path.name,
@@ -672,9 +572,8 @@ where
                 latest_known_block,
                 candidate_lag,
                 max_candidate_lag_blocks,
-                "candidate rejected before publish because quote block is stale"
+                "candidate published despite quote block lag; execution hot path owns final timeliness"
             );
-            continue;
         }
         debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(

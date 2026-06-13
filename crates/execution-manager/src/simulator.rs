@@ -229,69 +229,6 @@ pub fn build_execute_calldata(
     Ok(out)
 }
 
-pub fn min_profit_failure_key(candidate: &Candidate) -> String {
-    let mut raw = format!(
-        "{}|{:#x}|{}|{}|{}",
-        candidate.path.name,
-        candidate.token_in,
-        candidate.amount_in,
-        candidate.min_profit,
-        candidate.expected_profit
-    );
-    for step in &candidate.path.steps {
-        raw.push_str(&format!(
-            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}|{:?}",
-            step.dex,
-            step.variant,
-            step.factory_address,
-            step.pool,
-            step.token_in,
-            step.token_out,
-            step.fee_bps,
-            step.stable,
-            step.tick_spacing
-        ));
-    }
-    format!("{:#x}", keccak256(raw.as_bytes()))
-}
-
-pub fn route_failure_key(candidate: &Candidate) -> String {
-    let mut raw = format!(
-        "{}|{:#x}|{}",
-        candidate.path.name, candidate.token_in, candidate.amount_in
-    );
-    append_step_fingerprint(&mut raw, candidate);
-    format!("{:#x}", keccak256(raw.as_bytes()))
-}
-
-pub fn candidate_block_seen_key(candidate: &Candidate) -> String {
-    let mut raw = format!(
-        "candidate-block|{}|{}|{:#x}|{}|{}",
-        candidate.block_number,
-        candidate.path.name,
-        candidate.token_in,
-        candidate.amount_in,
-        candidate.min_profit,
-    );
-    append_step_fingerprint(&mut raw, candidate);
-    format!("{:#x}", keccak256(raw.as_bytes()))
-}
-
-pub fn is_min_profit_not_met(simulation: &SimulationResult) -> bool {
-    simulation.revert_reason.as_deref() == Some("Executor revert: MinProfitNotMet")
-}
-
-pub fn is_structural_route_failure(simulation: &SimulationResult) -> bool {
-    matches!(
-        simulation.revert_reason.as_deref(),
-        Some("router/no-revert-data")
-            | Some("Executor revert: PoolMismatch")
-            | Some("Executor revert: UnsupportedDex")
-            | Some("Executor revert: InvalidPath")
-            | Some("Executor revert: InvalidTickSpacing")
-    )
-}
-
 pub fn required_token_approvals(
     candidate: &Candidate,
     settings: &Settings,
@@ -308,23 +245,6 @@ pub fn required_token_approvals(
     approvals.sort();
     approvals.dedup();
     Ok(approvals)
-}
-
-fn append_step_fingerprint(raw: &mut String, candidate: &Candidate) {
-    for step in &candidate.path.steps {
-        raw.push_str(&format!(
-            "|{:?}|{:?}|{:?}|{:#x}|{:#x}|{:#x}|{:?}|{:?}|{:?}",
-            step.dex,
-            step.variant,
-            step.factory_address,
-            step.pool,
-            step.token_in,
-            step.token_out,
-            step.fee_bps,
-            step.stable,
-            step.tick_spacing
-        ));
-    }
 }
 
 fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {

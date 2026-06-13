@@ -9,7 +9,7 @@ use base_arb_common::config::Settings;
 use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore, EoaStateStore,
-    FailureStore, PendingTransactionStore, RecorderStore,
+    PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -20,7 +20,6 @@ use tracing_subscriber::EnvFilter;
 const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
-const MIN_CANDIDATE_SEEN_TTL_SECS: u64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,7 +77,7 @@ async fn run_execution_cycle<C, E, R>(
     circuit_breaker: &mut ExecutionCircuitBreaker,
 ) -> Result<()>
 where
-    C: CandidateStore + CurrentBlockStore + FailureStore,
+    C: CandidateStore + CurrentBlockStore,
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
@@ -304,7 +303,7 @@ impl ExecutionCircuitBreaker {
 }
 
 async fn handle_candidate<C, E, R>(
-    candidate_store: &C,
+    _candidate_store: &C,
     eoa_store: &E,
     recorder: &R,
     provider: &ChainProvider,
@@ -319,7 +318,7 @@ async fn handle_candidate<C, E, R>(
     max_candidate_lag_blocks: u64,
 ) -> Result<CandidateAction>
 where
-    C: CandidateStore + FailureStore,
+    C: CandidateStore,
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
@@ -336,50 +335,6 @@ where
         );
         return Ok(CandidateAction::Skipped("block_lag"));
     }
-
-    let candidate_seen_key = simulator::candidate_block_seen_key(&candidate);
-    let min_profit_failure_key = simulator::min_profit_failure_key(&candidate);
-    if candidate_store
-        .has_failure_key(&min_profit_failure_key)
-        .await?
-    {
-        debug!(
-            candidate_id = %candidate.id,
-            path = %candidate.path.name,
-            amount_in = %candidate.amount_in,
-            min_profit = %candidate.min_profit,
-            expected_profit = %candidate.expected_profit,
-            "candidate skipped after previous MinProfitNotMet for identical path parameters"
-        );
-        return Ok(CandidateAction::Skipped("cached_min_profit"));
-    }
-    let route_failure_key = simulator::route_failure_key(&candidate);
-    if candidate_store.has_failure_key(&route_failure_key).await? {
-        debug!(
-            candidate_id = %candidate.id,
-            path = %candidate.path.name,
-            amount_in = %candidate.amount_in,
-            min_profit = %candidate.min_profit,
-            expected_profit = %candidate.expected_profit,
-            "candidate skipped after previous structural route failure for identical path parameters"
-        );
-        return Ok(CandidateAction::Skipped("cached_route_failure"));
-    }
-    if candidate_store.has_failure_key(&candidate_seen_key).await? {
-        debug!(
-            candidate_id = %candidate.id,
-            path = %candidate.path.name,
-            block_number = candidate.block_number,
-            amount_in = %candidate.amount_in,
-            min_profit = %candidate.min_profit,
-            expected_profit = %candidate.expected_profit,
-            "candidate skipped after previous simulation for identical path parameters in same block"
-        );
-        return Ok(CandidateAction::Skipped("same_block_seen"));
-    }
-    candidate_store
-        .mark_failure_key(&candidate_seen_key, candidate_seen_ttl_secs(settings))
-        .await?;
 
     if settings.execution_submit_enabled {
         if wallet.is_none() {
@@ -583,37 +538,6 @@ where
     debug!(candidate_id = %candidate.id, success = simulation.success, "simulation success/fail");
 
     if !simulation.success {
-        if simulator::is_min_profit_not_met(&simulation) {
-            candidate_store
-                .mark_failure_key(
-                    &min_profit_failure_key,
-                    settings.min_profit_failure_ttl_secs,
-                )
-                .await?;
-            info!(
-                candidate_id = %candidate.id,
-                path = %candidate.path.name,
-                amount_in = %candidate.amount_in,
-                min_profit = %candidate.min_profit,
-                expected_profit = %candidate.expected_profit,
-                ttl_secs = settings.min_profit_failure_ttl_secs,
-                "cached MinProfitNotMet candidate fingerprint"
-            );
-        } else if simulator::is_structural_route_failure(&simulation) {
-            candidate_store
-                .mark_failure_key(&route_failure_key, settings.min_profit_failure_ttl_secs)
-                .await?;
-            info!(
-                candidate_id = %candidate.id,
-                path = %candidate.path.name,
-                amount_in = %candidate.amount_in,
-                min_profit = %candidate.min_profit,
-                expected_profit = %candidate.expected_profit,
-                reason = ?simulation.revert_reason,
-                ttl_secs = settings.min_profit_failure_ttl_secs,
-                "cached structural route failure candidate fingerprint"
-            );
-        }
         return Ok(CandidateAction::Simulated);
     }
 
@@ -781,16 +705,6 @@ fn parse_config_u256(raw: Option<&str>, name: &str) -> Result<U256> {
         .with_context(|| format!("invalid decimal U256 config value for {name}"))
 }
 
-fn candidate_seen_ttl_secs(settings: &Settings) -> u64 {
-    let ttl_from_candidate = settings
-        .candidate_ttl_ms
-        .max(0)
-        .saturating_add(999)
-        .checked_div(1000)
-        .unwrap_or(0) as u64;
-    ttl_from_candidate.saturating_add(MIN_CANDIDATE_SEEN_TTL_SECS)
-}
-
 async fn pop_fresh_candidates<C>(
     candidate_store: &C,
     current_block: u64,
@@ -809,10 +723,10 @@ where
     let mut min_stale_lag = u64::MAX;
     let mut max_stale_lag = 0u64;
 
-    for _ in 0..MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE {
-        let Some(candidate) = candidate_store.pop_candidate().await? else {
-            break;
-        };
+    for candidate in candidate_store
+        .pop_candidates(MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE)
+        .await?
+    {
         popped += 1;
         if candidate.is_expired(now) {
             expired += 1;

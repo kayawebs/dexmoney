@@ -92,7 +92,7 @@ where
         let mut active_refresh_cursor = 0usize;
         info!(last_seen_block, "market-data synchronized at startup");
 
-        let mut ticker = interval(Duration::from_secs(3));
+        let mut ticker = interval(Duration::from_millis(100));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
@@ -144,6 +144,8 @@ where
             )
             .await?;
 
+            let block_started = Instant::now();
+            let fetch_started = Instant::now();
             let events = self
                 .provider
                 .fetch_relevant_events_for_pools(
@@ -152,7 +154,9 @@ where
                     latest_block,
                 )
                 .await?;
+            let fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
+            let apply_started = Instant::now();
             let mut changed_pools = HashSet::new();
             let mut validation_snapshots = BTreeMap::new();
             let mut classic_fee_refreshes = HashMap::new();
@@ -234,7 +238,9 @@ where
                     break;
                 }
             }
+            let apply_ms = apply_started.elapsed().as_millis() as u64;
 
+            let fee_started = Instant::now();
             for (pool, block_number) in classic_fee_refreshes {
                 let Some(state) = monitored_states
                     .iter_mut()
@@ -326,7 +332,9 @@ where
             let fee_refreshed_pools = self
                 .refresh_slipstream_fees_at_block(&mut monitored_states, latest_block)
                 .await?;
+            let fee_ms = fee_started.elapsed().as_millis() as u64;
 
+            let publish_started = Instant::now();
             let watermarked_pools =
                 advance_valid_through_block(&mut monitored_states, latest_block);
             if !watermarked_pools.is_empty() {
@@ -346,10 +354,26 @@ where
                 )
                 .await?;
             }
+            let publish_ms = publish_started.elapsed().as_millis() as u64;
 
             enqueue_validation_snapshots(&mut pending_validations, validation_snapshots);
             self.validate_due_snapshots(&mut pending_validations, latest_block)
                 .await?;
+            info!(
+                from_block = last_seen_block + 1,
+                to_block = latest_block,
+                block_span = latest_block.saturating_sub(last_seen_block),
+                events = events.len(),
+                changed_pools = changed_pools.len(),
+                fee_refreshed_pools = fee_refreshed_pools.len(),
+                watermarked_pools = watermarked_pools.len(),
+                fetch_ms,
+                apply_ms,
+                fee_ms,
+                publish_ms,
+                total_ms = block_started.elapsed().as_millis() as u64,
+                "market-data sealed block summary"
+            );
 
             if Instant::now() >= next_active_refresh {
                 monitored_states = self
@@ -1254,17 +1278,6 @@ where
             .set_current_block(event.block_number)
             .await?;
         self.recorder.record_dex_event(event.clone()).await?;
-
-        // A flashblock event advances the pending-block view for every monitored
-        // pool: pools without a relevant log are unchanged through this pending
-        // block, while the event pool is updated below. Without this watermark,
-        // multi-pool quotes mix a pending state with sealed-block states and are
-        // rejected as having no common valid block.
-        let watermarked_pools = advance_valid_through_block(monitored_states, event.block_number);
-        if !watermarked_pools.is_empty() {
-            self.publish_validity_watermark(monitored_states, &watermarked_pools)
-                .await?;
-        }
 
         for state in monitored_states {
             if state.pool_id.address != event.pool_address {
