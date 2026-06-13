@@ -337,10 +337,6 @@ where
             let publish_started = Instant::now();
             let watermarked_pools =
                 advance_valid_through_block(&mut monitored_states, latest_block);
-            if !watermarked_pools.is_empty() {
-                self.publish_validity_watermark(&monitored_states, &watermarked_pools)
-                    .await?;
-            }
 
             if !changed_pools.is_empty() {
                 self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
@@ -1413,22 +1409,6 @@ where
         Ok(())
     }
 
-    async fn publish_validity_watermark(
-        &self,
-        states: &[PoolState],
-        selected: &HashSet<Address>,
-    ) -> Result<()> {
-        let mut changed_pools = Vec::with_capacity(selected.len());
-        for state in states {
-            if selected.contains(&state.pool_id.address) {
-                self.pool_store.set_pool_state(state.clone()).await?;
-                changed_pools.push(state.pool_id.address);
-            }
-        }
-        self.pool_store.mark_changed_pools(changed_pools).await?;
-        Ok(())
-    }
-
     async fn active_refresh_states(
         &self,
         mut states: Vec<PoolState>,
@@ -1546,11 +1526,7 @@ where
         }
 
         if !refreshed_pools.is_empty() {
-            let watermarked_pools = advance_valid_through_block(&mut states, block_number);
-            if !watermarked_pools.is_empty() {
-                self.publish_validity_watermark(&states, &watermarked_pools)
-                    .await?;
-            }
+            advance_valid_through_block(&mut states, block_number);
             self.publish_selected_states(&states, &refreshed_pools, "active_refresh")
                 .await?;
             self.publish_initialized_ticks(&refreshed_v3_states).await?;
