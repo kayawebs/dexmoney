@@ -33,6 +33,10 @@ pub fn tick_state_key(chain_id: u64, pool_address: alloy_primitives::Address, ti
     format!("ticks:{chain_id}:{pool_address}:{tick}")
 }
 
+pub fn tick_pool_index_key(pool_address: alloy_primitives::Address) -> String {
+    format!("ticks:index:{pool_address}")
+}
+
 pub fn candidates_key() -> &'static str {
     "candidates:priority"
 }
@@ -186,9 +190,13 @@ impl TickStateStore for RedisStore {
             tick_state.pool_id.address,
             tick_state.tick,
         );
+        let index_key = tick_pool_index_key(tick_state.pool_id.address);
         let value = serde_json::to_string(&tick_state)?;
         let mut manager = self.manager.clone();
-        let _: () = manager.set(key, value).await?;
+        let mut pipe = redis::pipe();
+        pipe.set(&key, value).ignore();
+        pipe.sadd(index_key, key).ignore();
+        let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
 
@@ -196,13 +204,12 @@ impl TickStateStore for RedisStore {
         let mut manager = self.manager.clone();
         let mut pipe = redis::pipe();
         for tick_state in tick_states {
-            let key = tick_state_key(
-                tick_state.pool_id.chain_id,
-                tick_state.pool_id.address,
-                tick_state.tick,
-            );
+            let pool = tick_state.pool_id.address;
+            let key = tick_state_key(tick_state.pool_id.chain_id, pool, tick_state.tick);
+            let index_key = tick_pool_index_key(pool);
             let value = serde_json::to_string(&tick_state)?;
-            pipe.set(key, value).ignore();
+            pipe.set(&key, value).ignore();
+            pipe.sadd(index_key, key).ignore();
         }
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
@@ -210,12 +217,17 @@ impl TickStateStore for RedisStore {
 
     async fn replace_pool_ticks(&self, pool: Address, tick_states: Vec<TickState>) -> Result<()> {
         let mut manager = self.manager.clone();
-        let pattern = format!("ticks:*:{pool}:*");
-        let existing_keys: Vec<String> = manager.keys(pattern).await?;
+        let index_key = tick_pool_index_key(pool);
+        let mut existing_keys: Vec<String> = manager.smembers(&index_key).await?;
+        if existing_keys.is_empty() {
+            let pattern = format!("ticks:*:{pool}:*");
+            existing_keys = manager.keys(pattern).await?;
+        }
         let mut pipe = redis::pipe();
         if !existing_keys.is_empty() {
             pipe.del(existing_keys).ignore();
         }
+        pipe.del(&index_key).ignore();
         for tick_state in tick_states {
             let key = tick_state_key(
                 tick_state.pool_id.chain_id,
@@ -223,7 +235,8 @@ impl TickStateStore for RedisStore {
                 tick_state.tick,
             );
             let value = serde_json::to_string(&tick_state)?;
-            pipe.set(key, value).ignore();
+            pipe.set(&key, value).ignore();
+            pipe.sadd(&index_key, key).ignore();
         }
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
@@ -231,8 +244,19 @@ impl TickStateStore for RedisStore {
 
     async fn get_pool_ticks(&self, pool: Address) -> Result<Vec<TickState>> {
         let mut manager = self.manager.clone();
-        let pattern = format!("ticks:*:{pool}:*");
-        let keys: Vec<String> = manager.keys(pattern).await?;
+        let index_key = tick_pool_index_key(pool);
+        let mut keys: Vec<String> = manager.smembers(&index_key).await?;
+        if keys.is_empty() {
+            let pattern = format!("ticks:*:{pool}:*");
+            keys = manager.keys(pattern).await?;
+            if !keys.is_empty() {
+                let mut pipe = redis::pipe();
+                for key in &keys {
+                    pipe.sadd(&index_key, key).ignore();
+                }
+                let _: () = pipe.query_async(&mut manager).await?;
+            }
+        }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
