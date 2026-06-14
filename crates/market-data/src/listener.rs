@@ -1313,31 +1313,80 @@ where
     }
 
     async fn reload_if_changed(&self, current: Vec<PoolState>) -> Result<Vec<PoolState>> {
-        let next = self.load_monitored_states().await?;
         let current_addresses = address_set(&current);
-        let next_addresses = address_set(&next);
-        if current_addresses != next_addresses {
-            let added = next_addresses
-                .difference(&current_addresses)
-                .filter_map(|address| address.parse::<Address>().ok())
-                .collect::<HashSet<_>>();
+        let registry_pools = self.recorder.enabled_registry_pools().await?;
+        if registry_pools.is_empty() {
+            return Ok(current);
+        }
+
+        let mut seen = HashSet::new();
+        let mut registry_entries = Vec::with_capacity(registry_pools.len());
+        for entry in registry_pools {
+            if seen.insert(entry.pool_address) {
+                registry_entries.push(entry);
+            }
+        }
+
+        let next_addresses = registry_entries
+            .iter()
+            .map(|entry| format!("{:#x}", entry.pool_address))
+            .collect::<HashSet<_>>();
+
+        if current_addresses == next_addresses {
+            return Ok(current);
+        }
+
+        let removed = current_addresses.difference(&next_addresses).count();
+        let mut next = current
+            .into_iter()
+            .filter(|state| next_addresses.contains(&format!("{:#x}", state.pool_id.address)))
+            .collect::<Vec<_>>();
+
+        let added_entries = registry_entries
+            .iter()
+            .filter(|entry| !current_addresses.contains(&format!("{:#x}", entry.pool_address)))
+            .collect::<Vec<_>>();
+
+        let mut added_states = Vec::with_capacity(added_entries.len());
+        let mut failed = 0usize;
+        for entry in added_entries {
+            match self.provider.fetch_pool_state_from_registry(entry).await {
+                Ok(state) => {
+                    added_states.push(state.clone());
+                    next.push(state);
+                }
+                Err(err) => {
+                    failed += 1;
+                    warn!(
+                        pool = %entry.pool_address,
+                        error = %err,
+                        "failed to load newly enabled registry pool"
+                    );
+                }
+            }
+        }
+
+        if !added_states.is_empty() || removed > 0 || failed > 0 {
             info!(
                 previous = current_addresses.len(),
                 next = next_addresses.len(),
-                added = added.len(),
+                added = added_states.len(),
+                removed,
+                failed,
                 "pool registry changed; reloading monitored pools"
             );
-            if !added.is_empty() {
-                self.publish_selected_states(&next, &added, "registry_reload")
-                    .await?;
-                let added_states = next
-                    .iter()
-                    .filter(|state| added.contains(&state.pool_id.address))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                self.spawn_initialized_tick_warmup(added_states, "registry_reload");
-            }
         }
+
+        if !added_states.is_empty() {
+            let added = added_states
+                .iter()
+                .map(|state| state.pool_id.address)
+                .collect::<HashSet<_>>();
+            self.publish_selected_states(&added_states, &added, "registry_reload")
+                .await?;
+            self.spawn_initialized_tick_warmup(added_states, "registry_reload");
+        }
+
         Ok(next)
     }
 
