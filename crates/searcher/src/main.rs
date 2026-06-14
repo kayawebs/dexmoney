@@ -87,6 +87,19 @@ async fn main() -> Result<()> {
                 candidates_coalesced = aggregate.candidates_coalesced,
                 inactive_pool_filtered_paths = aggregate.inactive_pool_filtered_paths,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
+                dynamic_multihop_anchors = aggregate.search.dynamic_multihop_anchors,
+                dynamic_multihop_changed_edges = aggregate.search.dynamic_multihop_changed_edges,
+                dynamic_multihop_prefix_empty = aggregate.search.dynamic_multihop_prefix_empty,
+                dynamic_multihop_suffix_empty = aggregate.search.dynamic_multihop_suffix_empty,
+                dynamic_multihop_invalid_cycle = aggregate.search.dynamic_multihop_invalid_cycle,
+                dynamic_multihop_duplicate_cycle =
+                    aggregate.search.dynamic_multihop_duplicate_cycle,
+                dynamic_multihop_rough_quote_failed =
+                    aggregate.search.dynamic_multihop_rough_quote_failed,
+                dynamic_multihop_rough_profit_below_min =
+                    aggregate.search.dynamic_multihop_rough_profit_below_min,
+                dynamic_multihop_candidate_cap_hit =
+                    aggregate.search.dynamic_multihop_candidate_cap_hit,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
                 risk_price_impact_rejected = aggregate.risk_price_impact_rejected,
@@ -358,7 +371,7 @@ where
         return Ok(SearchCycleStats::default());
     };
     let path_build_started = Instant::now();
-    let dynamic_paths =
+    let (dynamic_paths, dynamic_stats) =
         engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
     let search_paths_raw =
         engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
@@ -384,7 +397,7 @@ where
         ..SearchCycleStats::default()
     };
     cycle_stats.search.total_paths = path_index.total_paths();
-    cycle_stats.search.dynamic_multihop_paths = dynamic_paths.len() as u64;
+    cycle_stats.search.merge(&dynamic_stats);
     let mut refreshed_tick_pools = HashSet::new();
 
     for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {

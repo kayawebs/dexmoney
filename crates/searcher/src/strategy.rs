@@ -48,6 +48,15 @@ pub struct SearchStats {
     pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
     pub dynamic_multihop_paths: u64,
+    pub dynamic_multihop_anchors: u64,
+    pub dynamic_multihop_changed_edges: u64,
+    pub dynamic_multihop_prefix_empty: u64,
+    pub dynamic_multihop_suffix_empty: u64,
+    pub dynamic_multihop_invalid_cycle: u64,
+    pub dynamic_multihop_duplicate_cycle: u64,
+    pub dynamic_multihop_rough_quote_failed: u64,
+    pub dynamic_multihop_rough_profit_below_min: u64,
+    pub dynamic_multihop_candidate_cap_hit: u64,
     pub best_profit_before_impact: U256,
     pub best_profit_rejected_by_impact: U256,
     pub best_profit: U256,
@@ -68,6 +77,16 @@ impl SearchStats {
         self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
         self.dynamic_multihop_paths += other.dynamic_multihop_paths;
+        self.dynamic_multihop_anchors += other.dynamic_multihop_anchors;
+        self.dynamic_multihop_changed_edges += other.dynamic_multihop_changed_edges;
+        self.dynamic_multihop_prefix_empty += other.dynamic_multihop_prefix_empty;
+        self.dynamic_multihop_suffix_empty += other.dynamic_multihop_suffix_empty;
+        self.dynamic_multihop_invalid_cycle += other.dynamic_multihop_invalid_cycle;
+        self.dynamic_multihop_duplicate_cycle += other.dynamic_multihop_duplicate_cycle;
+        self.dynamic_multihop_rough_quote_failed += other.dynamic_multihop_rough_quote_failed;
+        self.dynamic_multihop_rough_profit_below_min +=
+            other.dynamic_multihop_rough_profit_below_min;
+        self.dynamic_multihop_candidate_cap_hit += other.dynamic_multihop_candidate_cap_hit;
         self.best_profit_before_impact = self
             .best_profit_before_impact
             .max(other.best_profit_before_impact);
@@ -469,13 +488,15 @@ impl SearchEngine {
         &self,
         graph: &GraphSnapshot,
         changed_pools: &HashSet<Address>,
-    ) -> Vec<SearchPath> {
+    ) -> (Vec<SearchPath>, SearchStats) {
+        let mut stats = SearchStats::default();
         if !self.multihop_enabled || changed_pools.is_empty() {
-            return Vec::new();
+            return (Vec::new(), stats);
         }
         let anchors = anchor_search_configs(&self.pair_configs);
+        stats.dynamic_multihop_anchors = anchors.len() as u64;
         if anchors.is_empty() {
-            return Vec::new();
+            return (Vec::new(), stats);
         }
 
         let mut candidates = Vec::new();
@@ -493,6 +514,7 @@ impl SearchEngine {
                         &anchor,
                         changed_edge,
                         3,
+                        &mut stats,
                     );
                     add_dynamic_cycles_for_changed_edge(
                         &mut candidates,
@@ -501,14 +523,20 @@ impl SearchEngine {
                         &anchor,
                         changed_edge,
                         4,
+                        &mut stats,
                     );
                     if candidates.len() >= MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN {
-                        return select_dynamic_paths(candidates);
+                        stats.dynamic_multihop_candidate_cap_hit += 1;
+                        let selected = select_dynamic_paths(candidates);
+                        stats.dynamic_multihop_paths = selected.len() as u64;
+                        return (selected, stats);
                     }
                 }
             }
         }
-        select_dynamic_paths(candidates)
+        let selected = select_dynamic_paths(candidates);
+        stats.dynamic_multihop_paths = selected.len() as u64;
+        (selected, stats)
     }
 
     #[cfg(test)]
@@ -950,16 +978,20 @@ fn add_dynamic_cycles_for_changed_edge(
     anchor: &AnchorSearchConfig,
     changed_edge: &OwnedPoolEdge,
     cycle_len: usize,
+    stats: &mut SearchStats,
 ) {
+    stats.dynamic_multihop_changed_edges += 1;
     for changed_position in 0..cycle_len {
         let prefix_len = changed_position;
         let suffix_len = cycle_len - changed_position - 1;
         let prefixes = edge_paths_between(graph, anchor.token, changed_edge.token_in, prefix_len);
         if prefixes.is_empty() {
+            stats.dynamic_multihop_prefix_empty += 1;
             continue;
         }
         let suffixes = edge_paths_between(graph, changed_edge.token_out, anchor.token, suffix_len);
         if suffixes.is_empty() {
+            stats.dynamic_multihop_suffix_empty += 1;
             continue;
         }
 
@@ -970,13 +1002,15 @@ fn add_dynamic_cycles_for_changed_edge(
                 cycle.push(changed_edge.clone());
                 cycle.extend(suffix.iter().cloned());
                 if !is_valid_dynamic_cycle(anchor.token, &cycle) {
+                    stats.dynamic_multihop_invalid_cycle += 1;
                     continue;
                 }
                 let fingerprint = cycle_fingerprint(anchor.token, &cycle);
                 if !seen.insert(fingerprint) {
+                    stats.dynamic_multihop_duplicate_cycle += 1;
                     continue;
                 }
-                let Some(scored_path) = score_dynamic_multihop_path(anchor, &cycle) else {
+                let Some(scored_path) = score_dynamic_multihop_path(anchor, &cycle, stats) else {
                     continue;
                 };
                 paths.push(scored_path);
@@ -1006,23 +1040,32 @@ fn select_dynamic_paths(mut paths: Vec<ScoredDynamicPath>) -> Vec<SearchPath> {
 fn score_dynamic_multihop_path(
     anchor: &AnchorSearchConfig,
     edges: &[OwnedPoolEdge],
+    stats: &mut SearchStats,
 ) -> Option<ScoredDynamicPath> {
     let mut best_score_bps = U256::ZERO;
     let mut best_profit = U256::ZERO;
-    for amount_in in anchor.amount_sizes.iter().copied() {
+    let mut quote_failed = false;
+    let mut below_min = false;
+    'amounts: for amount_in in anchor.amount_sizes.iter().copied() {
         if amount_in.is_zero() {
             continue;
         }
         let mut amount = amount_in;
         for edge in edges {
-            amount = rough_quote_edge_upper_bound(edge, amount)?;
+            let Some(next_amount) = rough_quote_edge_upper_bound(edge, amount) else {
+                quote_failed = true;
+                continue 'amounts;
+            };
+            amount = next_amount;
             if amount.is_zero() {
-                return None;
+                quote_failed = true;
+                continue 'amounts;
             }
         }
 
         let estimated_profit = amount.saturating_sub(amount_in);
         if estimated_profit < anchor.min_profit {
+            below_min = true;
             continue;
         }
         let score_bps = amount
@@ -1036,6 +1079,11 @@ fn score_dynamic_multihop_path(
         }
     }
     if best_score_bps.is_zero() {
+        if quote_failed {
+            stats.dynamic_multihop_rough_quote_failed += 1;
+        } else if below_min {
+            stats.dynamic_multihop_rough_profit_below_min += 1;
+        }
         return None;
     }
     Some(ScoredDynamicPath {
