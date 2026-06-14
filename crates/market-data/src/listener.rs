@@ -301,9 +301,6 @@ where
             let fee_ms = fee_started.elapsed().as_millis() as u64;
 
             let publish_started = Instant::now();
-            let watermarked_pools =
-                advance_valid_through_block(&mut monitored_states, latest_block);
-
             if !changed_pools.is_empty() {
                 self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
                     .await?;
@@ -326,7 +323,7 @@ where
                 events = events.len(),
                 changed_pools = changed_pools.len(),
                 fee_refreshed_pools = fee_refreshed_pools.len(),
-                watermarked_pools = watermarked_pools.len(),
+                watermarked_pools = 0usize,
                 fetch_ms,
                 apply_ms,
                 fee_ms,

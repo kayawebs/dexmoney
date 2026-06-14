@@ -557,7 +557,9 @@ impl PostgresStore {
                     WHEN NULLIF(BTRIM(tp.token1_search_amounts), '') IS NOT NULL
                         THEN tp.token1_min_profit
                     ELSE COALESCE(token1_multihop_default.min_profit, token1_default.min_profit)
-                END AS token1_multihop_min_profit
+                END AS token1_multihop_min_profit,
+                token0_default.min_profit AS token0_all_min_profit,
+                token1_default.min_profit AS token1_all_min_profit
             FROM token_pairs tp
             LEFT JOIN token_search_defaults token0_default
               ON token0_default.chain_id = tp.chain_id
@@ -1121,6 +1123,8 @@ struct TokenPairSearchConfigRow {
     token1_min_profit: Option<String>,
     token0_multihop_min_profit: Option<String>,
     token1_multihop_min_profit: Option<String>,
+    token0_all_min_profit: Option<String>,
+    token1_all_min_profit: Option<String>,
 }
 
 impl TryFrom<PoolRegistryRow> for PoolRegistryEntry {
@@ -1159,20 +1163,30 @@ impl TryFrom<TokenPairSearchConfigRow> for TokenPairSearchConfig {
             token1_multihop_search_amounts: parse_raw_amount_list(
                 row.token1_multihop_search_amounts.as_deref(),
             )?,
-            token0_min_profit: parse_raw_amount(row.token0_min_profit.as_deref())?
-                .unwrap_or(U256::from(1u64)),
-            token1_min_profit: parse_raw_amount(row.token1_min_profit.as_deref())?
-                .unwrap_or(U256::from(1u64)),
-            token0_multihop_min_profit: parse_raw_amount(
+            token0_min_profit: effective_min_profit(
+                row.token0_min_profit.as_deref(),
+                row.token0_all_min_profit.as_deref(),
+            )?,
+            token1_min_profit: effective_min_profit(
+                row.token1_min_profit.as_deref(),
+                row.token1_all_min_profit.as_deref(),
+            )?,
+            token0_multihop_min_profit: effective_min_profit(
                 row.token0_multihop_min_profit.as_deref(),
-            )?
-            .unwrap_or(U256::from(1u64)),
-            token1_multihop_min_profit: parse_raw_amount(
+                row.token0_all_min_profit.as_deref(),
+            )?,
+            token1_multihop_min_profit: effective_min_profit(
                 row.token1_multihop_min_profit.as_deref(),
-            )?
-            .unwrap_or(U256::from(1u64)),
+                row.token1_all_min_profit.as_deref(),
+            )?,
         })
     }
+}
+
+fn effective_min_profit(raw: Option<&str>, all_raw: Option<&str>) -> Result<U256> {
+    let min_profit = parse_raw_amount(raw)?.unwrap_or(U256::from(1u64));
+    let all_min_profit = parse_raw_amount(all_raw)?.unwrap_or(U256::ZERO);
+    Ok(min_profit.max(all_min_profit))
 }
 
 #[async_trait]
