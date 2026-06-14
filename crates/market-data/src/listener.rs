@@ -28,6 +28,8 @@ const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
+const TICK_WARMUP_BATCH_SIZE: usize = 16;
+const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
@@ -72,6 +74,7 @@ where
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states, "onchain_init")
             .await?;
+        self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
         self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
@@ -1332,7 +1335,7 @@ where
                     .filter(|state| added.contains(&state.pool_id.address))
                     .cloned()
                     .collect::<Vec<_>>();
-                self.publish_initialized_ticks(&added_states).await?;
+                self.spawn_initialized_tick_warmup(added_states, "registry_reload");
             }
         }
         Ok(next)
@@ -1748,6 +1751,53 @@ where
             );
         }
         Ok(())
+    }
+
+    fn spawn_initialized_tick_warmup(&self, states: Vec<PoolState>, reason: &'static str) {
+        let v3_states = states
+            .into_iter()
+            .filter(is_v3_style_state)
+            .collect::<Vec<_>>();
+        if v3_states.is_empty() {
+            return;
+        }
+
+        let service = MarketDataService {
+            settings: self.settings.clone(),
+            provider: self.provider.clone(),
+            pool_store: self.pool_store.clone(),
+            recorder: self.recorder.clone(),
+        };
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let total = v3_states.len();
+            let mut processed = 0usize;
+            info!(
+                total,
+                batch_size = TICK_WARMUP_BATCH_SIZE,
+                reason,
+                "initialized tick warmup started"
+            );
+            for chunk in v3_states.chunks(TICK_WARMUP_BATCH_SIZE) {
+                if let Err(err) = service.publish_initialized_ticks(chunk).await {
+                    warn!(
+                        reason,
+                        processed,
+                        total,
+                        error = %err,
+                        "initialized tick warmup batch failed"
+                    );
+                }
+                processed += chunk.len();
+                sleep(TICK_WARMUP_BATCH_PAUSE).await;
+            }
+            info!(
+                total,
+                warmup_ms = started.elapsed().as_millis() as u64,
+                reason,
+                "initialized tick warmup complete"
+            );
+        });
     }
 
     async fn apply_tick_deltas(
