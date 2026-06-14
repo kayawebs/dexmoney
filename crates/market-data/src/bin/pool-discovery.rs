@@ -18,13 +18,13 @@ async fn main() -> Result<()> {
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
 
-    info!("market-data initialized");
+    info!("pool-discovery initialized");
     let service = listener::MarketDataService {
         settings: settings.clone(),
         provider,
         pool_store: redis,
         recorder: postgres,
     };
-    listener::run(&service).await?;
+    service.run_pool_discovery().await?;
     Ok(())
 }

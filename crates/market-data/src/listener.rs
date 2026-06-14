@@ -26,6 +26,8 @@ const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
+const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
+const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
@@ -332,6 +334,44 @@ where
             );
 
             last_seen_block = latest_block;
+        }
+    }
+
+    pub async fn run_pool_discovery(&self) -> Result<()> {
+        info!("pool discovery started");
+        self.seed_default_factories().await?;
+
+        let mut last_scanned_block = self.provider.get_block_number().await?;
+        let mut globally_observed_pools = HashSet::new();
+        info!(last_scanned_block, "pool discovery synchronized at startup");
+
+        let mut ticker = interval(POOL_DISCOVERY_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            let latest_block = self.provider.get_block_number().await?;
+            if latest_block <= last_scanned_block {
+                continue;
+            }
+
+            let from_block = last_scanned_block + 1;
+            let to_block =
+                latest_block.min(last_scanned_block.saturating_add(POOL_DISCOVERY_MAX_BLOCK_SPAN));
+            let started = Instant::now();
+            self.discover_live_pool_creations(from_block, to_block)
+                .await?;
+            self.discover_global_swap_pools(from_block, to_block, &mut globally_observed_pools)
+                .await?;
+            info!(
+                from_block,
+                to_block,
+                latest_block,
+                lag_blocks = latest_block.saturating_sub(to_block),
+                discovery_ms = started.elapsed().as_millis() as u64,
+                "pool discovery scan complete"
+            );
+            last_scanned_block = to_block;
         }
     }
 
@@ -1347,6 +1387,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn active_refresh_states(
         &self,
         mut states: Vec<PoolState>,
@@ -1483,6 +1524,7 @@ where
         Ok(states)
     }
 
+    #[allow(dead_code)]
     async fn refresh_aerodrome_fees(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
         if states.is_empty() {
             return Ok(states);
@@ -1740,6 +1782,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn calibrate_states(&self, mut states: Vec<PoolState>) -> Result<Vec<PoolState>> {
         let mut corrected_pools = HashSet::new();
 
@@ -2020,6 +2063,7 @@ fn is_v3_style_state(state: &PoolState) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn is_aerodrome_fee_state(state: &PoolState) -> bool {
     if state.dex != DexKind::Aerodrome {
         return false;
@@ -2036,6 +2080,7 @@ fn is_aerodrome_fee_state(state: &PoolState) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn address_eq_str(address: Address, expected: &str) -> bool {
     expected
         .parse::<Address>()
@@ -2044,11 +2089,13 @@ fn address_eq_str(address: Address, expected: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum AerodromeFee {
     Classic(u32),
     Slipstream(u32),
 }
 
+#[allow(dead_code)]
 fn apply_aerodrome_fee(state: &mut PoolState, fee: AerodromeFee) -> bool {
     match (state.variant, fee) {
         (PoolVariant::AerodromeVolatile, AerodromeFee::Classic(fee_bps))
@@ -2110,6 +2157,7 @@ fn unique_pool_addresses(states: &[PoolState]) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn registry_entry_from_state(state: &PoolState) -> PoolRegistryEntry {
     PoolRegistryEntry {
         pool_address: state.pool_id.address,
@@ -2125,6 +2173,7 @@ fn registry_entry_from_state(state: &PoolState) -> PoolRegistryEntry {
     }
 }
 
+#[allow(dead_code)]
 fn should_calibrate(state: &PoolState) -> bool {
     matches!(
         (state.dex, state.variant),
@@ -2132,6 +2181,7 @@ fn should_calibrate(state: &PoolState) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn calibration_message(state: &PoolState, drift_bps: u64) -> String {
     match (state.dex, state.variant) {
         (DexKind::Aerodrome, PoolVariant::AerodromeVolatile) => {

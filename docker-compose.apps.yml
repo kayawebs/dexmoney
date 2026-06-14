@@ -21,7 +21,18 @@ services:
     build:
       context: .
       args:
+        APP_PACKAGE: market-data
         APP_BIN: market-data
+
+  pool-discovery:
+    <<: *app-common
+    container_name: dexmoney-pool-discovery
+    image: dexmoney-pool-discovery:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_PACKAGE: market-data
+        APP_BIN: pool-discovery
 
   searcher:
     <<: *app-common
@@ -30,6 +41,7 @@ services:
     build:
       context: .
       args:
+        APP_PACKAGE: searcher
         APP_BIN: searcher
 
   monitor-web:
@@ -39,6 +51,7 @@ services:
     build:
       context: .
       args:
+        APP_PACKAGE: monitor-web
         APP_BIN: monitor-web
     ports:
       - "${MONITOR_WEB_BIND:-127.0.0.1}:${MONITOR_WEB_PORT:-8085}:8085"
@@ -52,6 +65,7 @@ services:
     build:
       context: .
       args:
+        APP_PACKAGE: execution-manager
         APP_BIN: execution-manager
 
 networks:
