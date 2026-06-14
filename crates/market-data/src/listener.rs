@@ -256,6 +256,7 @@ where
             let apply_ms = apply_started.elapsed().as_millis() as u64;
 
             let fee_started = Instant::now();
+            let mut fee_refreshed_pools = HashSet::new();
             for (pool, block_number) in classic_fee_refreshes {
                 let Some(state) = monitored_states
                     .iter_mut()
@@ -278,6 +279,7 @@ where
                 match fee_result {
                     Ok(fee_bps) => {
                         state.fee_bps = fee_bps;
+                        fee_refreshed_pools.insert(pool);
                         validation_snapshots
                             .insert((state.block_number, state.pool_id.address), state.clone());
                         debug!(
@@ -322,6 +324,7 @@ where
                     Ok(fee_pips) => {
                         state.fee_pips = Some(fee_pips);
                         state.fee_bps = fee_pips / 100;
+                        fee_refreshed_pools.insert(pool);
                         validation_snapshots
                             .insert((state.block_number, state.pool_id.address), state.clone());
                         debug!(
@@ -344,9 +347,6 @@ where
                 }
             }
 
-            let fee_refreshed_pools = self
-                .refresh_slipstream_fees_at_block(&mut monitored_states, latest_block)
-                .await?;
             let fee_ms = fee_started.elapsed().as_millis() as u64;
 
             let publish_started = Instant::now();
@@ -1691,94 +1691,6 @@ where
                 Ok(false)
             }
         }
-    }
-
-    async fn refresh_slipstream_fees_at_block(
-        &self,
-        states: &mut [PoolState],
-        block_number: u64,
-    ) -> Result<HashSet<Address>> {
-        let block_hash = match self.provider.get_block_hash(block_number).await {
-            Ok(block_hash) => block_hash,
-            Err(err) => {
-                warn!(
-                    block_number,
-                    error = %err,
-                    "skipping per-block Slipstream fee refresh because block hash lookup failed"
-                );
-                return Ok(HashSet::new());
-            }
-        };
-
-        let mut changed_pools = HashSet::new();
-        let mut checked = 0usize;
-        let mut failed = 0usize;
-
-        for state in states {
-            if !matches!(
-                (state.dex, state.variant),
-                (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-            ) {
-                continue;
-            }
-
-            checked += 1;
-            let local = state.clone();
-            let fee_pips = match self
-                .provider
-                .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
-                    state.factory_address,
-                    state.pool_id.address,
-                    &block_hash,
-                )
-                .await
-            {
-                Ok(fee_pips) => fee_pips,
-                Err(err) => {
-                    failed += 1;
-                    warn!(
-                        pool = %state.pool_id.address,
-                        block_number,
-                        error = %err,
-                        "per-block Slipstream fee refresh failed"
-                    );
-                    continue;
-                }
-            };
-
-            if !apply_aerodrome_fee(state, AerodromeFee::Slipstream(fee_pips)) {
-                continue;
-            }
-
-            let drift_bps = state_drift_bps(&local, state);
-            let message = format!("Aerodrome fee refresh corrected fee drift by {drift_bps} bps");
-            self.recorder
-                .record_pool_state_warning(PoolStateWarning {
-                    pool_address: local.pool_id.address,
-                    dex: local.dex,
-                    variant: local.variant,
-                    block_number,
-                    local_state: local,
-                    onchain_state: state.clone(),
-                    drift_bps,
-                    message,
-                    created_at: chrono::Utc::now(),
-                })
-                .await?;
-            changed_pools.insert(state.pool_id.address);
-        }
-
-        if !changed_pools.is_empty() || failed > 0 {
-            debug!(
-                checked,
-                changed = changed_pools.len(),
-                failed,
-                block_number,
-                "per-block Slipstream fee refresh complete"
-            );
-        }
-
-        Ok(changed_pools)
     }
 
     async fn publish_initialized_ticks(&self, states: &[PoolState]) -> Result<()> {
