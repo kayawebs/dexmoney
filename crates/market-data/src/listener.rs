@@ -23,7 +23,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
-const CALIBRATION_INTERVAL: Duration = Duration::from_secs(30);
 const FLASHBLOCK_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
@@ -75,23 +74,10 @@ where
         self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
-        let mut last_discovered_block = last_seen_block;
         self.pool_store.set_current_block(last_seen_block).await?;
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
-        let mut next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-        let active_refresh_interval =
-            Duration::from_secs(self.settings.pool_active_refresh_interval_secs.max(10));
-        let mut next_active_refresh = Instant::now() + active_refresh_interval;
-        let aerodrome_fee_refresh_interval =
-            Duration::from_secs(self.settings.aerodrome_fee_refresh_interval_secs.max(1));
-        let mut next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
-        let tick_refresh_interval =
-            Duration::from_secs(self.settings.v3_tick_refresh_interval_secs.max(10));
-        let mut next_tick_refresh = Instant::now() + tick_refresh_interval;
         let mut recent_logs = RecentLogCache::new(20_000);
-        let mut globally_observed_pools = HashSet::new();
         let mut pending_validations = VecDeque::new();
-        let mut active_refresh_cursor = 0usize;
         info!(last_seen_block, "market-data synchronized at startup");
 
         let mut ticker = interval(Duration::from_millis(100));
@@ -102,48 +88,9 @@ where
             let latest_block = self.provider.get_block_number().await?;
             self.pool_store.set_current_block(latest_block).await?;
             if latest_block <= last_seen_block {
-                if last_discovered_block < latest_block {
-                    let discovery_started = Instant::now();
-                    self.discover_live_pool_creations(last_discovered_block + 1, latest_block)
-                        .await?;
-                    self.discover_global_swap_pools(
-                        last_discovered_block + 1,
-                        latest_block,
-                        &mut globally_observed_pools,
-                    )
-                    .await?;
-                    info!(
-                        from_block = last_discovered_block + 1,
-                        to_block = latest_block,
-                        discovery_ms = discovery_started.elapsed().as_millis() as u64,
-                        "market-data idle pool discovery complete"
-                    );
-                    last_discovered_block = latest_block;
-                }
                 if Instant::now() >= next_registry_reload {
                     monitored_states = self.reload_if_changed(monitored_states).await?;
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
-                }
-                if Instant::now() >= next_active_refresh {
-                    monitored_states = self
-                        .active_refresh_states(
-                            monitored_states,
-                            &mut active_refresh_cursor,
-                            latest_block,
-                        )
-                        .await?;
-                    next_active_refresh = Instant::now() + active_refresh_interval;
-                    next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-                    next_tick_refresh = Instant::now() + tick_refresh_interval;
-                } else if Instant::now() >= next_aerodrome_fee_refresh {
-                    monitored_states = self.refresh_aerodrome_fees(monitored_states).await?;
-                    next_aerodrome_fee_refresh = Instant::now() + aerodrome_fee_refresh_interval;
-                } else if Instant::now() >= next_calibration {
-                    monitored_states = self.calibrate_states(monitored_states).await?;
-                    next_calibration = Instant::now() + CALIBRATION_INTERVAL;
-                } else if Instant::now() >= next_tick_refresh {
-                    self.publish_initialized_ticks(&monitored_states).await?;
-                    next_tick_refresh = Instant::now() + tick_refresh_interval;
                 }
                 self.validate_due_snapshots(
                     &mut pending_validations,
