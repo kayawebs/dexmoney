@@ -72,7 +72,6 @@ where
         let mut monitored_states = self.load_monitored_states().await?;
         self.publish_monitored_states(&monitored_states, "onchain_init")
             .await?;
-        self.publish_initialized_ticks(&monitored_states).await?;
         self.spawn_flashblocks_listener();
 
         let mut last_seen_block = self.provider.get_block_number().await?;
@@ -1315,14 +1314,26 @@ where
         let current_addresses = address_set(&current);
         let next_addresses = address_set(&next);
         if current_addresses != next_addresses {
+            let added = next_addresses
+                .difference(&current_addresses)
+                .filter_map(|address| address.parse::<Address>().ok())
+                .collect::<HashSet<_>>();
             info!(
                 previous = current_addresses.len(),
                 next = next_addresses.len(),
+                added = added.len(),
                 "pool registry changed; reloading monitored pools"
             );
-            self.publish_monitored_states(&next, "registry_reload")
-                .await?;
-            self.publish_initialized_ticks(&next).await?;
+            if !added.is_empty() {
+                self.publish_selected_states(&next, &added, "registry_reload")
+                    .await?;
+                let added_states = next
+                    .iter()
+                    .filter(|state| added.contains(&state.pool_id.address))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.publish_initialized_ticks(&added_states).await?;
+            }
         }
         Ok(next)
     }
