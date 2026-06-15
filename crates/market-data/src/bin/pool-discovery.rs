@@ -21,10 +21,23 @@ async fn main() -> Result<()> {
     info!("pool-discovery initialized");
     let service = listener::MarketDataService {
         settings: settings.clone(),
-        provider,
-        pool_store: redis,
-        recorder: postgres,
+        provider: provider.clone(),
+        pool_store: redis.clone(),
+        recorder: postgres.clone(),
     };
+    if settings.competitor_pool_discovery_enabled {
+        let competitor_service = listener::MarketDataService {
+            settings,
+            provider,
+            pool_store: redis,
+            recorder: postgres,
+        };
+        tokio::spawn(async move {
+            if let Err(err) = competitor_service.run_competitor_pool_discovery().await {
+                tracing::error!(error = %err, "competitor pool discovery stopped");
+            }
+        });
+    }
     service.run_pool_discovery().await?;
     Ok(())
 }

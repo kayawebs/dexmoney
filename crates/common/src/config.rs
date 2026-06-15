@@ -43,6 +43,11 @@ pub struct Settings {
     pub pool_active_refresh_batch_size: u64,
     pub market_data_flashblocks_enabled: bool,
     pub market_data_global_pool_discovery_enabled: bool,
+    pub competitor_pool_discovery_enabled: bool,
+    pub competitor_collector_address: Option<Address>,
+    pub competitor_pool_discovery_interval_ms: u64,
+    pub competitor_pool_discovery_lookback_blocks: u64,
+    pub competitor_pool_discovery_max_block_span: u64,
     pub searcher_multihop_enabled: bool,
     pub aerodrome_fee_refresh_interval_secs: u64,
     pub v3_tick_refresh_interval_secs: u64,
@@ -79,6 +84,14 @@ impl Settings {
             .set_default("pool_active_refresh_batch_size", 25u64)?
             .set_default("market_data_flashblocks_enabled", true)?
             .set_default("market_data_global_pool_discovery_enabled", true)?
+            .set_default("competitor_pool_discovery_enabled", true)?
+            .set_default(
+                "competitor_collector_address",
+                "0x0629da86af5a4ae1ba5e1589b13702558d0fb056",
+            )?
+            .set_default("competitor_pool_discovery_interval_ms", 1000u64)?
+            .set_default("competitor_pool_discovery_lookback_blocks", 100u64)?
+            .set_default("competitor_pool_discovery_max_block_span", 25u64)?
             .set_default("searcher_multihop_enabled", true)?
             .set_default("aerodrome_fee_refresh_interval_secs", 3u64)?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?

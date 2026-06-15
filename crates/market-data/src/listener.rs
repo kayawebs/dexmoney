@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
@@ -47,6 +47,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const ERC20_TRANSFER_TOPIC: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -372,6 +374,196 @@ where
             );
             last_scanned_block = to_block;
         }
+    }
+
+    pub async fn run_competitor_pool_discovery(&self) -> Result<()> {
+        if !self.settings.competitor_pool_discovery_enabled {
+            info!("competitor pool discovery disabled");
+            return Ok(());
+        }
+        let Some(collector) = self.settings.competitor_collector_address else {
+            info!("competitor pool discovery skipped because collector address is not configured");
+            return Ok(());
+        };
+
+        let latest_block = self.provider.get_block_number().await?;
+        let mut last_scanned_block =
+            latest_block.saturating_sub(self.settings.competitor_pool_discovery_lookback_blocks);
+        let mut recent_txs = RecentTxCache::new(20_000);
+        info!(
+            collector = %collector,
+            last_scanned_block,
+            "competitor pool discovery synchronized at startup"
+        );
+
+        let mut ticker = interval(Duration::from_millis(
+            self.settings.competitor_pool_discovery_interval_ms.max(100),
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            let latest_block = self.provider.get_block_number().await?;
+            if latest_block <= last_scanned_block {
+                continue;
+            }
+            let from_block = last_scanned_block + 1;
+            let to_block = latest_block.min(
+                last_scanned_block.saturating_add(
+                    self.settings
+                        .competitor_pool_discovery_max_block_span
+                        .max(1),
+                ),
+            );
+            let started = Instant::now();
+            match self
+                .discover_competitor_receipt_pools(collector, from_block, to_block, &mut recent_txs)
+                .await
+            {
+                Ok(summary) => {
+                    if summary.transfer_txs > 0 || summary.imported > 0 || summary.observed_only > 0
+                    {
+                        info!(
+                            collector = %collector,
+                            from_block,
+                            to_block,
+                            latest_block,
+                            transfer_txs = summary.transfer_txs,
+                            receipts = summary.receipts,
+                            swap_logs = summary.swap_logs,
+                            imported = summary.imported,
+                            observed_only = summary.observed_only,
+                            skipped = summary.skipped,
+                            discovery_ms = started.elapsed().as_millis() as u64,
+                            "competitor pool discovery scan complete"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        collector = %collector,
+                        from_block,
+                        to_block,
+                        error = %err,
+                        "competitor pool discovery scan failed"
+                    );
+                }
+            }
+            last_scanned_block = to_block;
+        }
+    }
+
+    async fn discover_competitor_receipt_pools(
+        &self,
+        collector: Address,
+        from_block: u64,
+        to_block: u64,
+        recent_txs: &mut RecentTxCache,
+    ) -> Result<CompetitorPoolDiscoverySummary> {
+        if from_block > to_block {
+            return Ok(CompetitorPoolDiscoverySummary::default());
+        }
+
+        let params = json!([{
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": [ERC20_TRANSFER_TOPIC, null, address_topic(collector)]
+        }]);
+        let logs = match self.provider.get_logs_raw(params).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                warn!(
+                    from_block,
+                    to_block,
+                    error = %err,
+                    "competitor transfer getLogs failed"
+                );
+                return Ok(CompetitorPoolDiscoverySummary::default());
+            }
+        };
+        if logs.is_empty() {
+            return Ok(CompetitorPoolDiscoverySummary::default());
+        }
+
+        let trusted = self
+            .recorder
+            .trusted_factory_registry(self.settings.chain_id)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let address = row.factory_address.parse::<Address>().ok()?;
+                let dex = parse_dex_kind(&row.dex).ok()?;
+                let variant = parse_pool_variant(&row.variant).ok()?;
+                Some((address, (dex, variant, row)))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut summary = CompetitorPoolDiscoverySummary::default();
+        let mut receipt_txs = HashSet::new();
+        for raw in logs {
+            let Some(tx_hash) = raw_log_tx_hash(&raw) else {
+                summary.skipped += 1;
+                continue;
+            };
+            if !recent_txs.insert(tx_hash) {
+                continue;
+            }
+            receipt_txs.insert(tx_hash);
+        }
+        summary.transfer_txs = receipt_txs.len();
+
+        let mut seen_pools = HashSet::new();
+        for tx_hash in receipt_txs {
+            let Some(receipt) = self.provider.get_transaction_receipt(tx_hash).await? else {
+                summary.skipped += 1;
+                continue;
+            };
+            summary.receipts += 1;
+            let Some(logs) = receipt.raw.get("logs").and_then(Value::as_array) else {
+                continue;
+            };
+            for raw in logs {
+                let Some(topic0) = raw_log_topic0(raw) else {
+                    continue;
+                };
+                if !is_supported_swap_topic(&topic0) {
+                    continue;
+                }
+                let log = match parse_swap_log(raw.clone()) {
+                    Ok(log) => log,
+                    Err(err) => {
+                        debug!(
+                            tx_hash = %tx_hash,
+                            error = %err,
+                            "competitor receipt swap log skipped"
+                        );
+                        summary.skipped += 1;
+                        continue;
+                    }
+                };
+                summary.swap_logs += 1;
+                if !seen_pools.insert(log.pool) {
+                    continue;
+                }
+                match self.process_observed_swap_pool(&log, &trusted).await {
+                    Ok(LivePoolDiscoveryOutcome::Imported) => summary.imported += 1,
+                    Ok(LivePoolDiscoveryOutcome::ObservedOnly) => summary.observed_only += 1,
+                    Ok(LivePoolDiscoveryOutcome::Skipped) => summary.skipped += 1,
+                    Err(err) => {
+                        debug!(
+                            tx_hash = %tx_hash,
+                            pool = %log.pool,
+                            topic0 = %log.topic0,
+                            error = %err,
+                            "competitor receipt pool skipped"
+                        );
+                        summary.skipped += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
     }
 
     fn spawn_flashblocks_listener(&self) {
@@ -2489,6 +2681,30 @@ fn parse_swap_log(raw: Value) -> Result<SwapObservationLog> {
     })
 }
 
+fn raw_log_topic0(raw: &Value) -> Option<String> {
+    raw.get("topics")
+        .and_then(Value::as_array)
+        .and_then(|topics| topics.first())
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
+
+fn raw_log_tx_hash(raw: &Value) -> Option<B256> {
+    raw.get("transactionHash")
+        .and_then(Value::as_str)
+        .and_then(|hash| hash.parse::<B256>().ok())
+}
+
+fn address_topic(address: Address) -> String {
+    let address = format!("{address:#x}");
+    format!("0x{:0>64}", address.trim_start_matches("0x"))
+}
+
+fn is_supported_swap_topic(topic0: &str) -> bool {
+    let topic0 = topic0.to_ascii_lowercase();
+    topic0 == V3_SWAP_TOPIC || topic0 == PANCAKE_V3_SWAP_TOPIC || topic0 == CLASSIC_SWAP_TOPIC
+}
+
 fn data_word_addresses(data: &str) -> Vec<Address> {
     let hex = data.strip_prefix("0x").unwrap_or(data);
     if hex.len() < 64 {
@@ -2666,6 +2882,45 @@ impl RecentLogCache {
             return false;
         }
         self.order.push_back(key);
+        while self.order.len() > self.limit {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompetitorPoolDiscoverySummary {
+    transfer_txs: usize,
+    receipts: usize,
+    swap_logs: usize,
+    imported: usize,
+    observed_only: usize,
+    skipped: usize,
+}
+
+struct RecentTxCache {
+    limit: usize,
+    order: VecDeque<B256>,
+    set: HashSet<B256>,
+}
+
+impl RecentTxCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            order: VecDeque::with_capacity(limit),
+            set: HashSet::with_capacity(limit),
+        }
+    }
+
+    fn insert(&mut self, tx_hash: B256) -> bool {
+        if !self.set.insert(tx_hash) {
+            return false;
+        }
+        self.order.push_back(tx_hash);
         while self.order.len() > self.limit {
             if let Some(oldest) = self.order.pop_front() {
                 self.set.remove(&oldest);
