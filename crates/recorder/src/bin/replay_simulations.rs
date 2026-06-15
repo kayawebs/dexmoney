@@ -37,6 +37,7 @@ struct ReplayRow {
     opportunity_id: Uuid,
     opportunity_at: DateTime<Utc>,
     opportunity_block: i64,
+    strategy: String,
     token_in: String,
     amount_in: String,
     expected_profit: String,
@@ -47,6 +48,9 @@ struct ReplayRow {
     simulation_block: Option<i64>,
     simulation_success: bool,
     simulation_revert_reason: Option<String>,
+    simulated_profit: String,
+    net_simulated_profit: Option<String>,
+    path_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -58,6 +62,77 @@ struct ReplayResult {
     profit: Option<U256>,
     structural_notes: Vec<String>,
     router_probe_notes: Vec<String>,
+}
+
+#[derive(Default)]
+struct FeatureSummary {
+    classifications: BTreeMap<String, usize>,
+    original_reasons: BTreeMap<String, usize>,
+    strategies: BTreeMap<String, usize>,
+    path_lengths: BTreeMap<String, usize>,
+    simulation_block_deltas: BTreeMap<String, usize>,
+    step_source_lags: BTreeMap<String, usize>,
+    step_source_spans: BTreeMap<String, usize>,
+    variant_signatures: BTreeMap<String, usize>,
+    tick_profiles: BTreeMap<String, usize>,
+    top_pools: BTreeMap<String, usize>,
+}
+
+impl FeatureSummary {
+    fn record(&mut self, row: &ReplayRow, classification: &str) {
+        *self
+            .classifications
+            .entry(classification.to_string())
+            .or_default() += 1;
+        *self
+            .original_reasons
+            .entry(original_reason_label(row).to_string())
+            .or_default() += 1;
+        *self.strategies.entry(row.strategy.clone()).or_default() += 1;
+        for feature in row_features(row) {
+            if let Some(value) = feature.strip_prefix("path_len=") {
+                *self.path_lengths.entry(value.to_string()).or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("simulation_block_delta=") {
+                *self
+                    .simulation_block_deltas
+                    .entry(value.to_string())
+                    .or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("max_step_source_lag=") {
+                *self.step_source_lags.entry(value.to_string()).or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("step_source_span=") {
+                *self.step_source_spans.entry(value.to_string()).or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("variants=") {
+                *self
+                    .variant_signatures
+                    .entry(value.to_string())
+                    .or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("ticks=") {
+                *self.tick_profiles.entry(value.to_string()).or_default() += 1;
+            } else if let Some(value) = feature.strip_prefix("pool=") {
+                *self.top_pools.entry(value.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    fn write(&self, writer: &mut BufWriter<File>) -> Result<()> {
+        writeln!(writer, "== Feature Summary ==")?;
+        write_top_map(writer, "classifications", &self.classifications, 50)?;
+        write_top_map(writer, "original_reasons", &self.original_reasons, 50)?;
+        write_top_map(writer, "strategies", &self.strategies, 50)?;
+        write_top_map(writer, "path_lengths", &self.path_lengths, 20)?;
+        write_top_map(
+            writer,
+            "simulation_block_deltas",
+            &self.simulation_block_deltas,
+            20,
+        )?;
+        write_top_map(writer, "step_source_lags", &self.step_source_lags, 20)?;
+        write_top_map(writer, "step_source_spans", &self.step_source_spans, 20)?;
+        write_top_map(writer, "variant_signatures", &self.variant_signatures, 50)?;
+        write_top_map(writer, "tick_profiles", &self.tick_profiles, 50)?;
+        write_top_map(writer, "top_pools", &self.top_pools, 80)?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -93,6 +168,8 @@ async fn main() -> Result<()> {
 
     let mut summary = BTreeMap::<String, usize>::new();
     let mut path_summary = BTreeMap::<(String, String), usize>::new();
+    let mut feature_summary = FeatureSummary::default();
+    let mut classification_features = BTreeMap::<(String, String), usize>::new();
     for (idx, row) in rows.iter().enumerate() {
         let result = replay_row(row, &settings, &provider).await;
         write_row(&mut writer, idx + 1, row, &result)?;
@@ -107,12 +184,31 @@ async fn main() -> Result<()> {
             .map(|value| value.classification.clone())
             .unwrap_or_else(|err| format!("replay_error: {}", compact_err(err)));
         *path_summary.entry((classification, path_name)).or_default() += 1;
+        let classification = result
+            .as_ref()
+            .map(|value| value.classification.clone())
+            .unwrap_or_else(|err| format!("replay_error: {}", compact_err(err)));
+        feature_summary.record(row, classification.as_str());
+        for feature in row_features(row) {
+            *classification_features
+                .entry((classification.clone(), feature))
+                .or_default() += 1;
+        }
     }
 
     writeln!(writer)?;
     writeln!(writer, "== Summary ==")?;
     for (classification, n) in summary {
         writeln!(writer, "{classification}\t{n}")?;
+    }
+    writeln!(writer)?;
+    feature_summary.write(&mut writer)?;
+    writeln!(writer)?;
+    writeln!(writer, "== Classification x Feature Top 80 ==")?;
+    let mut class_features = classification_features.into_iter().collect::<Vec<_>>();
+    class_features.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for ((classification, feature), n) in class_features.into_iter().take(80) {
+        writeln!(writer, "{classification}\t{n}\t{feature}")?;
     }
     writeln!(writer)?;
     writeln!(writer, "== Path Summary ==")?;
@@ -417,6 +513,12 @@ fn write_row(
             }
         }
     }
+    writeln!(
+        writer,
+        "simulation_path_name: {}",
+        row.path_name.as_deref().unwrap_or("-")
+    )?;
+    writeln!(writer, "strategy: {}", row.strategy)?;
     writeln!(writer, "opportunity_at: {}", row.opportunity_at)?;
     writeln!(writer, "simulation_at: {}", row.simulation_at)?;
     writeln!(writer, "opportunity_block: {}", row.opportunity_block)?;
@@ -436,6 +538,12 @@ fn write_row(
     )?;
     writeln!(writer, "expected_profit: {}", row.expected_profit)?;
     writeln!(writer, "min_profit: {}", row.min_profit)?;
+    writeln!(writer, "simulated_profit: {}", row.simulated_profit)?;
+    writeln!(
+        writer,
+        "net_simulated_profit: {}",
+        row.net_simulated_profit.as_deref().unwrap_or("-")
+    )?;
     match result {
         Ok(result) => {
             writeln!(writer, "original_reason: {}", result.original_reason)?;
@@ -477,6 +585,158 @@ fn decode_path_name(row: &ReplayRow) -> Option<String> {
         .map(|path| path.name)
 }
 
+fn original_reason_label(row: &ReplayRow) -> &str {
+    row.simulation_revert_reason.as_deref().unwrap_or_else(|| {
+        if row.simulation_success {
+            "success"
+        } else {
+            "-"
+        }
+    })
+}
+
+fn row_features(row: &ReplayRow) -> Vec<String> {
+    let mut features = Vec::new();
+    features.push(format!("original_reason={}", original_reason_label(row)));
+    features.push(format!("strategy={}", row.strategy));
+    if let Some(delta) = row
+        .simulation_block
+        .map(|simulation_block| simulation_block - row.opportunity_block)
+    {
+        features.push(format!(
+            "simulation_block_delta={}",
+            block_delta_bucket(delta)
+        ));
+    } else {
+        features.push("simulation_block_delta=missing".into());
+    }
+
+    let Ok(path) = serde_json::from_value::<ArbPath>(row.path_json.clone()) else {
+        features.push("path_decode=failed".into());
+        return features;
+    };
+
+    features.push(format!("path_len={}", path.steps.len()));
+    features.push(format!("variants={}", variant_signature(&path)));
+    for step in &path.steps {
+        features.push(format!("pool={:#x}", step.pool));
+    }
+
+    let Some(diagnostics) = &path.diagnostics else {
+        features.push("diagnostics=missing".into());
+        return features;
+    };
+
+    let max_step_source_lag = diagnostics
+        .steps
+        .iter()
+        .filter_map(|step| i64::try_from(step.source_block).ok())
+        .map(|source_block| row.opportunity_block - source_block)
+        .max();
+    features.push(format!(
+        "max_step_source_lag={}",
+        max_step_source_lag
+            .map(block_delta_bucket)
+            .unwrap_or("missing")
+    ));
+
+    let min_source = diagnostics.steps.iter().map(|step| step.source_block).min();
+    let max_source = diagnostics.steps.iter().map(|step| step.source_block).max();
+    let source_span = min_source
+        .zip(max_source)
+        .and_then(|(min_block, max_block)| i64::try_from(max_block.saturating_sub(min_block)).ok());
+    features.push(format!(
+        "step_source_span={}",
+        source_span.map(block_delta_bucket).unwrap_or("missing")
+    ));
+
+    features.push(format!(
+        "ticks={}",
+        tick_profile(
+            diagnostics.ticks_used,
+            diagnostics.crossed_ticks,
+            diagnostics.tick_range_exhausted,
+            diagnostics.v3_pools_without_ticks,
+        )
+    ));
+    for step in &diagnostics.steps {
+        features.push(format!(
+            "step{}={:?}:{}",
+            step.step_no, step.variant, step.mode
+        ));
+        if step.tick_range_exhausted {
+            features.push(format!("step{}_tick_range_exhausted=true", step.step_no));
+        }
+    }
+
+    features
+}
+
+fn write_top_map(
+    writer: &mut BufWriter<File>,
+    title: &str,
+    values: &BTreeMap<String, usize>,
+    limit: usize,
+) -> Result<()> {
+    writeln!(writer, "-- {title} --")?;
+    let mut rows = values.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    for (key, n) in rows.into_iter().take(limit) {
+        writeln!(writer, "{n}\t{key}")?;
+    }
+    Ok(())
+}
+
+fn block_delta_bucket(delta: i64) -> &'static str {
+    match delta {
+        i64::MIN..=-1 => "negative",
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3..=5 => "3-5",
+        6..=10 => "6-10",
+        11..=30 => "11-30",
+        _ => ">30",
+    }
+}
+
+fn variant_signature(path: &ArbPath) -> String {
+    path.steps
+        .iter()
+        .map(|step| {
+            step.variant
+                .map(|variant| format!("{variant:?}"))
+                .unwrap_or_else(|| format!("{:?}", step.dex))
+        })
+        .collect::<Vec<_>>()
+        .join("->")
+}
+
+fn tick_profile(
+    ticks_used: u32,
+    crossed_ticks: u32,
+    tick_range_exhausted: bool,
+    v3_pools_without_ticks: u32,
+) -> String {
+    format!(
+        "used={} crossed={} exhausted={} missing_v3={}",
+        tick_count_bucket(ticks_used),
+        tick_count_bucket(crossed_ticks),
+        tick_range_exhausted,
+        v3_pools_without_ticks
+    )
+}
+
+fn tick_count_bucket(value: u32) -> &'static str {
+    match value {
+        0 => "0",
+        1 => "1",
+        2..=5 => "2-5",
+        6..=20 => "6-20",
+        _ => ">20",
+    }
+}
+
 async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
     let reason = cli.reason.as_deref().unwrap_or("%");
     sqlx::query_as::<_, ReplayRow>(
@@ -485,6 +745,7 @@ async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
             o.id AS opportunity_id,
             o.created_at AS opportunity_at,
             o.block_number AS opportunity_block,
+            o.strategy,
             o.token_in,
             o.amount_in,
             o.expected_profit,
@@ -494,7 +755,10 @@ async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
             s.created_at AS simulation_at,
             s.block_number AS simulation_block,
             s.success AS simulation_success,
-            s.revert_reason AS simulation_revert_reason
+            s.revert_reason AS simulation_revert_reason,
+            s.simulated_profit,
+            s.net_simulated_profit,
+            s.path_name
         FROM simulations s
         JOIN opportunities o ON o.id = s.opportunity_id
         WHERE s.created_at >= now() - ($1::bigint * interval '1 hour')
