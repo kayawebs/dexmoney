@@ -45,6 +45,7 @@ pub struct SearchStats {
     pub quote_skipped_tick_range_exhausted: u64,
     pub quote_skipped_error: u64,
     pub price_impact_rejected: u64,
+    pub quote_model_edge_rejected: u64,
     pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
     pub dynamic_multihop_paths: u64,
@@ -60,6 +61,7 @@ pub struct SearchStats {
     pub dynamic_multihop_candidate_cap_hit: u64,
     pub best_profit_before_impact: U256,
     pub best_profit_rejected_by_impact: U256,
+    pub best_profit_rejected_by_model_edge: U256,
     pub best_profit: U256,
 }
 
@@ -75,6 +77,7 @@ impl SearchStats {
         self.quote_skipped_tick_range_exhausted += other.quote_skipped_tick_range_exhausted;
         self.quote_skipped_error += other.quote_skipped_error;
         self.price_impact_rejected += other.price_impact_rejected;
+        self.quote_model_edge_rejected += other.quote_model_edge_rejected;
         self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
         self.dynamic_multihop_paths += other.dynamic_multihop_paths;
@@ -95,6 +98,9 @@ impl SearchStats {
         self.best_profit_rejected_by_impact = self
             .best_profit_rejected_by_impact
             .max(other.best_profit_rejected_by_impact);
+        self.best_profit_rejected_by_model_edge = self
+            .best_profit_rejected_by_model_edge
+            .max(other.best_profit_rejected_by_model_edge);
         self.best_profit = self.best_profit.max(other.best_profit);
     }
 
@@ -319,6 +325,17 @@ impl SearchEngine {
                         continue;
                     }
                     stats.best_profit = stats.best_profit.max(expected_profit);
+                    let quote_edge_floor = quote_model_edge_floor(
+                        *amount_in,
+                        &diagnostics,
+                        self.v3_quote_safety_bps,
+                    );
+                    if expected_profit < quote_edge_floor {
+                        stats.quote_model_edge_rejected += 1;
+                        stats.best_profit_rejected_by_model_edge =
+                            stats.best_profit_rejected_by_model_edge.max(expected_profit);
+                        continue;
+                    }
                     let required_profit = if search_path.min_profit.is_zero() {
                         self.min_expected_profit
                     } else {
@@ -437,6 +454,14 @@ impl SearchEngine {
                 continue;
             }
             stats.best_profit = stats.best_profit.max(expected_profit);
+            let quote_edge_floor =
+                quote_model_edge_floor(*amount_in, &diagnostics, self.v3_quote_safety_bps);
+            if expected_profit < quote_edge_floor {
+                stats.quote_model_edge_rejected += 1;
+                stats.best_profit_rejected_by_model_edge =
+                    stats.best_profit_rejected_by_model_edge.max(expected_profit);
+                continue;
+            }
             let required_profit = if search_path.min_profit.is_zero() {
                 self.min_expected_profit
             } else {
@@ -1507,6 +1532,24 @@ fn candidate_block_number_from_diagnostics(diagnostics: &QuoteDiagnostics) -> u6
         .map(|step| step.source_block)
         .max()
         .unwrap_or(0)
+}
+
+fn quote_model_edge_floor(
+    amount_in: U256,
+    diagnostics: &QuoteDiagnostics,
+    v3_quote_safety_bps: u64,
+) -> U256 {
+    let v3_steps = diagnostics
+        .steps
+        .iter()
+        .filter(|step| is_v3_style_variant(step.variant))
+        .count() as u64;
+    if amount_in.is_zero() || v3_steps == 0 || v3_quote_safety_bps == 0 {
+        return U256::ZERO;
+    }
+    amount_in
+        .saturating_mul(U256::from(v3_steps.saturating_mul(v3_quote_safety_bps)))
+        / U256::from(10_000u64)
 }
 
 fn path_with_diagnostics(path: &ArbPath, diagnostics: QuoteDiagnostics) -> ArbPath {

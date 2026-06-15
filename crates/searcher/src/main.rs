@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
                     aggregate.search.quote_skipped_tick_range_exhausted,
                 quote_skipped_error = aggregate.search.quote_skipped_error,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
+                quote_model_edge_rejected = aggregate.search.quote_model_edge_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
                 candidates_coalesced = aggregate.candidates_coalesced,
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
                 opportunities_created = aggregate.opportunities_created,
                 best_profit_before_impact = %aggregate.search.best_profit_before_impact,
                 best_profit_rejected_by_impact = %aggregate.search.best_profit_rejected_by_impact,
+                best_profit_rejected_by_model_edge = %aggregate.search.best_profit_rejected_by_model_edge,
                 best_profit_after_impact = %aggregate.search.best_profit,
                 "searcher cycle summary"
             );
