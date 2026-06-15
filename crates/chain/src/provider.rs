@@ -21,8 +21,6 @@ const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const UNISWAP_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10000];
 const PANCAKE_V3_FEE_TIERS: [u32; 4] = [100, 500, 2500, 10000];
 const FALLBACK_SLIPSTREAM_TICK_SPACINGS: [i32; 7] = [1, 10, 50, 100, 200, 500, 2000];
-const PANCAKE_V3_SWAP_TOPIC: &str =
-    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 
@@ -368,36 +366,35 @@ impl ChainProvider {
             .unwrap_or(UNISWAP_V3_FACTORY.parse()?);
         let slipstream_factories = slipstream_factories(settings)?;
 
-        let (dex, variant, source) =
-            if topic0 == PANCAKE_V3_SWAP_TOPIC || factory == Some(pancake_factory) {
-                (
-                    DexKind::PancakeSwap,
-                    PoolVariant::PancakeV3,
-                    "observed_pancake_v3_import",
-                )
-            } else if factory == Some(uniswap_factory) {
-                (
-                    DexKind::UniswapV3,
-                    PoolVariant::UniswapV3,
-                    "observed_uniswap_v3_import",
-                )
-            } else if factory
-                .map(|factory| slipstream_factories.contains(&factory))
-                .unwrap_or(false)
-            {
-                (
-                    DexKind::Aerodrome,
-                    PoolVariant::AerodromeSlipstream,
-                    "observed_slipstream_import",
-                )
-            } else {
-                anyhow::bail!(
-                    "unsupported v3-compatible factory {}; not enabling for execution",
-                    factory
-                        .map(|value| format!("{value:#x}"))
-                        .unwrap_or_else(|| "-".to_string())
-                );
-            };
+        let (dex, variant, source) = if factory == Some(pancake_factory) {
+            (
+                DexKind::PancakeSwap,
+                PoolVariant::PancakeV3,
+                "observed_pancake_v3_import",
+            )
+        } else if factory == Some(uniswap_factory) {
+            (
+                DexKind::UniswapV3,
+                PoolVariant::UniswapV3,
+                "observed_uniswap_v3_import",
+            )
+        } else if factory
+            .map(|factory| slipstream_factories.contains(&factory))
+            .unwrap_or(false)
+        {
+            (
+                DexKind::Aerodrome,
+                PoolVariant::AerodromeSlipstream,
+                "observed_slipstream_import",
+            )
+        } else {
+            anyhow::bail!(
+                "unsupported v3-compatible factory {}; exactInputSingle routers do not accept a custom factory",
+                factory
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        };
 
         let fee_bps = fee_pips.unwrap_or_default() / 100;
         Ok(DiscoveredPool {

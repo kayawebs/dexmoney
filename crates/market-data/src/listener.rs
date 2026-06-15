@@ -908,6 +908,7 @@ where
                         &metadata,
                         &symbol,
                         Some(factory),
+                        "observed_only",
                         Some(&format!("trusted factory pool resolve failed: {err}")),
                     )
                     .await?;
@@ -916,30 +917,67 @@ where
             }
         }
 
-        self.record_observed_swap_only_pool(
-            log,
-            &metadata,
-            &symbol,
-            Some(factory),
-            Some("factory is not trusted; auto-classification pending"),
-        )
-        .await?;
-        self.recorder
-            .upsert_factory_registry(
-                self.settings.chain_id,
-                factory,
-                inferred_dex_for_swap_topic(&log.topic0),
-                inferred_variant_for_swap_topic(&log.topic0),
-                false,
-                true,
-                "global_swap_discovery",
-                Some("observed from global swap logs; not trusted for execution"),
-                Some(i64::try_from(log.block_number)?),
-                Some(i64::try_from(log.block_number)?),
-                1,
-            )
-            .await?;
-        Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+        match self
+            .provider
+            .resolve_observed_pool_for_registry(&self.settings, log.pool, &log.topic0)
+            .await
+        {
+            Ok(discovered) => {
+                let dex = discovered.state.dex;
+                let variant = discovered.state.variant;
+                let factory = discovered.factory_address.unwrap_or(factory);
+                self.import_discovered_pool(
+                    log.pool,
+                    &log.topic0,
+                    "swap-log-auto-classified",
+                    log.block_number,
+                    &symbol,
+                    dex,
+                    variant,
+                    factory,
+                    discovered,
+                )
+                .await?;
+                info!(
+                    pool = %log.pool,
+                    factory = %factory,
+                    symbol,
+                    dex = ?dex,
+                    variant = ?variant,
+                    "global swap discovery auto-imported executable observed pool"
+                );
+                Ok(LivePoolDiscoveryOutcome::Imported)
+            }
+            Err(err) => {
+                self.record_observed_swap_only_pool(
+                    log,
+                    &metadata,
+                    &symbol,
+                    Some(factory),
+                    "classified_observed_only",
+                    Some(&format!(
+                        "not executable by configured routers/factories: {err}"
+                    )),
+                )
+                .await?;
+                self.recorder
+                    .upsert_factory_registry(
+                        self.settings.chain_id,
+                        factory,
+                        inferred_dex_for_swap_topic(&log.topic0),
+                        inferred_variant_for_swap_topic(&log.topic0),
+                        false,
+                        true,
+                        "global_swap_discovery",
+                        Some("observed from global swap logs; not trusted for execution"),
+                        Some(i64::try_from(log.block_number)?),
+                        Some(i64::try_from(log.block_number)?),
+                        1,
+                    )
+                    .await?;
+                Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1246,6 +1284,7 @@ where
         metadata: &base_arb_chain::provider::ObservedPoolMetadata,
         symbol: &str,
         factory: Option<Address>,
+        import_status: &str,
         reason: Option<&str>,
     ) -> Result<()> {
         self.recorder
@@ -1268,7 +1307,7 @@ where
                 1,
                 Some(i64::try_from(log.block_number)?),
                 Some(i64::try_from(log.block_number)?),
-                "observed_only",
+                import_status,
                 reason,
             )
             .await?;
