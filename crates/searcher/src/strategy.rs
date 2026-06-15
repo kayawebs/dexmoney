@@ -318,6 +318,15 @@ impl SearchEngine {
                     let expected_profit = expected_amount_out.saturating_sub(*amount_in);
                     stats.best_profit_before_impact =
                         stats.best_profit_before_impact.max(expected_profit);
+                    let required_profit = if search_path.min_profit.is_zero() {
+                        self.min_expected_profit
+                    } else {
+                        search_path.min_profit
+                    };
+                    if expected_profit < required_profit {
+                        stats.min_profit_rejected += 1;
+                        continue;
+                    }
                     if price_impact_bps > self.max_price_impact_bps {
                         stats.price_impact_rejected += 1;
                         stats.best_profit_rejected_by_impact =
@@ -334,15 +343,6 @@ impl SearchEngine {
                         stats.quote_model_edge_rejected += 1;
                         stats.best_profit_rejected_by_model_edge =
                             stats.best_profit_rejected_by_model_edge.max(expected_profit);
-                        continue;
-                    }
-                    let required_profit = if search_path.min_profit.is_zero() {
-                        self.min_expected_profit
-                    } else {
-                        search_path.min_profit
-                    };
-                    if expected_profit < required_profit {
-                        stats.min_profit_rejected += 1;
                         continue;
                     }
                     let block_number = candidate_block_number_from_diagnostics(&diagnostics);
@@ -447,6 +447,15 @@ impl SearchEngine {
             let (expected_amount_out, price_impact_bps, diagnostics) = quote;
             let expected_profit = expected_amount_out.saturating_sub(*amount_in);
             stats.best_profit_before_impact = stats.best_profit_before_impact.max(expected_profit);
+            let required_profit = if search_path.min_profit.is_zero() {
+                self.min_expected_profit
+            } else {
+                search_path.min_profit
+            };
+            if expected_profit < required_profit {
+                stats.min_profit_rejected += 1;
+                continue;
+            }
             if price_impact_bps > self.max_price_impact_bps {
                 stats.price_impact_rejected += 1;
                 stats.best_profit_rejected_by_impact =
@@ -460,15 +469,6 @@ impl SearchEngine {
                 stats.quote_model_edge_rejected += 1;
                 stats.best_profit_rejected_by_model_edge =
                     stats.best_profit_rejected_by_model_edge.max(expected_profit);
-                continue;
-            }
-            let required_profit = if search_path.min_profit.is_zero() {
-                self.min_expected_profit
-            } else {
-                search_path.min_profit
-            };
-            if expected_profit < required_profit {
-                stats.min_profit_rejected += 1;
                 continue;
             }
             let block_number = candidate_block_number_from_diagnostics(&diagnostics);
