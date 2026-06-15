@@ -96,6 +96,8 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_duplicate_cycle,
                 dynamic_multihop_rough_quote_failed =
                     aggregate.search.dynamic_multihop_rough_quote_failed,
+                dynamic_multihop_rough_quote_included =
+                    aggregate.search.dynamic_multihop_rough_quote_included,
                 dynamic_multihop_rough_profit_below_min =
                     aggregate.search.dynamic_multihop_rough_profit_below_min,
                 dynamic_multihop_candidate_cap_hit =

@@ -55,6 +55,7 @@ pub struct SearchStats {
     pub dynamic_multihop_invalid_cycle: u64,
     pub dynamic_multihop_duplicate_cycle: u64,
     pub dynamic_multihop_rough_quote_failed: u64,
+    pub dynamic_multihop_rough_quote_included: u64,
     pub dynamic_multihop_rough_profit_below_min: u64,
     pub dynamic_multihop_candidate_cap_hit: u64,
     pub best_profit_before_impact: U256,
@@ -84,6 +85,7 @@ impl SearchStats {
         self.dynamic_multihop_invalid_cycle += other.dynamic_multihop_invalid_cycle;
         self.dynamic_multihop_duplicate_cycle += other.dynamic_multihop_duplicate_cycle;
         self.dynamic_multihop_rough_quote_failed += other.dynamic_multihop_rough_quote_failed;
+        self.dynamic_multihop_rough_quote_included += other.dynamic_multihop_rough_quote_included;
         self.dynamic_multihop_rough_profit_below_min +=
             other.dynamic_multihop_rough_profit_below_min;
         self.dynamic_multihop_candidate_cap_hit += other.dynamic_multihop_candidate_cap_hit;
@@ -1081,6 +1083,12 @@ fn score_dynamic_multihop_path(
     if best_score_bps.is_zero() {
         if quote_failed {
             stats.dynamic_multihop_rough_quote_failed += 1;
+            stats.dynamic_multihop_rough_quote_included += 1;
+            return Some(ScoredDynamicPath {
+                path: build_dynamic_multihop_search_path(anchor, edges),
+                score_bps: U256::from(1u64),
+                estimated_profit: U256::ZERO,
+            });
         } else if below_min {
             stats.dynamic_multihop_rough_profit_below_min += 1;
         }
