@@ -30,6 +30,13 @@ async fn main() -> Result<()> {
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
+    let cleared_candidates = redis.clear_candidates().await?;
+    if cleared_candidates > 0 {
+        info!(
+            cleared_candidates,
+            "cleared stale candidate queue on execution-manager startup"
+        );
+    }
 
     if settings.execution_submit_enabled {
         let fund_wallet = configured_fund_wallet(&settings)?;

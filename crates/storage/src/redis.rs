@@ -23,6 +23,12 @@ impl RedisStore {
         info!("connected to redis");
         Ok(Self { manager })
     }
+
+    pub async fn clear_candidates(&self) -> Result<usize> {
+        let mut manager = self.manager.clone();
+        let deleted: usize = manager.del(candidates_key()).await?;
+        Ok(deleted)
+    }
 }
 
 pub fn pool_state_key(chain_id: u64, pool_address: alloy_primitives::Address) -> String {
