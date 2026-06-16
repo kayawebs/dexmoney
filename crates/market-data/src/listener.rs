@@ -1010,14 +1010,14 @@ where
             .upsert_token_registry(
                 self.settings.chain_id,
                 discovered.state.token0,
-                symbol.split('/').next().unwrap_or_default(),
+                &token_symbol(&self.provider, discovered.state.token0).await,
             )
             .await?;
         self.recorder
             .upsert_token_registry(
                 self.settings.chain_id,
                 discovered.state.token1,
-                symbol.split('/').nth(1).unwrap_or_default(),
+                &token_symbol(&self.provider, discovered.state.token1).await,
             )
             .await?;
         let (token0, token1) = canonical_pair(discovered.state.token0, discovered.state.token1);
@@ -1130,14 +1130,14 @@ where
                         .upsert_token_registry(
                             self.settings.chain_id,
                             discovered.state.token0,
-                            symbol.split('/').next().unwrap_or_default(),
+                            &token_symbol(&self.provider, discovered.state.token0).await,
                         )
                         .await?;
                     self.recorder
                         .upsert_token_registry(
                             self.settings.chain_id,
                             discovered.state.token1,
-                            symbol.split('/').nth(1).unwrap_or_default(),
+                            &token_symbol(&self.provider, discovered.state.token1).await,
                         )
                         .await?;
                     let (token0, token1) =
@@ -2838,17 +2838,32 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
     let token0_symbol = provider
         .fetch_erc20_symbol(token0)
         .await
-        .unwrap_or_else(|_| short_address(token0));
+        .unwrap_or_else(|_| "token".to_string());
     let token1_symbol = provider
         .fetch_erc20_symbol(token1)
         .await
-        .unwrap_or_else(|_| short_address(token1));
-    format!("{token0_symbol}/{token1_symbol}")
+        .unwrap_or_else(|_| "token".to_string());
+    format!(
+        "{}/{}",
+        token_label(&token0_symbol, token0),
+        token_label(&token1_symbol, token1)
+    )
 }
 
-fn short_address(address: Address) -> String {
+async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
+    provider
+        .fetch_erc20_symbol(token)
+        .await
+        .unwrap_or_else(|_| "token".to_string())
+}
+
+fn token_label(symbol: &str, address: Address) -> String {
+    format!("{symbol}-{}", short_address_suffix(address))
+}
+
+fn short_address_suffix(address: Address) -> String {
     let value = format!("{address:#x}");
-    value.get(0..10).map(ToString::to_string).unwrap_or(value)
+    value[value.len().saturating_sub(6)..].to_string()
 }
 
 fn dex_to_string(dex: DexKind) -> &'static str {

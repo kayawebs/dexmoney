@@ -116,16 +116,16 @@ async fn main() -> Result<()> {
                         &store.pool,
                         settings.chain_id,
                         discovered.state.token0,
-                        symbol.split('/').next().unwrap_or_default(),
+                        token_symbol_from_pair_symbol(&symbol, 0),
                     )
                     .await?;
-                    upsert_token_registry(
-                        &store.pool,
-                        settings.chain_id,
-                        discovered.state.token1,
-                        symbol.split('/').nth(1).unwrap_or_default(),
-                    )
-                    .await?;
+                upsert_token_registry(
+                    &store.pool,
+                    settings.chain_id,
+                    discovered.state.token1,
+                    token_symbol_from_pair_symbol(&symbol, 1),
+                )
+                .await?;
                     let (token0, token1) =
                         canonical_pair(discovered.state.token0, discovered.state.token1);
                     let pair_id = store
@@ -442,9 +442,9 @@ async fn upsert_token_registry(
     sqlx::query(
         r#"
         INSERT INTO tokens (id, chain_id, token_address, symbol, enabled, created_at, updated_at)
-        VALUES (uuid_generate_v4(), $1, $2, $3, TRUE, NOW(), NOW())
+        VALUES (uuid_generate_v4(), $1, $2, $3, FALSE, NOW(), NOW())
         ON CONFLICT (chain_id, token_address)
-        DO UPDATE SET symbol = EXCLUDED.symbol, enabled = TRUE, updated_at = NOW()
+        DO UPDATE SET symbol = EXCLUDED.symbol, updated_at = NOW()
         "#,
     )
     .bind(i64::try_from(chain_id)?)
@@ -459,12 +459,16 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
     let token0_symbol = provider
         .fetch_erc20_symbol(token0)
         .await
-        .unwrap_or_else(|_| short_addr(token0));
+        .unwrap_or_else(|_| "token".to_string());
     let token1_symbol = provider
         .fetch_erc20_symbol(token1)
         .await
-        .unwrap_or_else(|_| short_addr(token1));
-    format!("{token0_symbol}/{token1_symbol}")
+        .unwrap_or_else(|_| "token".to_string());
+    format!(
+        "{}/{}",
+        token_label(&token0_symbol, token0),
+        token_label(&token1_symbol, token1)
+    )
 }
 
 fn canonical_pair(a: Address, b: Address) -> (Address, Address) {
@@ -475,9 +479,21 @@ fn canonical_pair(a: Address, b: Address) -> (Address, Address) {
     }
 }
 
-fn short_addr(address: Address) -> String {
+fn token_label(symbol: &str, address: Address) -> String {
+    format!("{symbol}-{}", short_address_suffix(address))
+}
+
+fn token_symbol_from_pair_symbol(pair_symbol: &str, index: usize) -> &str {
+    pair_symbol
+        .split('/')
+        .nth(index)
+        .and_then(|label| label.rsplit_once('-').map(|(symbol, _)| symbol))
+        .unwrap_or_default()
+}
+
+fn short_address_suffix(address: Address) -> String {
     let value = format!("{address:#x}");
-    value.chars().take(8).collect()
+    value[value.len().saturating_sub(6)..].to_string()
 }
 
 fn dex_to_string(dex: DexKind) -> &'static str {

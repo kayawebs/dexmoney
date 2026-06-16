@@ -972,7 +972,7 @@ async fn import_observed_pools(
                     &state.pool,
                     state.settings.chain_id,
                     discovered.state.token0,
-                    symbol.split('/').next().unwrap_or_default(),
+                    &token_symbol(&state.provider, discovered.state.token0).await,
                 )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -980,7 +980,7 @@ async fn import_observed_pools(
                     &state.pool,
                     state.settings.chain_id,
                     discovered.state.token1,
-                    symbol.split('/').nth(1).unwrap_or_default(),
+                    &token_symbol(&state.provider, discovered.state.token1).await,
                 )
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1566,7 +1566,7 @@ async fn discover_and_upsert_pair_addresses(
         &state.pool,
         state.settings.chain_id,
         token0,
-        symbol.split('/').next().unwrap_or_default(),
+        &token_symbol(&state.provider, token0).await,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1574,7 +1574,7 @@ async fn discover_and_upsert_pair_addresses(
         &state.pool,
         state.settings.chain_id,
         token1,
-        symbol.split('/').nth(1).unwrap_or_default(),
+        &token_symbol(&state.provider, token1).await,
     )
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1808,13 +1808,27 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
             SELECT chain_id, token_address, symbol, enabled
             FROM tokens
             UNION
-            SELECT chain_id, token0 AS token_address, split_part(symbol, '/', 1) AS symbol, TRUE AS enabled
+            SELECT
+                tp.chain_id,
+                tp.token0 AS token_address,
+                COALESCE(t.symbol, tp.token0) AS symbol,
+                TRUE AS enabled
             FROM token_pairs
-            WHERE enabled = TRUE
+            LEFT JOIN tokens t
+              ON t.chain_id = tp.chain_id
+             AND lower(t.token_address) = lower(tp.token0)
+            WHERE tp.enabled = TRUE
             UNION
-            SELECT chain_id, token1 AS token_address, split_part(symbol, '/', 2) AS symbol, TRUE AS enabled
+            SELECT
+                tp.chain_id,
+                tp.token1 AS token_address,
+                COALESCE(t.symbol, tp.token1) AS symbol,
+                TRUE AS enabled
             FROM token_pairs
-            WHERE enabled = TRUE
+            LEFT JOIN tokens t
+              ON t.chain_id = tp.chain_id
+             AND lower(t.token_address) = lower(tp.token1)
+            WHERE tp.enabled = TRUE
             UNION
             SELECT chain_id, token_address, token_address AS symbol, TRUE AS enabled
             FROM token_search_defaults
@@ -1905,14 +1919,6 @@ async fn fetch_enabled_tokens(pool: &PgPool) -> Result<Vec<Address>> {
         WITH token_set AS (
             SELECT token_address
             FROM tokens
-            WHERE enabled = TRUE
-            UNION
-            SELECT token0 AS token_address
-            FROM token_pairs
-            WHERE enabled = TRUE
-            UNION
-            SELECT token1 AS token_address
-            FROM token_pairs
             WHERE enabled = TRUE
             UNION
             SELECT token_address
@@ -3909,12 +3915,16 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
     let symbol0 = provider
         .fetch_erc20_symbol(token0)
         .await
-        .unwrap_or_else(|_| short_address(token0));
+        .unwrap_or_else(|_| "token".to_string());
     let symbol1 = provider
         .fetch_erc20_symbol(token1)
         .await
-        .unwrap_or_else(|_| short_address(token1));
-    format!("{symbol0}/{symbol1}")
+        .unwrap_or_else(|_| "token".to_string());
+    format!(
+        "{}/{}",
+        pair_token_label(&symbol0, token0),
+        pair_token_label(&symbol1, token1)
+    )
 }
 
 async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
@@ -3927,6 +3937,15 @@ async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
 fn short_address(address: Address) -> String {
     let value = format!("{address:#x}");
     value.chars().take(8).collect()
+}
+
+fn pair_token_label(symbol: &str, address: Address) -> String {
+    format!("{symbol}-{}", short_address_suffix(address))
+}
+
+fn short_address_suffix(address: Address) -> String {
+    let value = format!("{address:#x}");
+    value[value.len().saturating_sub(6)..].to_string()
 }
 
 fn dex_to_string(dex: DexKind) -> &'static str {

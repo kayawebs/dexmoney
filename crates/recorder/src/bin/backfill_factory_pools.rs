@@ -286,14 +286,14 @@ async fn import_discovered_pool(
         .upsert_token_registry(
             settings.chain_id,
             discovered.state.token0,
-            symbol.split('/').next().unwrap_or_default(),
+            token_symbol_from_pair_symbol(symbol, 0),
         )
         .await?;
     store
         .upsert_token_registry(
             settings.chain_id,
             discovered.state.token1,
-            symbol.split('/').nth(1).unwrap_or_default(),
+            token_symbol_from_pair_symbol(symbol, 1),
         )
         .await?;
     let (token0, token1) = canonical_pair(discovered.state.token0, discovered.state.token1);
@@ -501,17 +501,33 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
     let token0_symbol = provider
         .fetch_erc20_symbol(token0)
         .await
-        .unwrap_or_else(|_| short_address(token0));
+        .unwrap_or_else(|_| "token".to_string());
     let token1_symbol = provider
         .fetch_erc20_symbol(token1)
         .await
-        .unwrap_or_else(|_| short_address(token1));
-    format!("{token0_symbol}/{token1_symbol}")
+        .unwrap_or_else(|_| "token".to_string());
+    format!(
+        "{}/{}",
+        token_label(&token0_symbol, token0),
+        token_label(&token1_symbol, token1)
+    )
 }
 
-fn short_address(address: Address) -> String {
+fn token_label(symbol: &str, address: Address) -> String {
+    format!("{symbol}-{}", short_address_suffix(address))
+}
+
+fn token_symbol_from_pair_symbol(pair_symbol: &str, index: usize) -> &str {
+    pair_symbol
+        .split('/')
+        .nth(index)
+        .and_then(|label| label.rsplit_once('-').map(|(symbol, _)| symbol))
+        .unwrap_or_default()
+}
+
+fn short_address_suffix(address: Address) -> String {
     let value = format!("{address:#x}");
-    value.get(0..10).map(ToString::to_string).unwrap_or(value)
+    value[value.len().saturating_sub(6)..].to_string()
 }
 
 fn canonical_pair(a: Address, b: Address) -> (Address, Address) {

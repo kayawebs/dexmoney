@@ -78,11 +78,10 @@ impl PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO tokens (chain_id, token_address, symbol, enabled, created_at, updated_at)
-            VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+            VALUES ($1, $2, $3, FALSE, NOW(), NOW())
             ON CONFLICT (chain_id, token_address)
             DO UPDATE SET
                 symbol = EXCLUDED.symbol,
-                enabled = TRUE,
                 updated_at = NOW()
             "#,
         )
@@ -1025,6 +1024,30 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS tokens_enabled_idx
             ON tokens (chain_id, enabled, symbol)"#,
+        r#"
+            UPDATE token_pairs tp
+            SET symbol =
+                COALESCE(
+                    NULLIF(BTRIM((
+                        SELECT t.symbol
+                        FROM tokens t
+                        WHERE t.chain_id = tp.chain_id
+                          AND lower(t.token_address) = lower(tp.token0)
+                        LIMIT 1
+                    )), ''),
+                    left(tp.token0, 10)
+                ) || '-' || right(tp.token0, 6) || '/' ||
+                COALESCE(
+                    NULLIF(BTRIM((
+                        SELECT t.symbol
+                        FROM tokens t
+                        WHERE t.chain_id = tp.chain_id
+                          AND lower(t.token_address) = lower(tp.token1)
+                        LIMIT 1
+                    )), ''),
+                    left(tp.token1, 10)
+                ) || '-' || right(tp.token1, 6)
+        "#,
         r#"CREATE TABLE IF NOT EXISTS observed_pools (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,
