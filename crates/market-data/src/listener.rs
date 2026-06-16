@@ -1190,6 +1190,7 @@ where
                         pool,
                         &metadata,
                         &symbol,
+                        "observed_only",
                         Some(&format!("trusted factory pool resolve failed: {err}")),
                     )
                     .await?;
@@ -1197,15 +1198,53 @@ where
                 }
             }
         } else {
-            self.record_observed_only_pool(
-                &log,
-                pool,
-                &metadata,
-                &symbol,
-                Some("factory is not trusted; confirm in monitor-web before enabling"),
-            )
-            .await?;
-            Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+            let compatible_topic = creation_compatible_swap_topic(&log.topic0);
+            match self
+                .provider
+                .resolve_observed_pool_for_registry(&self.settings, pool, compatible_topic)
+                .await
+            {
+                Ok(discovered) => {
+                    let dex = discovered.state.dex;
+                    let variant = discovered.state.variant;
+                    let factory = discovered.factory_address.unwrap_or(factory);
+                    self.import_discovered_pool(
+                        pool,
+                        &log.topic0,
+                        "pool-created-auto-classified",
+                        log.block_number,
+                        &symbol,
+                        dex,
+                        variant,
+                        factory,
+                        discovered,
+                    )
+                    .await?;
+                    info!(
+                        pool = %pool,
+                        factory = %factory,
+                        symbol,
+                        dex = ?dex,
+                        variant = ?variant,
+                        "live pool discovery auto-imported executable observed pool"
+                    );
+                    Ok(LivePoolDiscoveryOutcome::Imported)
+                }
+                Err(err) => {
+                    self.record_observed_only_pool(
+                        &log,
+                        pool,
+                        &metadata,
+                        &symbol,
+                        "classified_observed_only",
+                        Some(&format!(
+                            "not executable by configured routers/factories: {err}"
+                        )),
+                    )
+                    .await?;
+                    Ok(LivePoolDiscoveryOutcome::ObservedOnly)
+                }
+            }
         }
     }
 
@@ -1234,6 +1273,7 @@ where
         pool: Address,
         metadata: &base_arb_chain::provider::ObservedPoolMetadata,
         symbol: &str,
+        import_status: &str,
         reason: Option<&str>,
     ) -> Result<()> {
         self.recorder
@@ -1256,7 +1296,7 @@ where
                 1,
                 Some(i64::try_from(log.block_number)?),
                 Some(i64::try_from(log.block_number)?),
-                "observed_only",
+                import_status,
                 reason,
             )
             .await?;
@@ -2847,6 +2887,15 @@ fn inferred_variant_for_creation_topic(topic0: &str) -> &'static str {
         "AerodromeSlipstream"
     } else {
         "UniswapV3"
+    }
+}
+
+fn creation_compatible_swap_topic(topic0: &str) -> &'static str {
+    let topic0 = topic0.to_ascii_lowercase();
+    if topic0 == CLASSIC_POOL_CREATED_TOPIC || topic0 == CLASSIC_PAIR_CREATED_TOPIC {
+        CLASSIC_SWAP_TOPIC
+    } else {
+        V3_SWAP_TOPIC
     }
 }
 
