@@ -29,6 +29,7 @@ struct Cli {
     hours: i64,
     limit: i64,
     reason: Option<String>,
+    opportunity_id: Option<Uuid>,
     out: Option<PathBuf>,
 }
 
@@ -738,6 +739,44 @@ fn tick_count_bucket(value: u32) -> &'static str {
 }
 
 async fn load_rows(pool: &PgPool, cli: &Cli) -> Result<Vec<ReplayRow>> {
+    if let Some(opportunity_id) = cli.opportunity_id {
+        return sqlx::query_as::<_, ReplayRow>(
+            r#"
+            SELECT
+                o.id AS opportunity_id,
+                o.created_at AS opportunity_at,
+                o.block_number AS opportunity_block,
+                o.strategy,
+                o.token_in,
+                o.amount_in,
+                o.expected_profit,
+                o.min_profit,
+                o.path_json,
+                COALESCE(s.id, o.id) AS simulation_id,
+                COALESCE(s.created_at, o.created_at) AS simulation_at,
+                s.block_number AS simulation_block,
+                COALESCE(s.success, false) AS simulation_success,
+                s.revert_reason AS simulation_revert_reason,
+                COALESCE(s.simulated_profit, '0') AS simulated_profit,
+                s.net_simulated_profit,
+                s.path_name
+            FROM opportunities o
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM simulations s
+                WHERE s.opportunity_id = o.id
+                ORDER BY s.created_at DESC
+                LIMIT 1
+            ) s ON true
+            WHERE o.id = $1
+            "#,
+        )
+        .bind(opportunity_id)
+        .fetch_all(pool)
+        .await
+        .context("failed to load opportunity replay row");
+    }
+
     let reason = cli.reason.as_deref().unwrap_or("%");
     sqlx::query_as::<_, ReplayRow>(
         r#"
@@ -780,6 +819,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut hours = 12;
     let mut limit = 50;
     let mut reason = None;
+    let mut opportunity_id = None;
     let mut out = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -801,6 +841,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
             "--reason" => {
                 reason = Some(args.next().context("--reason requires a value")?);
             }
+            "--opportunity-id" => {
+                let value = args.next().context("--opportunity-id requires a value")?;
+                opportunity_id = Some(Uuid::parse_str(&value).context("invalid --opportunity-id")?);
+            }
             "--out" => {
                 out = Some(PathBuf::from(
                     args.next().context("--out requires a value")?,
@@ -817,13 +861,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
         hours,
         limit,
         reason,
+        opportunity_id,
         out,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -p base-arb-recorder --bin replay_simulations -- [--hours 12] [--limit 50] [--reason '%MinProfitNotMet%'] [--out reports/replay.txt]"
+        "Usage: cargo run -p base-arb-recorder --bin replay_simulations -- [--hours 12] [--limit 50] [--reason '%MinProfitNotMet%'] [--opportunity-id UUID] [--out reports/replay.txt]"
     );
 }
 
