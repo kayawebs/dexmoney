@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::constants::{
-    AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER,
+    AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER,
 };
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
@@ -154,7 +154,12 @@ pub fn build_live_execution_calldata(
 }
 
 pub fn executor_for_candidate(settings: &Settings, candidate: &Candidate) -> Result<Address> {
-    let selected = if candidate.path.steps.len() == 2 {
+    let requires_hub = candidate_requires_direct_execution(candidate, settings);
+    let selected = if requires_hub {
+        settings
+            .executor_contract_multihop
+            .or(settings.executor_contract)
+    } else if candidate.path.steps.len() == 2 {
         settings
             .executor_contract_2hop
             .or(settings.executor_contract)
@@ -166,7 +171,9 @@ pub fn executor_for_candidate(settings: &Settings, candidate: &Candidate) -> Res
     selected
         .filter(|address| *address != Address::ZERO)
         .with_context(|| {
-            if candidate.path.steps.len() == 2 {
+            if requires_hub {
+                "EXECUTOR_CONTRACT_MULTIHOP or EXECUTOR_CONTRACT is required for direct pool execution"
+            } else if candidate.path.steps.len() == 2 {
                 "EXECUTOR_CONTRACT_2HOP or EXECUTOR_CONTRACT is not configured"
             } else {
                 "EXECUTOR_CONTRACT_MULTIHOP or EXECUTOR_CONTRACT is not configured"
@@ -235,6 +242,9 @@ pub fn required_token_approvals(
 ) -> Result<Vec<ApprovalRequirement>> {
     let mut approvals = Vec::new();
     for step in &candidate.path.steps {
+        if step_execution_kind(step, settings)?.is_direct() {
+            continue;
+        }
         let spender = router_for_step(step.dex, step.variant, settings)
             .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?;
         approvals.push(ApprovalRequirement {
@@ -252,12 +262,14 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     out.extend(encode_u256(U256::from(candidate.path.steps.len())));
 
     for step in &candidate.path.steps {
-        let router = router_for_step(step.dex, step.variant, settings)
-            .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?;
-        out.extend(encode_u256(U256::from(executor_dex_kind(
-            step.dex,
-            step.variant,
-        )?)));
+        let execution_kind = step_execution_kind(step, settings)?;
+        let router = if execution_kind.is_direct() {
+            Address::ZERO
+        } else {
+            router_for_step(step.dex, step.variant, settings)
+                .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?
+        };
+        out.extend(encode_u256(U256::from(execution_kind.abi_value())));
         out.extend(encode_address(router));
         out.extend(encode_address(step.pool));
         out.extend(encode_address(step.token_in));
@@ -273,6 +285,95 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorStepKind {
+    AerodromeClassic,
+    AerodromeSlipstream,
+    UniswapV3Router,
+    PancakeV3Router,
+    DirectV2,
+    DirectV3,
+}
+
+impl ExecutorStepKind {
+    fn abi_value(self) -> u8 {
+        match self {
+            Self::AerodromeClassic => 0,
+            Self::AerodromeSlipstream => 1,
+            Self::UniswapV3Router => 2,
+            Self::PancakeV3Router => 3,
+            Self::DirectV2 => 4,
+            Self::DirectV3 => 5,
+        }
+    }
+
+    fn is_direct(self) -> bool {
+        matches!(self, Self::DirectV2 | Self::DirectV3)
+    }
+}
+
+fn candidate_requires_direct_execution(candidate: &Candidate, settings: &Settings) -> bool {
+    candidate
+        .path
+        .steps
+        .iter()
+        .any(|step| step_execution_kind(step, settings).is_ok_and(|kind| kind.is_direct()))
+}
+
+fn step_execution_kind(
+    step: &base_arb_common::types::SwapStep,
+    settings: &Settings,
+) -> Result<ExecutorStepKind> {
+    match (step.dex, step.variant) {
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
+            let default_factory = settings
+                .aerodrome_pool_factory
+                .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
+            if !step.stable.unwrap_or(false)
+                && is_unknown_router_factory(step.factory_address, default_factory)
+            {
+                Ok(ExecutorStepKind::DirectV2)
+            } else {
+                Ok(ExecutorStepKind::AerodromeClassic)
+            }
+        }
+        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
+            Ok(ExecutorStepKind::AerodromeSlipstream)
+        }
+        (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => {
+            if is_unknown_router_factory(step.factory_address, settings.uniswap_v3_factory) {
+                Ok(ExecutorStepKind::DirectV3)
+            } else {
+                Ok(ExecutorStepKind::UniswapV3Router)
+            }
+        }
+        (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
+            let pancake_factory = settings
+                .pancake_v3_factory
+                .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
+            if is_unknown_router_factory(step.factory_address, pancake_factory) {
+                Ok(ExecutorStepKind::DirectV3)
+            } else {
+                Ok(ExecutorStepKind::PancakeV3Router)
+            }
+        }
+        _ => anyhow::bail!("dex and pool variant mismatch"),
+    }
+}
+
+fn is_unknown_router_factory(
+    step_factory: Option<Address>,
+    configured_factory: Option<Address>,
+) -> bool {
+    let Some(factory) = step_factory else {
+        return false;
+    };
+    let Some(configured) = configured_factory else {
+        return true;
+    };
+    factory != configured
 }
 
 fn router_fee_for_step(
@@ -299,20 +400,6 @@ fn router_fee_for_step(
         }
         _ => fee_bps,
     })
-}
-
-fn executor_dex_kind(dex: DexKind, variant: Option<PoolVariant>) -> Result<u8> {
-    match (dex, variant) {
-        (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
-            Ok(0)
-        }
-        (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => Ok(1),
-        (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => Ok(2),
-        (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
-            Ok(3)
-        }
-        _ => anyhow::bail!("dex and pool variant mismatch"),
-    }
 }
 
 fn classic_stable_flag(step: &base_arb_common::types::SwapStep) -> bool {
@@ -528,7 +615,7 @@ mod tests {
 
     use super::{
         build_execute_calldata, decode_executor_error, decode_uint256_result,
-        executor_for_candidate, router_fee_for_step,
+        executor_for_candidate, required_token_approvals, router_fee_for_step,
     };
 
     fn settings() -> base_arb_common::config::Settings {
@@ -570,6 +657,13 @@ mod tests {
             pool_active_refresh_batch_size: 25,
             market_data_flashblocks_enabled: true,
             market_data_global_pool_discovery_enabled: true,
+            competitor_pool_discovery_enabled: true,
+            competitor_collector_address: Some(address!(
+                "0629da86af5a4ae1ba5e1589b13702558d0fb056"
+            )),
+            competitor_pool_discovery_interval_ms: 1000,
+            competitor_pool_discovery_lookback_blocks: 100,
+            competitor_pool_discovery_max_block_span: 25,
             searcher_multihop_enabled: true,
             aerodrome_fee_refresh_interval_secs: 15,
             v3_tick_refresh_interval_secs: 60,
@@ -648,6 +742,45 @@ mod tests {
         assert_eq!(
             executor_for_candidate(&settings, &candidate_with_step_count(4)).unwrap(),
             address!("4444444444444444444444444444444444444444")
+        );
+    }
+
+    #[test]
+    fn direct_v3_uses_multihop_executor_and_needs_no_router_approval() {
+        let mut settings = settings();
+        settings.uniswap_v3_factory = Some(address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        settings.executor_contract = Some(address!("3333333333333333333333333333333333333333"));
+        settings.executor_contract_2hop =
+            Some(address!("2222222222222222222222222222222222222222"));
+        settings.executor_contract_multihop =
+            Some(address!("4444444444444444444444444444444444444444"));
+
+        let mut candidate = candidate_with_step_count(2);
+        candidate.path.steps[0].factory_address =
+            Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        candidate.path.steps[1].factory_address =
+            Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+
+        assert_eq!(
+            executor_for_candidate(&settings, &candidate).unwrap(),
+            address!("4444444444444444444444444444444444444444")
+        );
+        assert!(required_token_approvals(&candidate, &settings)
+            .unwrap()
+            .is_empty());
+
+        let calldata = build_execute_calldata(
+            &candidate,
+            U256::from(5_000u64),
+            U256::from(123),
+            &settings,
+        )
+        .unwrap();
+        let array_start = 4 + 5 * 32;
+        let first_step_kind_offset = array_start + 32;
+        assert_eq!(
+            U256::from_be_slice(&calldata[first_step_kind_offset..first_step_kind_offset + 32]),
+            U256::from(5u64)
         );
     }
 

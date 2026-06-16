@@ -388,12 +388,11 @@ impl ChainProvider {
                 "observed_slipstream_import",
             )
         } else {
-            anyhow::bail!(
-                "unsupported v3-compatible factory {}; exactInputSingle routers do not accept a custom factory",
-                factory
-                    .map(|value| format!("{value:#x}"))
-                    .unwrap_or_else(|| "-".to_string())
-            );
+            (
+                DexKind::UniswapV3,
+                PoolVariant::UniswapV3,
+                "observed_direct_v3_import",
+            )
         };
 
         let fee_bps = fee_pips.unwrap_or_default() / 100;
