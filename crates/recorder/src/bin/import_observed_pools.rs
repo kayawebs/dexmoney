@@ -188,6 +188,7 @@ async fn main() -> Result<()> {
                             row.swap_logs,
                             Some(row.first_block),
                             Some(row.latest_block),
+                            "manual_import",
                             "observed_only",
                             Some(&err.to_string()),
                         )
@@ -425,6 +426,7 @@ async fn upsert_observed(
             row.swap_logs,
             Some(row.first_block),
             Some(row.latest_block),
+            "manual_import",
             import_status,
             import_reason,
         )

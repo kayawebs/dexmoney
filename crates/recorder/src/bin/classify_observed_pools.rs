@@ -142,6 +142,7 @@ async fn classify_row(
                         row.logs_30d,
                         row.first_block,
                         row.latest_block,
+                        "classifier",
                         "unresolved",
                         Some(&format!("metadata probe failed: {err}")),
                     )
@@ -301,6 +302,7 @@ async fn import_discovered_pool(
             row.logs_30d,
             row.first_block,
             row.latest_block,
+            "classifier",
             "imported",
             None,
         )
@@ -335,6 +337,7 @@ async fn record_classified_observed_only(
             row.logs_30d,
             row.first_block,
             row.latest_block,
+            "classifier",
             "classified_observed_only",
             reason,
         )

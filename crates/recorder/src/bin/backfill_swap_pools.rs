@@ -256,6 +256,7 @@ async fn process_observed_pool(
                     logs,
                     first_block,
                     latest_block,
+                    "backfill_swap",
                     "observed_only",
                     Some("pool factory() unavailable; cannot prove executor support"),
                 )
@@ -434,6 +435,7 @@ async fn import_discovered_pool(
             logs,
             first_block,
             latest_block,
+            "backfill_swap",
             "imported",
             None,
         )
@@ -490,6 +492,7 @@ async fn record_observed_only(
             logs,
             first_block,
             latest_block,
+            "backfill_swap",
             "observed_only",
             reason,
         )

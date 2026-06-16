@@ -261,6 +261,7 @@ impl PostgresStore {
         logs_30d: i64,
         first_block: Option<i64>,
         latest_block: Option<i64>,
+        discovery_source: &str,
         import_status: &str,
         import_reason: Option<&str>,
     ) -> Result<()> {
@@ -269,10 +270,11 @@ impl PostgresStore {
             INSERT INTO observed_pools (
                 chain_id, pool_address, topic0, family, token0, token1, symbol,
                 factory_address, dex, variant, fee_bps, fee_pips, tick_spacing, stable,
-                txs_30d, logs_30d, first_block, latest_block, import_status, import_reason,
+                txs_30d, logs_30d, first_block, latest_block, discovery_source,
+                import_status, import_reason,
                 created_at, updated_at
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),NOW()
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW(),NOW()
             )
             ON CONFLICT (chain_id, pool_address)
             DO UPDATE SET
@@ -292,6 +294,7 @@ impl PostgresStore {
                 logs_30d = EXCLUDED.logs_30d,
                 first_block = EXCLUDED.first_block,
                 latest_block = EXCLUDED.latest_block,
+                discovery_source = EXCLUDED.discovery_source,
                 import_status = EXCLUDED.import_status,
                 import_reason = EXCLUDED.import_reason,
                 updated_at = NOW()
@@ -315,6 +318,7 @@ impl PostgresStore {
         .bind(logs_30d)
         .bind(first_block)
         .bind(latest_block)
+        .bind(discovery_source)
         .bind(import_status)
         .bind(import_reason)
         .execute(&self.pool)
@@ -1041,6 +1045,7 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             logs_30d BIGINT NOT NULL DEFAULT 0,
             first_block BIGINT,
             latest_block BIGINT,
+            discovery_source TEXT NOT NULL DEFAULT 'unknown',
             import_status TEXT NOT NULL,
             import_reason TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1051,6 +1056,10 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON observed_pools (chain_id, import_status, txs_30d DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS observed_pools_symbol_idx
             ON observed_pools (chain_id, symbol, txs_30d DESC)"#,
+        r#"ALTER TABLE observed_pools
+            ADD COLUMN IF NOT EXISTS discovery_source TEXT NOT NULL DEFAULT 'unknown'"#,
+        r#"CREATE INDEX IF NOT EXISTS observed_pools_source_idx
+            ON observed_pools (chain_id, discovery_source, updated_at DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS factory_registry (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,

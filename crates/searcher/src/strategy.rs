@@ -19,6 +19,7 @@ const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 5_000;
 const MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN: usize = 20_000;
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
 const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
+const TOP_REJECTED_SAMPLES: usize = 5;
 
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
@@ -63,6 +64,18 @@ pub struct SearchStats {
     pub best_profit_rejected_by_impact: U256,
     pub best_profit_rejected_by_model_edge: U256,
     pub best_profit: U256,
+    pub top_min_profit_rejected: Vec<RejectedQuoteSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RejectedQuoteSample {
+    pub path_name: String,
+    pub token_in: Address,
+    pub amount_in: U256,
+    pub expected_profit: U256,
+    pub required_profit: U256,
+    pub step_count: usize,
+    pub modes: String,
 }
 
 impl SearchStats {
@@ -102,6 +115,9 @@ impl SearchStats {
             .best_profit_rejected_by_model_edge
             .max(other.best_profit_rejected_by_model_edge);
         self.best_profit = self.best_profit.max(other.best_profit);
+        for sample in &other.top_min_profit_rejected {
+            self.record_min_profit_rejected_sample(sample.clone());
+        }
     }
 
     fn record_quote_skip(&mut self, reason: QuoteSkipReason) {
@@ -114,6 +130,69 @@ impl SearchStats {
             }
             QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
         }
+    }
+
+    fn record_min_profit_rejected(
+        &mut self,
+        path: &ArbPath,
+        amount_in: U256,
+        expected_profit: U256,
+        required_profit: U256,
+        diagnostics: &QuoteDiagnostics,
+    ) {
+        self.min_profit_rejected += 1;
+        self.record_min_profit_rejected_sample(RejectedQuoteSample {
+            path_name: path.name.clone(),
+            token_in: path
+                .steps
+                .first()
+                .map(|step| step.token_in)
+                .unwrap_or(Address::ZERO),
+            amount_in,
+            expected_profit,
+            required_profit,
+            step_count: path.steps.len(),
+            modes: diagnostics.modes.join("+"),
+        });
+    }
+
+    fn record_min_profit_rejected_sample(&mut self, sample: RejectedQuoteSample) {
+        self.top_min_profit_rejected.push(sample);
+        self.top_min_profit_rejected.sort_by(|a, b| {
+            b.expected_profit
+                .cmp(&a.expected_profit)
+                .then_with(|| b.required_profit.cmp(&a.required_profit))
+        });
+        self.top_min_profit_rejected.truncate(TOP_REJECTED_SAMPLES);
+    }
+
+    pub fn top_min_profit_rejected_summary(&self) -> String {
+        if self.top_min_profit_rejected.is_empty() {
+            return "-".to_string();
+        }
+        self.top_min_profit_rejected
+            .iter()
+            .map(|sample| {
+                let ratio_bps = if sample.required_profit.is_zero() {
+                    U256::ZERO
+                } else {
+                    sample.expected_profit.saturating_mul(U256::from(10_000u64))
+                        / sample.required_profit
+                };
+                format!(
+                    "path={} token_in={:#x} steps={} amount={} profit={} min={} ratio_bps={} modes={}",
+                    sample.path_name,
+                    sample.token_in,
+                    sample.step_count,
+                    sample.amount_in,
+                    sample.expected_profit,
+                    sample.required_profit,
+                    ratio_bps,
+                    sample.modes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
@@ -324,7 +403,13 @@ impl SearchEngine {
                         search_path.min_profit
                     };
                     if expected_profit < required_profit {
-                        stats.min_profit_rejected += 1;
+                        stats.record_min_profit_rejected(
+                            &search_path.path,
+                            *amount_in,
+                            expected_profit,
+                            required_profit,
+                            &diagnostics,
+                        );
                         continue;
                     }
                     if price_impact_bps > self.max_price_impact_bps {
@@ -334,15 +419,13 @@ impl SearchEngine {
                         continue;
                     }
                     stats.best_profit = stats.best_profit.max(expected_profit);
-                    let quote_edge_floor = quote_model_edge_floor(
-                        *amount_in,
-                        &diagnostics,
-                        self.v3_quote_safety_bps,
-                    );
+                    let quote_edge_floor =
+                        quote_model_edge_floor(*amount_in, &diagnostics, self.v3_quote_safety_bps);
                     if expected_profit < quote_edge_floor {
                         stats.quote_model_edge_rejected += 1;
-                        stats.best_profit_rejected_by_model_edge =
-                            stats.best_profit_rejected_by_model_edge.max(expected_profit);
+                        stats.best_profit_rejected_by_model_edge = stats
+                            .best_profit_rejected_by_model_edge
+                            .max(expected_profit);
                         continue;
                     }
                     let block_number = candidate_block_number_from_diagnostics(&diagnostics);
@@ -453,7 +536,13 @@ impl SearchEngine {
                 search_path.min_profit
             };
             if expected_profit < required_profit {
-                stats.min_profit_rejected += 1;
+                stats.record_min_profit_rejected(
+                    &search_path.path,
+                    *amount_in,
+                    expected_profit,
+                    required_profit,
+                    &diagnostics,
+                );
                 continue;
             }
             if price_impact_bps > self.max_price_impact_bps {
@@ -467,8 +556,9 @@ impl SearchEngine {
                 quote_model_edge_floor(*amount_in, &diagnostics, self.v3_quote_safety_bps);
             if expected_profit < quote_edge_floor {
                 stats.quote_model_edge_rejected += 1;
-                stats.best_profit_rejected_by_model_edge =
-                    stats.best_profit_rejected_by_model_edge.max(expected_profit);
+                stats.best_profit_rejected_by_model_edge = stats
+                    .best_profit_rejected_by_model_edge
+                    .max(expected_profit);
                 continue;
             }
             let block_number = candidate_block_number_from_diagnostics(&diagnostics);
@@ -1547,8 +1637,7 @@ fn quote_model_edge_floor(
     if amount_in.is_zero() || v3_steps == 0 || v3_quote_safety_bps == 0 {
         return U256::ZERO;
     }
-    amount_in
-        .saturating_mul(U256::from(v3_steps.saturating_mul(v3_quote_safety_bps)))
+    amount_in.saturating_mul(U256::from(v3_steps.saturating_mul(v3_quote_safety_bps)))
         / U256::from(10_000u64)
 }
 

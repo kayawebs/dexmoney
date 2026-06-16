@@ -237,6 +237,7 @@ async fn process_creation_log(
                         1,
                         Some(i64::try_from(log.block_number)?),
                         Some(i64::try_from(log.block_number)?),
+                        "backfill_factory",
                         "observed_only",
                         Some(&format!("trusted factory pool resolve failed: {err}")),
                     )
@@ -320,6 +321,7 @@ async fn import_discovered_pool(
             1,
             Some(i64::try_from(block_number)?),
             Some(i64::try_from(block_number)?),
+            "backfill_factory",
             "imported",
             None,
         )

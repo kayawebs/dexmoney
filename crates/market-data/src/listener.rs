@@ -545,7 +545,10 @@ where
                 if !seen_pools.insert(log.pool) {
                     continue;
                 }
-                match self.process_observed_swap_pool(&log, &trusted).await {
+                match self
+                    .process_observed_swap_pool(&log, &trusted, "competitor_collector")
+                    .await
+                {
                     Ok(LivePoolDiscoveryOutcome::Imported) => summary.imported += 1,
                     Ok(LivePoolDiscoveryOutcome::ObservedOnly) => summary.observed_only += 1,
                     Ok(LivePoolDiscoveryOutcome::Skipped) => summary.skipped += 1,
@@ -802,7 +805,10 @@ where
             if !seen_pools.insert(log.pool) {
                 continue;
             }
-            match self.process_observed_swap_pool(&log, &trusted).await {
+            match self
+                .process_observed_swap_pool(&log, &trusted, "global_swap")
+                .await
+            {
                 Ok(LivePoolDiscoveryOutcome::Imported) => imported += 1,
                 Ok(LivePoolDiscoveryOutcome::ObservedOnly) => observed_only += 1,
                 Ok(LivePoolDiscoveryOutcome::Skipped) => skipped += 1,
@@ -835,6 +841,7 @@ where
         &self,
         log: &SwapObservationLog,
         trusted: &HashMap<Address, (DexKind, PoolVariant, FactoryRegistryRecord)>,
+        discovery_source: &str,
     ) -> Result<LivePoolDiscoveryOutcome> {
         let metadata = match self
             .provider
@@ -874,6 +881,7 @@ where
                     1,
                     Some(i64::try_from(log.block_number)?),
                     Some(i64::try_from(log.block_number)?),
+                    discovery_source,
                     "observed_only",
                     Some("pool factory() unavailable; cannot prove executor support"),
                 )
@@ -898,6 +906,7 @@ where
                         *variant,
                         factory,
                         discovered,
+                        discovery_source,
                     )
                     .await?;
                     return Ok(LivePoolDiscoveryOutcome::Imported);
@@ -908,6 +917,7 @@ where
                         &metadata,
                         &symbol,
                         Some(factory),
+                        discovery_source,
                         "observed_only",
                         Some(&format!("trusted factory pool resolve failed: {err}")),
                     )
@@ -936,6 +946,7 @@ where
                     variant,
                     factory,
                     discovered,
+                    discovery_source,
                 )
                 .await?;
                 info!(
@@ -954,6 +965,7 @@ where
                     &metadata,
                     &symbol,
                     Some(factory),
+                    discovery_source,
                     "classified_observed_only",
                     Some(&format!(
                         "not executable by configured routers/factories: {err}"
@@ -992,6 +1004,7 @@ where
         variant: PoolVariant,
         factory: Address,
         discovered: base_arb_common::types::DiscoveredPool,
+        discovery_source: &str,
     ) -> Result<()> {
         self.recorder
             .upsert_token_registry(
@@ -1035,6 +1048,7 @@ where
                 1,
                 Some(i64::try_from(block_number)?),
                 Some(i64::try_from(block_number)?),
+                discovery_source,
                 "imported",
                 None,
             )
@@ -1155,6 +1169,7 @@ where
                             1,
                             Some(i64::try_from(log.block_number)?),
                             Some(i64::try_from(log.block_number)?),
+                            "factory_event",
                             "imported",
                             None,
                         )
@@ -1218,6 +1233,7 @@ where
                         variant,
                         factory,
                         discovered,
+                        "factory_event",
                     )
                     .await?;
                     info!(
@@ -1296,6 +1312,7 @@ where
                 1,
                 Some(i64::try_from(log.block_number)?),
                 Some(i64::try_from(log.block_number)?),
+                "factory_event",
                 import_status,
                 reason,
             )
@@ -1324,6 +1341,7 @@ where
         metadata: &base_arb_chain::provider::ObservedPoolMetadata,
         symbol: &str,
         factory: Option<Address>,
+        discovery_source: &str,
         import_status: &str,
         reason: Option<&str>,
     ) -> Result<()> {
@@ -1347,6 +1365,7 @@ where
                 1,
                 Some(i64::try_from(log.block_number)?),
                 Some(i64::try_from(log.block_number)?),
+                discovery_source,
                 import_status,
                 reason,
             )

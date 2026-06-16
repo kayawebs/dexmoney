@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
                 best_profit_rejected_by_impact = %aggregate.search.best_profit_rejected_by_impact,
                 best_profit_rejected_by_model_edge = %aggregate.search.best_profit_rejected_by_model_edge,
                 best_profit_after_impact = %aggregate.search.best_profit,
+                top_min_profit_rejected = %aggregate.search.top_min_profit_rejected_summary(),
                 "searcher cycle summary"
             );
             aggregate = SearchCycleStats::default();
