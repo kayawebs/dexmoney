@@ -1024,29 +1024,29 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS tokens_enabled_idx
             ON tokens (chain_id, enabled, symbol)"#,
+        r#"CREATE INDEX IF NOT EXISTS tokens_chain_lower_address_idx
+            ON tokens (chain_id, lower(token_address))"#,
         r#"
+            WITH computed AS (
+                SELECT
+                    tp.id,
+                    COALESCE(NULLIF(BTRIM(t0.symbol), ''), left(tp.token0, 10))
+                        || '-' || right(tp.token0, 6) || '/' ||
+                    COALESCE(NULLIF(BTRIM(t1.symbol), ''), left(tp.token1, 10))
+                        || '-' || right(tp.token1, 6) AS new_symbol
+                FROM token_pairs tp
+                LEFT JOIN tokens t0
+                    ON t0.chain_id = tp.chain_id
+                   AND lower(t0.token_address) = lower(tp.token0)
+                LEFT JOIN tokens t1
+                    ON t1.chain_id = tp.chain_id
+                   AND lower(t1.token_address) = lower(tp.token1)
+            )
             UPDATE token_pairs tp
-            SET symbol =
-                COALESCE(
-                    NULLIF(BTRIM((
-                        SELECT t.symbol
-                        FROM tokens t
-                        WHERE t.chain_id = tp.chain_id
-                          AND lower(t.token_address) = lower(tp.token0)
-                        LIMIT 1
-                    )), ''),
-                    left(tp.token0, 10)
-                ) || '-' || right(tp.token0, 6) || '/' ||
-                COALESCE(
-                    NULLIF(BTRIM((
-                        SELECT t.symbol
-                        FROM tokens t
-                        WHERE t.chain_id = tp.chain_id
-                          AND lower(t.token_address) = lower(tp.token1)
-                        LIMIT 1
-                    )), ''),
-                    left(tp.token1, 10)
-                ) || '-' || right(tp.token1, 6)
+            SET symbol = computed.new_symbol
+            FROM computed
+            WHERE tp.id = computed.id
+              AND tp.symbol IS DISTINCT FROM computed.new_symbol
         "#,
         r#"CREATE TABLE IF NOT EXISTS observed_pools (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

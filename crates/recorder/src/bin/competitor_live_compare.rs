@@ -298,7 +298,7 @@ async fn load_pool_coverage(
         r#"
         WITH target AS (SELECT lower($1::text) AS pool)
         SELECT
-            p.symbol,
+            COALESCE(tp.symbol, op.symbol) AS symbol,
             p.dex,
             p.variant,
             p.enabled AS pool_enabled,
@@ -320,6 +320,7 @@ async fn load_pool_coverage(
             ) AS opportunities_near_block
         FROM target t
         LEFT JOIN pools p ON lower(p.pool_address) = t.pool
+        LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         LEFT JOIN LATERAL (
             SELECT block_number, source
             FROM pool_states ps
