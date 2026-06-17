@@ -61,9 +61,11 @@ struct PoolCoverage {
 struct TxDiagnostics {
     topic_summary: String,
     transfer_flow: Vec<String>,
+    unrecognized_transfer_counterparties: Vec<String>,
     recognized_swap_pools: usize,
     anchors_touched: Vec<String>,
     recognized_anchor_cycle: bool,
+    anchor_cycles: Vec<String>,
     searcher_gap: String,
 }
 
@@ -434,7 +436,8 @@ fn tx_diagnostics(
 ) -> TxDiagnostics {
     let recognized_swap_pools = coverages.len();
     let anchors_touched = anchors_touched(coverages, anchor_tokens);
-    let recognized_anchor_cycle = has_anchor_cycle(coverages, anchor_tokens, 4);
+    let anchor_cycles = anchor_cycles(coverages, anchor_tokens, 4);
+    let recognized_anchor_cycle = !anchor_cycles.is_empty();
     let has_opportunity = coverages.iter().any(|row| row.opportunities_near_block > 0);
     let searcher_gap = if recognized_swap_pools == 0 {
         "no_supported_swap_logs"
@@ -450,9 +453,13 @@ fn tx_diagnostics(
     TxDiagnostics {
         topic_summary: receipt_topic_summary(receipt),
         transfer_flow: receipt_transfer_flow(receipt, collector),
+        unrecognized_transfer_counterparties: unrecognized_transfer_counterparties(
+            receipt, collector, coverages,
+        ),
         recognized_swap_pools,
         anchors_touched,
         recognized_anchor_cycle,
+        anchor_cycles,
         searcher_gap,
     }
 }
@@ -470,42 +477,61 @@ fn anchors_touched(coverages: &[PoolCoverage], anchor_tokens: &BTreeSet<String>)
     touched.into_iter().collect()
 }
 
-fn has_anchor_cycle(
+fn anchor_cycles(
     coverages: &[PoolCoverage],
     anchor_tokens: &BTreeSet<String>,
     max_depth: usize,
-) -> bool {
+) -> Vec<String> {
     let edges = coverages
         .iter()
         .enumerate()
         .filter_map(|(idx, row)| {
             let token0 = row.token0.as_ref()?.to_ascii_lowercase();
             let token1 = row.token1.as_ref()?.to_ascii_lowercase();
-            Some((idx, token0, token1))
+            Some((idx, row.pool.clone(), row.symbol.clone(), token0, token1))
         })
         .collect::<Vec<_>>();
 
-    anchor_tokens.iter().any(|anchor| {
-        edges
+    let mut cycles = Vec::new();
+    for anchor in anchor_tokens {
+        if !edges
             .iter()
-            .any(|(_, token0, token1)| token0 == anchor || token1 == anchor)
-            && dfs_anchor_cycle(anchor, anchor, &edges, &mut BTreeSet::new(), 0, max_depth)
-    })
+            .any(|(_, _, _, token0, token1)| token0 == anchor || token1 == anchor)
+        {
+            continue;
+        }
+        collect_anchor_cycles(
+            anchor,
+            anchor,
+            &edges,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+            0,
+            max_depth,
+            &mut cycles,
+        );
+    }
+    cycles.sort();
+    cycles.dedup();
+    cycles.truncate(10);
+    cycles
 }
 
-fn dfs_anchor_cycle(
+fn collect_anchor_cycles(
     anchor: &str,
     current: &str,
-    edges: &[(usize, String, String)],
+    edges: &[(usize, String, Option<String>, String, String)],
     used_edges: &mut BTreeSet<usize>,
+    path: &mut Vec<String>,
     depth: usize,
     max_depth: usize,
-) -> bool {
+    cycles: &mut Vec<String>,
+) {
     if depth >= max_depth {
-        return false;
+        return;
     }
 
-    for (idx, token0, token1) in edges {
+    for (idx, pool, symbol, token0, token1) in edges {
         if used_edges.contains(idx) {
             continue;
         }
@@ -517,18 +543,33 @@ fn dfs_anchor_cycle(
             continue;
         };
 
+        path.push(format!(
+            "{}:{}({}->{})",
+            short_addr(pool),
+            symbol.as_deref().unwrap_or("-"),
+            short_addr(current),
+            short_addr(next)
+        ));
         if next == anchor && depth + 1 >= 2 {
-            return true;
+            cycles.push(path.join(" | "));
+            path.pop();
+            continue;
         }
 
         used_edges.insert(*idx);
-        if dfs_anchor_cycle(anchor, next, edges, used_edges, depth + 1, max_depth) {
-            return true;
-        }
+        collect_anchor_cycles(
+            anchor,
+            next,
+            edges,
+            used_edges,
+            path,
+            depth + 1,
+            max_depth,
+            cycles,
+        );
         used_edges.remove(idx);
+        path.pop();
     }
-
-    false
 }
 
 fn receipt_topic_summary(receipt: &TxReceipt) -> String {
@@ -620,6 +661,83 @@ fn receipt_transfer_flow(receipt: &TxReceipt, collector: Address) -> Vec<String>
     transfers
 }
 
+fn unrecognized_transfer_counterparties(
+    receipt: &TxReceipt,
+    collector: Address,
+    coverages: &[PoolCoverage],
+) -> Vec<String> {
+    let collector_address = format!("{:#x}", collector).to_ascii_lowercase();
+    let mut known = coverages
+        .iter()
+        .map(|coverage| coverage.pool.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    known.insert(collector_address.clone());
+    known.insert("0x0000000000000000000000000000000000000000".into());
+
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        let Some(from) = topics[1].as_str().and_then(topic_address) else {
+            continue;
+        };
+        let Some(to) = topics[2].as_str().and_then(topic_address) else {
+            continue;
+        };
+        if to == collector_address {
+            // This is usually the competitor's executor/settlement contract.
+            known.insert(from);
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        for topic in topics.iter().skip(1).take(2) {
+            let Some(address) = topic.as_str().and_then(topic_address) else {
+                continue;
+            };
+            if !known.contains(&address) {
+                out.insert(address);
+            }
+        }
+    }
+
+    out.into_iter().collect()
+}
+
 fn write_tx(
     writer: &mut BufWriter<File>,
     tx: &CollectorTx,
@@ -677,6 +795,29 @@ fn write_tx(
         diagnostics.recognized_anchor_cycle
     )?;
     writeln!(writer, "searcher_gap: {}", diagnostics.searcher_gap)?;
+    writeln!(
+        writer,
+        "anchor_cycles: {}",
+        if diagnostics.anchor_cycles.is_empty() {
+            "-".into()
+        } else {
+            diagnostics.anchor_cycles.join(" || ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "unrecognized_transfer_counterparties: {}",
+        if diagnostics.unrecognized_transfer_counterparties.is_empty() {
+            "-".into()
+        } else {
+            diagnostics
+                .unrecognized_transfer_counterparties
+                .iter()
+                .map(|address| short_addr(address))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )?;
     writeln!(writer, "transfer_flow:")?;
     for transfer in &diagnostics.transfer_flow {
         writeln!(writer, "  - {transfer}")?;
