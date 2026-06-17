@@ -43,6 +43,8 @@ struct CollectorTx {
 struct PoolCoverage {
     pool: String,
     topic0: String,
+    token0: Option<String>,
+    token1: Option<String>,
     symbol: Option<String>,
     dex: Option<String>,
     variant: Option<String>,
@@ -53,6 +55,16 @@ struct PoolCoverage {
     discovery_source: Option<String>,
     dex_event_logs_same_block: i64,
     opportunities_near_block: i64,
+}
+
+#[derive(Debug)]
+struct TxDiagnostics {
+    topic_summary: String,
+    transfer_flow: Vec<String>,
+    recognized_swap_pools: usize,
+    anchors_touched: Vec<String>,
+    recognized_anchor_cycle: bool,
+    searcher_gap: String,
 }
 
 #[tokio::main]
@@ -100,6 +112,16 @@ async fn main() -> Result<()> {
     writeln!(writer, "from_block: {from_block}")?;
     writeln!(writer, "to_block: {latest_block}")?;
     writeln!(writer, "collector_transfer_txs: {}", txs.len())?;
+    let anchor_tokens = load_anchor_tokens(&store.pool).await?;
+    writeln!(
+        writer,
+        "anchor_tokens: {}",
+        anchor_tokens
+            .iter()
+            .map(|token| short_addr(token))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )?;
     writeln!(writer)?;
 
     let mut summary = BTreeMap::<String, usize>::new();
@@ -128,6 +150,7 @@ async fn main() -> Result<()> {
             );
         }
         let classification = classify_tx(&coverages);
+        let diagnostics = tx_diagnostics(&receipt, cli.collector, &coverages, &anchor_tokens);
         *summary.entry(classification.clone()).or_default() += 1;
         write_tx(
             &mut writer,
@@ -135,6 +158,7 @@ async fn main() -> Result<()> {
             &receipt,
             &profits,
             &coverages,
+            &diagnostics,
             &classification,
         )?;
     }
@@ -298,6 +322,8 @@ async fn load_pool_coverage(
         r#"
         WITH target AS (SELECT lower($1::text) AS pool)
         SELECT
+            COALESCE(p.token0, op.token0) AS token0,
+            COALESCE(p.token1, op.token1) AS token1,
             COALESCE(tp.symbol, op.symbol) AS symbol,
             p.dex,
             p.variant,
@@ -341,6 +367,8 @@ async fn load_pool_coverage(
     Ok(PoolCoverage {
         pool: pool_address.to_string(),
         topic0: topic0.to_string(),
+        token0: row.try_get("token0")?,
+        token1: row.try_get("token1")?,
         symbol: row.try_get("symbol")?,
         dex: row.try_get("dex")?,
         variant: row.try_get("variant")?,
@@ -352,6 +380,31 @@ async fn load_pool_coverage(
         dex_event_logs_same_block: row.try_get("dex_event_logs_same_block")?,
         opportunities_near_block: row.try_get("opportunities_near_block")?,
     })
+}
+
+async fn load_anchor_tokens(pool: &PgPool) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT lower(token_address) AS token
+        FROM token_search_defaults
+        WHERE COALESCE(search_amounts, '') <> ''
+        UNION
+        SELECT lower(token0) AS token
+        FROM token_pairs
+        WHERE COALESCE(token0_search_amounts, '') <> ''
+        UNION
+        SELECT lower(token1) AS token
+        FROM token_pairs
+        WHERE COALESCE(token1_search_amounts, '') <> ''
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| row.try_get::<String, _>("token"))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn classify_tx(coverages: &[PoolCoverage]) -> String {
@@ -373,12 +426,207 @@ fn classify_tx(coverages: &[PoolCoverage]) -> String {
     "opportunity_existed_near_block".into()
 }
 
+fn tx_diagnostics(
+    receipt: &TxReceipt,
+    collector: Address,
+    coverages: &[PoolCoverage],
+    anchor_tokens: &BTreeSet<String>,
+) -> TxDiagnostics {
+    let recognized_swap_pools = coverages.len();
+    let anchors_touched = anchors_touched(coverages, anchor_tokens);
+    let recognized_anchor_cycle = has_anchor_cycle(coverages, anchor_tokens, 4);
+    let has_opportunity = coverages.iter().any(|row| row.opportunities_near_block > 0);
+    let searcher_gap = if recognized_swap_pools == 0 {
+        "no_supported_swap_logs"
+    } else if !recognized_anchor_cycle {
+        "recognized_swaps_do_not_form_anchor_cycle"
+    } else if !has_opportunity {
+        "recognized_anchor_cycle_but_no_opportunity"
+    } else {
+        "opportunity_existed_near_block"
+    }
+    .to_string();
+
+    TxDiagnostics {
+        topic_summary: receipt_topic_summary(receipt),
+        transfer_flow: receipt_transfer_flow(receipt, collector),
+        recognized_swap_pools,
+        anchors_touched,
+        recognized_anchor_cycle,
+        searcher_gap,
+    }
+}
+
+fn anchors_touched(coverages: &[PoolCoverage], anchor_tokens: &BTreeSet<String>) -> Vec<String> {
+    let mut touched = BTreeSet::new();
+    for row in coverages {
+        for token in [&row.token0, &row.token1].into_iter().flatten() {
+            let token = token.to_ascii_lowercase();
+            if anchor_tokens.contains(&token) {
+                touched.insert(token);
+            }
+        }
+    }
+    touched.into_iter().collect()
+}
+
+fn has_anchor_cycle(
+    coverages: &[PoolCoverage],
+    anchor_tokens: &BTreeSet<String>,
+    max_depth: usize,
+) -> bool {
+    let edges = coverages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            let token0 = row.token0.as_ref()?.to_ascii_lowercase();
+            let token1 = row.token1.as_ref()?.to_ascii_lowercase();
+            Some((idx, token0, token1))
+        })
+        .collect::<Vec<_>>();
+
+    anchor_tokens.iter().any(|anchor| {
+        edges
+            .iter()
+            .any(|(_, token0, token1)| token0 == anchor || token1 == anchor)
+            && dfs_anchor_cycle(anchor, anchor, &edges, &mut BTreeSet::new(), 0, max_depth)
+    })
+}
+
+fn dfs_anchor_cycle(
+    anchor: &str,
+    current: &str,
+    edges: &[(usize, String, String)],
+    used_edges: &mut BTreeSet<usize>,
+    depth: usize,
+    max_depth: usize,
+) -> bool {
+    if depth >= max_depth {
+        return false;
+    }
+
+    for (idx, token0, token1) in edges {
+        if used_edges.contains(idx) {
+            continue;
+        }
+        let next = if token0 == current {
+            token1
+        } else if token1 == current {
+            token0
+        } else {
+            continue;
+        };
+
+        if next == anchor && depth + 1 >= 2 {
+            return true;
+        }
+
+        used_edges.insert(*idx);
+        if dfs_anchor_cycle(anchor, next, edges, used_edges, depth + 1, max_depth) {
+            return true;
+        }
+        used_edges.remove(idx);
+    }
+
+    false
+}
+
+fn receipt_topic_summary(receipt: &TxReceipt) -> String {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        let label = if topic0 == ERC20_TRANSFER_TOPIC {
+            "erc20_transfer".into()
+        } else if is_swap_topic(&topic0) {
+            topic_family(&topic0).into()
+        } else {
+            format!("unknown:{}", short_hash(&topic0))
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+
+    if counts.is_empty() {
+        return "-".into();
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn receipt_transfer_flow(receipt: &TxReceipt, collector: Address) -> Vec<String> {
+    let collector_address = format!("{:#x}", collector).to_ascii_lowercase();
+    let mut transfers = Vec::new();
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        let Some(from) = topics[1].as_str().and_then(topic_address) else {
+            continue;
+        };
+        let Some(to) = topics[2].as_str().and_then(topic_address) else {
+            continue;
+        };
+        let token = log
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_ascii_lowercase();
+        let amount = hex_to_decimal(log.get("data").and_then(Value::as_str).unwrap_or("0x0"));
+        let collector_tag = if to == collector_address {
+            " collector_in"
+        } else if from == collector_address {
+            " collector_out"
+        } else {
+            ""
+        };
+        transfers.push(format!(
+            "token={} from={} to={} amount={}{}",
+            short_addr(&token),
+            short_addr(&from),
+            short_addr(&to),
+            amount,
+            collector_tag
+        ));
+    }
+
+    if transfers.is_empty() {
+        transfers.push("-".into());
+    }
+    transfers
+}
+
 fn write_tx(
     writer: &mut BufWriter<File>,
     tx: &CollectorTx,
     receipt: &TxReceipt,
     profits: &[String],
     coverages: &[PoolCoverage],
+    diagnostics: &TxDiagnostics,
     classification: &str,
 ) -> Result<()> {
     writeln!(writer, "== Tx ==")?;
@@ -403,13 +651,51 @@ fn write_tx(
     )?;
     writeln!(writer, "collector_in: {}", profits.join(", "))?;
     writeln!(writer, "classification: {classification}")?;
+    writeln!(writer, "topic_summary: {}", diagnostics.topic_summary)?;
+    writeln!(
+        writer,
+        "recognized_swap_pools: {}",
+        diagnostics.recognized_swap_pools
+    )?;
+    writeln!(
+        writer,
+        "anchors_touched: {}",
+        if diagnostics.anchors_touched.is_empty() {
+            "-".into()
+        } else {
+            diagnostics
+                .anchors_touched
+                .iter()
+                .map(|token| short_addr(token))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "recognized_anchor_cycle: {}",
+        diagnostics.recognized_anchor_cycle
+    )?;
+    writeln!(writer, "searcher_gap: {}", diagnostics.searcher_gap)?;
+    writeln!(writer, "transfer_flow:")?;
+    for transfer in &diagnostics.transfer_flow {
+        writeln!(writer, "  - {transfer}")?;
+    }
     writeln!(writer, "pools:")?;
     for row in coverages {
         writeln!(
             writer,
-            "  - pool={} topic={} symbol={} dex={} variant={} enabled={} state_block={} state_source={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
+            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} enabled={} state_block={} state_source={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
             short_addr(&row.pool),
             topic_family(&row.topic0),
+            row.token0
+                .as_deref()
+                .map(short_addr)
+                .unwrap_or_else(|| "-".into()),
+            row.token1
+                .as_deref()
+                .map(short_addr)
+                .unwrap_or_else(|| "-".into()),
             row.symbol.as_deref().unwrap_or("-"),
             row.dex.as_deref().unwrap_or("-"),
             row.variant.as_deref().unwrap_or("-"),
@@ -470,6 +756,14 @@ fn parse_hex_u64(raw: &str) -> Option<u64> {
     u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
 }
 
+fn topic_address(topic: &str) -> Option<String> {
+    let raw = topic.trim_start_matches("0x");
+    if raw.len() < 40 {
+        return None;
+    }
+    Some(format!("0x{}", &raw[raw.len() - 40..]).to_ascii_lowercase())
+}
+
 fn hex_to_decimal(raw: &str) -> String {
     alloy_primitives::U256::from_str_radix(raw.trim_start_matches("0x"), 16)
         .map(|value| value.to_string())
@@ -482,4 +776,12 @@ fn short_addr(address: &str) -> String {
         return lower;
     }
     format!("{}..{}", &lower[..8], &lower[lower.len() - 6..])
+}
+
+fn short_hash(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.len() <= 18 {
+        return lower;
+    }
+    format!("{}..{}", &lower[..10], &lower[lower.len() - 6..])
 }
