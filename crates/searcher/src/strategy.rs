@@ -69,6 +69,13 @@ pub struct SearchStats {
     pub dynamic_multihop_invalid_cycle: u64,
     pub dynamic_multihop_duplicate_cycle: u64,
     pub dynamic_multihop_rough_quote_failed: u64,
+    pub dynamic_multihop_rough_missing_reserves: u64,
+    pub dynamic_multihop_rough_token_mismatch: u64,
+    pub dynamic_multihop_rough_missing_decimals: u64,
+    pub dynamic_multihop_rough_stable_quote_failed: u64,
+    pub dynamic_multihop_rough_v2_quote_failed: u64,
+    pub dynamic_multihop_rough_v3_spot_quote_failed: u64,
+    pub dynamic_multihop_rough_zero_output: u64,
     pub dynamic_multihop_rough_quote_included: u64,
     pub dynamic_multihop_rough_profit_below_min: u64,
     pub dynamic_multihop_candidate_cap_hit: u64,
@@ -113,6 +120,17 @@ impl SearchStats {
         self.dynamic_multihop_invalid_cycle += other.dynamic_multihop_invalid_cycle;
         self.dynamic_multihop_duplicate_cycle += other.dynamic_multihop_duplicate_cycle;
         self.dynamic_multihop_rough_quote_failed += other.dynamic_multihop_rough_quote_failed;
+        self.dynamic_multihop_rough_missing_reserves +=
+            other.dynamic_multihop_rough_missing_reserves;
+        self.dynamic_multihop_rough_token_mismatch += other.dynamic_multihop_rough_token_mismatch;
+        self.dynamic_multihop_rough_missing_decimals +=
+            other.dynamic_multihop_rough_missing_decimals;
+        self.dynamic_multihop_rough_stable_quote_failed +=
+            other.dynamic_multihop_rough_stable_quote_failed;
+        self.dynamic_multihop_rough_v2_quote_failed += other.dynamic_multihop_rough_v2_quote_failed;
+        self.dynamic_multihop_rough_v3_spot_quote_failed +=
+            other.dynamic_multihop_rough_v3_spot_quote_failed;
+        self.dynamic_multihop_rough_zero_output += other.dynamic_multihop_rough_zero_output;
         self.dynamic_multihop_rough_quote_included += other.dynamic_multihop_rough_quote_included;
         self.dynamic_multihop_rough_profit_below_min +=
             other.dynamic_multihop_rough_profit_below_min;
@@ -1175,7 +1193,7 @@ fn score_dynamic_multihop_path(
 ) -> Option<ScoredDynamicPath> {
     let mut best_score_bps = U256::ZERO;
     let mut best_profit = U256::ZERO;
-    let mut quote_failed = false;
+    let mut quote_failure: Option<RoughQuoteFailure> = None;
     let mut below_min = false;
     'amounts: for amount_in in anchor.amount_sizes.iter().copied() {
         if amount_in.is_zero() {
@@ -1183,15 +1201,18 @@ fn score_dynamic_multihop_path(
         }
         let mut amount = amount_in;
         for edge in edges {
-            let Some(next_amount) = rough_quote_edge_upper_bound(edge, amount) else {
-                quote_failed = true;
-                continue 'amounts;
+            let next_amount = match rough_quote_edge_upper_bound(edge, amount) {
+                Ok(next_amount) => next_amount,
+                Err(reason) => {
+                    quote_failure.get_or_insert(reason);
+                    continue 'amounts;
+                }
             };
-            amount = next_amount;
-            if amount.is_zero() {
-                quote_failed = true;
+            if next_amount.is_zero() {
+                quote_failure.get_or_insert(RoughQuoteFailure::ZeroOutput);
                 continue 'amounts;
             }
+            amount = next_amount;
         }
 
         let estimated_profit = amount.saturating_sub(amount_in);
@@ -1210,8 +1231,9 @@ fn score_dynamic_multihop_path(
         }
     }
     if best_score_bps.is_zero() {
-        if quote_failed {
+        if let Some(reason) = quote_failure {
             stats.dynamic_multihop_rough_quote_failed += 1;
+            stats.record_rough_quote_failure(reason);
             stats.dynamic_multihop_rough_quote_included += 1;
             return Some(ScoredDynamicPath {
                 path: build_dynamic_multihop_search_path(anchor, edges),
@@ -1230,21 +1252,75 @@ fn score_dynamic_multihop_path(
     })
 }
 
-fn rough_quote_edge_upper_bound(edge: &OwnedPoolEdge, amount_in: U256) -> Option<U256> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoughQuoteFailure {
+    MissingReserves,
+    TokenMismatch,
+    MissingDecimals,
+    StableQuoteFailed,
+    V2QuoteFailed,
+    V3SpotQuoteFailed,
+    ZeroOutput,
+}
+
+impl SearchStats {
+    fn record_rough_quote_failure(&mut self, reason: RoughQuoteFailure) {
+        match reason {
+            RoughQuoteFailure::MissingReserves => {
+                self.dynamic_multihop_rough_missing_reserves += 1;
+            }
+            RoughQuoteFailure::TokenMismatch => {
+                self.dynamic_multihop_rough_token_mismatch += 1;
+            }
+            RoughQuoteFailure::MissingDecimals => {
+                self.dynamic_multihop_rough_missing_decimals += 1;
+            }
+            RoughQuoteFailure::StableQuoteFailed => {
+                self.dynamic_multihop_rough_stable_quote_failed += 1;
+            }
+            RoughQuoteFailure::V2QuoteFailed => {
+                self.dynamic_multihop_rough_v2_quote_failed += 1;
+            }
+            RoughQuoteFailure::V3SpotQuoteFailed => {
+                self.dynamic_multihop_rough_v3_spot_quote_failed += 1;
+            }
+            RoughQuoteFailure::ZeroOutput => {
+                self.dynamic_multihop_rough_zero_output += 1;
+            }
+        }
+    }
+}
+
+fn rough_quote_edge_upper_bound(
+    edge: &OwnedPoolEdge,
+    amount_in: U256,
+) -> Result<U256, RoughQuoteFailure> {
     match edge.state.variant {
         PoolVariant::AerodromeVolatile => {
-            let reserve0 = edge.state.reserve0?;
-            let reserve1 = edge.state.reserve1?;
+            let reserve0 = edge
+                .state
+                .reserve0
+                .ok_or(RoughQuoteFailure::MissingReserves)?;
+            let reserve1 = edge
+                .state
+                .reserve1
+                .ok_or(RoughQuoteFailure::MissingReserves)?;
             let (reserve_in, reserve_out) = if edge.token_in == edge.state.token0 {
                 (reserve0, reserve1)
             } else if edge.token_in == edge.state.token1 {
                 (reserve1, reserve0)
             } else {
-                return None;
+                return Err(RoughQuoteFailure::TokenMismatch);
             };
             if edge.state.stable.unwrap_or(false) {
-                let decimals0 = edge.state.token0_decimals?;
-                let decimals1 = edge.state.token1_decimals?;
+                let decimals0 = edge
+                    .state
+                    .token0_decimals
+                    .ok_or(RoughQuoteFailure::MissingDecimals)?;
+                let decimals1 = edge
+                    .state
+                    .token1_decimals
+                    .ok_or(RoughQuoteFailure::MissingDecimals)?;
                 let (decimals_in, decimals_out) = if edge.token_in == edge.state.token0 {
                     (decimals0, decimals1)
                 } else {
@@ -1258,7 +1334,7 @@ fn rough_quote_edge_upper_bound(edge: &OwnedPoolEdge, amount_in: U256) -> Option
                     decimals_in,
                     decimals_out,
                 )
-                .ok()
+                .map_err(|_| RoughQuoteFailure::StableQuoteFailed)
             } else {
                 AerodromeVolatileQuoter::quote_amount_out(
                     reserve_in,
@@ -1266,11 +1342,12 @@ fn rough_quote_edge_upper_bound(edge: &OwnedPoolEdge, amount_in: U256) -> Option
                     amount_in,
                     edge.state.fee_bps,
                 )
-                .ok()
+                .map_err(|_| RoughQuoteFailure::V2QuoteFailed)
             }
         }
         PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
-            spot_quote_exact_in(&edge.state, edge.token_in, amount_in).ok()
+            spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
+                .map_err(|_| RoughQuoteFailure::V3SpotQuoteFailed)
         }
     }
 }

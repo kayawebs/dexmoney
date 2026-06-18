@@ -97,6 +97,20 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_duplicate_cycle,
                 dynamic_multihop_rough_quote_failed =
                     aggregate.search.dynamic_multihop_rough_quote_failed,
+                dynamic_multihop_rough_missing_reserves =
+                    aggregate.search.dynamic_multihop_rough_missing_reserves,
+                dynamic_multihop_rough_token_mismatch =
+                    aggregate.search.dynamic_multihop_rough_token_mismatch,
+                dynamic_multihop_rough_missing_decimals =
+                    aggregate.search.dynamic_multihop_rough_missing_decimals,
+                dynamic_multihop_rough_stable_quote_failed =
+                    aggregate.search.dynamic_multihop_rough_stable_quote_failed,
+                dynamic_multihop_rough_v2_quote_failed =
+                    aggregate.search.dynamic_multihop_rough_v2_quote_failed,
+                dynamic_multihop_rough_v3_spot_quote_failed =
+                    aggregate.search.dynamic_multihop_rough_v3_spot_quote_failed,
+                dynamic_multihop_rough_zero_output =
+                    aggregate.search.dynamic_multihop_rough_zero_output,
                 dynamic_multihop_rough_quote_included =
                     aggregate.search.dynamic_multihop_rough_quote_included,
                 dynamic_multihop_rough_profit_below_min =
