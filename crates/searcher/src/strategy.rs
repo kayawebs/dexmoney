@@ -20,6 +20,8 @@ const MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN: usize = 20_000;
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
 const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 const TOP_REJECTED_SAMPLES: usize = 5;
+const TOP_QUOTE_SKIP_SAMPLES: usize = 8;
+const TOP_ROUGH_QUOTE_FAILURE_SAMPLES: usize = 8;
 const MAX_AMOUNT_TIER_DENOMINATOR: u64 = 1_000_000;
 const MAX_AMOUNT_TIER_NUMERATORS: &[u64] = &[
     100,       // 0.01%
@@ -85,6 +87,8 @@ pub struct SearchStats {
     pub best_profit_rejected_by_model_edge: U256,
     pub best_profit: U256,
     pub top_min_profit_rejected: Vec<RejectedQuoteSample>,
+    pub top_quote_skipped: Vec<QuoteSkipSample>,
+    pub top_rough_quote_failures: Vec<RoughQuoteFailureSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +100,27 @@ pub struct RejectedQuoteSample {
     pub required_profit: U256,
     pub step_count: usize,
     pub modes: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuoteSkipSample {
+    pub reason: QuoteSkipReason,
+    pub path_name: String,
+    pub amount_in: U256,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoughQuoteFailureSample {
+    pub reason: RoughQuoteFailure,
+    pub anchor: Address,
+    pub amount_in: U256,
+    pub failed_amount_in: U256,
+    pub failed_pool: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub variant: PoolVariant,
+    pub path_preview: String,
 }
 
 impl SearchStats {
@@ -151,6 +176,12 @@ impl SearchStats {
         for sample in &other.top_min_profit_rejected {
             self.record_min_profit_rejected_sample(sample.clone());
         }
+        for sample in &other.top_quote_skipped {
+            self.record_quote_skip_sample(sample.clone());
+        }
+        for sample in &other.top_rough_quote_failures {
+            self.record_rough_quote_failure_sample(sample.clone());
+        }
     }
 
     fn record_quote_skip(&mut self, reason: QuoteSkipReason) {
@@ -163,6 +194,34 @@ impl SearchStats {
             }
             QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
         }
+    }
+
+    fn record_quote_skip_with_sample(
+        &mut self,
+        reason: QuoteSkipReason,
+        path_name: String,
+        amount_in: U256,
+        message: String,
+    ) {
+        self.record_quote_skip(reason);
+        self.record_quote_skip_sample(QuoteSkipSample {
+            reason,
+            path_name,
+            amount_in,
+            message,
+        });
+    }
+
+    fn record_quote_skip_sample(&mut self, sample: QuoteSkipSample) {
+        if self.top_quote_skipped.iter().any(|existing| {
+            existing.path_name == sample.path_name && existing.reason == sample.reason
+        }) {
+            return;
+        }
+        self.top_quote_skipped.push(sample);
+        self.top_quote_skipped
+            .sort_by(|left, right| left.path_name.cmp(&right.path_name));
+        self.top_quote_skipped.truncate(TOP_QUOTE_SKIP_SAMPLES);
     }
 
     fn record_min_profit_rejected(
@@ -227,9 +286,49 @@ impl SearchStats {
             .collect::<Vec<_>>()
             .join(" | ")
     }
+
+    pub fn top_quote_skipped_summary(&self) -> String {
+        if self.top_quote_skipped.is_empty() {
+            return "-".to_string();
+        }
+        self.top_quote_skipped
+            .iter()
+            .map(|sample| {
+                format!(
+                    "reason={:?} path={} amount={} error={}",
+                    sample.reason, sample.path_name, sample.amount_in, sample.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    pub fn top_rough_quote_failure_summary(&self) -> String {
+        if self.top_rough_quote_failures.is_empty() {
+            return "-".to_string();
+        }
+        self.top_rough_quote_failures
+            .iter()
+            .map(|sample| {
+                format!(
+                    "reason={:?} anchor={:#x} amount={} failed_amount={} pool={:#x} token_in={:#x} token_out={:#x} variant={:?} path={}",
+                    sample.reason,
+                    sample.anchor,
+                    sample.amount_in,
+                    sample.failed_amount_in,
+                    sample.failed_pool,
+                    sample.token_in,
+                    sample.token_out,
+                    sample.variant,
+                    sample.path_preview
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteSkipReason {
     MissingState,
     MissingTicks,
@@ -410,11 +509,21 @@ impl SearchEngine {
                         quote
                     }
                     Ok(None) => {
-                        stats.record_quote_skip(QuoteSkipReason::QuoteError);
+                        stats.record_quote_skip_with_sample(
+                            QuoteSkipReason::QuoteError,
+                            search_path.path.name.clone(),
+                            *amount_in,
+                            "quote returned no result".to_string(),
+                        );
                         continue;
                     }
                     Err(err) => {
-                        stats.record_quote_skip(err.reason);
+                        stats.record_quote_skip_with_sample(
+                            err.reason,
+                            search_path.path.name.clone(),
+                            *amount_in,
+                            err.message.clone(),
+                        );
                         debug!(
                             path = %search_path.path.name,
                             amount_in = %amount_in,
@@ -545,11 +654,21 @@ impl SearchEngine {
                     quote
                 }
                 Ok(None) => {
-                    stats.record_quote_skip(QuoteSkipReason::QuoteError);
+                    stats.record_quote_skip_with_sample(
+                        QuoteSkipReason::QuoteError,
+                        search_path.path.name.clone(),
+                        *amount_in,
+                        "quote returned no result".to_string(),
+                    );
                     continue;
                 }
                 Err(err) => {
-                    stats.record_quote_skip(err.reason);
+                    stats.record_quote_skip_with_sample(
+                        err.reason,
+                        search_path.path.name.clone(),
+                        *amount_in,
+                        err.message.clone(),
+                    );
                     debug!(
                         path = %search_path.path.name,
                         amount_in = %amount_in,
@@ -1198,6 +1317,7 @@ fn score_dynamic_multihop_path(
     let mut best_score_bps = U256::ZERO;
     let mut best_profit = U256::ZERO;
     let mut quote_failure: Option<RoughQuoteFailure> = None;
+    let mut quote_failure_sample: Option<RoughQuoteFailureSample> = None;
     let mut below_min = false;
     'amounts: for amount_in in anchor.amount_sizes.iter().copied() {
         if amount_in.is_zero() {
@@ -1209,11 +1329,33 @@ fn score_dynamic_multihop_path(
                 Ok(next_amount) => next_amount,
                 Err(reason) => {
                     quote_failure.get_or_insert(reason);
+                    quote_failure_sample.get_or_insert_with(|| RoughQuoteFailureSample {
+                        reason,
+                        anchor: anchor.token,
+                        amount_in,
+                        failed_amount_in: amount,
+                        failed_pool: edge.pool(),
+                        token_in: edge.token_in,
+                        token_out: edge.token_out,
+                        variant: edge.state.variant,
+                        path_preview: rough_path_preview(anchor.token, edges),
+                    });
                     continue 'amounts;
                 }
             };
             if next_amount.is_zero() {
                 quote_failure.get_or_insert(RoughQuoteFailure::ZeroOutput);
+                quote_failure_sample.get_or_insert_with(|| RoughQuoteFailureSample {
+                    reason: RoughQuoteFailure::ZeroOutput,
+                    anchor: anchor.token,
+                    amount_in,
+                    failed_amount_in: amount,
+                    failed_pool: edge.pool(),
+                    token_in: edge.token_in,
+                    token_out: edge.token_out,
+                    variant: edge.state.variant,
+                    path_preview: rough_path_preview(anchor.token, edges),
+                });
                 continue 'amounts;
             }
             amount = next_amount;
@@ -1238,6 +1380,9 @@ fn score_dynamic_multihop_path(
         if let Some(reason) = quote_failure {
             stats.dynamic_multihop_rough_quote_failed += 1;
             stats.record_rough_quote_failure(reason);
+            if let Some(sample) = quote_failure_sample {
+                stats.record_rough_quote_failure_sample(sample);
+            }
             stats.dynamic_multihop_rough_quote_included += 1;
             return Some(ScoredDynamicPath {
                 path: build_dynamic_multihop_search_path(anchor, edges),
@@ -1257,7 +1402,7 @@ fn score_dynamic_multihop_path(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoughQuoteFailure {
+pub enum RoughQuoteFailure {
     MissingReserves,
     TokenMismatch,
     MissingDecimals,
@@ -1297,6 +1442,34 @@ impl SearchStats {
             }
         }
     }
+
+    fn record_rough_quote_failure_sample(&mut self, sample: RoughQuoteFailureSample) {
+        if self.top_rough_quote_failures.iter().any(|existing| {
+            existing.reason == sample.reason
+                && existing.failed_pool == sample.failed_pool
+                && existing.token_in == sample.token_in
+                && existing.token_out == sample.token_out
+        }) {
+            return;
+        }
+        self.top_rough_quote_failures.push(sample);
+        self.top_rough_quote_failures.sort_by(|left, right| {
+            format!("{:?}", left.reason)
+                .cmp(&format!("{:?}", right.reason))
+                .then_with(|| left.failed_pool.cmp(&right.failed_pool))
+        });
+        self.top_rough_quote_failures
+            .truncate(TOP_ROUGH_QUOTE_FAILURE_SAMPLES);
+    }
+}
+
+fn rough_path_preview(anchor: Address, edges: &[OwnedPoolEdge]) -> String {
+    let mut parts = Vec::with_capacity(edges.len() + 1);
+    parts.push(format!("{anchor:#x}"));
+    for edge in edges {
+        parts.push(format!("{:#x}[{:#x}]", edge.token_out, edge.pool()));
+    }
+    parts.join("->")
 }
 
 fn rough_quote_edge_upper_bound(
