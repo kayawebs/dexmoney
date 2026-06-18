@@ -4,20 +4,13 @@ x-app-common: &app-common
   restart: unless-stopped
   env_file:
     - .env
+    - path: .env.docker
+      required: false
   environment:
     POSTGRES_URL: ${POSTGRES_URL_DOCKER:-postgres://user:password@base-arb-postgres:5432/base_arb}
     REDIS_URL: ${REDIS_URL_DOCKER:-redis://base-arb-redis:6379}
     BASE_RPC_HTTP: ${BASE_RPC_HTTP_DOCKER:-http://node-execution-1:8545}
     BASE_RPC_WS: ${BASE_RPC_WS_DOCKER:-ws://node-execution-1:8546}
-    BASE_RPC_FLASHBLOCKS_WS: ${BASE_RPC_FLASHBLOCKS_WS:-}
-    UNISWAP_V4_POOL_MANAGER: ${UNISWAP_V4_POOL_MANAGER:-}
-    UNISWAP_V4_ADAPTER: ${UNISWAP_V4_ADAPTER:-}
-    BALANCER_V3_VAULT: ${BALANCER_V3_VAULT:-}
-    BALANCER_V3_ROUTER: ${BALANCER_V3_ROUTER:-}
-    BALANCER_V3_ADAPTER: ${BALANCER_V3_ADAPTER:-}
-    EXECUTION_SUBMIT_ENABLED: ${EXECUTION_SUBMIT_ENABLED:-false}
-    EXECUTION_MAX_CANDIDATE_LAG_BLOCKS: ${EXECUTION_MAX_CANDIDATE_LAG_BLOCKS:-1}
-    CANDIDATE_TTL_MS: ${CANDIDATE_TTL_MS:-500}
   networks:
     - dexmoney
     - base-node
