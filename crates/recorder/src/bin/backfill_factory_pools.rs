@@ -547,6 +547,8 @@ fn dex_to_string(dex: DexKind) -> &'static str {
         DexKind::Aerodrome => "Aerodrome",
         DexKind::UniswapV3 => "UniswapV3",
         DexKind::PancakeSwap => "PancakeSwap",
+        DexKind::UniswapV4 => "UniswapV4",
+        DexKind::Balancer => "Balancer",
     }
 }
 
@@ -556,6 +558,8 @@ fn variant_to_string(variant: PoolVariant) -> &'static str {
         PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
         PoolVariant::UniswapV3 => "UniswapV3",
         PoolVariant::PancakeV3 => "PancakeV3",
+        PoolVariant::UniswapV4 => "UniswapV4",
+        PoolVariant::BalancerV3 => "BalancerV3",
     }
 }
 
@@ -564,6 +568,8 @@ fn parse_dex_kind(value: &str) -> Result<DexKind> {
         "Aerodrome" => Ok(DexKind::Aerodrome),
         "UniswapV3" => Ok(DexKind::UniswapV3),
         "PancakeSwap" => Ok(DexKind::PancakeSwap),
+        "UniswapV4" => Ok(DexKind::UniswapV4),
+        "Balancer" => Ok(DexKind::Balancer),
         _ => bail!("unknown dex: {value}"),
     }
 }
@@ -574,6 +580,8 @@ fn parse_pool_variant(value: &str) -> Result<PoolVariant> {
         "AerodromeSlipstream" => Ok(PoolVariant::AerodromeSlipstream),
         "UniswapV3" => Ok(PoolVariant::UniswapV3),
         "PancakeV3" => Ok(PoolVariant::PancakeV3),
+        "UniswapV4" => Ok(PoolVariant::UniswapV4),
+        "BalancerV3" => Ok(PoolVariant::BalancerV3),
         _ => bail!("unknown pool variant: {value}"),
     }
 }

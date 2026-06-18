@@ -327,6 +327,9 @@ async fn quote_local_step(
                 Ok(quote.amount_out)
             }
         }
+        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {
+            bail!("local quote not implemented for {:?}", state.variant)
+        }
     }
 }
 
@@ -726,7 +729,7 @@ fn encode_executor_steps(path: &ArbPath, settings: &Settings) -> Result<Vec<u8>>
                 fee: router_fee_for_step(step)?,
                 stable: classic_stable_flag(step),
                 factory: factory_for_step(step, settings)?.unwrap_or(Address::ZERO),
-                data: Vec::new(),
+                data: adapter_data_for_step(step)?,
             })
         })
         .map(|step: Result<EncodedSwapStep>| step.map(encode_swap_step_tuple))
@@ -786,15 +789,27 @@ fn router_for_step(step: &SwapStep, settings: &Settings) -> Option<Address> {
         (DexKind::PancakeSwap, _) => settings
             .pancake_v3_router
             .or_else(|| PANCAKE_V3_ROUTER.parse().ok()),
+        (DexKind::UniswapV4, _) => settings.uniswap_v4_adapter,
+        (DexKind::Balancer, _) => settings.balancer_v3_adapter,
     }
+}
+
+fn adapter_data_for_step(step: &SwapStep) -> Result<Vec<u8>> {
+    let Some(data) = step.adapter_data.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let clean = data.strip_prefix("0x").unwrap_or(data);
+    hex::decode(clean)
+        .with_context(|| format!("invalid adapter_data hex for pool {:#x}", step.pool))
 }
 
 fn router_fee_for_step(step: &SwapStep) -> Result<u32> {
     let fee_bps = step.fee_bps.unwrap_or_default();
     Ok(match (step.dex, step.variant) {
-        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) => {
+        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) | (DexKind::UniswapV4, _) => {
             fee_bps.checked_mul(100).context("V3 fee bps overflow")?
         }
+        (DexKind::Balancer, _) => fee_bps,
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
             let spacing = step
                 .tick_spacing
@@ -818,6 +833,8 @@ fn executor_dex_kind(step: &SwapStep) -> Result<u8> {
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
             Ok(3)
         }
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => Ok(6),
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => Ok(6),
         _ => bail!("dex and pool variant mismatch"),
     }
 }
@@ -827,6 +844,8 @@ fn default_variant(dex: DexKind) -> PoolVariant {
         DexKind::Aerodrome => PoolVariant::AerodromeVolatile,
         DexKind::UniswapV3 => PoolVariant::UniswapV3,
         DexKind::PancakeSwap => PoolVariant::PancakeV3,
+        DexKind::UniswapV4 => PoolVariant::UniswapV4,
+        DexKind::Balancer => PoolVariant::BalancerV3,
     }
 }
 

@@ -121,13 +121,13 @@ async fn main() -> Result<()> {
                         token_symbol_from_pair_symbol(&symbol, 0),
                     )
                     .await?;
-                upsert_token_registry(
-                    &store.pool,
-                    settings.chain_id,
-                    discovered.state.token1,
-                    token_symbol_from_pair_symbol(&symbol, 1),
-                )
-                .await?;
+                    upsert_token_registry(
+                        &store.pool,
+                        settings.chain_id,
+                        discovered.state.token1,
+                        token_symbol_from_pair_symbol(&symbol, 1),
+                    )
+                    .await?;
                     let (token0, token1) =
                         canonical_pair(discovered.state.token0, discovered.state.token1);
                     let pair_id = store
@@ -506,6 +506,8 @@ fn dex_to_string(dex: DexKind) -> &'static str {
         DexKind::Aerodrome => "Aerodrome",
         DexKind::UniswapV3 => "UniswapV3",
         DexKind::PancakeSwap => "PancakeSwap",
+        DexKind::UniswapV4 => "UniswapV4",
+        DexKind::Balancer => "Balancer",
     }
 }
 
@@ -515,6 +517,8 @@ fn variant_to_string(variant: PoolVariant) -> &'static str {
         PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
         PoolVariant::UniswapV3 => "UniswapV3",
         PoolVariant::PancakeV3 => "PancakeV3",
+        PoolVariant::UniswapV4 => "UniswapV4",
+        PoolVariant::BalancerV3 => "BalancerV3",
     }
 }
 

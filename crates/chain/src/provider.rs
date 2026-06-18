@@ -204,6 +204,12 @@ impl ChainProvider {
                     updated_at: Utc::now(),
                 })
             }
+            DexKind::UniswapV4 | DexKind::Balancer => {
+                anyhow::bail!(
+                    "registry pool state fetch is not implemented for singleton/vault dex {:?}",
+                    entry.dex
+                )
+            }
         }
     }
 
@@ -284,6 +290,12 @@ impl ChainProvider {
                     valid_through_block: block_number,
                     updated_at: Utc::now(),
                 })
+            }
+            DexKind::UniswapV4 | DexKind::Balancer => {
+                anyhow::bail!(
+                    "registry pool state fetch by block hash is not implemented for singleton/vault dex {:?}",
+                    entry.dex
+                )
             }
         }
     }
@@ -512,6 +524,12 @@ impl ChainProvider {
                     stable: None,
                     source: "live_factory_discovery".to_string(),
                 })
+            }
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {
+                anyhow::bail!(
+                    "trusted factory resolver is not implemented for singleton/vault variant {:?}",
+                    variant
+                )
             }
         }
     }

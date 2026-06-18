@@ -1021,7 +1021,7 @@ fn encode_executor_steps(path: &ArbPath, settings: &Settings) -> Result<Vec<u8>>
                 fee: router_fee_for_step(step)?,
                 stable: classic_stable_flag(step),
                 factory: factory_for_step(step, settings)?.unwrap_or(Address::ZERO),
-                data: Vec::new(),
+                data: adapter_data_for_step(step)?,
             })
         })
         .map(|step: Result<EncodedSwapStep>| step.map(encode_swap_step_tuple))
@@ -1081,7 +1081,18 @@ fn router_for_step(step: &SwapStep, settings: &Settings) -> Option<Address> {
         (DexKind::PancakeSwap, _) => settings
             .pancake_v3_router
             .or_else(|| PANCAKE_V3_ROUTER.parse().ok()),
+        (DexKind::UniswapV4, _) => settings.uniswap_v4_adapter,
+        (DexKind::Balancer, _) => settings.balancer_v3_adapter,
     }
+}
+
+fn adapter_data_for_step(step: &SwapStep) -> Result<Vec<u8>> {
+    let Some(data) = step.adapter_data.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let clean = data.strip_prefix("0x").unwrap_or(data);
+    hex::decode(clean)
+        .with_context(|| format!("invalid adapter_data hex for pool {:#x}", step.pool))
 }
 
 fn factory_for_step(step: &SwapStep, settings: &Settings) -> Result<Option<Address>> {

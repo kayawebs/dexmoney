@@ -242,7 +242,7 @@ pub fn required_token_approvals(
 ) -> Result<Vec<ApprovalRequirement>> {
     let mut approvals = Vec::new();
     for step in &candidate.path.steps {
-        if step_execution_kind(step, settings)?.is_direct() {
+        if !step_execution_kind(step, settings)?.needs_router_approval() {
             continue;
         }
         let spender = router_for_step(step.dex, step.variant, settings)
@@ -275,7 +275,7 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             fee: router_fee_for_step(step.dex, step.variant, step.fee_bps, step.tick_spacing)?,
             stable: classic_stable_flag(step),
             factory: factory_for_step(step, settings)?,
-            data: Vec::new(),
+            data: adapter_data_for_step(step)?,
         })
     })
 }
@@ -342,6 +342,7 @@ enum ExecutorStepKind {
     PancakeV3Router,
     DirectV2,
     DirectV3,
+    Adapter,
 }
 
 impl ExecutorStepKind {
@@ -353,11 +354,20 @@ impl ExecutorStepKind {
             Self::PancakeV3Router => 3,
             Self::DirectV2 => 4,
             Self::DirectV3 => 5,
+            Self::Adapter => 6,
         }
     }
 
     fn is_direct(self) -> bool {
         matches!(self, Self::DirectV2 | Self::DirectV3)
+    }
+
+    fn needs_router_approval(self) -> bool {
+        !matches!(self, Self::DirectV2 | Self::DirectV3 | Self::Adapter)
+    }
+
+    fn requires_hub(self) -> bool {
+        matches!(self, Self::DirectV2 | Self::DirectV3 | Self::Adapter)
     }
 }
 
@@ -366,7 +376,7 @@ fn candidate_requires_direct_execution(candidate: &Candidate, settings: &Setting
         .path
         .steps
         .iter()
-        .any(|step| step_execution_kind(step, settings).is_ok_and(|kind| kind.is_direct()))
+        .any(|step| step_execution_kind(step, settings).is_ok_and(|kind| kind.requires_hub()))
 }
 
 fn step_execution_kind(
@@ -405,6 +415,12 @@ fn step_execution_kind(
             } else {
                 Ok(ExecutorStepKind::PancakeV3Router)
             }
+        }
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => {
+            Ok(ExecutorStepKind::Adapter)
+        }
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => {
+            Ok(ExecutorStepKind::Adapter)
         }
         _ => anyhow::bail!("dex and pool variant mismatch"),
     }
@@ -445,6 +461,10 @@ fn router_fee_for_step(
             }
             u32::try_from(tick_spacing)?
         }
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => fee_bps
+            .checked_mul(100)
+            .ok_or_else(|| anyhow::anyhow!("Uniswap V4 fee bps overflow"))?,
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => fee_bps,
         _ => fee_bps,
     })
 }
@@ -493,6 +513,20 @@ fn factory_for_step(
             .pancake_v3_factory
             .or_else(|| PANCAKE_V3_FACTORY.parse().ok())
             .unwrap_or(Address::ZERO))
+    } else if matches!(
+        (dex, variant),
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None)
+    ) {
+        settings
+            .uniswap_v4_pool_manager
+            .context("UNISWAP_V4_POOL_MANAGER is required for Uniswap V4 adapter execution")
+    } else if matches!(
+        (dex, variant),
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None)
+    ) {
+        settings
+            .balancer_v3_vault
+            .context("BALANCER_V3_VAULT is required for Balancer V3 adapter execution")
     } else {
         Ok(Address::ZERO)
     }
@@ -512,7 +546,18 @@ fn router_for_step(
         (DexKind::PancakeSwap, _) => settings
             .pancake_v3_router
             .or_else(|| PANCAKE_V3_ROUTER.parse().ok()),
+        (DexKind::UniswapV4, _) => settings.uniswap_v4_adapter,
+        (DexKind::Balancer, _) => settings.balancer_v3_adapter,
     }
+}
+
+fn adapter_data_for_step(step: &base_arb_common::types::SwapStep) -> Result<Vec<u8>> {
+    let Some(data) = step.adapter_data.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let clean = data.strip_prefix("0x").unwrap_or(data);
+    hex::decode(clean)
+        .with_context(|| format!("invalid adapter_data hex for pool {:#x}", step.pool))
 }
 
 fn encode_address(address: Address) -> Vec<u8> {
@@ -693,6 +738,11 @@ mod tests {
             uniswap_v3_quoter: None,
             uniswap_v3_usdc_weth_500_pool: None,
             uniswap_v3_usdc_weth_3000_pool: None,
+            uniswap_v4_pool_manager: None,
+            uniswap_v4_adapter: None,
+            balancer_v3_vault: None,
+            balancer_v3_router: None,
+            balancer_v3_adapter: None,
             pancake_v3_factory: None,
             pancake_v3_router: None,
             executor_contract: Some(address!("3333333333333333333333333333333333333333")),
@@ -755,6 +805,7 @@ mod tests {
             fee_bps: Some(5),
             stable: None,
             tick_spacing: None,
+            adapter_data: None,
         };
         base_arb_common::types::Candidate {
             id: Uuid::new_v4(),
@@ -838,6 +889,47 @@ mod tests {
     }
 
     #[test]
+    fn adapter_steps_use_multihop_executor_and_need_no_router_approval() {
+        let mut settings = settings();
+        settings.uniswap_v4_pool_manager =
+            Some(address!("498581ff718922c3f8e6a244956af099b2652b2b"));
+        settings.uniswap_v4_adapter = Some(address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        settings.executor_contract = Some(address!("3333333333333333333333333333333333333333"));
+        settings.executor_contract_2hop =
+            Some(address!("2222222222222222222222222222222222222222"));
+        settings.executor_contract_multihop =
+            Some(address!("4444444444444444444444444444444444444444"));
+
+        let mut candidate = candidate_with_step_count(2);
+        for step in &mut candidate.path.steps {
+            step.dex = base_arb_common::types::DexKind::UniswapV4;
+            step.variant = Some(base_arb_common::types::PoolVariant::UniswapV4);
+            step.factory_address = settings.uniswap_v4_pool_manager;
+            step.adapter_data = Some("0x1234".into());
+        }
+
+        assert_eq!(
+            executor_for_candidate(&settings, &candidate).unwrap(),
+            address!("4444444444444444444444444444444444444444")
+        );
+        assert!(required_token_approvals(&candidate, &settings)
+            .unwrap()
+            .is_empty());
+
+        let calldata =
+            build_execute_calldata(&candidate, U256::from(5_000u64), U256::from(123), &settings)
+                .unwrap();
+        let array_start = 4 + 5 * 32;
+        let first_element_offset =
+            U256::from_be_slice(&calldata[array_start + 32..array_start + 64]).to::<usize>();
+        let first_step_kind_offset = array_start + 32 + first_element_offset;
+        assert_eq!(
+            U256::from_be_slice(&calldata[first_step_kind_offset..first_step_kind_offset + 32]),
+            U256::from(6u64)
+        );
+    }
+
+    #[test]
     fn builds_executor_calldata() {
         let candidate = base_arb_common::types::Candidate {
             id: Uuid::new_v4(),
@@ -863,6 +955,7 @@ mod tests {
                     fee_bps: Some(5),
                     stable: None,
                     tick_spacing: None,
+                    adapter_data: None,
                 }],
                 diagnostics: None,
             },

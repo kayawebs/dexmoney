@@ -75,6 +75,7 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_stable_quote_failed: u64,
     pub dynamic_multihop_rough_v2_quote_failed: u64,
     pub dynamic_multihop_rough_v3_spot_quote_failed: u64,
+    pub dynamic_multihop_rough_unsupported_pool: u64,
     pub dynamic_multihop_rough_zero_output: u64,
     pub dynamic_multihop_rough_quote_included: u64,
     pub dynamic_multihop_rough_profit_below_min: u64,
@@ -130,6 +131,8 @@ impl SearchStats {
         self.dynamic_multihop_rough_v2_quote_failed += other.dynamic_multihop_rough_v2_quote_failed;
         self.dynamic_multihop_rough_v3_spot_quote_failed +=
             other.dynamic_multihop_rough_v3_spot_quote_failed;
+        self.dynamic_multihop_rough_unsupported_pool +=
+            other.dynamic_multihop_rough_unsupported_pool;
         self.dynamic_multihop_rough_zero_output += other.dynamic_multihop_rough_zero_output;
         self.dynamic_multihop_rough_quote_included += other.dynamic_multihop_rough_quote_included;
         self.dynamic_multihop_rough_profit_below_min +=
@@ -1117,6 +1120,7 @@ fn pool_depth_score(state: &PoolState) -> U256 {
         PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
             state.liquidity.unwrap_or_default()
         }
+        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => U256::ZERO,
     }
 }
 
@@ -1260,6 +1264,7 @@ enum RoughQuoteFailure {
     StableQuoteFailed,
     V2QuoteFailed,
     V3SpotQuoteFailed,
+    UnsupportedPool,
     ZeroOutput,
 }
 
@@ -1283,6 +1288,9 @@ impl SearchStats {
             }
             RoughQuoteFailure::V3SpotQuoteFailed => {
                 self.dynamic_multihop_rough_v3_spot_quote_failed += 1;
+            }
+            RoughQuoteFailure::UnsupportedPool => {
+                self.dynamic_multihop_rough_unsupported_pool += 1;
             }
             RoughQuoteFailure::ZeroOutput => {
                 self.dynamic_multihop_rough_zero_output += 1;
@@ -1349,6 +1357,7 @@ fn rough_quote_edge_upper_bound(
             spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
                 .map_err(|_| RoughQuoteFailure::V3SpotQuoteFailed)
         }
+        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
     }
 }
 
@@ -1665,6 +1674,12 @@ async fn quote_path(
                     diagnostics.tick_range_exhausted |= v3_diagnostics.tick_range_exhausted;
                     quote
                 }
+            }
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {
+                return Err(QuoteSkip::quote_error(format!(
+                    "quote not implemented for {:?}",
+                    pool_state.variant
+                )));
             }
         };
         let amount_out_raw = quote.amount_out;
@@ -1989,6 +2004,7 @@ fn swap_step_from_pool(state: &PoolState, token_in: Address, token_out: Address)
         fee_bps: Some(state.fee_bps),
         stable: state.stable,
         tick_spacing: state.tick_spacing,
+        adapter_data: None,
     }
 }
 
@@ -2079,6 +2095,7 @@ fn is_supported_pool(state: &PoolState) -> bool {
                 _ => false,
             }
         }
+        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
     }
 }
 
@@ -2092,6 +2109,8 @@ fn pool_label(state: &PoolState) -> String {
         }
         (DexKind::UniswapV3, PoolVariant::UniswapV3) => format!("uni-v3-{suffix}"),
         (DexKind::PancakeSwap, PoolVariant::PancakeV3) => format!("pancake-v3-{suffix}"),
+        (DexKind::UniswapV4, PoolVariant::UniswapV4) => format!("uni-v4-{suffix}"),
+        (DexKind::Balancer, PoolVariant::BalancerV3) => format!("balancer-v3-{suffix}"),
         _ => format!("pool-{suffix}"),
     }
 }

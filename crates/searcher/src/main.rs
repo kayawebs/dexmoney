@@ -109,6 +109,8 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_rough_v2_quote_failed,
                 dynamic_multihop_rough_v3_spot_quote_failed =
                     aggregate.search.dynamic_multihop_rough_v3_spot_quote_failed,
+                dynamic_multihop_rough_unsupported_pool =
+                    aggregate.search.dynamic_multihop_rough_unsupported_pool,
                 dynamic_multihop_rough_zero_output =
                     aggregate.search.dynamic_multihop_rough_zero_output,
                 dynamic_multihop_rough_quote_included =
@@ -502,6 +504,7 @@ fn is_pool_state_active(state: &PoolState, now: DateTime<Utc>, max_pool_state_ag
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
+        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
     }
 }
 

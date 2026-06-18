@@ -3953,6 +3953,8 @@ fn dex_to_string(dex: DexKind) -> &'static str {
         DexKind::Aerodrome => "Aerodrome",
         DexKind::UniswapV3 => "UniswapV3",
         DexKind::PancakeSwap => "PancakeSwap",
+        DexKind::UniswapV4 => "UniswapV4",
+        DexKind::Balancer => "Balancer",
     }
 }
 
@@ -3962,5 +3964,7 @@ fn variant_to_string(variant: PoolVariant) -> &'static str {
         PoolVariant::AerodromeSlipstream => "AerodromeSlipstream",
         PoolVariant::UniswapV3 => "UniswapV3",
         PoolVariant::PancakeV3 => "PancakeV3",
+        PoolVariant::UniswapV4 => "UniswapV4",
+        PoolVariant::BalancerV3 => "BalancerV3",
     }
 }

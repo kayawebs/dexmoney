@@ -21,6 +21,8 @@ pub enum DexKind {
     Aerodrome,
     UniswapV3,
     PancakeSwap,
+    UniswapV4,
+    Balancer,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub enum PoolVariant {
     AerodromeSlipstream,
     UniswapV3,
     PancakeV3,
+    UniswapV4,
+    BalancerV3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +180,8 @@ pub struct SwapStep {
     pub stable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_spacing: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
