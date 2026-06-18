@@ -24,6 +24,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const AERODROME_CLASSIC_SWAP_TOPIC: &str =
+    "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 
 #[derive(Debug)]
 struct Cli {
@@ -888,7 +890,10 @@ fn write_tx(
 fn is_swap_topic(topic0: &str) -> bool {
     matches!(
         topic0,
-        UNI_V3_SWAP_TOPIC | PANCAKE_V3_SWAP_TOPIC | CLASSIC_SWAP_TOPIC
+        UNI_V3_SWAP_TOPIC
+            | PANCAKE_V3_SWAP_TOPIC
+            | CLASSIC_SWAP_TOPIC
+            | AERODROME_CLASSIC_SWAP_TOPIC
     )
 }
 
@@ -897,6 +902,7 @@ fn topic_family(topic0: &str) -> &'static str {
         UNI_V3_SWAP_TOPIC => "uni_v3",
         PANCAKE_V3_SWAP_TOPIC => "pancake_v3",
         CLASSIC_SWAP_TOPIC => "classic",
+        AERODROME_CLASSIC_SWAP_TOPIC => "aero_classic",
         _ => "unknown",
     }
 }

@@ -24,6 +24,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const AERODROME_CLASSIC_SWAP_TOPIC: &str =
+    "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 
 #[derive(Debug)]
 struct Cli {
@@ -181,14 +183,17 @@ async fn main() -> Result<()> {
     ranked.truncate(cli.top);
 
     writeln!(writer, "== Counterparty Probe ==")?;
+    let mut importable = Vec::new();
     for (address, stats) in ranked {
         let address = Address::from_str(&address)
             .with_context(|| format!("invalid counterparty address {address}"))?;
         let db = load_db_profile(&store.pool, settings.chain_id, address).await?;
         let rpc = probe_rpc_profile(&provider, address).await;
         let classification = classify_counterparty(&db, rpc.as_ref().ok());
+        let action = recommended_action(classification, &db, rpc.as_ref().ok());
         writeln!(writer, "address: {:#x}", address)?;
         writeln!(writer, "classification: {classification}")?;
+        writeln!(writer, "recommended_action: {action}")?;
         writeln!(
             writer,
             "usage: txs={} transfer_in={} transfer_out={}",
@@ -226,6 +231,9 @@ async fn main() -> Result<()> {
         )?;
         match rpc {
             Ok(rpc) => {
+                if classification == "pool_like_unregistered" {
+                    importable.push(importable_pool_line(address, &rpc));
+                }
                 writeln!(
                     writer,
                     "rpc: code_bytes={} token0={} token1={} factory={} slot0={} liquidity={} reserves={} stable={} decimals={} total_supply={} symbol={}",
@@ -253,6 +261,13 @@ async fn main() -> Result<()> {
             Err(err) => {
                 writeln!(writer, "rpc_error: {err:#}")?;
             }
+        }
+        writeln!(writer)?;
+    }
+    if !importable.is_empty() {
+        writeln!(writer, "== Importable Pool-like Counterparties ==")?;
+        for line in importable {
+            writeln!(writer, "{line}")?;
         }
         writeln!(writer)?;
     }
@@ -566,6 +581,58 @@ fn classify_counterparty(db: &DbProfile, rpc: Option<&RpcProfile>) -> &'static s
     "contract_unknown_or_router"
 }
 
+fn recommended_action(
+    classification: &str,
+    db: &DbProfile,
+    rpc: Option<&RpcProfile>,
+) -> &'static str {
+    match classification {
+        "known_pool" => {
+            if db.pool_enabled == Some(true) {
+                "already_known_pool; if this still forms a gap, inspect swap-topic coverage or path composition"
+            } else {
+                "known_pool_disabled; decide whether to enable it"
+            }
+        }
+        "known_token" | "eoa" | "erc20_like" => "not_a_pool; usually ignore for pool coverage",
+        "pool_like_unregistered" => {
+            let Some(rpc) = rpc else {
+                return "rpc_failed; rerun probe";
+            };
+            if rpc.factory.is_some() {
+                "pool_like_unregistered; import/classify this pool or trust its factory if executor supports it"
+            } else {
+                "pool_like_unregistered_without_factory; classify manually before importing"
+            }
+        }
+        "pair_like_no_state" => "pair_like_but_no_readable_state; protocol adapter likely needed",
+        "contract_unknown_or_router" => {
+            "router_or_vault_gap; decode emitted topics and trace neighboring pools before treating as executable pool"
+        }
+        "rpc_probe_failed" => "rpc_probe_failed; rerun with a smaller window or inspect RPC errors",
+        _ => "unknown; inspect manually",
+    }
+}
+
+fn importable_pool_line(address: Address, rpc: &RpcProfile) -> String {
+    format!(
+        "pool={:#x} token0={} token1={} factory={} stable={} reserves={} slot0={} liquidity={} symbol={}",
+        address,
+        rpc.token0.as_deref().unwrap_or("-"),
+        rpc.token1.as_deref().unwrap_or("-"),
+        rpc.factory.as_deref().unwrap_or("-"),
+        rpc.stable
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        rpc.reserves,
+        rpc.slot0,
+        rpc.liquidity
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        rpc.symbol.as_deref().unwrap_or("-"),
+    )
+}
+
 async fn call_raw(
     provider: &ChainProvider,
     address: Address,
@@ -652,7 +719,10 @@ fn parse_transfer_log(log: &Value) -> Option<(String, String, String, String)> {
 fn is_swap_topic(topic0: &str) -> bool {
     matches!(
         topic0,
-        UNI_V3_SWAP_TOPIC | PANCAKE_V3_SWAP_TOPIC | CLASSIC_SWAP_TOPIC
+        UNI_V3_SWAP_TOPIC
+            | PANCAKE_V3_SWAP_TOPIC
+            | CLASSIC_SWAP_TOPIC
+            | AERODROME_CLASSIC_SWAP_TOPIC
     )
 }
 

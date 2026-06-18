@@ -24,6 +24,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const AERODROME_CLASSIC_SWAP_TOPIC: &str =
+    "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 const APPROX_BASE_BLOCKS_PER_DAY: u64 = 43_200;
 
 static REPORT_OUTPUT: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -348,6 +350,7 @@ async fn fetch_pool_hits(
                 WHEN $5 THEN 'v3/slipstream'
                 WHEN $6 THEN 'pancake-v3'
                 WHEN $7 THEN 'classic-v2'
+                WHEN $8 THEN 'aero-classic'
                 ELSE sl.topic0
             END AS family,
             COUNT(*)::bigint AS swap_logs,
@@ -359,9 +362,9 @@ async fn fetch_pool_hits(
         LEFT JOIN pools p ON lower(p.pool_address) = sl.pool_address
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         GROUP BY sl.pool_address, sl.topic0, tp.symbol
-        HAVING COUNT(DISTINCT sl.tx_hash) >= $8
+        HAVING COUNT(DISTINCT sl.tx_hash) >= $9
         ORDER BY COUNT(DISTINCT sl.tx_hash) DESC, COUNT(*) DESC
-        LIMIT $9
+        LIMIT $10
         "#,
     )
     .bind(seed)
@@ -371,10 +374,12 @@ async fn fetch_pool_hits(
         UNI_V3_SWAP_TOPIC.to_string(),
         PANCAKE_V3_SWAP_TOPIC.to_string(),
         CLASSIC_SWAP_TOPIC.to_string(),
+        AERODROME_CLASSIC_SWAP_TOPIC.to_string(),
     ])
     .bind(UNI_V3_SWAP_TOPIC)
     .bind(PANCAKE_V3_SWAP_TOPIC)
     .bind(CLASSIC_SWAP_TOPIC)
+    .bind(AERODROME_CLASSIC_SWAP_TOPIC)
     .bind(cli.min_pool_txs)
     .bind(cli.pool_limit)
     .fetch_all(pool)

@@ -47,6 +47,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const AERODROME_CLASSIC_SWAP_TOPIC: &str =
+    "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
@@ -758,7 +760,8 @@ where
             "topics": [[
                 V3_SWAP_TOPIC,
                 PANCAKE_V3_SWAP_TOPIC,
-                CLASSIC_SWAP_TOPIC
+                CLASSIC_SWAP_TOPIC,
+                AERODROME_CLASSIC_SWAP_TOPIC
             ]]
         }]);
         let logs = match self.provider.get_logs_raw(params).await {
@@ -2800,7 +2803,10 @@ fn address_topic(address: Address) -> String {
 
 fn is_supported_swap_topic(topic0: &str) -> bool {
     let topic0 = topic0.to_ascii_lowercase();
-    topic0 == V3_SWAP_TOPIC || topic0 == PANCAKE_V3_SWAP_TOPIC || topic0 == CLASSIC_SWAP_TOPIC
+    topic0 == V3_SWAP_TOPIC
+        || topic0 == PANCAKE_V3_SWAP_TOPIC
+        || topic0 == CLASSIC_SWAP_TOPIC
+        || topic0 == AERODROME_CLASSIC_SWAP_TOPIC
 }
 
 fn data_word_addresses(data: &str) -> Vec<Address> {
@@ -2935,7 +2941,7 @@ fn creation_compatible_swap_topic(topic0: &str) -> &'static str {
 
 fn inferred_dex_for_swap_topic(topic0: &str) -> &'static str {
     let topic0 = topic0.to_ascii_lowercase();
-    if topic0 == CLASSIC_SWAP_TOPIC {
+    if topic0 == CLASSIC_SWAP_TOPIC || topic0 == AERODROME_CLASSIC_SWAP_TOPIC {
         "Aerodrome"
     } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
         "PancakeSwap"
@@ -2946,7 +2952,7 @@ fn inferred_dex_for_swap_topic(topic0: &str) -> &'static str {
 
 fn inferred_variant_for_swap_topic(topic0: &str) -> &'static str {
     let topic0 = topic0.to_ascii_lowercase();
-    if topic0 == CLASSIC_SWAP_TOPIC {
+    if topic0 == CLASSIC_SWAP_TOPIC || topic0 == AERODROME_CLASSIC_SWAP_TOPIC {
         "AerodromeVolatile"
     } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
         "PancakeV3"
@@ -2959,6 +2965,8 @@ fn swap_family_for_topic(topic0: &str) -> &'static str {
     let topic0 = topic0.to_ascii_lowercase();
     if topic0 == CLASSIC_SWAP_TOPIC {
         "classic-v2"
+    } else if topic0 == AERODROME_CLASSIC_SWAP_TOPIC {
+        "aero-classic"
     } else if topic0 == PANCAKE_V3_SWAP_TOPIC {
         "pancake-v3"
     } else {

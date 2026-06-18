@@ -22,6 +22,8 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const AERODROME_CLASSIC_SWAP_TOPIC: &str =
+    "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -192,7 +194,8 @@ async fn fetch_swap_logs(
         "topics": [[
             V3_SWAP_TOPIC,
             PANCAKE_V3_SWAP_TOPIC,
-            CLASSIC_SWAP_TOPIC
+            CLASSIC_SWAP_TOPIC,
+            AERODROME_CLASSIC_SWAP_TOPIC
         ]]
     }]);
     provider
@@ -592,6 +595,7 @@ fn swap_family_for_topic(topic0: &str) -> &'static str {
         V3_SWAP_TOPIC => "v3",
         PANCAKE_V3_SWAP_TOPIC => "pancake-v3",
         CLASSIC_SWAP_TOPIC => "classic-v2",
+        AERODROME_CLASSIC_SWAP_TOPIC => "aero-classic",
         _ => "unknown",
     }
 }
@@ -599,6 +603,7 @@ fn swap_family_for_topic(topic0: &str) -> &'static str {
 fn inferred_dex_for_swap_topic(topic0: &str) -> &'static str {
     match topic0 {
         PANCAKE_V3_SWAP_TOPIC => "PancakeSwap",
+        AERODROME_CLASSIC_SWAP_TOPIC => "Aerodrome",
         _ => "Unknown",
     }
 }
@@ -608,6 +613,7 @@ fn inferred_variant_for_swap_topic(topic0: &str) -> &'static str {
         PANCAKE_V3_SWAP_TOPIC => "PancakeV3",
         V3_SWAP_TOPIC => "UniswapV3Compatible",
         CLASSIC_SWAP_TOPIC => "V2Compatible",
+        AERODROME_CLASSIC_SWAP_TOPIC => "AerodromeVolatile",
         _ => "Unknown",
     }
 }
