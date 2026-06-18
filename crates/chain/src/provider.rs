@@ -611,6 +611,13 @@ impl ChainProvider {
         parse_hex_u256(value.as_str().unwrap_or("0x0"))
     }
 
+    pub async fn get_code(&self, address: Address) -> Result<String> {
+        let value = self
+            .rpc("eth_getCode", json!([format!("{address:#x}"), "latest"]))
+            .await?;
+        Ok(value.as_str().unwrap_or("0x").to_string())
+    }
+
     pub async fn estimate_gas(&self, from: Address, to: Address, data: &str) -> Result<U256> {
         let call = json!({
             "from": format!("{from:#x}"),
