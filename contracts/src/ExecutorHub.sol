@@ -106,7 +106,8 @@ interface IExecutorAdapterHub {
         bool stable,
         address factory,
         uint256 amountIn,
-        address recipient
+        address recipient,
+        bytes calldata data
     ) external returns (uint256 amountOut);
 }
 
@@ -130,6 +131,7 @@ contract ExecutorHub {
         uint24 fee;
         bool stable;
         address factory;
+        bytes data;
     }
 
     struct V3CallbackData {
@@ -392,7 +394,8 @@ contract ExecutorHub {
             step.stable,
             step.factory,
             amountIn,
-            address(this)
+            address(this),
+            step.data
         );
     }
 

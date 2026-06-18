@@ -223,7 +223,7 @@ pub fn build_execute_calldata(
     settings: &Settings,
 ) -> Result<Vec<u8>> {
     let selector = &keccak256(
-        b"executeWithOwnFunds(address,uint256,(uint8,address,address,address,address,uint24,bool,address)[],uint256,uint256)",
+        b"executeWithOwnFunds(address,uint256,(uint8,address,address,address,address,uint24,bool,address,bytes)[],uint256,uint256)",
     )[..4];
     let mut out = Vec::new();
     out.extend_from_slice(selector);
@@ -258,10 +258,7 @@ pub fn required_token_approvals(
 }
 
 fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend(encode_u256(U256::from(candidate.path.steps.len())));
-
-    for step in &candidate.path.steps {
+    encode_swap_steps(candidate.path.steps.iter(), |step| {
         let execution_kind = step_execution_kind(step, settings)?;
         let router = if execution_kind.is_direct() {
             Address::ZERO
@@ -269,22 +266,72 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             router_for_step(step.dex, step.variant, settings)
                 .with_context(|| format!("router missing for {:?} {:?}", step.dex, step.variant))?
         };
-        out.extend(encode_u256(U256::from(execution_kind.abi_value())));
-        out.extend(encode_address(router));
-        out.extend(encode_address(step.pool));
-        out.extend(encode_address(step.token_in));
-        out.extend(encode_address(step.token_out));
-        out.extend(encode_u256(U256::from(router_fee_for_step(
-            step.dex,
-            step.variant,
-            step.fee_bps,
-            step.tick_spacing,
-        )?)));
-        out.extend(encode_bool(classic_stable_flag(step)));
-        out.extend(encode_address(factory_for_step(step, settings)?));
-    }
+        Ok(EncodedSwapStep {
+            dex: execution_kind.abi_value(),
+            router,
+            pool: step.pool,
+            token_in: step.token_in,
+            token_out: step.token_out,
+            fee: router_fee_for_step(step.dex, step.variant, step.fee_bps, step.tick_spacing)?,
+            stable: classic_stable_flag(step),
+            factory: factory_for_step(step, settings)?,
+            data: Vec::new(),
+        })
+    })
+}
 
+struct EncodedSwapStep {
+    dex: u8,
+    router: Address,
+    pool: Address,
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    stable: bool,
+    factory: Address,
+    data: Vec<u8>,
+}
+
+fn encode_swap_steps<'a, I, F>(steps: I, mut encode_step: F) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = &'a base_arb_common::types::SwapStep>,
+    F: FnMut(&'a base_arb_common::types::SwapStep) -> Result<EncodedSwapStep>,
+{
+    let encoded_steps = steps
+        .into_iter()
+        .map(|step| encode_step(step).map(encode_swap_step_tuple))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut out = Vec::new();
+    out.extend(encode_u256(U256::from(encoded_steps.len())));
+    let mut offset = 32usize
+        .checked_mul(encoded_steps.len())
+        .context("swap step offset overflow")?;
+    for step in &encoded_steps {
+        out.extend(encode_u256(U256::from(offset)));
+        offset = offset
+            .checked_add(step.len())
+            .context("swap step offset overflow")?;
+    }
+    for step in encoded_steps {
+        out.extend(step);
+    }
     Ok(out)
+}
+
+fn encode_swap_step_tuple(step: EncodedSwapStep) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(encode_u256(U256::from(step.dex)));
+    out.extend(encode_address(step.router));
+    out.extend(encode_address(step.pool));
+    out.extend(encode_address(step.token_in));
+    out.extend(encode_address(step.token_out));
+    out.extend(encode_u256(U256::from(step.fee)));
+    out.extend(encode_bool(step.stable));
+    out.extend(encode_address(step.factory));
+    out.extend(encode_u256(U256::from(9 * 32)));
+    out.extend(encode_bytes(&step.data));
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,6 +535,14 @@ fn encode_u256(value: U256) -> Vec<u8> {
 
 fn encode_bool(value: bool) -> Vec<u8> {
     encode_u256(U256::from(u8::from(value)))
+}
+
+fn encode_bytes(value: &[u8]) -> Vec<u8> {
+    let mut out = encode_u256(U256::from(value.len()));
+    out.extend_from_slice(value);
+    let padding = (32 - (value.len() % 32)) % 32;
+    out.extend(std::iter::repeat_n(0u8, padding));
+    out
 }
 
 fn decode_uint256_result(raw: &str) -> Option<U256> {
@@ -769,15 +824,13 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let calldata = build_execute_calldata(
-            &candidate,
-            U256::from(5_000u64),
-            U256::from(123),
-            &settings,
-        )
-        .unwrap();
+        let calldata =
+            build_execute_calldata(&candidate, U256::from(5_000u64), U256::from(123), &settings)
+                .unwrap();
         let array_start = 4 + 5 * 32;
-        let first_step_kind_offset = array_start + 32;
+        let first_element_offset =
+            U256::from_be_slice(&calldata[array_start + 32..array_start + 64]).to::<usize>();
+        let first_step_kind_offset = array_start + 32 + first_element_offset;
         assert_eq!(
             U256::from_be_slice(&calldata[first_step_kind_offset..first_step_kind_offset + 32]),
             U256::from(5u64)
