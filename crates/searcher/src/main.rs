@@ -601,6 +601,10 @@ where
     R: RecorderStore,
 {
     let original_candidate_count = candidates.len();
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| retag_candidate_for_publish(candidate, latest_known_block))
+        .collect::<Vec<_>>();
     let candidates = coalesce_candidates(candidates);
     cycle_stats.candidates_coalesced +=
         original_candidate_count.saturating_sub(candidates.len()) as u64;
@@ -639,6 +643,16 @@ where
         }
     }
     Ok(())
+}
+
+fn retag_candidate_for_publish(
+    mut candidate: base_arb_common::types::Candidate,
+    latest_known_block: u64,
+) -> base_arb_common::types::Candidate {
+    if latest_known_block != 0 {
+        candidate.block_number = latest_known_block;
+    }
+    candidate
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
