@@ -83,17 +83,51 @@ Next contract changes:
   router/vault path.
 - Keep adapter whitelist on Hub.
 
+## Current Status
+
+Completed:
+
+- Execution plumbing: `ExecutorHub` supports adapter steps and adapter whitelisting.
+- Adapter contracts: `UniswapV4Adapter` and `BalancerV3Adapter` compile.
+- Deployment scripts: V4 and Balancer adapters can be deployed independently and attached
+  to the hub.
+- Execution-manager plumbing: V4/Balancer steps map to `StepKind.Adapter` when
+  `adapterData` is present.
+- Market-data observation: V4 PoolManager and Balancer V3 Vault events are recorded into
+  `protocol_pool_observations` for coverage analysis.
+- Searcher diagnostics: opaque rough quote failures are sampled by concrete pool/path
+  reason.
+
+Not completed:
+
+- V4 pools are not yet promoted into the normal `pools`/`pool_states` quote model. V4 is
+  PoolId/singleton-manager based, so treating PoolManager as a pool address would corrupt
+  state.
+- V4 tick liquidity/net tick state is not yet stored by PoolId, so exact concentrated
+  liquidity quote is not available.
+- Balancer pools are not yet classified by pool math type. Exact quote requires per-pool
+  type metadata or a safe query path.
+- Searcher intentionally rejects V4/Balancer as unsupported quote pools until the required
+  metadata is complete.
+
+`dynamic_multihop_rough_quote_failed` means dynamic path expansion found a possible graph
+edge but could not compute even a conservative rough output for one step. Typical reasons
+are unsupported pool type, missing state, missing ticks, exhausted tick range, or invalid
+token direction. The cycle summary now includes samples so this bucket is actionable.
+
 ## Implementation Order
 
-1. Diagnose current rough quote failures.
-2. Add protocol enum/string parsing and metadata columns.
-3. Add V4 discovery/state skeleton and report-only quote rejection reasons.
-4. Add Balancer discovery/state skeleton and report-only quote rejection reasons.
-5. Implement V4 quote.
-6. Implement V4 adapter contract and execution-manager adapterData.
-7. Implement Balancer quote for the pool type with highest competitor coverage.
-8. Implement Balancer adapter contract and execution-manager adapterData.
-9. Run competitor live compare and replay against the same block window.
+1. Diagnose current rough quote failures. Done.
+2. Add protocol enum/string parsing and metadata columns. Done.
+3. Add V4 discovery/state skeleton and report-only quote rejection reasons. Done.
+4. Add Balancer discovery/state skeleton and report-only quote rejection reasons. Done.
+5. Implement V4 adapter contract and execution-manager adapterData. Done.
+6. Implement Balancer adapter contract and execution-manager adapterData. Done.
+7. Implement V4 PoolId-keyed state/tick storage and exact quote.
+8. Implement Balancer pool type classification and quote for the dominant competitor pool
+   type.
+9. Promote quoteable V4/Balancer observations into executable search paths.
+10. Run competitor live compare and replay against the same block window.
 
 ## Validation Gates
 

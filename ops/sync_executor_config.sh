@@ -88,6 +88,10 @@ supports_whitelists() {
   cast call "$EXECUTOR" "tokenWhitelist(address)(bool)" "$ZERO_ADDRESS" --rpc-url "$RPC_URL" >/dev/null 2>&1
 }
 
+supports_adapters() {
+  cast call "$EXECUTOR" "adapters(address)(bool)" "$ZERO_ADDRESS" --rpc-url "$RPC_URL" >/dev/null 2>&1
+}
+
 send_or_print() {
   local signature="$1"
   shift
@@ -184,9 +188,25 @@ if [[ -n "${AERODROME_POOL_FACTORY:-}" ]] && psql_at "SELECT EXISTS (SELECT 1 FR
   FACTORIES+=("$AERODROME_POOL_FACTORY")
 fi
 
+ADAPTERS=()
+if [[ -n "${UNISWAP_V4_ADAPTER:-}" ]]; then
+  ADAPTERS+=("$UNISWAP_V4_ADAPTER")
+fi
+if [[ -n "${BALANCER_V3_ADAPTER:-}" ]]; then
+  ADAPTERS+=("$BALANCER_V3_ADAPTER")
+fi
+
 echo "executor: $EXECUTOR"
-echo "tokens: ${#TOKENS[@]}, pools: ${#POOLS[@]}, routers: ${#ROUTERS[@]}, factories: ${#FACTORIES[@]}"
+echo "tokens: ${#TOKENS[@]}, pools: ${#POOLS[@]}, routers: ${#ROUTERS[@]}, factories: ${#FACTORIES[@]}, adapters: ${#ADAPTERS[@]}"
 echo "dry_run: $DRY_RUN"
+
+if supports_adapters; then
+  for adapter in "${ADAPTERS[@]}"; do
+    ensure_mapping "adapter" "adapters(address)(bool)" "setAdapter(address,bool)" "$adapter"
+  done
+elif [[ "${#ADAPTERS[@]}" -gt 0 ]]; then
+  echo "executor has no adapter interface; skipping adapter sync"
+fi
 
 if supports_whitelists; then
   for router in "${ROUTERS[@]}"; do

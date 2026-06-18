@@ -126,7 +126,65 @@ FULL JOIN tx ON tx.hour = COALESCE(opp.hour, sim.hour)
 ORDER BY hour DESC;
 SQL
 
-run_query "1c. latest opportunities by path signature" <<'SQL'
+run_query "1c. protocol adapter observation status" <<'SQL'
+SELECT
+  protocol,
+  import_status,
+  count(*) AS pools,
+  count(*) FILTER (WHERE token0 IS NOT NULL AND token1 IS NOT NULL) AS pools_with_tokens,
+  count(*) FILTER (WHERE sqrt_price_x96 IS NOT NULL) AS pools_with_spot_state,
+  count(*) FILTER (WHERE liquidity IS NOT NULL) AS pools_with_liquidity,
+  count(*) FILTER (WHERE tick IS NOT NULL) AS pools_with_tick,
+  sum(logs_30d) AS logs_seen,
+  max(latest_block) AS latest_block,
+  max(updated_at) AS latest_updated_at
+FROM protocol_pool_observations
+WHERE updated_at >= now() - :'interval'::interval
+GROUP BY 1, 2
+ORDER BY protocol, pools DESC;
+
+SELECT
+  protocol,
+  symbol,
+  import_status,
+  count(*) AS pools,
+  sum(logs_30d) AS logs_seen,
+  max(latest_block) AS latest_block,
+  max(updated_at) AS latest_updated_at
+FROM protocol_pool_observations
+WHERE updated_at >= now() - :'interval'::interval
+GROUP BY 1, 2, 3
+ORDER BY logs_seen DESC NULLS LAST, pools DESC
+LIMIT 80;
+
+SELECT
+  updated_at,
+  latest_block,
+  protocol,
+  dex,
+  variant,
+  import_status,
+  pool_uid,
+  pool_address,
+  symbol,
+  token0,
+  token1,
+  factory_address,
+  fee_bps,
+  fee_pips,
+  tick_spacing,
+  hooks_address,
+  sqrt_price_x96,
+  liquidity,
+  tick,
+  import_reason
+FROM protocol_pool_observations
+WHERE updated_at >= now() - :'interval'::interval
+ORDER BY updated_at DESC
+LIMIT 80;
+SQL
+
+run_query "1d. latest opportunities by path signature" <<'SQL'
 WITH opp AS (
   SELECT
     o.*,
