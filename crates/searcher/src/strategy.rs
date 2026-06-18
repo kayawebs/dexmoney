@@ -20,6 +20,18 @@ const MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN: usize = 20_000;
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
 const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 const TOP_REJECTED_SAMPLES: usize = 5;
+const MAX_AMOUNT_TIER_DENOMINATOR: u64 = 1_000_000;
+const MAX_AMOUNT_TIER_NUMERATORS: &[u64] = &[
+    100,       // 0.01%
+    300,       // 0.03%
+    1_000,     // 0.1%
+    3_000,     // 0.3%
+    10_000,    // 1%
+    30_000,    // 3%
+    100_000,   // 10%
+    300_000,   // 30%
+    1_000_000, // 100%
+];
 
 pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
@@ -860,7 +872,9 @@ pub fn engine_from_settings(
     pair_configs: Vec<TokenPairSearchConfig>,
 ) -> anyhow::Result<SearchEngine> {
     Ok(SearchEngine {
-        amount_sizes: parse_search_amounts(settings.search_amount_usdc.as_deref())?,
+        amount_sizes: expand_max_amounts(&parse_search_amounts(
+            settings.search_amount_usdc.as_deref(),
+        )?),
         paths: Vec::new(),
         pair_configs,
         min_expected_profit,
@@ -1361,6 +1375,30 @@ fn cycle_fingerprint(anchor: Address, edges: &[OwnedPoolEdge]) -> String {
     fingerprint
 }
 
+fn expand_max_amounts(max_amounts: &[U256]) -> Vec<U256> {
+    let denominator = U256::from(MAX_AMOUNT_TIER_DENOMINATOR);
+    let mut out = Vec::new();
+    for max_amount in max_amounts
+        .iter()
+        .copied()
+        .filter(|amount| !amount.is_zero())
+    {
+        for numerator in MAX_AMOUNT_TIER_NUMERATORS {
+            let amount = max_amount
+                .saturating_mul(U256::from(*numerator))
+                .checked_div(denominator)
+                .unwrap_or(U256::ZERO);
+            if !amount.is_zero() {
+                out.push(amount);
+            }
+        }
+        out.push(max_amount);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn parse_search_amounts(raw: Option<&str>) -> anyhow::Result<Vec<U256>> {
     let raw = raw.unwrap_or("10,30,50,100");
     let mut out = Vec::new();
@@ -1720,7 +1758,7 @@ fn add_pair_direction_paths(
             second,
             config.token0,
             config.token1,
-            config.token0_search_amounts.clone(),
+            expand_max_amounts(&config.token0_search_amounts),
             config.token0_min_profit,
         ));
     }
@@ -1732,7 +1770,7 @@ fn add_pair_direction_paths(
             second,
             config.token1,
             config.token0,
-            config.token1_search_amounts.clone(),
+            expand_max_amounts(&config.token1_search_amounts),
             config.token1_min_profit,
         ));
     }
@@ -1909,16 +1947,17 @@ fn merge_anchor_config(
     by_token
         .entry(token)
         .and_modify(|existing| {
-            for amount in amounts {
-                if !existing.amount_sizes.contains(amount) {
-                    existing.amount_sizes.push(*amount);
+            for amount in expand_max_amounts(amounts) {
+                if !existing.amount_sizes.contains(&amount) {
+                    existing.amount_sizes.push(amount);
                 }
             }
+            existing.amount_sizes.sort();
             existing.min_profit = existing.min_profit.min(min_profit);
         })
         .or_insert_with(|| AnchorSearchConfig {
             token,
-            amount_sizes: amounts.to_vec(),
+            amount_sizes: expand_max_amounts(amounts),
             min_profit,
         });
 }
@@ -1991,7 +2030,23 @@ mod tests {
     use base_arb_common::types::{PoolId, PoolVariant, TickState, TokenPairSearchConfig};
     use chrono::Utc;
 
-    use super::{demo_pool_states, is_supported_config_pool, SearchEngine, SearchPath};
+    use super::{
+        demo_pool_states, expand_max_amounts, is_supported_config_pool, SearchEngine, SearchPath,
+    };
+
+    #[test]
+    fn configured_amount_is_treated_as_max_and_expanded_to_tiers() {
+        let max = U256::from(40_000_000_000_000_000u64);
+        let amounts = expand_max_amounts(&[max]);
+
+        assert_eq!(
+            amounts.first().copied(),
+            Some(U256::from(4_000_000_000_000u64))
+        );
+        assert_eq!(amounts.last().copied(), Some(max));
+        assert!(amounts.contains(&U256::from(400_000_000_000_000u64)));
+        assert_eq!(amounts.len(), 9);
+    }
 
     #[tokio::test]
     async fn search_engine_emits_candidates_for_demo_state() {
