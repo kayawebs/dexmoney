@@ -127,6 +127,8 @@ async fn main() -> Result<()> {
     writeln!(writer)?;
 
     let mut summary = BTreeMap::<String, usize>::new();
+    let mut gap_summary = BTreeMap::<String, usize>::new();
+    let mut unrecognized_counterparty_summary = BTreeMap::<String, usize>::new();
     for tx in txs {
         let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {
             *summary.entry("receipt_missing".into()).or_default() += 1;
@@ -154,6 +156,14 @@ async fn main() -> Result<()> {
         let classification = classify_tx(&coverages);
         let diagnostics = tx_diagnostics(&receipt, cli.collector, &coverages, &anchor_tokens);
         *summary.entry(classification.clone()).or_default() += 1;
+        *gap_summary
+            .entry(diagnostics.searcher_gap.clone())
+            .or_default() += 1;
+        for counterparty in &diagnostics.unrecognized_transfer_counterparties {
+            *unrecognized_counterparty_summary
+                .entry(counterparty.clone())
+                .or_default() += 1;
+        }
         write_tx(
             &mut writer,
             &tx,
@@ -169,6 +179,24 @@ async fn main() -> Result<()> {
     writeln!(writer, "== Summary ==")?;
     for (classification, n) in summary {
         writeln!(writer, "{classification}\t{n}")?;
+    }
+    writeln!(writer)?;
+    writeln!(writer, "== Searcher Gap Summary ==")?;
+    for (gap, n) in gap_summary {
+        writeln!(writer, "{gap}\t{n}")?;
+    }
+    writeln!(writer)?;
+    writeln!(writer, "== Unrecognized Counterparties ==")?;
+    let mut counterparties = unrecognized_counterparty_summary
+        .into_iter()
+        .collect::<Vec<_>>();
+    counterparties.sort_by(|(left_address, left_count), (right_address, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_address.cmp(right_address))
+    });
+    for (address, n) in counterparties {
+        writeln!(writer, "{}\t{}", address, n)?;
     }
     writer.flush()?;
 
@@ -545,10 +573,10 @@ fn collect_anchor_cycles(
 
         path.push(format!(
             "{}:{}({}->{})",
-            short_addr(pool),
+            pool,
             symbol.as_deref().unwrap_or("-"),
-            short_addr(current),
-            short_addr(next)
+            current,
+            next
         ));
         if next == anchor && depth + 1 >= 2 {
             cycles.push(path.join(" | "));
@@ -813,7 +841,7 @@ fn write_tx(
             diagnostics
                 .unrecognized_transfer_counterparties
                 .iter()
-                .map(|address| short_addr(address))
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         }
