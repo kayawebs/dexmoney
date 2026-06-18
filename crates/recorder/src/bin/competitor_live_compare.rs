@@ -7,7 +7,7 @@ use std::{
     str::FromStr,
 };
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{bail, Context, Result};
 use base_arb_chain::provider::{ChainProvider, TxReceipt};
 use base_arb_common::config::Settings;
@@ -64,11 +64,20 @@ struct TxDiagnostics {
     topic_summary: String,
     transfer_flow: Vec<String>,
     unrecognized_transfer_counterparties: Vec<String>,
+    anchor_input_guesses: Vec<String>,
     recognized_swap_pools: usize,
     anchors_touched: Vec<String>,
     recognized_anchor_cycle: bool,
     anchor_cycles: Vec<String>,
     searcher_gap: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AnchorAmountConfig {
+    all_amounts: Option<String>,
+    all_min_profit: Option<String>,
+    multihop_amounts: Option<String>,
+    multihop_min_profit: Option<String>,
 }
 
 #[tokio::main]
@@ -116,7 +125,8 @@ async fn main() -> Result<()> {
     writeln!(writer, "from_block: {from_block}")?;
     writeln!(writer, "to_block: {latest_block}")?;
     writeln!(writer, "collector_transfer_txs: {}", txs.len())?;
-    let anchor_tokens = load_anchor_tokens(&store.pool).await?;
+    let anchor_configs = load_anchor_configs(&store.pool).await?;
+    let anchor_tokens = anchor_configs.keys().cloned().collect::<BTreeSet<_>>();
     writeln!(
         writer,
         "anchor_tokens: {}",
@@ -156,7 +166,13 @@ async fn main() -> Result<()> {
             );
         }
         let classification = classify_tx(&coverages);
-        let diagnostics = tx_diagnostics(&receipt, cli.collector, &coverages, &anchor_tokens);
+        let diagnostics = tx_diagnostics(
+            &receipt,
+            cli.collector,
+            &coverages,
+            &anchor_tokens,
+            &anchor_configs,
+        );
         *summary.entry(classification.clone()).or_default() += 1;
         *gap_summary
             .entry(diagnostics.searcher_gap.clone())
@@ -414,29 +430,41 @@ async fn load_pool_coverage(
     })
 }
 
-async fn load_anchor_tokens(pool: &PgPool) -> Result<BTreeSet<String>> {
+async fn load_anchor_configs(pool: &PgPool) -> Result<BTreeMap<String, AnchorAmountConfig>> {
     let rows = sqlx::query(
         r#"
-        SELECT lower(token_address) AS token
+        SELECT
+            lower(token_address) AS token,
+            executor_scope,
+            search_amounts,
+            min_profit
         FROM token_search_defaults
         WHERE COALESCE(search_amounts, '') <> ''
-        UNION
-        SELECT lower(token0) AS token
-        FROM token_pairs
-        WHERE COALESCE(token0_search_amounts, '') <> ''
-        UNION
-        SELECT lower(token1) AS token
-        FROM token_pairs
-        WHERE COALESCE(token1_search_amounts, '') <> ''
         "#,
     )
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| row.try_get::<String, _>("token"))
-        .collect::<std::result::Result<BTreeSet<_>, _>>()
-        .map_err(Into::into)
+    let mut configs = BTreeMap::new();
+    for row in rows {
+        let token: String = row.try_get("token")?;
+        let scope: String = row.try_get("executor_scope")?;
+        let search_amounts: Option<String> = row.try_get("search_amounts")?;
+        let min_profit: Option<String> = row.try_get("min_profit")?;
+        let config: &mut AnchorAmountConfig = configs.entry(token).or_default();
+        match scope.as_str() {
+            "all" => {
+                config.all_amounts = search_amounts;
+                config.all_min_profit = min_profit;
+            }
+            "multihop" => {
+                config.multihop_amounts = search_amounts;
+                config.multihop_min_profit = min_profit;
+            }
+            _ => {}
+        }
+    }
+    Ok(configs)
 }
 
 fn classify_tx(coverages: &[PoolCoverage]) -> String {
@@ -463,6 +491,7 @@ fn tx_diagnostics(
     collector: Address,
     coverages: &[PoolCoverage],
     anchor_tokens: &BTreeSet<String>,
+    anchor_configs: &BTreeMap<String, AnchorAmountConfig>,
 ) -> TxDiagnostics {
     let recognized_swap_pools = coverages.len();
     let anchors_touched = anchors_touched(coverages, anchor_tokens);
@@ -485,6 +514,12 @@ fn tx_diagnostics(
         transfer_flow: receipt_transfer_flow(receipt, collector),
         unrecognized_transfer_counterparties: unrecognized_transfer_counterparties(
             receipt, collector, coverages,
+        ),
+        anchor_input_guesses: anchor_input_guesses(
+            receipt,
+            collector,
+            anchor_tokens,
+            anchor_configs,
         ),
         recognized_swap_pools,
         anchors_touched,
@@ -768,6 +803,134 @@ fn unrecognized_transfer_counterparties(
     out.into_iter().collect()
 }
 
+fn anchor_input_guesses(
+    receipt: &TxReceipt,
+    collector: Address,
+    anchor_tokens: &BTreeSet<String>,
+    anchor_configs: &BTreeMap<String, AnchorAmountConfig>,
+) -> Vec<String> {
+    let collector_address = format!("{:#x}", collector).to_ascii_lowercase();
+    let mut executor_addresses = BTreeSet::new();
+    let mut profit_by_token = BTreeMap::<String, U256>::new();
+    let mut input_by_token = BTreeMap::<String, U256>::new();
+
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        let Some(from) = topics[1].as_str().and_then(topic_address) else {
+            continue;
+        };
+        let Some(to) = topics[2].as_str().and_then(topic_address) else {
+            continue;
+        };
+        if to != collector_address {
+            continue;
+        }
+        let token = log
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_ascii_lowercase();
+        if !anchor_tokens.contains(&token) {
+            continue;
+        }
+        executor_addresses.insert(from);
+        let amount = parse_hex_u256(log.get("data").and_then(Value::as_str).unwrap_or("0x0"));
+        *profit_by_token.entry(token).or_default() += amount;
+    }
+
+    if executor_addresses.is_empty() {
+        return Vec::new();
+    }
+
+    for log in receipt
+        .raw
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(topic0) = raw_log_topic0(log) else {
+            continue;
+        };
+        if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        let Some(from) = topics[1].as_str().and_then(topic_address) else {
+            continue;
+        };
+        let Some(to) = topics[2].as_str().and_then(topic_address) else {
+            continue;
+        };
+        if !executor_addresses.contains(&from) || to == collector_address {
+            continue;
+        }
+        let token = log
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_ascii_lowercase();
+        if !anchor_tokens.contains(&token) {
+            continue;
+        }
+        let amount = parse_hex_u256(log.get("data").and_then(Value::as_str).unwrap_or("0x0"));
+        *input_by_token.entry(token).or_default() += amount;
+    }
+
+    let tokens = input_by_token
+        .keys()
+        .chain(profit_by_token.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    for token in tokens {
+        let input = input_by_token.get(&token).copied().unwrap_or_default();
+        let profit = profit_by_token.get(&token).copied().unwrap_or_default();
+        let config = anchor_configs.get(&token).cloned().unwrap_or_default();
+        let configured_amounts = config
+            .multihop_amounts
+            .as_deref()
+            .or(config.all_amounts.as_deref())
+            .unwrap_or("-");
+        let configured_min_profit = config
+            .multihop_min_profit
+            .as_deref()
+            .or(config.all_min_profit.as_deref())
+            .unwrap_or("-");
+        out.push(format!(
+            "token={} input_raw={} profit_raw={} configured_multihop_amounts={} configured_multihop_min_profit={}",
+            short_addr(&token),
+            input,
+            profit,
+            configured_amounts,
+            configured_min_profit
+        ));
+    }
+    out
+}
+
 fn write_tx(
     writer: &mut BufWriter<File>,
     tx: &CollectorTx,
@@ -832,6 +995,15 @@ fn write_tx(
             "-".into()
         } else {
             diagnostics.anchor_cycles.join(" || ")
+        }
+    )?;
+    writeln!(
+        writer,
+        "anchor_input_guess: {}",
+        if diagnostics.anchor_input_guesses.is_empty() {
+            "-".into()
+        } else {
+            diagnostics.anchor_input_guesses.join("; ")
         }
     )?;
     writeln!(
@@ -940,9 +1112,15 @@ fn topic_address(topic: &str) -> Option<String> {
 }
 
 fn hex_to_decimal(raw: &str) -> String {
-    alloy_primitives::U256::from_str_radix(raw.trim_start_matches("0x"), 16)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| "0".into())
+    parse_hex_u256(raw).to_string()
+}
+
+fn parse_hex_u256(raw: &str) -> U256 {
+    let raw = raw.trim_start_matches("0x");
+    if raw.is_empty() {
+        return U256::ZERO;
+    }
+    U256::from_str_radix(raw, 16).unwrap_or(U256::ZERO)
 }
 
 fn short_addr(address: &str) -> String {
