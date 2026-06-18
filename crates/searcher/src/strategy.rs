@@ -76,7 +76,9 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_missing_decimals: u64,
     pub dynamic_multihop_rough_stable_quote_failed: u64,
     pub dynamic_multihop_rough_v2_quote_failed: u64,
+    pub dynamic_multihop_rough_missing_v3_state: u64,
     pub dynamic_multihop_rough_v3_spot_quote_failed: u64,
+    pub dynamic_multihop_rough_v3_spot_overflow: u64,
     pub dynamic_multihop_rough_unsupported_pool: u64,
     pub dynamic_multihop_rough_zero_output: u64,
     pub dynamic_multihop_rough_quote_included: u64,
@@ -154,8 +156,12 @@ impl SearchStats {
         self.dynamic_multihop_rough_stable_quote_failed +=
             other.dynamic_multihop_rough_stable_quote_failed;
         self.dynamic_multihop_rough_v2_quote_failed += other.dynamic_multihop_rough_v2_quote_failed;
+        self.dynamic_multihop_rough_missing_v3_state +=
+            other.dynamic_multihop_rough_missing_v3_state;
         self.dynamic_multihop_rough_v3_spot_quote_failed +=
             other.dynamic_multihop_rough_v3_spot_quote_failed;
+        self.dynamic_multihop_rough_v3_spot_overflow +=
+            other.dynamic_multihop_rough_v3_spot_overflow;
         self.dynamic_multihop_rough_unsupported_pool +=
             other.dynamic_multihop_rough_unsupported_pool;
         self.dynamic_multihop_rough_zero_output += other.dynamic_multihop_rough_zero_output;
@@ -1408,7 +1414,9 @@ pub enum RoughQuoteFailure {
     MissingDecimals,
     StableQuoteFailed,
     V2QuoteFailed,
+    MissingV3State,
     V3SpotQuoteFailed,
+    V3SpotOverflow,
     UnsupportedPool,
     ZeroOutput,
 }
@@ -1431,8 +1439,14 @@ impl SearchStats {
             RoughQuoteFailure::V2QuoteFailed => {
                 self.dynamic_multihop_rough_v2_quote_failed += 1;
             }
+            RoughQuoteFailure::MissingV3State => {
+                self.dynamic_multihop_rough_missing_v3_state += 1;
+            }
             RoughQuoteFailure::V3SpotQuoteFailed => {
                 self.dynamic_multihop_rough_v3_spot_quote_failed += 1;
+            }
+            RoughQuoteFailure::V3SpotOverflow => {
+                self.dynamic_multihop_rough_v3_spot_overflow += 1;
             }
             RoughQuoteFailure::UnsupportedPool => {
                 self.dynamic_multihop_rough_unsupported_pool += 1;
@@ -1528,9 +1542,23 @@ fn rough_quote_edge_upper_bound(
         }
         PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
             spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
-                .map_err(|_| RoughQuoteFailure::V3SpotQuoteFailed)
+                .map_err(classify_v3_spot_quote_failure)
         }
         PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
+    }
+}
+
+fn classify_v3_spot_quote_failure(err: base_arb_common::errors::ArbBotError) -> RoughQuoteFailure {
+    let message = err.to_string();
+    if message.contains("token_in not in pool") {
+        RoughQuoteFailure::TokenMismatch
+    } else if message.contains("missing sqrt_price_x96") || message.contains("empty sqrt_price_x96")
+    {
+        RoughQuoteFailure::MissingV3State
+    } else if message.contains("overflow") {
+        RoughQuoteFailure::V3SpotOverflow
+    } else {
+        RoughQuoteFailure::V3SpotQuoteFailed
     }
 }
 

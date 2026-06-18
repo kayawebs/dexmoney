@@ -107,8 +107,12 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_rough_stable_quote_failed,
                 dynamic_multihop_rough_v2_quote_failed =
                     aggregate.search.dynamic_multihop_rough_v2_quote_failed,
+                dynamic_multihop_rough_missing_v3_state =
+                    aggregate.search.dynamic_multihop_rough_missing_v3_state,
                 dynamic_multihop_rough_v3_spot_quote_failed =
                     aggregate.search.dynamic_multihop_rough_v3_spot_quote_failed,
+                dynamic_multihop_rough_v3_spot_overflow =
+                    aggregate.search.dynamic_multihop_rough_v3_spot_overflow,
                 dynamic_multihop_rough_unsupported_pool =
                     aggregate.search.dynamic_multihop_rough_unsupported_pool,
                 dynamic_multihop_rough_zero_output =
