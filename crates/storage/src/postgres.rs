@@ -30,6 +30,35 @@ pub struct FactoryRegistryRecord {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProtocolPoolObservation {
+    pub chain_id: u64,
+    pub protocol: String,
+    pub manager_address: Address,
+    pub pool_uid: String,
+    pub pool_address: Option<Address>,
+    pub topic0: String,
+    pub event_type: String,
+    pub token0: Option<Address>,
+    pub token1: Option<Address>,
+    pub symbol: Option<String>,
+    pub factory_address: Option<Address>,
+    pub dex: Option<String>,
+    pub variant: Option<String>,
+    pub fee_bps: Option<u32>,
+    pub fee_pips: Option<u32>,
+    pub tick_spacing: Option<i32>,
+    pub hooks_address: Option<Address>,
+    pub sqrt_price_x96: Option<U256>,
+    pub liquidity: Option<U256>,
+    pub tick: Option<i32>,
+    pub block_number: u64,
+    pub discovery_source: String,
+    pub import_status: String,
+    pub import_reason: Option<String>,
+    pub raw_json: serde_json::Value,
+}
+
 #[derive(Clone)]
 pub struct PostgresStore {
     pub pool: PgPool,
@@ -191,6 +220,80 @@ impl PostgresStore {
         .bind(first_seen_block)
         .bind(latest_seen_block)
         .bind(observed_pools_delta)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_protocol_pool_observation(
+        &self,
+        observation: ProtocolPoolObservation,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO protocol_pool_observations (
+                chain_id, protocol, manager_address, pool_uid, pool_address, topic0, event_type,
+                token0, token1, symbol, factory_address, dex, variant, fee_bps, fee_pips,
+                tick_spacing, hooks_address, sqrt_price_x96, liquidity, tick,
+                first_block, latest_block, logs_30d, discovery_source, import_status,
+                import_reason, raw_json, created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                $21,$21,1,$22,$23,$24,$25,NOW(),NOW()
+            )
+            ON CONFLICT (chain_id, protocol, manager_address, pool_uid)
+            DO UPDATE SET
+                pool_address = COALESCE(EXCLUDED.pool_address, protocol_pool_observations.pool_address),
+                topic0 = EXCLUDED.topic0,
+                event_type = EXCLUDED.event_type,
+                token0 = COALESCE(EXCLUDED.token0, protocol_pool_observations.token0),
+                token1 = COALESCE(EXCLUDED.token1, protocol_pool_observations.token1),
+                symbol = COALESCE(EXCLUDED.symbol, protocol_pool_observations.symbol),
+                factory_address = COALESCE(EXCLUDED.factory_address, protocol_pool_observations.factory_address),
+                dex = COALESCE(EXCLUDED.dex, protocol_pool_observations.dex),
+                variant = COALESCE(EXCLUDED.variant, protocol_pool_observations.variant),
+                fee_bps = COALESCE(EXCLUDED.fee_bps, protocol_pool_observations.fee_bps),
+                fee_pips = COALESCE(EXCLUDED.fee_pips, protocol_pool_observations.fee_pips),
+                tick_spacing = COALESCE(EXCLUDED.tick_spacing, protocol_pool_observations.tick_spacing),
+                hooks_address = COALESCE(EXCLUDED.hooks_address, protocol_pool_observations.hooks_address),
+                sqrt_price_x96 = COALESCE(EXCLUDED.sqrt_price_x96, protocol_pool_observations.sqrt_price_x96),
+                liquidity = COALESCE(EXCLUDED.liquidity, protocol_pool_observations.liquidity),
+                tick = COALESCE(EXCLUDED.tick, protocol_pool_observations.tick),
+                first_block = LEAST(protocol_pool_observations.first_block, EXCLUDED.first_block),
+                latest_block = GREATEST(protocol_pool_observations.latest_block, EXCLUDED.latest_block),
+                logs_30d = protocol_pool_observations.logs_30d + 1,
+                discovery_source = EXCLUDED.discovery_source,
+                import_status = EXCLUDED.import_status,
+                import_reason = EXCLUDED.import_reason,
+                raw_json = EXCLUDED.raw_json,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(observation.chain_id)?)
+        .bind(observation.protocol)
+        .bind(address_to_string(observation.manager_address))
+        .bind(observation.pool_uid)
+        .bind(observation.pool_address.map(address_to_string))
+        .bind(observation.topic0)
+        .bind(observation.event_type)
+        .bind(observation.token0.map(address_to_string))
+        .bind(observation.token1.map(address_to_string))
+        .bind(observation.symbol)
+        .bind(observation.factory_address.map(address_to_string))
+        .bind(observation.dex)
+        .bind(observation.variant)
+        .bind(observation.fee_bps.map(i64::from))
+        .bind(observation.fee_pips.map(i64::from))
+        .bind(observation.tick_spacing.map(i64::from))
+        .bind(observation.hooks_address.map(address_to_string))
+        .bind(observation.sqrt_price_x96.map(|value| value.to_string()))
+        .bind(observation.liquidity.map(|value| value.to_string()))
+        .bind(observation.tick.map(i64::from))
+        .bind(i64::try_from(observation.block_number)?)
+        .bind(observation.discovery_source)
+        .bind(observation.import_status)
+        .bind(observation.import_reason)
+        .bind(sqlx::types::Json(observation.raw_json))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1083,6 +1186,46 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS discovery_source TEXT NOT NULL DEFAULT 'unknown'"#,
         r#"CREATE INDEX IF NOT EXISTS observed_pools_source_idx
             ON observed_pools (chain_id, discovery_source, updated_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS protocol_pool_observations (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            protocol TEXT NOT NULL,
+            manager_address TEXT NOT NULL,
+            pool_uid TEXT NOT NULL,
+            pool_address TEXT,
+            topic0 TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            token0 TEXT,
+            token1 TEXT,
+            symbol TEXT,
+            factory_address TEXT,
+            dex TEXT,
+            variant TEXT,
+            fee_bps BIGINT,
+            fee_pips BIGINT,
+            tick_spacing BIGINT,
+            hooks_address TEXT,
+            sqrt_price_x96 TEXT,
+            liquidity TEXT,
+            tick BIGINT,
+            first_block BIGINT NOT NULL,
+            latest_block BIGINT NOT NULL,
+            logs_30d BIGINT NOT NULL DEFAULT 0,
+            discovery_source TEXT NOT NULL,
+            import_status TEXT NOT NULL,
+            import_reason TEXT,
+            raw_json JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (chain_id, protocol, manager_address, pool_uid)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_status_idx
+            ON protocol_pool_observations (chain_id, protocol, import_status, logs_30d DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_latest_idx
+            ON protocol_pool_observations (chain_id, latest_block DESC, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_pool_address_idx
+            ON protocol_pool_observations (chain_id, lower(pool_address))
+            WHERE pool_address IS NOT NULL"#,
         r#"CREATE TABLE IF NOT EXISTS factory_registry (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,

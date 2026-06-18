@@ -11,7 +11,7 @@ use base_arb_common::types::{
     PoolVariant, TickState,
 };
 use base_arb_storage::{
-    postgres::{FactoryRegistryRecord, PostgresStore},
+    postgres::{FactoryRegistryRecord, PostgresStore, ProtocolPoolObservation},
     CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
     TickStateStore,
 };
@@ -51,6 +51,16 @@ const AERODROME_CLASSIC_SWAP_TOPIC: &str =
     "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
 const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const UNISWAP_V4_INITIALIZE_TOPIC: &str =
+    "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+const UNISWAP_V4_SWAP_TOPIC: &str =
+    "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
+const UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC: &str =
+    "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec";
+const BALANCER_V3_POOL_REGISTERED_TOPIC: &str =
+    "0x853ac13ac53a4640819c3cdb0d84f232b972040b62c0083953db0e0318707715";
+const BALANCER_V3_SWAP_TOPIC: &str =
+    "0x0874b2d545cb271cdbda4e093020c452328b24af12382ed62c4d00f5c26709db";
 
 pub struct MarketDataService<P> {
     pub settings: Settings,
@@ -365,6 +375,8 @@ where
             self.discover_live_pool_creations(from_block, to_block)
                 .await?;
             self.discover_global_swap_pools(from_block, to_block, &mut globally_observed_pools)
+                .await?;
+            self.discover_protocol_pool_logs(from_block, to_block)
                 .await?;
             info!(
                 from_block,
@@ -835,6 +847,88 @@ where
                 from_block,
                 to_block,
                 "global swap pool discovery processed swap logs"
+            );
+        }
+        Ok(())
+    }
+
+    async fn discover_protocol_pool_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
+        if from_block > to_block {
+            return Ok(());
+        }
+
+        let mut addresses = Vec::new();
+        if let Some(pool_manager) = self.settings.uniswap_v4_pool_manager {
+            addresses.push(pool_manager);
+        }
+        if let Some(vault) = self.settings.balancer_v3_vault {
+            addresses.push(vault);
+        }
+        if addresses.is_empty() {
+            return Ok(());
+        }
+
+        let topics = [
+            UNISWAP_V4_INITIALIZE_TOPIC,
+            UNISWAP_V4_SWAP_TOPIC,
+            UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC,
+            BALANCER_V3_POOL_REGISTERED_TOPIC,
+            BALANCER_V3_SWAP_TOPIC,
+        ];
+        let params = json!([{
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "address": addresses.iter().map(|address| format!("{address:#x}")).collect::<Vec<_>>(),
+            "topics": [topics]
+        }]);
+        let logs = match self.provider.get_logs_raw(params).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                warn!(
+                    from_block,
+                    to_block,
+                    error = %err,
+                    "protocol pool discovery getLogs failed"
+                );
+                return Ok(());
+            }
+        };
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        let mut observed = 0usize;
+        let mut skipped = 0usize;
+        for raw in logs {
+            let observation = match parse_protocol_pool_observation(
+                &self.settings,
+                &self.provider,
+                raw.clone(),
+                "protocol_log",
+            )
+            .await
+            {
+                Ok(Some(observation)) => observation,
+                Ok(None) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(err) => {
+                    debug!(error = %err, raw = %raw, "protocol pool discovery log skipped");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            self.recorder
+                .upsert_protocol_pool_observation(observation)
+                .await?;
+            observed += 1;
+        }
+
+        if observed > 0 {
+            info!(
+                observed,
+                skipped, from_block, to_block, "protocol pool discovery processed logs"
             );
         }
         Ok(())
@@ -2782,6 +2876,235 @@ fn parse_swap_log(raw: Value) -> Result<SwapObservationLog> {
     })
 }
 
+async fn parse_protocol_pool_observation(
+    settings: &Settings,
+    provider: &ChainProvider,
+    raw: Value,
+    discovery_source: &str,
+) -> Result<Option<ProtocolPoolObservation>> {
+    let manager_address =
+        raw_log_address(&raw).ok_or_else(|| anyhow::anyhow!("protocol log missing address"))?;
+    let topic0 =
+        raw_log_topic0(&raw).ok_or_else(|| anyhow::anyhow!("protocol log missing topic0"))?;
+    let block_number = raw
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(parse_hex_u64_local)
+        .ok_or_else(|| anyhow::anyhow!("protocol log missing blockNumber"))?;
+    let topics = raw_log_topics(&raw);
+    let data_words = raw_log_data_words(&raw);
+
+    if Some(manager_address) == settings.uniswap_v4_pool_manager {
+        return parse_uniswap_v4_protocol_observation(
+            settings,
+            provider,
+            manager_address,
+            topic0,
+            topics,
+            data_words,
+            block_number,
+            discovery_source,
+            raw,
+        )
+        .await
+        .map(Some);
+    }
+    if Some(manager_address) == settings.balancer_v3_vault {
+        return parse_balancer_v3_protocol_observation(
+            settings,
+            provider,
+            manager_address,
+            topic0,
+            topics,
+            data_words,
+            block_number,
+            discovery_source,
+            raw,
+        )
+        .await
+        .map(Some);
+    }
+
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn parse_uniswap_v4_protocol_observation(
+    settings: &Settings,
+    provider: &ChainProvider,
+    manager_address: Address,
+    topic0: String,
+    topics: Vec<String>,
+    data_words: Vec<String>,
+    block_number: u64,
+    discovery_source: &str,
+    raw: Value,
+) -> Result<ProtocolPoolObservation> {
+    let pool_uid = topics
+        .get(1)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Uniswap V4 log missing PoolId topic"))?;
+    let pool_address = synthetic_address_from_pool_uid(&pool_uid);
+
+    let mut token0 = None;
+    let mut token1 = None;
+    let mut symbol = None;
+    let mut fee_pips = None;
+    let mut fee_bps = None;
+    let mut tick_spacing = None;
+    let mut hooks_address = None;
+    let mut sqrt_price_x96 = None;
+    let mut liquidity = None;
+    let tick;
+    let event_type = if topic0 == UNISWAP_V4_INITIALIZE_TOPIC {
+        token0 = topics.get(2).and_then(|topic| address_from_topic(topic));
+        token1 = topics.get(3).and_then(|topic| address_from_topic(topic));
+        if let (Some(left), Some(right)) = (token0, token1) {
+            symbol = Some(pair_symbol(provider, left, right).await);
+        }
+        fee_pips = data_words
+            .first()
+            .and_then(|word| parse_word_u256_local(word))
+            .and_then(|value| u32::try_from(value).ok());
+        fee_bps = fee_pips.map(|fee| fee / 100);
+        tick_spacing = data_words
+            .get(1)
+            .and_then(|word| parse_word_i24_local(word));
+        hooks_address = data_words.get(2).and_then(|word| address_from_word(word));
+        sqrt_price_x96 = data_words
+            .get(3)
+            .and_then(|word| parse_word_u256_local(word));
+        tick = data_words
+            .get(4)
+            .and_then(|word| parse_word_i24_local(word));
+        "Initialize"
+    } else if topic0 == UNISWAP_V4_SWAP_TOPIC {
+        sqrt_price_x96 = data_words
+            .get(2)
+            .and_then(|word| parse_word_u256_local(word));
+        liquidity = data_words
+            .get(3)
+            .and_then(|word| parse_word_u256_local(word));
+        tick = data_words
+            .get(4)
+            .and_then(|word| parse_word_i24_local(word));
+        fee_pips = data_words
+            .get(5)
+            .and_then(|word| parse_word_u256_local(word))
+            .and_then(|value| u32::try_from(value).ok());
+        fee_bps = fee_pips.map(|fee| fee / 100);
+        "Swap"
+    } else if topic0 == UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC {
+        tick = data_words
+            .get(1)
+            .and_then(|word| parse_word_i24_local(word));
+        "ModifyLiquidity"
+    } else {
+        anyhow::bail!("unsupported Uniswap V4 topic {topic0}");
+    };
+
+    Ok(ProtocolPoolObservation {
+        chain_id: settings.chain_id,
+        protocol: "uniswap-v4".to_string(),
+        manager_address,
+        pool_uid,
+        pool_address,
+        topic0,
+        event_type: event_type.to_string(),
+        token0,
+        token1,
+        symbol,
+        factory_address: Some(manager_address),
+        dex: Some("UniswapV4".to_string()),
+        variant: Some("UniswapV4".to_string()),
+        fee_bps,
+        fee_pips,
+        tick_spacing,
+        hooks_address,
+        sqrt_price_x96,
+        liquidity,
+        tick,
+        block_number,
+        discovery_source: discovery_source.to_string(),
+        import_status: "observed_only".to_string(),
+        import_reason: Some(
+            "Uniswap V4 PoolManager pool observed; offchain state import pending".to_string(),
+        ),
+        raw_json: raw,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn parse_balancer_v3_protocol_observation(
+    settings: &Settings,
+    provider: &ChainProvider,
+    manager_address: Address,
+    topic0: String,
+    topics: Vec<String>,
+    data_words: Vec<String>,
+    block_number: u64,
+    discovery_source: &str,
+    raw: Value,
+) -> Result<ProtocolPoolObservation> {
+    let pool_address = topics
+        .get(1)
+        .and_then(|topic| address_from_topic(topic))
+        .ok_or_else(|| anyhow::anyhow!("Balancer V3 log missing pool topic"))?;
+    let mut token0 = None;
+    let mut token1 = None;
+    let mut symbol = None;
+    let mut factory_address = None;
+    let mut fee_bps = None;
+    let event_type = if topic0 == BALANCER_V3_SWAP_TOPIC {
+        token0 = topics.get(2).and_then(|topic| address_from_topic(topic));
+        token1 = topics.get(3).and_then(|topic| address_from_topic(topic));
+        if let (Some(left), Some(right)) = (token0, token1) {
+            symbol = Some(pair_symbol(provider, left, right).await);
+        }
+        fee_bps = data_words
+            .get(2)
+            .and_then(|word| parse_word_u256_local(word))
+            .and_then(fixed_18_percentage_to_bps);
+        "Swap"
+    } else if topic0 == BALANCER_V3_POOL_REGISTERED_TOPIC {
+        factory_address = topics.get(2).and_then(|topic| address_from_topic(topic));
+        "PoolRegistered"
+    } else {
+        anyhow::bail!("unsupported Balancer V3 topic {topic0}");
+    };
+
+    Ok(ProtocolPoolObservation {
+        chain_id: settings.chain_id,
+        protocol: "balancer-v3".to_string(),
+        manager_address,
+        pool_uid: format!("{pool_address:#x}"),
+        pool_address: Some(pool_address),
+        topic0,
+        event_type: event_type.to_string(),
+        token0,
+        token1,
+        symbol,
+        factory_address,
+        dex: Some("Balancer".to_string()),
+        variant: Some("BalancerV3".to_string()),
+        fee_bps,
+        fee_pips: None,
+        tick_spacing: None,
+        hooks_address: None,
+        sqrt_price_x96: None,
+        liquidity: None,
+        tick: None,
+        block_number,
+        discovery_source: discovery_source.to_string(),
+        import_status: "observed_only".to_string(),
+        import_reason: Some(
+            "Balancer V3 Vault pool observed; pool math/adapter-data classification pending"
+                .to_string(),
+        ),
+        raw_json: raw,
+    })
+}
+
 fn raw_log_topic0(raw: &Value) -> Option<String> {
     raw.get("topics")
         .and_then(Value::as_array)
@@ -2790,10 +3113,86 @@ fn raw_log_topic0(raw: &Value) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+fn raw_log_address(raw: &Value) -> Option<Address> {
+    raw.get("address")
+        .and_then(Value::as_str)
+        .and_then(|address| address.parse::<Address>().ok())
+}
+
+fn raw_log_topics(raw: &Value) -> Vec<String> {
+    raw.get("topics")
+        .and_then(Value::as_array)
+        .map(|topics| {
+            topics
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn raw_log_data_words(raw: &Value) -> Vec<String> {
+    raw.get("data")
+        .and_then(Value::as_str)
+        .map(data_words)
+        .unwrap_or_default()
+}
+
 fn raw_log_tx_hash(raw: &Value) -> Option<B256> {
     raw.get("transactionHash")
         .and_then(Value::as_str)
         .and_then(|hash| hash.parse::<B256>().ok())
+}
+
+fn data_words(data: &str) -> Vec<String> {
+    let hex = data.strip_prefix("0x").unwrap_or(data);
+    if hex.is_empty() || hex.len() % 64 != 0 {
+        return Vec::new();
+    }
+    (0..hex.len())
+        .step_by(64)
+        .map(|index| hex[index..index + 64].to_string())
+        .collect()
+}
+
+fn parse_word_u256_local(word: &str) -> Option<U256> {
+    U256::from_str_radix(word.trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_word_i24_local(word: &str) -> Option<i32> {
+    let clean = word.trim_start_matches("0x");
+    let tail = clean.get(clean.len().saturating_sub(6)..)?;
+    let value = i32::from_str_radix(tail, 16).ok()?;
+    if value & 0x800000 != 0 {
+        Some(value - 0x1000000)
+    } else {
+        Some(value)
+    }
+}
+
+fn address_from_topic(topic: &str) -> Option<Address> {
+    address_from_word(topic.trim_start_matches("0x"))
+}
+
+fn address_from_word(word: &str) -> Option<Address> {
+    let clean = word.trim_start_matches("0x");
+    if clean.len() < 40 {
+        return None;
+    }
+    let tail = &clean[clean.len() - 40..];
+    format!("0x{tail}").parse::<Address>().ok()
+}
+
+fn synthetic_address_from_pool_uid(pool_uid: &str) -> Option<Address> {
+    address_from_word(pool_uid)
+}
+
+fn fixed_18_percentage_to_bps(value: U256) -> Option<u32> {
+    let bps = value
+        .checked_mul(U256::from(10_000u64))?
+        .checked_div(U256::from(1_000_000_000_000_000_000u128))?;
+    u32::try_from(bps).ok()
 }
 
 fn address_topic(address: Address) -> String {
