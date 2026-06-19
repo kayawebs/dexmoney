@@ -13,6 +13,7 @@ base-arb-storage = { path = "../storage" }
 chrono.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true

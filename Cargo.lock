@@ -2180,6 +2180,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "serde_json",
+ "sqlx",
  "tokio",
  "tokio-tungstenite",
  "tracing",

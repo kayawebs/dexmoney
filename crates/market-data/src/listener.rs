@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base_arb_chain::events::DexEvent;
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -17,6 +17,7 @@ use base_arb_storage::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -28,6 +29,10 @@ const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
+const V4_METADATA_HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
+const V4_METADATA_HYDRATE_LIMIT: i64 = 25;
+const V4_METADATA_HYDRATE_CHUNK_BLOCKS: u64 = 5_000;
+const V4_METADATA_HYDRATE_LOOKBACK_BLOCKS: u64 = 2_000_000;
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
@@ -356,6 +361,7 @@ where
 
         let mut last_scanned_block = self.provider.get_block_number().await?;
         let mut globally_observed_pools = HashSet::new();
+        let mut next_v4_metadata_hydrate = Instant::now();
         info!(last_scanned_block, "pool discovery synchronized at startup");
 
         let mut ticker = interval(POOL_DISCOVERY_INTERVAL);
@@ -378,6 +384,20 @@ where
                 .await?;
             self.discover_protocol_pool_logs(from_block, to_block)
                 .await?;
+            if Instant::now() >= next_v4_metadata_hydrate {
+                let hydrate_started = Instant::now();
+                let stats = self.hydrate_missing_uniswap_v4_metadata(to_block).await?;
+                if stats.hydrated > 0 || stats.not_found > 0 || stats.failed > 0 {
+                    info!(
+                        hydrated = stats.hydrated,
+                        not_found = stats.not_found,
+                        failed = stats.failed,
+                        hydrate_ms = hydrate_started.elapsed().as_millis() as u64,
+                        "Uniswap V4 metadata hydrate processed observations"
+                    );
+                }
+                next_v4_metadata_hydrate = Instant::now() + V4_METADATA_HYDRATE_INTERVAL;
+            }
             info!(
                 from_block,
                 to_block,
@@ -932,6 +952,104 @@ where
             );
         }
         Ok(())
+    }
+
+    async fn hydrate_missing_uniswap_v4_metadata(&self, to_block: u64) -> Result<V4HydrateStats> {
+        let Some(pool_manager) = self.settings.uniswap_v4_pool_manager else {
+            return Ok(V4HydrateStats::default());
+        };
+
+        let missing = sqlx::query(
+            r#"
+            SELECT manager_address, pool_uid, first_block
+            FROM protocol_pool_observations
+            WHERE chain_id = $1
+              AND protocol = 'uniswap-v4'
+              AND manager_address = $2
+              AND (token0 IS NULL OR token1 IS NULL OR tick_spacing IS NULL OR hooks_address IS NULL)
+            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(i64::try_from(self.settings.chain_id)?)
+        .bind(format!("{pool_manager:#x}"))
+        .bind(V4_METADATA_HYDRATE_LIMIT)
+        .fetch_all(&self.recorder.pool)
+        .await?;
+
+        let mut stats = V4HydrateStats::default();
+        for row in missing {
+            let pool_uid = row
+                .try_get::<String, _>("pool_uid")
+                .context("protocol_pool_observations.pool_uid decode failed")?;
+            let first_block = row.try_get::<i64, _>("first_block").unwrap_or(0);
+            let first_block = u64::try_from(first_block).unwrap_or(0);
+            match self
+                .hydrate_uniswap_v4_pool_uid(pool_manager, &pool_uid, first_block, to_block)
+                .await
+            {
+                Ok(true) => stats.hydrated += 1,
+                Ok(false) => stats.not_found += 1,
+                Err(err) => {
+                    stats.failed += 1;
+                    debug!(
+                        pool_uid,
+                        error = %err,
+                        "Uniswap V4 metadata hydrate failed"
+                    );
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn hydrate_uniswap_v4_pool_uid(
+        &self,
+        pool_manager: Address,
+        pool_uid: &str,
+        first_block: u64,
+        to_block: u64,
+    ) -> Result<bool> {
+        let pool_uid_topic = normalize_topic(pool_uid)?;
+        let from_block = first_block.saturating_sub(V4_METADATA_HYDRATE_LOOKBACK_BLOCKS);
+        let mut cursor = from_block;
+        while cursor <= to_block {
+            let chunk_to = to_block.min(
+                cursor
+                    .saturating_add(V4_METADATA_HYDRATE_CHUNK_BLOCKS)
+                    .saturating_sub(1),
+            );
+            let params = json!([{
+                "fromBlock": format!("0x{cursor:x}"),
+                "toBlock": format!("0x{chunk_to:x}"),
+                "address": format!("{pool_manager:#x}"),
+                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC], [pool_uid_topic]]
+            }]);
+            let logs = self.provider.get_logs_raw(params).await.with_context(|| {
+                format!("Uniswap V4 Initialize getLogs failed for blocks {cursor}..{chunk_to}")
+            })?;
+            for raw in logs {
+                let Some(observation) = parse_protocol_pool_observation(
+                    &self.settings,
+                    &self.provider,
+                    raw,
+                    "v4_initialize_hydrate",
+                )
+                .await?
+                else {
+                    continue;
+                };
+                self.recorder
+                    .upsert_protocol_pool_observation(observation)
+                    .await?;
+                return Ok(true);
+            }
+            if chunk_to == u64::MAX {
+                break;
+            }
+            cursor = chunk_to + 1;
+        }
+        Ok(false)
     }
 
     async fn process_observed_swap_pool(
@@ -3381,9 +3499,24 @@ fn swap_family_for_topic(topic0: &str) -> &'static str {
     }
 }
 
+fn normalize_topic(raw: &str) -> Result<String> {
+    let hex = raw.trim_start_matches("0x").to_ascii_lowercase();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid topic: {raw}");
+    }
+    Ok(format!("0x{hex}"))
+}
+
 #[derive(Debug, Clone)]
 struct PendingValidation {
     state: PoolState,
+}
+
+#[derive(Debug, Default)]
+struct V4HydrateStats {
+    hydrated: usize,
+    not_found: usize,
+    failed: usize,
 }
 
 fn enqueue_validation_snapshots(
