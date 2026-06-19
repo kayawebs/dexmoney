@@ -232,7 +232,7 @@ async fn fetch_initialize_logs_split(
         }]);
         match provider.get_logs_raw(params).await {
             Ok(mut logs) => out.append(&mut logs),
-            Err(err) if is_max_results_error(&err) && from < to => {
+            Err(_) if from < to => {
                 let mid = from + (to - from) / 2;
                 ranges.push((mid + 1, to));
                 ranges.push((from, mid));
@@ -242,11 +242,6 @@ async fn fetch_initialize_logs_split(
     }
 
     Ok(out)
-}
-
-fn is_max_results_error(err: &anyhow::Error) -> bool {
-    let message = format!("{err:#}");
-    message.contains("exceeds max results") || message.contains("max results")
 }
 
 fn parse_initialize_observation(
