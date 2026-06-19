@@ -157,14 +157,8 @@ async fn hydrate_batch(
         let mut cursor = search_from;
         while cursor <= to_block && !pending.is_empty() {
             let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
-            let params = json!([{
-                "fromBlock": format!("0x{cursor:x}"),
-                "toBlock": format!("0x{chunk_to:x}"),
-                "address": format!("{manager:#x}"),
-                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC]]
-            }]);
             summary.chunks += 1;
-            let logs = match provider.get_logs_raw(params).await {
+            let logs = match fetch_initialize_logs_split(provider, manager, cursor, chunk_to).await {
                 Ok(logs) => logs,
                 Err(err) => {
                     summary.failed += pending.len();
@@ -218,6 +212,41 @@ async fn hydrate_batch(
         summary.not_found += pending.len();
     }
     Ok(summary)
+}
+
+async fn fetch_initialize_logs_split(
+    provider: &ChainProvider,
+    manager: Address,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<Value>> {
+    let mut ranges = vec![(from_block, to_block)];
+    let mut out = Vec::new();
+
+    while let Some((from, to)) = ranges.pop() {
+        let params = json!([{
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "address": format!("{manager:#x}"),
+            "topics": [[UNISWAP_V4_INITIALIZE_TOPIC]]
+        }]);
+        match provider.get_logs_raw(params).await {
+            Ok(mut logs) => out.append(&mut logs),
+            Err(err) if is_max_results_error(&err) && from < to => {
+                let mid = from + (to - from) / 2;
+                ranges.push((mid + 1, to));
+                ranges.push((from, mid));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(out)
+}
+
+fn is_max_results_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("exceeds max results") || message.contains("max results")
 }
 
 fn parse_initialize_observation(
