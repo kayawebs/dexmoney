@@ -1,4 +1,8 @@
-use std::{env, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    str::FromStr,
+};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
@@ -58,38 +62,26 @@ async fn main() -> Result<()> {
         cli.chunk_blocks
     );
 
-    let mut hydrated = 0usize;
-    let mut not_found = 0usize;
-    let mut failed = 0usize;
-
-    for row in missing {
-        let search_from = from_block.min(row.first_block.saturating_sub(1));
-        match hydrate_one(
-            &settings,
-            &store,
-            &provider,
-            &row,
-            search_from,
-            to_block,
-            cli.chunk_blocks,
-            cli.apply,
-        )
-        .await
-        {
-            Ok(true) => hydrated += 1,
-            Ok(false) => not_found += 1,
-            Err(err) => {
-                failed += 1;
-                println!(
-                    "failed pool_uid={} manager={:#x} error={err:#}",
-                    row.pool_uid, row.manager_address
-                );
-            }
-        }
-    }
+    let HydrateSummary {
+        hydrated,
+        not_found,
+        failed,
+        chunks,
+        logs_seen,
+    } = hydrate_batch(
+        &settings,
+        &store,
+        &provider,
+        missing,
+        from_block,
+        to_block,
+        cli.chunk_blocks,
+        cli.apply,
+    )
+    .await?;
 
     println!();
-    println!("hydrated={hydrated} not_found={not_found} failed={failed}");
+    println!("hydrated={hydrated} not_found={not_found} failed={failed} chunks={chunks} logs_seen={logs_seen}");
     Ok(())
 }
 
@@ -129,63 +121,103 @@ async fn fetch_missing_observations(
         .collect()
 }
 
-async fn hydrate_one(
+#[derive(Debug, Default)]
+struct HydrateSummary {
+    hydrated: usize,
+    not_found: usize,
+    failed: usize,
+    chunks: usize,
+    logs_seen: usize,
+}
+
+async fn hydrate_batch(
     settings: &Settings,
     store: &PostgresStore,
     provider: &ChainProvider,
-    missing: &MissingObservation,
+    missing: Vec<MissingObservation>,
     from_block: u64,
     to_block: u64,
     chunk_blocks: u64,
     apply: bool,
-) -> Result<bool> {
-    let pool_uid_topic = normalize_topic(&missing.pool_uid)?;
-    let mut cursor = from_block;
-    while cursor <= to_block {
-        let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
-        let params = json!([{
-            "fromBlock": format!("0x{cursor:x}"),
-            "toBlock": format!("0x{chunk_to:x}"),
-            "address": format!("{:#x}", missing.manager_address),
-            "topics": [[UNISWAP_V4_INITIALIZE_TOPIC], [pool_uid_topic]]
-        }]);
-        let logs = provider
-            .get_logs_raw(params)
-            .await
-            .with_context(|| format!("eth_getLogs failed for blocks {cursor}..{chunk_to}"))?;
-        for raw in logs {
-            let Some(observation) =
-                parse_initialize_observation(settings, missing.manager_address, raw)?
-            else {
-                continue;
-            };
-            println!(
-                "hydrate pool_uid={} token0={} token1={} fee_pips={:?} tick_spacing={:?} hooks={:?} block={}",
-                observation.pool_uid,
-                observation
-                    .token0
-                    .map(|address| format!("{address:#x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                observation
-                    .token1
-                    .map(|address| format!("{address:#x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-                observation.fee_pips,
-                observation.tick_spacing,
-                observation.hooks_address.map(|address| format!("{address:#x}")),
-                observation.block_number,
-            );
-            if apply {
-                store.upsert_protocol_pool_observation(observation).await?;
-            }
-            return Ok(true);
-        }
-        if chunk_to == u64::MAX {
-            break;
-        }
-        cursor = chunk_to + 1;
+) -> Result<HydrateSummary> {
+    let mut groups: HashMap<Address, HashMap<String, MissingObservation>> = HashMap::new();
+    let mut search_from = from_block;
+    for row in missing {
+        search_from = search_from.min(row.first_block.saturating_sub(1));
+        let uid = normalize_topic(&row.pool_uid)?;
+        groups
+            .entry(row.manager_address)
+            .or_default()
+            .insert(uid, row);
     }
-    Ok(false)
+
+    let mut summary = HydrateSummary::default();
+    for (manager, rows) in groups {
+        let mut pending = rows.keys().cloned().collect::<HashSet<_>>();
+        let mut cursor = search_from;
+        while cursor <= to_block && !pending.is_empty() {
+            let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
+            let params = json!([{
+                "fromBlock": format!("0x{cursor:x}"),
+                "toBlock": format!("0x{chunk_to:x}"),
+                "address": format!("{manager:#x}"),
+                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC]]
+            }]);
+            summary.chunks += 1;
+            let logs = match provider.get_logs_raw(params).await {
+                Ok(logs) => logs,
+                Err(err) => {
+                    summary.failed += pending.len();
+                    println!(
+                        "failed manager={manager:#x} blocks={cursor}..{chunk_to} pending={} error={err:#}",
+                        pending.len()
+                    );
+                    pending.clear();
+                    break;
+                }
+            };
+            summary.logs_seen += logs.len();
+            for raw in logs {
+                let Some(pool_uid) = topic_at(&raw, 1) else {
+                    continue;
+                };
+                if !pending.contains(&pool_uid) {
+                    continue;
+                }
+                let Some(observation) = parse_initialize_observation(settings, manager, raw)?
+                else {
+                    continue;
+                };
+                println!(
+                    "hydrate pool_uid={} token0={} token1={} fee_pips={:?} tick_spacing={:?} hooks={:?} block={}",
+                    observation.pool_uid,
+                    observation
+                        .token0
+                        .map(|address| format!("{address:#x}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    observation
+                        .token1
+                        .map(|address| format!("{address:#x}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                    observation.fee_pips,
+                    observation.tick_spacing,
+                    observation.hooks_address.map(|address| format!("{address:#x}")),
+                    observation.block_number,
+                );
+                if apply {
+                    store.upsert_protocol_pool_observation(observation).await?;
+                }
+                pending.remove(&pool_uid);
+                summary.hydrated += 1;
+            }
+            if chunk_to == u64::MAX {
+                break;
+            }
+            cursor = chunk_to + 1;
+        }
+        summary.not_found += pending.len();
+    }
+    Ok(summary)
 }
 
 fn parse_initialize_observation(
