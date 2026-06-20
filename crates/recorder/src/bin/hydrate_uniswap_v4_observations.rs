@@ -289,6 +289,7 @@ fn parse_initialize_observation(
         variant: Some("UniswapV4".to_string()),
         fee_bps,
         fee_pips,
+        pool_key_fee_pips: fee_pips,
         tick_spacing,
         hooks_address,
         sqrt_price_x96,

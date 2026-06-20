@@ -34,7 +34,6 @@ const V4_METADATA_HYDRATE_LIMIT: i64 = 1_000;
 const V4_METADATA_HYDRATE_CHUNK_BLOCKS: u64 = 5_000;
 const V4_METADATA_HYDRATE_LOOKBACK_BLOCKS: u64 = 2_000_000;
 const V4_PROMOTE_LIMIT: i64 = 1_000;
-const V4_DYNAMIC_FEE_FLAG: u32 = 0x800000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
@@ -1095,7 +1094,8 @@ where
             r#"
             SELECT
                 pool_uid, pool_address, manager_address, token0, token1, symbol,
-                fee_bps, fee_pips, tick_spacing, sqrt_price_x96, liquidity, tick, latest_block
+                fee_bps, fee_pips, pool_key_fee_pips, tick_spacing, hooks_address,
+                sqrt_price_x96, liquidity, tick, latest_block
             FROM protocol_pool_observations
             WHERE chain_id = $1
               AND protocol = 'uniswap-v4'
@@ -1104,9 +1104,8 @@ where
               AND token0 IS NOT NULL
               AND token1 IS NOT NULL
               AND fee_pips IS NOT NULL
-              AND fee_pips <> $3
               AND tick_spacing IS NOT NULL
-              AND lower(COALESCE(hooks_address, $4)) = lower($4)
+              AND lower(COALESCE(hooks_address, $3)) = lower($3)
               AND sqrt_price_x96 IS NOT NULL
               AND liquidity IS NOT NULL
               AND tick IS NOT NULL
@@ -1120,12 +1119,11 @@ where
                   )
               )
             ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
-            LIMIT $5
+            LIMIT $4
             "#,
         )
         .bind(i64::try_from(self.settings.chain_id)?)
         .bind(format!("{pool_manager:#x}"))
-        .bind(i64::from(V4_DYNAMIC_FEE_FLAG))
         .bind(ZERO_ADDRESS)
         .bind(V4_PROMOTE_LIMIT)
         .fetch_all(&self.recorder.pool)
@@ -1185,7 +1183,7 @@ where
                 r#"
                 UPDATE protocol_pool_observations
                 SET import_status = 'imported',
-                    import_reason = 'static zero-hook Uniswap V4 pool promoted for quote/search',
+                    import_reason = 'zero-hook Uniswap V4 pool promoted for quote/search',
                     updated_at = NOW()
                 WHERE chain_id = $1
                   AND protocol = 'uniswap-v4'
@@ -1228,7 +1226,8 @@ where
             r#"
             SELECT
                 pool_uid, pool_address, manager_address, token0, token1, symbol,
-                fee_bps, fee_pips, tick_spacing, sqrt_price_x96, liquidity, tick, latest_block
+                fee_bps, fee_pips, pool_key_fee_pips, tick_spacing, hooks_address,
+                sqrt_price_x96, liquidity, tick, latest_block
             FROM protocol_pool_observations
             WHERE chain_id = $1
               AND protocol = 'uniswap-v4'
@@ -1236,9 +1235,8 @@ where
               AND token0 IS NOT NULL
               AND token1 IS NOT NULL
               AND fee_pips IS NOT NULL
-              AND fee_pips <> $3
               AND tick_spacing IS NOT NULL
-              AND lower(COALESCE(hooks_address, $4)) = lower($4)
+              AND lower(COALESCE(hooks_address, $3)) = lower($3)
               AND sqrt_price_x96 IS NOT NULL
               AND liquidity IS NOT NULL
               AND tick IS NOT NULL
@@ -1248,7 +1246,6 @@ where
         )
         .bind(i64::try_from(self.settings.chain_id)?)
         .bind(format!("{:#x}", entry.pool_address))
-        .bind(i64::from(V4_DYNAMIC_FEE_FLAG))
         .bind(ZERO_ADDRESS)
         .fetch_one(&self.recorder.pool)
         .await?;
@@ -1272,6 +1269,14 @@ where
             .try_get::<Option<i64>, _>("fee_bps")?
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(fee_pips / 100);
+        let pool_key_fee_pips = row
+            .try_get::<Option<i64>, _>("pool_key_fee_pips")?
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(fee_pips);
+        let hooks_address = row
+            .try_get::<Option<String>, _>("hooks_address")?
+            .map(|value| value.parse::<Address>())
+            .transpose()?;
         let tick_spacing = row
             .try_get::<Option<i64>, _>("tick_spacing")?
             .and_then(|value| i32::try_from(value).ok())
@@ -1305,6 +1310,8 @@ where
             token1_decimals: None,
             fee_bps,
             fee_pips: Some(fee_pips),
+            pool_key_fee_pips: Some(pool_key_fee_pips),
+            hooks_address,
             stable: None,
             reserve0: None,
             reserve1: None,
@@ -3376,6 +3383,7 @@ async fn parse_uniswap_v4_protocol_observation(
     let mut symbol = None;
     let mut fee_pips = None;
     let mut fee_bps = None;
+    let mut pool_key_fee_pips = None;
     let mut tick_spacing = None;
     let mut hooks_address = None;
     let mut sqrt_price_x96 = None;
@@ -3392,6 +3400,7 @@ async fn parse_uniswap_v4_protocol_observation(
             .and_then(|word| parse_word_u256_local(word))
             .and_then(|value| u32::try_from(value).ok());
         fee_bps = fee_pips.map(|fee| fee / 100);
+        pool_key_fee_pips = fee_pips;
         tick_spacing = data_words
             .get(1)
             .and_then(|word| parse_word_i24_local(word));
@@ -3442,6 +3451,7 @@ async fn parse_uniswap_v4_protocol_observation(
         variant: Some("UniswapV4".to_string()),
         fee_bps,
         fee_pips,
+        pool_key_fee_pips,
         tick_spacing,
         hooks_address,
         sqrt_price_x96,
@@ -3512,6 +3522,7 @@ async fn parse_balancer_v3_protocol_observation(
         variant: Some("BalancerV3".to_string()),
         fee_bps,
         fee_pips: None,
+        pool_key_fee_pips: None,
         tick_spacing: None,
         hooks_address: None,
         sqrt_price_x96: None,
@@ -4019,6 +4030,8 @@ mod tests {
             token1_decimals: None,
             fee_bps: 30,
             fee_pips: (variant == PoolVariant::AerodromeSlipstream).then_some(3_000),
+            pool_key_fee_pips: None,
+            hooks_address: None,
             stable: Some(false),
             reserve0: Some(U256::from(1_000_000u64)),
             reserve1: Some(U256::from(2_000_000u64)),
@@ -4116,6 +4129,7 @@ mod tests {
             variant: None,
             fee_bps: None,
             fee_pips: None,
+            pool_key_fee_pips: None,
             tick_spacing: None,
             hooks_address: None,
             sqrt_price_x96: None,

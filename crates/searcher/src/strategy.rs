@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{hex, Address, U256};
 use std::collections::{HashMap, HashSet};
 
 use base_arb_common::config::Settings;
@@ -2211,10 +2211,81 @@ fn swap_step_from_pool(state: &PoolState, token_in: Address, token_out: Address)
         token_in,
         token_out,
         fee_bps: Some(state.fee_bps),
+        pool_key_fee_pips: state.pool_key_fee_pips,
+        hooks_address: state.hooks_address,
         stable: state.stable,
         tick_spacing: state.tick_spacing,
-        adapter_data: None,
+        adapter_data: adapter_data_from_pool(state),
     }
+}
+
+fn adapter_data_from_pool(state: &PoolState) -> Option<String> {
+    match state.variant {
+        PoolVariant::UniswapV4 => {
+            let pool_key_fee = state.pool_key_fee_pips.or(state.fee_pips)?;
+            let tick_spacing = state.tick_spacing?;
+            let hooks = state.hooks_address.unwrap_or(Address::ZERO);
+            Some(format!(
+                "0x{}",
+                hex::encode(encode_uniswap_v4_adapter_data(
+                    state.token0,
+                    state.token1,
+                    pool_key_fee,
+                    tick_spacing,
+                    hooks,
+                ))
+            ))
+        }
+        PoolVariant::BalancerV3 => None,
+        _ => None,
+    }
+}
+
+fn encode_uniswap_v4_adapter_data(
+    currency0: Address,
+    currency1: Address,
+    fee: u32,
+    tick_spacing: i32,
+    hooks: Address,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(encode_address(currency0));
+    out.extend(encode_address(currency1));
+    out.extend(encode_u256(U256::from(fee)));
+    out.extend(encode_i256(i128::from(tick_spacing)));
+    out.extend(encode_address(hooks));
+    out.extend(encode_u256(U256::ZERO));
+    out.extend(encode_u256(U256::from(7 * 32)));
+    out.extend(encode_bytes(&[]));
+    out
+}
+
+fn encode_address(address: Address) -> Vec<u8> {
+    let mut out = vec![0u8; 12];
+    out.extend_from_slice(address.as_slice());
+    out
+}
+
+fn encode_u256(value: U256) -> Vec<u8> {
+    value.to_be_bytes::<32>().to_vec()
+}
+
+fn encode_i256(value: i128) -> Vec<u8> {
+    if value >= 0 {
+        return encode_u256(U256::from(value as u128));
+    }
+    let magnitude = U256::from(value.unsigned_abs());
+    (U256::MAX - magnitude + U256::from(1u8))
+        .to_be_bytes::<32>()
+        .to_vec()
+}
+
+fn encode_bytes(value: &[u8]) -> Vec<u8> {
+    let mut out = encode_u256(U256::from(value.len()));
+    out.extend_from_slice(value);
+    let padding = (32 - (value.len() % 32)) % 32;
+    out.extend(std::iter::repeat_n(0u8, padding));
+    out
 }
 
 fn anchor_search_configs(configs: &[TokenPairSearchConfig]) -> Vec<AnchorSearchConfig> {

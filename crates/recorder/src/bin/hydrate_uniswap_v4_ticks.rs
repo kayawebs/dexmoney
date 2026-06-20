@@ -18,7 +18,6 @@ use tracing_subscriber::EnvFilter;
 
 const UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC: &str =
     "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec";
-const V4_DYNAMIC_FEE_FLAG: i64 = 0x800000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone)]
@@ -28,6 +27,7 @@ struct Cli {
     max_lookback_blocks: Option<u64>,
     limit: i64,
     chunk_blocks: u64,
+    manager_scan: bool,
     apply: bool,
     refresh_existing: bool,
 }
@@ -55,6 +55,7 @@ struct Summary {
     marked_changed_pools: usize,
     skipped_existing_pools: usize,
     skipped_lookback_pools: usize,
+    ignored_logs: usize,
     chunks: usize,
     logs_seen: usize,
     ticks_written: usize,
@@ -85,19 +86,35 @@ async fn main() -> Result<()> {
         cli.chunk_blocks
     );
 
-    let summary = hydrate_ticks(
-        &settings,
-        &provider,
-        &redis,
-        pools,
-        cli.from_block,
-        cli.max_lookback_blocks,
-        to_block,
-        cli.chunk_blocks,
-        cli.apply,
-        cli.refresh_existing,
-    )
-    .await?;
+    let summary = if cli.manager_scan {
+        hydrate_ticks_by_manager_scan(
+            &settings,
+            &provider,
+            &redis,
+            pools,
+            cli.from_block,
+            cli.max_lookback_blocks,
+            to_block,
+            cli.chunk_blocks,
+            cli.apply,
+            cli.refresh_existing,
+        )
+        .await?
+    } else {
+        hydrate_ticks(
+            &settings,
+            &provider,
+            &redis,
+            pools,
+            cli.from_block,
+            cli.max_lookback_blocks,
+            to_block,
+            cli.chunk_blocks,
+            cli.apply,
+            cli.refresh_existing,
+        )
+        .await?
+    };
 
     println!();
     println!(
@@ -110,12 +127,13 @@ async fn main() -> Result<()> {
         summary.failed
     );
     println!(
-        "nonzero_tick_pools={} zero_tick_pools={} marked_changed_pools={} skipped_existing_pools={} skipped_lookback_pools={}",
+        "nonzero_tick_pools={} zero_tick_pools={} marked_changed_pools={} skipped_existing_pools={} skipped_lookback_pools={} ignored_logs={}",
         summary.nonzero_tick_pools,
         summary.zero_tick_pools,
         summary.marked_changed_pools,
         summary.skipped_existing_pools,
-        summary.skipped_lookback_pools
+        summary.skipped_lookback_pools,
+        summary.ignored_logs
     );
     Ok(())
 }
@@ -135,15 +153,13 @@ async fn fetch_quoteable_v4_pools(
           AND token0 IS NOT NULL
           AND token1 IS NOT NULL
           AND fee_pips IS NOT NULL
-          AND fee_pips <> $2
           AND tick_spacing IS NOT NULL
-          AND lower(COALESCE(hooks_address, $3)) = lower($3)
+          AND lower(COALESCE(hooks_address, $2)) = lower($2)
         ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(i64::try_from(chain_id)?)
-    .bind(V4_DYNAMIC_FEE_FLAG)
     .bind(ZERO_ADDRESS)
     .bind(limit)
     .fetch_all(&store.pool)
@@ -292,6 +308,174 @@ async fn hydrate_ticks(
     Ok(summary)
 }
 
+async fn hydrate_ticks_by_manager_scan(
+    settings: &Settings,
+    provider: &ChainProvider,
+    redis: &RedisStore,
+    pools: Vec<V4Pool>,
+    from_block_override: Option<u64>,
+    max_lookback_blocks: Option<u64>,
+    to_block: u64,
+    chunk_blocks: u64,
+    apply: bool,
+    refresh_existing: bool,
+) -> Result<Summary> {
+    let mut summary = Summary {
+        pools: pools.len(),
+        ..Summary::default()
+    };
+    let min_from_block = max_lookback_blocks.map(|lookback| to_block.saturating_sub(lookback));
+    let mut selected = BTreeMap::<String, V4Pool>::new();
+    for pool in pools {
+        if !refresh_existing && from_block_override.is_none() {
+            let existing_ticks = redis.get_pool_ticks(pool.pool_address).await?;
+            if !existing_ticks.is_empty() {
+                println!(
+                    "skip existing pool={} uid={} ticks={}",
+                    pool.pool_address,
+                    pool.pool_uid,
+                    existing_ticks.len()
+                );
+                summary.skipped_existing_pools += 1;
+                continue;
+            }
+        }
+        if let Some(min_from_block) = min_from_block {
+            if from_block_override.is_none() && pool.first_block < min_from_block {
+                println!(
+                    "skip lookback pool={} uid={} from={} min_from={} to={} max_lookback_blocks={}",
+                    pool.pool_address,
+                    pool.pool_uid,
+                    pool.first_block,
+                    min_from_block,
+                    to_block,
+                    max_lookback_blocks.unwrap_or_default()
+                );
+                summary.skipped_lookback_pools += 1;
+                continue;
+            }
+        }
+        selected.insert(pool.pool_uid.clone(), pool);
+    }
+    if selected.is_empty() {
+        return Ok(summary);
+    }
+
+    let mut managers = selected
+        .values()
+        .map(|pool| pool.manager)
+        .collect::<Vec<_>>();
+    managers.sort();
+    managers.dedup();
+
+    let from_block = from_block_override.or(min_from_block).unwrap_or_else(|| {
+        selected
+            .values()
+            .map(|pool| pool.first_block)
+            .min()
+            .unwrap_or(to_block)
+    });
+    let mut ticks_by_pool = selected
+        .keys()
+        .map(|pool_uid| (pool_uid.clone(), BTreeMap::<i32, TickAccumulator>::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for manager in managers {
+        let mut cursor = from_block;
+        while cursor <= to_block {
+            let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
+            summary.chunks += 1;
+            let logs =
+                match fetch_modify_liquidity_logs_for_manager(provider, manager, cursor, chunk_to)
+                    .await
+                {
+                    Ok(logs) => logs,
+                    Err(err) => {
+                        summary.failed += selected.len();
+                        println!(
+                            "failed manager={} blocks={}..{} pending={} error={err:#}",
+                            manager,
+                            cursor,
+                            chunk_to,
+                            selected.len()
+                        );
+                        break;
+                    }
+                };
+            summary.logs_seen += logs.len();
+            for raw in logs {
+                let Some(pool_uid) = topic_at(&raw, 1) else {
+                    summary.ignored_logs += 1;
+                    continue;
+                };
+                let Some(ticks) = ticks_by_pool.get_mut(&pool_uid) else {
+                    summary.ignored_logs += 1;
+                    continue;
+                };
+                let Some(delta) = parse_modify_liquidity_delta(&raw)? else {
+                    continue;
+                };
+                apply_delta(ticks, delta)?;
+            }
+            if chunk_to == u64::MAX {
+                break;
+            }
+            cursor = chunk_to + 1;
+        }
+    }
+
+    for (pool_uid, ticks) in ticks_by_pool {
+        let pool = selected
+            .get(&pool_uid)
+            .with_context(|| format!("selected pool disappeared {pool_uid}"))?;
+        let tick_states = ticks
+            .into_iter()
+            .filter(|(_, acc)| acc.liquidity_gross > 0 || acc.liquidity_net != 0)
+            .map(|(tick, acc)| {
+                Ok(TickState {
+                    pool_id: PoolId {
+                        chain_id: settings.chain_id,
+                        address: pool.pool_address,
+                    },
+                    tick,
+                    liquidity_net: acc.liquidity_net,
+                    liquidity_gross: U256::from(u128::try_from(acc.liquidity_gross)?),
+                    block_number: to_block,
+                    updated_at: chrono::Utc::now(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!(
+            "pool={} uid={} ticks={} from={} to={}",
+            pool.pool_address,
+            pool.pool_uid,
+            tick_states.len(),
+            from_block,
+            to_block
+        );
+        if tick_states.is_empty() {
+            summary.zero_tick_pools += 1;
+        } else {
+            summary.nonzero_tick_pools += 1;
+        }
+        if apply {
+            redis
+                .replace_pool_ticks(pool.pool_address, tick_states.clone())
+                .await?;
+            if !tick_states.is_empty() {
+                redis
+                    .mark_tick_changed_pools(vec![pool.pool_address])
+                    .await?;
+                summary.marked_changed_pools += 1;
+            }
+        }
+        summary.ticks_written += tick_states.len();
+        summary.hydrated_pools += 1;
+    }
+
+    Ok(summary)
+}
+
 async fn fetch_modify_liquidity_logs_split(
     provider: &ChainProvider,
     pool: &V4Pool,
@@ -309,6 +493,37 @@ async fn fetch_modify_liquidity_logs_split(
             "topics": [
                 [UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC],
                 [pool.pool_uid.clone()]
+            ]
+        }]);
+        match provider.get_logs_raw(params).await {
+            Ok(mut logs) => out.append(&mut logs),
+            Err(_) if from < to => {
+                let mid = from + (to - from) / 2;
+                ranges.push((mid + 1, to));
+                ranges.push((from, mid));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_modify_liquidity_logs_for_manager(
+    provider: &ChainProvider,
+    manager: Address,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<Value>> {
+    let mut ranges = vec![(from_block, to_block)];
+    let mut out = Vec::new();
+
+    while let Some((from, to)) = ranges.pop() {
+        let params = json!([{
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "address": format!("{:#x}", manager),
+            "topics": [
+                [UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC]
             ]
         }]);
         match provider.get_logs_raw(params).await {
@@ -387,6 +602,7 @@ where
         max_lookback_blocks: None,
         limit: 200,
         chunk_blocks: 10_000,
+        manager_scan: false,
         apply: false,
         refresh_existing: false,
     };
@@ -400,6 +616,7 @@ where
             }
             "--limit" => cli.limit = parse_next(&mut args, "--limit")?,
             "--chunk-blocks" => cli.chunk_blocks = parse_next(&mut args, "--chunk-blocks")?,
+            "--manager-scan" => cli.manager_scan = true,
             "--apply" => cli.apply = true,
             "--refresh-existing" => cli.refresh_existing = true,
             "--help" | "-h" => {
@@ -429,7 +646,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--refresh-existing] [--apply]"
+        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--refresh-existing] [--apply]"
     );
 }
 

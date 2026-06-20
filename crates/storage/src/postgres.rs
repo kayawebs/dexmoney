@@ -47,6 +47,7 @@ pub struct ProtocolPoolObservation {
     pub variant: Option<String>,
     pub fee_bps: Option<u32>,
     pub fee_pips: Option<u32>,
+    pub pool_key_fee_pips: Option<u32>,
     pub tick_spacing: Option<i32>,
     pub hooks_address: Option<Address>,
     pub sqrt_price_x96: Option<U256>,
@@ -234,12 +235,12 @@ impl PostgresStore {
             INSERT INTO protocol_pool_observations (
                 chain_id, protocol, manager_address, pool_uid, pool_address, topic0, event_type,
                 token0, token1, symbol, factory_address, dex, variant, fee_bps, fee_pips,
-                tick_spacing, hooks_address, sqrt_price_x96, liquidity, tick,
+                pool_key_fee_pips, tick_spacing, hooks_address, sqrt_price_x96, liquidity, tick,
                 first_block, latest_block, logs_30d, discovery_source, import_status,
                 import_reason, raw_json, created_at, updated_at
             ) VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                $21,$21,1,$22,$23,$24,$25,NOW(),NOW()
+                $21,$22,$22,1,$23,$24,$25,$26,NOW(),NOW()
             )
             ON CONFLICT (chain_id, protocol, manager_address, pool_uid)
             DO UPDATE SET
@@ -254,6 +255,7 @@ impl PostgresStore {
                 variant = COALESCE(EXCLUDED.variant, protocol_pool_observations.variant),
                 fee_bps = COALESCE(EXCLUDED.fee_bps, protocol_pool_observations.fee_bps),
                 fee_pips = COALESCE(EXCLUDED.fee_pips, protocol_pool_observations.fee_pips),
+                pool_key_fee_pips = COALESCE(EXCLUDED.pool_key_fee_pips, protocol_pool_observations.pool_key_fee_pips),
                 tick_spacing = COALESCE(EXCLUDED.tick_spacing, protocol_pool_observations.tick_spacing),
                 hooks_address = COALESCE(EXCLUDED.hooks_address, protocol_pool_observations.hooks_address),
                 sqrt_price_x96 = COALESCE(EXCLUDED.sqrt_price_x96, protocol_pool_observations.sqrt_price_x96),
@@ -284,6 +286,7 @@ impl PostgresStore {
         .bind(observation.variant)
         .bind(observation.fee_bps.map(i64::from))
         .bind(observation.fee_pips.map(i64::from))
+        .bind(observation.pool_key_fee_pips.map(i64::from))
         .bind(observation.tick_spacing.map(i64::from))
         .bind(observation.hooks_address.map(address_to_string))
         .bind(observation.sqrt_price_x96.map(|value| value.to_string()))
@@ -1165,6 +1168,7 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             variant TEXT,
             fee_bps BIGINT,
             fee_pips BIGINT,
+            pool_key_fee_pips BIGINT,
             tick_spacing BIGINT,
             stable BOOLEAN,
             txs_30d BIGINT NOT NULL DEFAULT 0,
@@ -1226,6 +1230,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_pool_address_idx
             ON protocol_pool_observations (chain_id, lower(pool_address))
             WHERE pool_address IS NOT NULL"#,
+        r#"ALTER TABLE protocol_pool_observations
+            ADD COLUMN IF NOT EXISTS pool_key_fee_pips BIGINT"#,
         r#"CREATE TABLE IF NOT EXISTS factory_registry (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,

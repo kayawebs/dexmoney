@@ -52,6 +52,10 @@ pub struct PoolState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_pips: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_key_fee_pips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks_address: Option<Address>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
     pub reserve0: Option<U256>,
     pub reserve1: Option<U256>,
@@ -176,6 +180,10 @@ pub struct SwapStep {
     pub token_in: Address,
     pub token_out: Address,
     pub fee_bps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_key_fee_pips: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks_address: Option<Address>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
