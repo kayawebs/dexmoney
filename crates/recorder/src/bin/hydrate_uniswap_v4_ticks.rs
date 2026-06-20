@@ -10,7 +10,7 @@ use base_arb_common::{
 use base_arb_storage::{
     postgres::{ensure_registry_schema, PostgresStore},
     redis::RedisStore,
-    TickStateStore,
+    TickChangeStore, TickStateStore,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -48,6 +48,9 @@ struct TickAccumulator {
 struct Summary {
     pools: usize,
     hydrated_pools: usize,
+    nonzero_tick_pools: usize,
+    zero_tick_pools: usize,
+    marked_changed_pools: usize,
     chunks: usize,
     logs_seen: usize,
     ticks_written: usize,
@@ -99,6 +102,10 @@ async fn main() -> Result<()> {
         summary.logs_seen,
         summary.ticks_written,
         summary.failed
+    );
+    println!(
+        "nonzero_tick_pools={} zero_tick_pools={} marked_changed_pools={}",
+        summary.nonzero_tick_pools, summary.zero_tick_pools, summary.marked_changed_pools
     );
     Ok(())
 }
@@ -221,10 +228,21 @@ async fn hydrate_ticks(
             from_block,
             to_block
         );
+        if tick_states.is_empty() {
+            summary.zero_tick_pools += 1;
+        } else {
+            summary.nonzero_tick_pools += 1;
+        }
         if apply {
             redis
                 .replace_pool_ticks(pool.pool_address, tick_states.clone())
                 .await?;
+            if !tick_states.is_empty() {
+                redis
+                    .mark_tick_changed_pools(vec![pool.pool_address])
+                    .await?;
+                summary.marked_changed_pools += 1;
+            }
         }
         summary.ticks_written += tick_states.len();
         summary.hydrated_pools += 1;
