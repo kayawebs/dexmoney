@@ -8,9 +8,7 @@ use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_storage::postgres::{
-    ensure_registry_schema, PostgresStore, ProtocolPoolObservation,
-};
+use base_arb_storage::postgres::{ensure_registry_schema, PostgresStore, ProtocolPoolObservation};
 use serde_json::{json, Value};
 use sqlx::Row;
 use tracing_subscriber::EnvFilter;
@@ -158,7 +156,8 @@ async fn hydrate_batch(
         while cursor <= to_block && !pending.is_empty() {
             let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
             summary.chunks += 1;
-            let logs = match fetch_initialize_logs_split(provider, manager, cursor, chunk_to).await {
+            let logs = match fetch_initialize_logs_split(provider, manager, cursor, chunk_to).await
+            {
                 Ok(logs) => logs,
                 Err(err) => {
                     summary.failed += pending.len();

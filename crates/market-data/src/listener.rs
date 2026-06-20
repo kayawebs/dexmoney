@@ -30,7 +30,7 @@ const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
 const V4_METADATA_HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
-const V4_METADATA_HYDRATE_LIMIT: i64 = 25;
+const V4_METADATA_HYDRATE_LIMIT: i64 = 1_000;
 const V4_METADATA_HYDRATE_CHUNK_BLOCKS: u64 = 5_000;
 const V4_METADATA_HYDRATE_LOOKBACK_BLOCKS: u64 = 2_000_000;
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
@@ -392,6 +392,8 @@ where
                         hydrated = stats.hydrated,
                         not_found = stats.not_found,
                         failed = stats.failed,
+                        chunks = stats.chunks,
+                        logs_seen = stats.logs_seen,
                         hydrate_ms = hydrate_started.elapsed().as_millis() as u64,
                         "Uniswap V4 metadata hydrate processed observations"
                     );
@@ -959,7 +961,7 @@ where
             return Ok(V4HydrateStats::default());
         };
 
-        let missing = sqlx::query(
+        let missing_rows = sqlx::query(
             r#"
             SELECT manager_address, pool_uid, first_block
             FROM protocol_pool_observations
@@ -978,40 +980,24 @@ where
         .await?;
 
         let mut stats = V4HydrateStats::default();
-        for row in missing {
+        if missing_rows.is_empty() {
+            return Ok(stats);
+        }
+
+        let mut pending = HashSet::with_capacity(missing_rows.len());
+        let mut from_block = to_block;
+        for row in missing_rows {
             let pool_uid = row
                 .try_get::<String, _>("pool_uid")
                 .context("protocol_pool_observations.pool_uid decode failed")?;
+            let normalized = normalize_topic(&pool_uid)?;
+            pending.insert(normalized);
             let first_block = row.try_get::<i64, _>("first_block").unwrap_or(0);
             let first_block = u64::try_from(first_block).unwrap_or(0);
-            match self
-                .hydrate_uniswap_v4_pool_uid(pool_manager, &pool_uid, first_block, to_block)
-                .await
-            {
-                Ok(true) => stats.hydrated += 1,
-                Ok(false) => stats.not_found += 1,
-                Err(err) => {
-                    stats.failed += 1;
-                    debug!(
-                        pool_uid,
-                        error = %err,
-                        "Uniswap V4 metadata hydrate failed"
-                    );
-                }
-            }
+            from_block =
+                from_block.min(first_block.saturating_sub(V4_METADATA_HYDRATE_LOOKBACK_BLOCKS));
         }
-        Ok(stats)
-    }
 
-    async fn hydrate_uniswap_v4_pool_uid(
-        &self,
-        pool_manager: Address,
-        pool_uid: &str,
-        first_block: u64,
-        to_block: u64,
-    ) -> Result<bool> {
-        let pool_uid_topic = normalize_topic(pool_uid)?;
-        let from_block = first_block.saturating_sub(V4_METADATA_HYDRATE_LOOKBACK_BLOCKS);
         let mut cursor = from_block;
         while cursor <= to_block {
             let chunk_to = to_block.min(
@@ -1019,16 +1005,32 @@ where
                     .saturating_add(V4_METADATA_HYDRATE_CHUNK_BLOCKS)
                     .saturating_sub(1),
             );
-            let params = json!([{
-                "fromBlock": format!("0x{cursor:x}"),
-                "toBlock": format!("0x{chunk_to:x}"),
-                "address": format!("{pool_manager:#x}"),
-                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC], [pool_uid_topic]]
-            }]);
-            let logs = self.provider.get_logs_raw(params).await.with_context(|| {
-                format!("Uniswap V4 Initialize getLogs failed for blocks {cursor}..{chunk_to}")
-            })?;
+            stats.chunks += 1;
+            let logs = match self
+                .fetch_uniswap_v4_initialize_logs(pool_manager, cursor, chunk_to)
+                .await
+            {
+                Ok(logs) => logs,
+                Err(err) => {
+                    stats.failed += pending.len();
+                    debug!(
+                        from_block = cursor,
+                        to_block = chunk_to,
+                        pending = pending.len(),
+                        error = %err,
+                        "Uniswap V4 batch metadata hydrate getLogs failed"
+                    );
+                    return Ok(stats);
+                }
+            };
+            stats.logs_seen += logs.len();
             for raw in logs {
+                let Some(pool_uid) = raw_log_topics(&raw).get(1).cloned() else {
+                    continue;
+                };
+                if !pending.contains(&pool_uid) {
+                    continue;
+                }
                 let Some(observation) = parse_protocol_pool_observation(
                     &self.settings,
                     &self.provider,
@@ -1042,14 +1044,49 @@ where
                 self.recorder
                     .upsert_protocol_pool_observation(observation)
                     .await?;
-                return Ok(true);
+                pending.remove(&pool_uid);
+                stats.hydrated += 1;
+            }
+            if pending.is_empty() {
+                break;
             }
             if chunk_to == u64::MAX {
                 break;
             }
             cursor = chunk_to + 1;
         }
-        Ok(false)
+        stats.not_found += pending.len();
+        Ok(stats)
+    }
+
+    async fn fetch_uniswap_v4_initialize_logs(
+        &self,
+        pool_manager: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<Value>> {
+        let mut ranges = vec![(from_block, to_block)];
+        let mut out = Vec::new();
+
+        while let Some((from, to)) = ranges.pop() {
+            let params = json!([{
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+                "address": format!("{pool_manager:#x}"),
+                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC]]
+            }]);
+            match self.provider.get_logs_raw(params).await {
+                Ok(mut logs) => out.append(&mut logs),
+                Err(_) if from < to => {
+                    let mid = from + (to - from) / 2;
+                    ranges.push((mid + 1, to));
+                    ranges.push((from, mid));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(out)
     }
 
     async fn process_observed_swap_pool(
@@ -3517,6 +3554,8 @@ struct V4HydrateStats {
     hydrated: usize,
     not_found: usize,
     failed: usize,
+    chunks: usize,
+    logs_seen: usize,
 }
 
 fn enqueue_validation_snapshots(

@@ -26,6 +26,8 @@ const CLASSIC_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const AERODROME_CLASSIC_SWAP_TOPIC: &str =
     "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b";
+const UNISWAP_V4_SWAP_TOPIC: &str =
+    "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
 
 #[derive(Debug)]
 struct Cli {
@@ -50,6 +52,9 @@ struct PoolCoverage {
     symbol: Option<String>,
     dex: Option<String>,
     variant: Option<String>,
+    fee_pips: Option<i64>,
+    tick_spacing: Option<i64>,
+    hooks_address: Option<String>,
     pool_enabled: Option<bool>,
     latest_state_block: Option<i64>,
     latest_state_source: Option<String>,
@@ -140,6 +145,7 @@ async fn main() -> Result<()> {
 
     let mut summary = BTreeMap::<String, usize>::new();
     let mut gap_summary = BTreeMap::<String, usize>::new();
+    let mut v4_feature_summary = BTreeMap::<String, usize>::new();
     let mut unrecognized_counterparty_summary = BTreeMap::<String, usize>::new();
     for tx in txs {
         let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {
@@ -174,6 +180,13 @@ async fn main() -> Result<()> {
             &anchor_configs,
         );
         *summary.entry(classification.clone()).or_default() += 1;
+        for coverage in &coverages {
+            if coverage.topic0 == UNISWAP_V4_SWAP_TOPIC {
+                *v4_feature_summary
+                    .entry(v4_feature_bucket(coverage))
+                    .or_default() += 1;
+            }
+        }
         *gap_summary
             .entry(diagnostics.searcher_gap.clone())
             .or_default() += 1;
@@ -202,6 +215,15 @@ async fn main() -> Result<()> {
     writeln!(writer, "== Searcher Gap Summary ==")?;
     for (gap, n) in gap_summary {
         writeln!(writer, "{gap}\t{n}")?;
+    }
+    writeln!(writer)?;
+    writeln!(writer, "== Uniswap V4 Feature Summary ==")?;
+    if v4_feature_summary.is_empty() {
+        writeln!(writer, "-\t0")?;
+    } else {
+        for (bucket, n) in v4_feature_summary {
+            writeln!(writer, "{bucket}\t{n}")?;
+        }
     }
     writeln!(writer)?;
     writeln!(writer, "== Unrecognized Counterparties ==")?;
@@ -318,7 +340,12 @@ fn receipt_swap_logs(receipt: &TxReceipt) -> Vec<(String, String)> {
             if !is_swap_topic(&topic0) {
                 return None;
             }
-            let pool = log.get("address")?.as_str()?.to_ascii_lowercase();
+            let pool = if topic0 == UNISWAP_V4_SWAP_TOPIC {
+                let pool_uid = log.get("topics")?.as_array()?.get(1)?.as_str()?;
+                synthetic_address_from_pool_uid(pool_uid)?
+            } else {
+                log.get("address")?.as_str()?.to_ascii_lowercase()
+            };
             Some((pool, topic0))
         })
         .collect()
@@ -370,16 +397,19 @@ async fn load_pool_coverage(
         r#"
         WITH target AS (SELECT lower($1::text) AS pool)
         SELECT
-            COALESCE(p.token0, op.token0) AS token0,
-            COALESCE(p.token1, op.token1) AS token1,
-            COALESCE(tp.symbol, op.symbol) AS symbol,
-            p.dex,
-            p.variant,
+            COALESCE(p.token0, op.token0, po.token0) AS token0,
+            COALESCE(p.token1, op.token1, po.token1) AS token1,
+            COALESCE(tp.symbol, op.symbol, po.symbol) AS symbol,
+            COALESCE(p.dex, po.dex) AS dex,
+            COALESCE(p.variant, po.variant) AS variant,
+            COALESCE(p.fee_pips, op.fee_pips, po.fee_pips) AS fee_pips,
+            COALESCE(p.tick_spacing, op.tick_spacing, po.tick_spacing) AS tick_spacing,
+            po.hooks_address AS hooks_address,
             p.enabled AS pool_enabled,
             ps.block_number AS latest_state_block,
             ps.source AS latest_state_source,
-            op.import_status AS observed_status,
-            op.discovery_source,
+            COALESCE(op.import_status, po.import_status) AS observed_status,
+            COALESCE(op.discovery_source, po.discovery_source) AS discovery_source,
             (
                 SELECT count(*)
                 FROM dex_events e, target t
@@ -404,6 +434,8 @@ async fn load_pool_coverage(
         ) ps ON true
         LEFT JOIN observed_pools op
             ON op.chain_id = $3 AND lower(op.pool_address) = t.pool
+        LEFT JOIN protocol_pool_observations po
+            ON po.chain_id = $3 AND lower(po.pool_address) = t.pool
         "#,
     )
     .bind(pool_address)
@@ -420,6 +452,9 @@ async fn load_pool_coverage(
         symbol: row.try_get("symbol")?,
         dex: row.try_get("dex")?,
         variant: row.try_get("variant")?,
+        fee_pips: row.try_get("fee_pips")?,
+        tick_spacing: row.try_get("tick_spacing")?,
+        hooks_address: row.try_get("hooks_address")?,
         pool_enabled: row.try_get("pool_enabled")?,
         latest_state_block: row.try_get("latest_state_block")?,
         latest_state_source: row.try_get("latest_state_source")?,
@@ -1028,7 +1063,7 @@ fn write_tx(
     for row in coverages {
         writeln!(
             writer,
-            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} enabled={} state_block={} state_source={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
+            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} fee_pips={} tick_spacing={} hooks={} enabled={} state_block={} state_source={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
             short_addr(&row.pool),
             topic_family(&row.topic0),
             row.token0
@@ -1042,6 +1077,16 @@ fn write_tx(
             row.symbol.as_deref().unwrap_or("-"),
             row.dex.as_deref().unwrap_or("-"),
             row.variant.as_deref().unwrap_or("-"),
+            row.fee_pips
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.tick_spacing
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.hooks_address
+                .as_deref()
+                .map(short_addr)
+                .unwrap_or_else(|| "-".into()),
             row.pool_enabled
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
@@ -1066,6 +1111,7 @@ fn is_swap_topic(topic0: &str) -> bool {
             | PANCAKE_V3_SWAP_TOPIC
             | CLASSIC_SWAP_TOPIC
             | AERODROME_CLASSIC_SWAP_TOPIC
+            | UNISWAP_V4_SWAP_TOPIC
     )
 }
 
@@ -1075,8 +1121,32 @@ fn topic_family(topic0: &str) -> &'static str {
         PANCAKE_V3_SWAP_TOPIC => "pancake_v3",
         CLASSIC_SWAP_TOPIC => "classic",
         AERODROME_CLASSIC_SWAP_TOPIC => "aero_classic",
+        UNISWAP_V4_SWAP_TOPIC => "uniswap_v4",
         _ => "unknown",
     }
+}
+
+fn v4_feature_bucket(row: &PoolCoverage) -> String {
+    let fee = row.fee_pips.unwrap_or_default();
+    let fee_bucket = if row.fee_pips.is_none() {
+        "fee_missing"
+    } else if fee == 0x800000 {
+        "dynamic_fee"
+    } else {
+        "static_fee"
+    };
+    let hook_bucket = match row.hooks_address.as_deref() {
+        None => "hook_missing",
+        Some("0x0000000000000000000000000000000000000000") => "zero_hook",
+        Some(_) => "nonzero_hook",
+    };
+    let metadata_bucket =
+        if row.token0.is_some() && row.token1.is_some() && row.tick_spacing.is_some() {
+            "metadata_complete"
+        } else {
+            "metadata_incomplete"
+        };
+    format!("{metadata_bucket}/{fee_bucket}/{hook_bucket}")
 }
 
 fn raw_log_topic0(log: &Value) -> Option<String> {
@@ -1109,6 +1179,10 @@ fn topic_address(topic: &str) -> Option<String> {
         return None;
     }
     Some(format!("0x{}", &raw[raw.len() - 40..]).to_ascii_lowercase())
+}
+
+fn synthetic_address_from_pool_uid(pool_uid: &str) -> Option<String> {
+    topic_address(pool_uid)
 }
 
 fn hex_to_decimal(raw: &str) -> String {
