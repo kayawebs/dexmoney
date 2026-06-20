@@ -1242,10 +1242,11 @@ fn pool_depth_score(state: &PoolState) -> U256 {
         PoolVariant::AerodromeVolatile => {
             state.reserve0.unwrap_or_default() + state.reserve1.unwrap_or_default()
         }
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
-            state.liquidity.unwrap_or_default()
-        }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => U256::ZERO,
+        PoolVariant::AerodromeSlipstream
+        | PoolVariant::UniswapV3
+        | PoolVariant::PancakeV3
+        | PoolVariant::UniswapV4 => state.liquidity.unwrap_or_default(),
+        PoolVariant::BalancerV3 => U256::ZERO,
     }
 }
 
@@ -1540,11 +1541,12 @@ fn rough_quote_edge_upper_bound(
                 .map_err(|_| RoughQuoteFailure::V2QuoteFailed)
             }
         }
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
-            spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
-                .map_err(classify_v3_spot_quote_failure)
-        }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
+        PoolVariant::AerodromeSlipstream
+        | PoolVariant::UniswapV3
+        | PoolVariant::PancakeV3
+        | PoolVariant::UniswapV4 => spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
+            .map_err(classify_v3_spot_quote_failure),
+        PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
     }
 }
 
@@ -1876,7 +1878,18 @@ async fn quote_path(
                     quote
                 }
             }
-            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {
+            PoolVariant::UniswapV4 => {
+                let amount_out = spot_quote_exact_in(pool_state, step.token_in, amount)
+                    .map_err(|err| QuoteSkip::quote_error(err.to_string()))?;
+                mode = "v4_spot".into();
+                diagnostics.modes.push(mode.clone());
+                QuoteResult {
+                    amount_in: amount,
+                    amount_out,
+                    gas_estimate: None,
+                }
+            }
+            PoolVariant::BalancerV3 => {
                 return Err(QuoteSkip::quote_error(format!(
                     "quote not implemented for {:?}",
                     pool_state.variant
@@ -1995,7 +2008,10 @@ fn apply_quote_haircut(amount: U256, haircut_bps: u64) -> anyhow::Result<U256> {
 fn is_v3_style_variant(variant: PoolVariant) -> bool {
     matches!(
         variant,
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3
+        PoolVariant::AerodromeSlipstream
+            | PoolVariant::UniswapV3
+            | PoolVariant::PancakeV3
+            | PoolVariant::UniswapV4
     )
 }
 
@@ -2283,7 +2299,7 @@ fn is_supported_pool(state: &PoolState) -> bool {
                 _ => false,
             }
         }
-        PoolVariant::AerodromeSlipstream => {
+        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV4 => {
             match (
                 state.sqrt_price_x96,
                 state.liquidity,
@@ -2296,7 +2312,7 @@ fn is_supported_pool(state: &PoolState) -> bool {
                 _ => false,
             }
         }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
+        PoolVariant::BalancerV3 => false,
     }
 }
 

@@ -45,6 +45,21 @@
   - Generate 2/3/4-hop cycles from active pools around anchors.
 - [ ] Rank graph edges by recent swap frequency, liquidity/state freshness, and quote reliability before path generation.
 
+## Current: Competitor Protocol Coverage
+
+- [x] Observe Uniswap V4 PoolManager and Balancer V3 Vault logs into `protocol_pool_observations`.
+- [x] Hydrate Uniswap V4 observations with matching `Initialize` metadata so PoolId rows can be classified.
+- [ ] Promote quoteable Uniswap V4 pools into the hot path:
+  - Static fee only; dynamic-fee flag pools stay observation-only until dynamic fee reads are modeled.
+  - Zero-hook only; nonzero hook pools stay observation-only until hook semantics are proven safe.
+  - Require token0/token1/fee/tickSpacing/sqrtPrice/liquidity/tick before publishing state.
+- [ ] Add Uniswap V4 PoolId-keyed tick liquidity storage and exact cross-tick quote support.
+- [ ] Add Balancer V3 pool-type classification:
+  - Identify pool type and math family from Vault/pool metadata.
+  - Store pool-specific balances, scaling factors, fees, and rate-provider data.
+  - Quote only pool types with fully implemented local math.
+- [ ] Extend competitor reports to separate `unsupported_protocol`, `missing_state`, `hooked_v4`, and `dynamic_fee_v4` gaps.
+
 ## Immediate
 
 - Replace demo `market-data` bootstrap with real Base RPC/WS initialization.

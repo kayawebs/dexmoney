@@ -33,6 +33,9 @@ const V4_METADATA_HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
 const V4_METADATA_HYDRATE_LIMIT: i64 = 1_000;
 const V4_METADATA_HYDRATE_CHUNK_BLOCKS: u64 = 5_000;
 const V4_METADATA_HYDRATE_LOOKBACK_BLOCKS: u64 = 2_000_000;
+const V4_PROMOTE_LIMIT: i64 = 1_000;
+const V4_DYNAMIC_FEE_FLAG: u32 = 0x800000;
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
@@ -396,6 +399,20 @@ where
                         logs_seen = stats.logs_seen,
                         hydrate_ms = hydrate_started.elapsed().as_millis() as u64,
                         "Uniswap V4 metadata hydrate processed observations"
+                    );
+                }
+                let promote_started = Instant::now();
+                let promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
+                if promote_stats.promoted > 0
+                    || promote_stats.published_states > 0
+                    || promote_stats.skipped > 0
+                {
+                    info!(
+                        promoted = promote_stats.promoted,
+                        published_states = promote_stats.published_states,
+                        skipped = promote_stats.skipped,
+                        promote_ms = promote_started.elapsed().as_millis() as u64,
+                        "Uniswap V4 quoteable pool promotion processed observations"
                     );
                 }
                 next_v4_metadata_hydrate = Instant::now() + V4_METADATA_HYDRATE_INTERVAL;
@@ -1057,6 +1074,238 @@ where
         }
         stats.not_found += pending.len();
         Ok(stats)
+    }
+
+    async fn promote_quoteable_uniswap_v4_pools(&self) -> Result<V4PromoteStats> {
+        let Some(pool_manager) = self.settings.uniswap_v4_pool_manager else {
+            return Ok(V4PromoteStats::default());
+        };
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pool_uid, pool_address, manager_address, token0, token1, symbol,
+                fee_bps, fee_pips, tick_spacing, sqrt_price_x96, liquidity, tick, latest_block
+            FROM protocol_pool_observations
+            WHERE chain_id = $1
+              AND protocol = 'uniswap-v4'
+              AND lower(manager_address) = lower($2)
+              AND pool_address IS NOT NULL
+              AND token0 IS NOT NULL
+              AND token1 IS NOT NULL
+              AND fee_pips IS NOT NULL
+              AND fee_pips <> $3
+              AND tick_spacing IS NOT NULL
+              AND lower(COALESCE(hooks_address, $4)) = lower($4)
+              AND sqrt_price_x96 IS NOT NULL
+              AND liquidity IS NOT NULL
+              AND tick IS NOT NULL
+              AND (
+                  updated_at >= NOW() - INTERVAL '2 minutes'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM pools p
+                      WHERE p.chain_id = protocol_pool_observations.chain_id
+                        AND lower(p.pool_address) = lower(protocol_pool_observations.pool_address)
+                  )
+              )
+            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
+            LIMIT $5
+            "#,
+        )
+        .bind(i64::try_from(self.settings.chain_id)?)
+        .bind(format!("{pool_manager:#x}"))
+        .bind(i64::from(V4_DYNAMIC_FEE_FLAG))
+        .bind(ZERO_ADDRESS)
+        .bind(V4_PROMOTE_LIMIT)
+        .fetch_all(&self.recorder.pool)
+        .await?;
+
+        let mut stats = V4PromoteStats::default();
+        let mut changed = Vec::new();
+        for row in rows {
+            let state = match self.uniswap_v4_state_from_row(&row).await {
+                Ok(state) => state,
+                Err(err) => {
+                    stats.skipped += 1;
+                    debug!(error = %err, "quoteable Uniswap V4 observation skipped during promotion");
+                    continue;
+                }
+            };
+            let symbol = if let Some(symbol) = row
+                .try_get::<Option<String>, _>("symbol")
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+            {
+                symbol
+            } else {
+                pair_symbol(&self.provider, state.token0, state.token1).await
+            };
+            self.recorder
+                .upsert_token_registry(
+                    self.settings.chain_id,
+                    state.token0,
+                    &token_symbol(&self.provider, state.token0).await,
+                )
+                .await?;
+            self.recorder
+                .upsert_token_registry(
+                    self.settings.chain_id,
+                    state.token1,
+                    &token_symbol(&self.provider, state.token1).await,
+                )
+                .await?;
+            let (token0, token1) = canonical_pair(state.token0, state.token1);
+            let pair_id = self
+                .recorder
+                .upsert_token_pair(self.settings.chain_id, token0, token1, &symbol)
+                .await?;
+            let discovered = base_arb_common::types::DiscoveredPool {
+                factory_address: state.factory_address,
+                tick_spacing: state.tick_spacing,
+                stable: None,
+                source: "uniswap_v4_protocol_observation".to_string(),
+                state: state.clone(),
+            };
+            self.recorder
+                .upsert_discovered_pool(pair_id, &discovered)
+                .await?;
+            sqlx::query(
+                r#"
+                UPDATE protocol_pool_observations
+                SET import_status = 'imported',
+                    import_reason = 'static zero-hook Uniswap V4 pool promoted for quote/search',
+                    updated_at = NOW()
+                WHERE chain_id = $1
+                  AND protocol = 'uniswap-v4'
+                  AND lower(pool_address) = lower($2)
+                "#,
+            )
+            .bind(i64::try_from(self.settings.chain_id)?)
+            .bind(format!("{:#x}", state.pool_id.address))
+            .execute(&self.recorder.pool)
+            .await?;
+
+            self.pool_store.set_pool_state(state.clone()).await?;
+            self.recorder
+                .record_pool_state_with_source(state.clone(), "uniswap_v4_protocol")
+                .await?;
+            changed.push(state.pool_id.address);
+            stats.promoted += 1;
+            stats.published_states += 1;
+        }
+        if !changed.is_empty() {
+            self.pool_store.mark_changed_pools(changed).await?;
+        }
+        Ok(stats)
+    }
+
+    async fn fetch_registry_pool_state(&self, entry: &PoolRegistryEntry) -> Result<PoolState> {
+        match (entry.dex, entry.variant) {
+            (DexKind::UniswapV4, PoolVariant::UniswapV4) => {
+                self.fetch_uniswap_v4_state_from_observation(entry).await
+            }
+            _ => self.provider.fetch_pool_state_from_registry(entry).await,
+        }
+    }
+
+    async fn fetch_uniswap_v4_state_from_observation(
+        &self,
+        entry: &PoolRegistryEntry,
+    ) -> Result<PoolState> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                pool_uid, pool_address, manager_address, token0, token1, symbol,
+                fee_bps, fee_pips, tick_spacing, sqrt_price_x96, liquidity, tick, latest_block
+            FROM protocol_pool_observations
+            WHERE chain_id = $1
+              AND protocol = 'uniswap-v4'
+              AND lower(pool_address) = lower($2)
+              AND token0 IS NOT NULL
+              AND token1 IS NOT NULL
+              AND fee_pips IS NOT NULL
+              AND fee_pips <> $3
+              AND tick_spacing IS NOT NULL
+              AND lower(COALESCE(hooks_address, $4)) = lower($4)
+              AND sqrt_price_x96 IS NOT NULL
+              AND liquidity IS NOT NULL
+              AND tick IS NOT NULL
+            ORDER BY latest_block DESC, updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(i64::try_from(self.settings.chain_id)?)
+        .bind(format!("{:#x}", entry.pool_address))
+        .bind(i64::from(V4_DYNAMIC_FEE_FLAG))
+        .bind(ZERO_ADDRESS)
+        .fetch_one(&self.recorder.pool)
+        .await?;
+        self.uniswap_v4_state_from_row(&row).await
+    }
+
+    async fn uniswap_v4_state_from_row(&self, row: &sqlx::postgres::PgRow) -> Result<PoolState> {
+        let pool_address = row
+            .try_get::<String, _>("pool_address")?
+            .parse::<Address>()?;
+        let manager_address = row
+            .try_get::<String, _>("manager_address")?
+            .parse::<Address>()?;
+        let token0 = row.try_get::<String, _>("token0")?.parse::<Address>()?;
+        let token1 = row.try_get::<String, _>("token1")?.parse::<Address>()?;
+        let fee_pips = row
+            .try_get::<Option<i64>, _>("fee_pips")?
+            .and_then(|value| u32::try_from(value).ok())
+            .context("Uniswap V4 observation missing valid fee_pips")?;
+        let fee_bps = row
+            .try_get::<Option<i64>, _>("fee_bps")?
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(fee_pips / 100);
+        let tick_spacing = row
+            .try_get::<Option<i64>, _>("tick_spacing")?
+            .and_then(|value| i32::try_from(value).ok())
+            .context("Uniswap V4 observation missing valid tick_spacing")?;
+        let sqrt_price_x96 = parse_decimal_u256(
+            row.try_get::<String, _>("sqrt_price_x96")?.as_str(),
+            "sqrt_price_x96",
+        )?;
+        let liquidity =
+            parse_decimal_u256(row.try_get::<String, _>("liquidity")?.as_str(), "liquidity")?;
+        let tick = row
+            .try_get::<Option<i64>, _>("tick")?
+            .and_then(|value| i32::try_from(value).ok())
+            .context("Uniswap V4 observation missing valid tick")?;
+        let block_number = row
+            .try_get::<Option<i64>, _>("latest_block")?
+            .and_then(|value| u64::try_from(value).ok())
+            .context("Uniswap V4 observation missing latest_block")?;
+
+        Ok(PoolState {
+            pool_id: PoolId {
+                chain_id: self.settings.chain_id,
+                address: pool_address,
+            },
+            dex: DexKind::UniswapV4,
+            variant: PoolVariant::UniswapV4,
+            factory_address: Some(manager_address),
+            token0,
+            token1,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps,
+            fee_pips: Some(fee_pips),
+            stable: None,
+            reserve0: None,
+            reserve1: None,
+            sqrt_price_x96: Some(sqrt_price_x96),
+            liquidity: Some(liquidity),
+            tick: Some(tick),
+            tick_spacing: Some(tick_spacing),
+            block_number,
+            valid_through_block: block_number,
+            updated_at: chrono::Utc::now(),
+        })
     }
 
     async fn fetch_uniswap_v4_initialize_logs(
@@ -1846,7 +2095,18 @@ where
                 );
                 continue;
             }
-            out.push(self.provider.fetch_pool_state_from_registry(entry).await?);
+            match self.fetch_registry_pool_state(entry).await {
+                Ok(state) => out.push(state),
+                Err(err) => {
+                    warn!(
+                        pool = %entry.pool_address,
+                        dex = ?entry.dex,
+                        variant = ?entry.variant,
+                        error = %err,
+                        "failed to load enabled registry pool; skipping"
+                    );
+                }
+            }
         }
         Ok(out)
     }
@@ -1889,7 +2149,7 @@ where
         let mut added_states = Vec::with_capacity(added_entries.len());
         let mut failed = 0usize;
         for entry in added_entries {
-            match self.provider.fetch_pool_state_from_registry(entry).await {
+            match self.fetch_registry_pool_state(entry).await {
                 Ok(state) => {
                     added_states.push(state.clone());
                     next.push(state);
@@ -3315,6 +3575,11 @@ fn parse_word_u256_local(word: &str) -> Option<U256> {
     U256::from_str_radix(word.trim_start_matches("0x"), 16).ok()
 }
 
+fn parse_decimal_u256(value: &str, field: &str) -> Result<U256> {
+    U256::from_str_radix(value.trim(), 10)
+        .with_context(|| format!("invalid decimal U256 in {field}: {value}"))
+}
+
 fn parse_word_i24_local(word: &str) -> Option<i32> {
     let clean = word.trim_start_matches("0x");
     let tail = clean.get(clean.len().saturating_sub(6)..)?;
@@ -3556,6 +3821,13 @@ struct V4HydrateStats {
     failed: usize,
     chunks: usize,
     logs_seen: usize,
+}
+
+#[derive(Debug, Default)]
+struct V4PromoteStats {
+    promoted: usize,
+    published_states: usize,
+    skipped: usize,
 }
 
 fn enqueue_validation_snapshots(

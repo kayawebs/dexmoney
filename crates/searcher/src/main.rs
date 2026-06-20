@@ -505,12 +505,12 @@ fn is_pool_state_active(state: &PoolState, now: DateTime<Utc>, max_pool_state_ag
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
-        PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+        PoolVariant::UniswapV3 | PoolVariant::PancakeV3 | PoolVariant::UniswapV4 => {
             state.sqrt_price_x96.is_some()
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
+        PoolVariant::BalancerV3 => false,
     }
 }
 
