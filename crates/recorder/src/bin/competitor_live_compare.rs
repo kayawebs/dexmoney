@@ -402,7 +402,7 @@ async fn load_pool_coverage(
             COALESCE(tp.symbol, op.symbol, po.symbol) AS symbol,
             COALESCE(p.dex, po.dex) AS dex,
             COALESCE(p.variant, po.variant) AS variant,
-            COALESCE(p.fee_pips, op.fee_pips, po.fee_pips) AS fee_pips,
+            COALESCE(op.fee_pips, po.fee_pips, p.fee_bps * 100) AS fee_pips,
             COALESCE(p.tick_spacing, op.tick_spacing, po.tick_spacing) AS tick_spacing,
             po.hooks_address AS hooks_address,
             p.enabled AS pool_enabled,
