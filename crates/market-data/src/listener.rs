@@ -958,9 +958,19 @@ where
                     continue;
                 }
             };
+            let v4_tick_deltas = uniswap_v4_tick_deltas_from_observation(&observation)?;
+            let v4_pool_id = observation.pool_address.map(|address| PoolId {
+                chain_id: observation.chain_id,
+                address,
+            });
+            let v4_block_number = observation.block_number;
             self.recorder
                 .upsert_protocol_pool_observation(observation)
                 .await?;
+            if let Some(pool_id) = v4_pool_id.filter(|_| !v4_tick_deltas.is_empty()) {
+                self.apply_tick_deltas(&pool_id, &v4_tick_deltas, v4_block_number)
+                    .await?;
+            }
             observed += 1;
         }
 
@@ -3410,9 +3420,7 @@ async fn parse_uniswap_v4_protocol_observation(
         fee_bps = fee_pips.map(|fee| fee / 100);
         "Swap"
     } else if topic0 == UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC {
-        tick = data_words
-            .get(1)
-            .and_then(|word| parse_word_i24_local(word));
+        tick = None;
         "ModifyLiquidity"
     } else {
         anyhow::bail!("unsupported Uniswap V4 topic {topic0}");
@@ -3520,6 +3528,45 @@ async fn parse_balancer_v3_protocol_observation(
     })
 }
 
+fn uniswap_v4_tick_deltas_from_observation(
+    observation: &ProtocolPoolObservation,
+) -> Result<Vec<super::state_updater::TickDelta>> {
+    if observation.protocol != "uniswap-v4" || observation.event_type != "ModifyLiquidity" {
+        return Ok(Vec::new());
+    }
+    let data_words = raw_log_data_words(&observation.raw_json);
+    let tick_lower = data_words
+        .first()
+        .and_then(|word| parse_word_i24_local(word))
+        .context("Uniswap V4 ModifyLiquidity missing tickLower")?;
+    let tick_upper = data_words
+        .get(1)
+        .and_then(|word| parse_word_i24_local(word))
+        .context("Uniswap V4 ModifyLiquidity missing tickUpper")?;
+    let liquidity_delta = data_words
+        .get(2)
+        .map(|word| parse_word_i256_i128_local(word))
+        .transpose()?
+        .context("Uniswap V4 ModifyLiquidity missing liquidityDelta")?;
+    if liquidity_delta == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![
+        super::state_updater::TickDelta {
+            tick: tick_lower,
+            liquidity_gross_delta: liquidity_delta,
+            liquidity_net_delta: liquidity_delta,
+        },
+        super::state_updater::TickDelta {
+            tick: tick_upper,
+            liquidity_gross_delta: liquidity_delta,
+            liquidity_net_delta: liquidity_delta
+                .checked_neg()
+                .ok_or_else(|| anyhow::anyhow!("Uniswap V4 liquidityDelta underflow"))?,
+        },
+    ])
+}
+
 fn raw_log_topic0(raw: &Value) -> Option<String> {
     raw.get("topics")
         .and_then(Value::as_array)
@@ -3573,6 +3620,39 @@ fn data_words(data: &str) -> Vec<String> {
 
 fn parse_word_u256_local(word: &str) -> Option<U256> {
     U256::from_str_radix(word.trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_word_i256_i128_local(word: &str) -> Result<i128> {
+    let clean = word.trim_start_matches("0x");
+    if clean.len() != 64 {
+        anyhow::bail!("int256 ABI word must be 32 bytes");
+    }
+    let unsigned = U256::from_str_radix(clean, 16)?;
+    let negative = clean
+        .as_bytes()
+        .first()
+        .and_then(|byte| char::from(*byte).to_digit(16))
+        .map(|nibble| nibble >= 8)
+        .unwrap_or(false);
+    if !negative {
+        let value =
+            u128::try_from(unsigned).map_err(|_| anyhow::anyhow!("int256 does not fit i128"))?;
+        if value > i128::MAX as u128 {
+            anyhow::bail!("positive int256 does not fit i128");
+        }
+        return Ok(value as i128);
+    }
+
+    let magnitude = U256::MAX
+        .checked_sub(unsigned)
+        .and_then(|value| value.checked_add(U256::from(1u64)))
+        .ok_or_else(|| anyhow::anyhow!("negative int256 magnitude overflow"))?;
+    let value =
+        u128::try_from(magnitude).map_err(|_| anyhow::anyhow!("int256 does not fit i128"))?;
+    if value > i128::MAX as u128 {
+        anyhow::bail!("negative int256 does not fit i128");
+    }
+    Ok(-(value as i128))
 }
 
 fn parse_decimal_u256(value: &str, field: &str) -> Result<U256> {
@@ -3915,9 +3995,14 @@ impl RecentTxCache {
 mod tests {
     use alloy_primitives::{Address, U256};
     use chrono::Utc;
+    use serde_json::json;
 
-    use super::{advance_valid_through_block, apply_aerodrome_fee, state_drift_bps, AerodromeFee};
+    use super::{
+        advance_valid_through_block, apply_aerodrome_fee, parse_word_i256_i128_local,
+        state_drift_bps, uniswap_v4_tick_deltas_from_observation, AerodromeFee,
+    };
     use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
+    use base_arb_storage::postgres::ProtocolPoolObservation;
 
     fn pool_state(variant: PoolVariant) -> PoolState {
         PoolState {
@@ -3996,5 +4081,61 @@ mod tests {
         assert!(changed.contains(&Address::ZERO));
         assert_eq!(states[0].block_number, 1);
         assert_eq!(states[0].valid_through_block, 9);
+    }
+
+    #[test]
+    fn parses_signed_v4_liquidity_delta() {
+        let positive = format!("{:064x}", U256::from(1000u64));
+        let negative = format!("{:064x}", U256::MAX - U256::from(999u64));
+
+        assert_eq!(parse_word_i256_i128_local(&positive).unwrap(), 1000);
+        assert_eq!(parse_word_i256_i128_local(&negative).unwrap(), -1000);
+    }
+
+    #[test]
+    fn decodes_v4_modify_liquidity_into_tick_deltas() {
+        let tick_lower = format!("{:064x}", U256::MAX - U256::from(59u64));
+        let tick_upper = format!("{:064x}", U256::from(60u64));
+        let liquidity_delta = format!("{:064x}", U256::from(1000u64));
+        let raw_json = json!({
+            "data": format!("0x{tick_lower}{tick_upper}{liquidity_delta}{:064x}", U256::ZERO)
+        });
+        let observation = ProtocolPoolObservation {
+            chain_id: 8453,
+            protocol: "uniswap-v4".to_string(),
+            manager_address: Address::ZERO,
+            pool_uid: "0x00".to_string(),
+            pool_address: Some(Address::ZERO),
+            topic0: super::UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC.to_string(),
+            event_type: "ModifyLiquidity".to_string(),
+            token0: None,
+            token1: None,
+            symbol: None,
+            factory_address: None,
+            dex: None,
+            variant: None,
+            fee_bps: None,
+            fee_pips: None,
+            tick_spacing: None,
+            hooks_address: None,
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            block_number: 1,
+            discovery_source: "test".to_string(),
+            import_status: "observed_only".to_string(),
+            import_reason: None,
+            raw_json,
+        };
+
+        let deltas = uniswap_v4_tick_deltas_from_observation(&observation).unwrap();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].tick, -60);
+        assert_eq!(deltas[0].liquidity_gross_delta, 1000);
+        assert_eq!(deltas[0].liquidity_net_delta, 1000);
+        assert_eq!(deltas[1].tick, 60);
+        assert_eq!(deltas[1].liquidity_gross_delta, 1000);
+        assert_eq!(deltas[1].liquidity_net_delta, -1000);
     }
 }

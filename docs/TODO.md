@@ -54,6 +54,8 @@
   - Zero-hook only; nonzero hook pools stay observation-only until hook semantics are proven safe.
   - Require token0/token1/fee/tickSpacing/sqrtPrice/liquidity/tick before publishing state.
 - [ ] Add Uniswap V4 PoolId-keyed tick liquidity storage and exact cross-tick quote support.
+  - Backfill initialized ticks from historical `ModifyLiquidity` before trusting exact V4 quotes.
+  - Continue applying live `ModifyLiquidity` deltas from PoolManager logs after backfill.
 - [ ] Add Balancer V3 pool-type classification:
   - Identify pool type and math family from Vault/pool metadata.
   - Store pool-specific balances, scaling factors, fees, and rate-provider data.

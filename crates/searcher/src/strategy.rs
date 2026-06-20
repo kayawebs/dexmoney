@@ -1846,7 +1846,10 @@ async fn quote_path(
                         .map_err(|err| QuoteSkip::quote_error(err.to_string()))?
                 }
             }
-            PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+            PoolVariant::AerodromeSlipstream
+            | PoolVariant::UniswapV3
+            | PoolVariant::PancakeV3
+            | PoolVariant::UniswapV4 => {
                 let pool_ticks = context
                     .pool_ticks(pool_state.pool_id.address)
                     .unwrap_or_default();
@@ -1876,17 +1879,6 @@ async fn quote_path(
                     diagnostics.crossed_ticks += v3_diagnostics.crossed_ticks;
                     diagnostics.tick_range_exhausted |= v3_diagnostics.tick_range_exhausted;
                     quote
-                }
-            }
-            PoolVariant::UniswapV4 => {
-                let amount_out = spot_quote_exact_in(pool_state, step.token_in, amount)
-                    .map_err(|err| QuoteSkip::quote_error(err.to_string()))?;
-                mode = "v4_spot".into();
-                diagnostics.modes.push(mode.clone());
-                QuoteResult {
-                    amount_in: amount,
-                    amount_out,
-                    gas_estimate: None,
                 }
             }
             PoolVariant::BalancerV3 => {
