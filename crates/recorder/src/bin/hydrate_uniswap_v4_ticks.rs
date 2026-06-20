@@ -25,9 +25,11 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 struct Cli {
     from_block: Option<u64>,
     to_block: Option<u64>,
+    max_lookback_blocks: Option<u64>,
     limit: i64,
     chunk_blocks: u64,
     apply: bool,
+    refresh_existing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +53,8 @@ struct Summary {
     nonzero_tick_pools: usize,
     zero_tick_pools: usize,
     marked_changed_pools: usize,
+    skipped_existing_pools: usize,
+    skipped_lookback_pools: usize,
     chunks: usize,
     logs_seen: usize,
     ticks_written: usize,
@@ -87,9 +91,11 @@ async fn main() -> Result<()> {
         &redis,
         pools,
         cli.from_block,
+        cli.max_lookback_blocks,
         to_block,
         cli.chunk_blocks,
         cli.apply,
+        cli.refresh_existing,
     )
     .await?;
 
@@ -104,8 +110,12 @@ async fn main() -> Result<()> {
         summary.failed
     );
     println!(
-        "nonzero_tick_pools={} zero_tick_pools={} marked_changed_pools={}",
-        summary.nonzero_tick_pools, summary.zero_tick_pools, summary.marked_changed_pools
+        "nonzero_tick_pools={} zero_tick_pools={} marked_changed_pools={} skipped_existing_pools={} skipped_lookback_pools={}",
+        summary.nonzero_tick_pools,
+        summary.zero_tick_pools,
+        summary.marked_changed_pools,
+        summary.skipped_existing_pools,
+        summary.skipped_lookback_pools
     );
     Ok(())
 }
@@ -163,16 +173,48 @@ async fn hydrate_ticks(
     redis: &RedisStore,
     pools: Vec<V4Pool>,
     from_block_override: Option<u64>,
+    max_lookback_blocks: Option<u64>,
     to_block: u64,
     chunk_blocks: u64,
     apply: bool,
+    refresh_existing: bool,
 ) -> Result<Summary> {
     let mut summary = Summary {
         pools: pools.len(),
         ..Summary::default()
     };
     for pool in pools {
-        let from_block = from_block_override.unwrap_or(pool.first_block);
+        if !refresh_existing && from_block_override.is_none() {
+            let existing_ticks = redis.get_pool_ticks(pool.pool_address).await?;
+            if !existing_ticks.is_empty() {
+                println!(
+                    "skip existing pool={} uid={} ticks={}",
+                    pool.pool_address,
+                    pool.pool_uid,
+                    existing_ticks.len()
+                );
+                summary.skipped_existing_pools += 1;
+                continue;
+            }
+        }
+        let mut from_block = from_block_override.unwrap_or(pool.first_block);
+        if let Some(max_lookback_blocks) = max_lookback_blocks {
+            let min_from_block = to_block.saturating_sub(max_lookback_blocks);
+            if from_block < min_from_block {
+                println!(
+                    "skip lookback pool={} uid={} from={} min_from={} to={} max_lookback_blocks={}",
+                    pool.pool_address,
+                    pool.pool_uid,
+                    from_block,
+                    min_from_block,
+                    to_block,
+                    max_lookback_blocks
+                );
+                summary.skipped_lookback_pools += 1;
+                continue;
+            }
+            from_block = from_block.max(min_from_block);
+        }
         let mut cursor = from_block;
         let mut ticks: BTreeMap<i32, TickAccumulator> = BTreeMap::new();
         while cursor <= to_block {
@@ -342,18 +384,24 @@ where
     let mut cli = Cli {
         from_block: None,
         to_block: None,
+        max_lookback_blocks: None,
         limit: 200,
         chunk_blocks: 10_000,
         apply: false,
+        refresh_existing: false,
     };
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--from-block" => cli.from_block = Some(parse_next(&mut args, "--from-block")?),
             "--to-block" => cli.to_block = Some(parse_next(&mut args, "--to-block")?),
+            "--max-lookback-blocks" => {
+                cli.max_lookback_blocks = Some(parse_next(&mut args, "--max-lookback-blocks")?)
+            }
             "--limit" => cli.limit = parse_next(&mut args, "--limit")?,
             "--chunk-blocks" => cli.chunk_blocks = parse_next(&mut args, "--chunk-blocks")?,
             "--apply" => cli.apply = true,
+            "--refresh-existing" => cli.refresh_existing = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -381,7 +429,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--limit 200] [--chunk-blocks 10000] [--apply]"
+        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--refresh-existing] [--apply]"
     );
 }
 
