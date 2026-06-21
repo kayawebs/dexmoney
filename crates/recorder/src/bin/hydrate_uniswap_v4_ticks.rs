@@ -56,6 +56,8 @@ struct Summary {
     skipped_existing_pools: usize,
     skipped_lookback_pools: usize,
     ignored_logs: usize,
+    invalid_logs: usize,
+    negative_gross_ticks: usize,
     chunks: usize,
     logs_seen: usize,
     ticks_written: usize,
@@ -134,6 +136,10 @@ async fn main() -> Result<()> {
         summary.skipped_existing_pools,
         summary.skipped_lookback_pools,
         summary.ignored_logs
+    );
+    println!(
+        "invalid_logs={} negative_gross_ticks={}",
+        summary.invalid_logs, summary.negative_gross_ticks
     );
     Ok(())
 }
@@ -254,10 +260,19 @@ async fn hydrate_ticks(
             summary.logs_seen += chunk_logs;
             let before_ticks = ticks.len();
             for raw in logs {
-                let Some(delta) = parse_modify_liquidity_delta(&raw)? else {
-                    continue;
+                let delta = match parse_modify_liquidity_delta(&raw) {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        summary.invalid_logs += 1;
+                        println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
+                        continue;
+                    }
                 };
-                apply_delta(&mut ticks, delta)?;
+                if let Err(err) = apply_delta(&mut ticks, delta) {
+                    summary.invalid_logs += 1;
+                    println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
+                }
             }
             print_progress(
                 "pool_scan",
@@ -288,6 +303,10 @@ async fn hydrate_ticks(
             .into_iter()
             .filter(|(_, acc)| acc.liquidity_gross > 0 || acc.liquidity_net != 0)
             .map(|(tick, acc)| {
+                let liquidity_gross = nonnegative_liquidity_gross(acc.liquidity_gross);
+                if liquidity_gross.is_zero() && acc.liquidity_gross < 0 {
+                    summary.negative_gross_ticks += 1;
+                }
                 Ok(TickState {
                     pool_id: PoolId {
                         chain_id: settings.chain_id,
@@ -295,7 +314,7 @@ async fn hydrate_ticks(
                     },
                     tick,
                     liquidity_net: acc.liquidity_net,
-                    liquidity_gross: U256::from(u128::try_from(acc.liquidity_gross)?),
+                    liquidity_gross,
                     block_number: to_block,
                     updated_at: chrono::Utc::now(),
                 })
@@ -439,10 +458,19 @@ async fn hydrate_ticks_by_manager_scan(
                     summary.ignored_logs += 1;
                     continue;
                 };
-                let Some(delta) = parse_modify_liquidity_delta(&raw)? else {
-                    continue;
+                let delta = match parse_modify_liquidity_delta(&raw) {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        summary.invalid_logs += 1;
+                        println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
+                        continue;
+                    }
                 };
-                apply_delta(ticks, delta)?;
+                if let Err(err) = apply_delta(ticks, delta) {
+                    summary.invalid_logs += 1;
+                    println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
+                }
             }
             let chunk_ignored = summary.ignored_logs.saturating_sub(ignored_before);
             print_progress(
@@ -478,6 +506,10 @@ async fn hydrate_ticks_by_manager_scan(
             .into_iter()
             .filter(|(_, acc)| acc.liquidity_gross > 0 || acc.liquidity_net != 0)
             .map(|(tick, acc)| {
+                let liquidity_gross = nonnegative_liquidity_gross(acc.liquidity_gross);
+                if liquidity_gross.is_zero() && acc.liquidity_gross < 0 {
+                    summary.negative_gross_ticks += 1;
+                }
                 Ok(TickState {
                     pool_id: PoolId {
                         chain_id: settings.chain_id,
@@ -485,7 +517,7 @@ async fn hydrate_ticks_by_manager_scan(
                     },
                     tick,
                     liquidity_net: acc.liquidity_net,
-                    liquidity_gross: U256::from(u128::try_from(acc.liquidity_gross)?),
+                    liquidity_gross,
                     block_number: to_block,
                     updated_at: chrono::Utc::now(),
                 })
@@ -636,6 +668,14 @@ fn apply_delta(
         .checked_sub(liquidity_delta)
         .context("liquidity_net overflow")?;
     Ok(())
+}
+
+fn nonnegative_liquidity_gross(value: i128) -> U256 {
+    if value <= 0 {
+        U256::ZERO
+    } else {
+        U256::from(value as u128)
+    }
 }
 
 fn parse_args<I>(mut args: I) -> Result<Cli>
