@@ -12,6 +12,7 @@ use base_arb_common::config::Settings;
 use base_arb_storage::postgres::{ensure_registry_schema, PostgresStore, ProtocolPoolObservation};
 use serde_json::{json, Value};
 use sqlx::Row;
+use tokio::time::{sleep, Duration};
 use tracing_subscriber::EnvFilter;
 
 const UNISWAP_V4_INITIALIZE_TOPIC: &str =
@@ -25,6 +26,10 @@ struct Cli {
     limit: i64,
     chunk_blocks: u64,
     manager_scan: bool,
+    loop_mode: bool,
+    interval_ms: u64,
+    max_observation_age_blocks: Option<u64>,
+    mark_not_found: bool,
     apply: bool,
 }
 
@@ -45,6 +50,47 @@ async fn main() -> Result<()> {
     let store = PostgresStore::connect(&settings.postgres_url).await?;
     ensure_registry_schema(&store.pool).await?;
     let provider = ChainProvider::from_settings(&settings);
+
+    if cli.loop_mode {
+        run_loop(settings, store, provider, cli).await?;
+        return Ok(());
+    }
+
+    run_once(&settings, &store, &provider, &cli).await?;
+    Ok(())
+}
+
+async fn run_loop(
+    settings: Settings,
+    store: PostgresStore,
+    provider: ChainProvider,
+    cli: Cli,
+) -> Result<()> {
+    if cli.manager_scan {
+        anyhow::bail!("--loop is only supported for pending hydration, not --manager-scan");
+    }
+    if !cli.apply {
+        anyhow::bail!("--loop requires --apply");
+    }
+    println!(
+        "== Uniswap V4 Observation Hydrator Loop == interval_ms={} limit={} lookback_blocks={} max_observation_age_blocks={:?} chunk_blocks={}",
+        cli.interval_ms, cli.limit, cli.lookback_blocks, cli.max_observation_age_blocks, cli.chunk_blocks
+    );
+
+    loop {
+        if let Err(err) = run_once(&settings, &store, &provider, &cli).await {
+            println!("loop iteration failed: {err:#}");
+        }
+        sleep(Duration::from_millis(cli.interval_ms.max(100))).await;
+    }
+}
+
+async fn run_once(
+    settings: &Settings,
+    store: &PostgresStore,
+    provider: &ChainProvider,
+    cli: &Cli,
+) -> Result<()> {
     let latest_block = provider.get_block_number().await?;
     let to_block = cli.to_block.unwrap_or(latest_block);
     let from_block = cli
@@ -54,7 +100,10 @@ async fn main() -> Result<()> {
     let missing = if cli.manager_scan {
         Vec::new()
     } else {
-        fetch_missing_observations(&store, settings.chain_id, cli.limit).await?
+        let min_first_block = cli
+            .max_observation_age_blocks
+            .map(|age| latest_block.saturating_sub(age));
+        fetch_missing_observations(store, settings.chain_id, cli.limit, min_first_block).await?
     };
     println!("== Uniswap V4 Observation Hydration ==");
     println!(
@@ -98,6 +147,7 @@ async fn main() -> Result<()> {
             to_block,
             cli.chunk_blocks,
             cli.apply,
+            cli.mark_not_found,
         )
         .await?
     };
@@ -177,6 +227,7 @@ async fn fetch_missing_observations(
     store: &PostgresStore,
     chain_id: u64,
     limit: i64,
+    min_first_block: Option<u64>,
 ) -> Result<Vec<MissingObservation>> {
     let rows = sqlx::query(
         r#"
@@ -185,12 +236,15 @@ async fn fetch_missing_observations(
         WHERE chain_id = $1
           AND protocol = 'uniswap-v4'
           AND (token0 IS NULL OR token1 IS NULL OR tick_spacing IS NULL OR hooks_address IS NULL)
+          AND import_status != 'metadata_not_found'
+          AND ($3::BIGINT IS NULL OR first_block >= $3)
         ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
         LIMIT $2
         "#,
     )
     .bind(i64::try_from(chain_id)?)
     .bind(limit)
+    .bind(min_first_block.map(i64::try_from).transpose()?)
     .fetch_all(&store.pool)
     .await?;
 
@@ -227,6 +281,7 @@ async fn hydrate_batch(
     to_block: u64,
     chunk_blocks: u64,
     apply: bool,
+    mark_not_found: bool,
 ) -> Result<HydrateSummary> {
     let mut groups: HashMap<Address, HashMap<String, MissingObservation>> = HashMap::new();
     let mut search_from = from_block;
@@ -321,8 +376,42 @@ async fn hydrate_batch(
             cursor = chunk_to + 1;
         }
         summary.not_found += pending.len();
+        if apply && mark_not_found && !pending.is_empty() {
+            mark_metadata_not_found(store, settings.chain_id, manager, pending.iter()).await?;
+        }
     }
     Ok(summary)
+}
+
+async fn mark_metadata_not_found<'a, I>(
+    store: &PostgresStore,
+    chain_id: u64,
+    manager: Address,
+    pool_uids: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    for pool_uid in pool_uids {
+        sqlx::query(
+            r#"
+            UPDATE protocol_pool_observations
+            SET import_status = 'metadata_not_found',
+                import_reason = 'Uniswap V4 Initialize not found by live metadata hydrator',
+                updated_at = NOW()
+            WHERE chain_id = $1
+              AND protocol = 'uniswap-v4'
+              AND lower(manager_address) = lower($2)
+              AND lower(pool_uid) = lower($3)
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(format!("{manager:#x}"))
+        .bind(pool_uid)
+        .execute(&store.pool)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn fetch_initialize_logs_split(
@@ -428,6 +517,10 @@ where
         limit: 500,
         chunk_blocks: 10_000,
         manager_scan: false,
+        loop_mode: false,
+        interval_ms: 30_000,
+        max_observation_age_blocks: None,
+        mark_not_found: false,
         apply: false,
     };
 
@@ -441,6 +534,16 @@ where
             "--limit" => cli.limit = parse_next(&mut args, "--limit")?,
             "--chunk-blocks" => cli.chunk_blocks = parse_next(&mut args, "--chunk-blocks")?,
             "--manager-scan" => cli.manager_scan = true,
+            "--loop" => {
+                cli.loop_mode = true;
+                cli.mark_not_found = true;
+            }
+            "--interval-ms" => cli.interval_ms = parse_next(&mut args, "--interval-ms")?,
+            "--max-observation-age-blocks" => {
+                cli.max_observation_age_blocks =
+                    Some(parse_next(&mut args, "--max-observation-age-blocks")?)
+            }
+            "--mark-not-found" => cli.mark_not_found = true,
             "--apply" => cli.apply = true,
             "--help" | "-h" => {
                 print_help();
@@ -469,7 +572,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_observations [--from-block N] [--to-block N] [--lookback-blocks 2000000] [--limit 500] [--chunk-blocks 10000] [--manager-scan] [--apply]"
+        "Usage: hydrate_uniswap_v4_observations [--from-block N] [--to-block N] [--lookback-blocks 2000000] [--limit 500] [--chunk-blocks 10000] [--manager-scan] [--loop] [--interval-ms 30000] [--max-observation-age-blocks N] [--mark-not-found] [--apply]"
     );
 }
 

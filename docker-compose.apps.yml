@@ -36,6 +36,30 @@ services:
         APP_PACKAGE: market-data
         APP_BIN: pool-discovery
 
+  v4-metadata-hydrator:
+    <<: *app-common
+    container_name: dexmoney-v4-metadata-hydrator
+    image: dexmoney-v4-metadata-hydrator:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_PACKAGE: base-arb-recorder
+        APP_BIN: hydrate_uniswap_v4_observations
+    command:
+      - app
+      - --loop
+      - --apply
+      - --limit
+      - "${V4_METADATA_HYDRATOR_LIMIT:-100}"
+      - --lookback-blocks
+      - "${V4_METADATA_HYDRATOR_LOOKBACK_BLOCKS:-500000}"
+      - --max-observation-age-blocks
+      - "${V4_METADATA_HYDRATOR_MAX_OBSERVATION_AGE_BLOCKS:-5000}"
+      - --chunk-blocks
+      - "${V4_METADATA_HYDRATOR_CHUNK_BLOCKS:-1000}"
+      - --interval-ms
+      - "${V4_METADATA_HYDRATOR_INTERVAL_MS:-30000}"
+
   searcher:
     <<: *app-common
     container_name: dexmoney-searcher
