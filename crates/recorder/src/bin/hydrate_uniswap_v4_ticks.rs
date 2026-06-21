@@ -149,7 +149,8 @@ async fn fetch_quoteable_v4_pools(
     chain_id: u64,
     limit: i64,
 ) -> Result<Vec<V4Pool>> {
-    let rows = sqlx::query(
+    let limit_clause = if limit > 0 { "LIMIT $3" } else { "" };
+    let query = format!(
         r#"
         SELECT manager_address, pool_uid, pool_address, first_block
         FROM protocol_pool_observations
@@ -162,14 +163,19 @@ async fn fetch_quoteable_v4_pools(
           AND tick_spacing IS NOT NULL
           AND lower(COALESCE(hooks_address, $2)) = lower($2)
         ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
-        LIMIT $3
-        "#,
+        {limit_clause}
+        "#
+    );
+    let rows = sqlx::query(
+        &query,
     )
     .bind(i64::try_from(chain_id)?)
-    .bind(ZERO_ADDRESS)
-    .bind(limit)
-    .fetch_all(&store.pool)
-    .await?;
+    .bind(ZERO_ADDRESS);
+    let rows = if limit > 0 {
+        rows.bind(limit).fetch_all(&store.pool).await?
+    } else {
+        rows.fetch_all(&store.pool).await?
+    };
 
     rows.into_iter()
         .map(|row| {
@@ -732,7 +738,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--refresh-existing] [--apply]"
+        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--refresh-existing] [--apply]\n\nUse --limit 0 to select all quoteable V4 pools."
     );
 }
 
