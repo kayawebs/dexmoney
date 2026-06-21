@@ -29,10 +29,7 @@ const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
-const V4_METADATA_HYDRATE_INTERVAL: Duration = Duration::from_secs(30);
-const V4_METADATA_HYDRATE_LIMIT: i64 = 1_000;
-const V4_METADATA_HYDRATE_CHUNK_BLOCKS: u64 = 5_000;
-const V4_METADATA_HYDRATE_LOOKBACK_BLOCKS: u64 = 2_000_000;
+const V4_PROMOTE_INTERVAL: Duration = Duration::from_secs(30);
 const V4_PROMOTE_LIMIT: i64 = 1_000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
@@ -363,7 +360,7 @@ where
 
         let mut last_scanned_block = self.provider.get_block_number().await?;
         let mut globally_observed_pools = HashSet::new();
-        let mut next_v4_metadata_hydrate = Instant::now();
+        let mut next_v4_promotion = Instant::now();
         info!(last_scanned_block, "pool discovery synchronized at startup");
 
         let mut ticker = interval(POOL_DISCOVERY_INTERVAL);
@@ -386,20 +383,7 @@ where
                 .await?;
             self.discover_protocol_pool_logs(from_block, to_block)
                 .await?;
-            if Instant::now() >= next_v4_metadata_hydrate {
-                let hydrate_started = Instant::now();
-                let stats = self.hydrate_missing_uniswap_v4_metadata(to_block).await?;
-                if stats.hydrated > 0 || stats.not_found > 0 || stats.failed > 0 {
-                    info!(
-                        hydrated = stats.hydrated,
-                        not_found = stats.not_found,
-                        failed = stats.failed,
-                        chunks = stats.chunks,
-                        logs_seen = stats.logs_seen,
-                        hydrate_ms = hydrate_started.elapsed().as_millis() as u64,
-                        "Uniswap V4 metadata hydrate processed observations"
-                    );
-                }
+            if Instant::now() >= next_v4_promotion {
                 let promote_started = Instant::now();
                 let promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
                 if promote_stats.promoted > 0
@@ -414,7 +398,7 @@ where
                         "Uniswap V4 quoteable pool promotion processed observations"
                     );
                 }
-                next_v4_metadata_hydrate = Instant::now() + V4_METADATA_HYDRATE_INTERVAL;
+                next_v4_promotion = Instant::now() + V4_PROMOTE_INTERVAL;
             }
             info!(
                 from_block,
@@ -982,109 +966,6 @@ where
         Ok(())
     }
 
-    async fn hydrate_missing_uniswap_v4_metadata(&self, to_block: u64) -> Result<V4HydrateStats> {
-        let Some(pool_manager) = self.settings.uniswap_v4_pool_manager else {
-            return Ok(V4HydrateStats::default());
-        };
-
-        let missing_rows = sqlx::query(
-            r#"
-            SELECT manager_address, pool_uid, first_block
-            FROM protocol_pool_observations
-            WHERE chain_id = $1
-              AND protocol = 'uniswap-v4'
-              AND manager_address = $2
-              AND (token0 IS NULL OR token1 IS NULL OR tick_spacing IS NULL OR hooks_address IS NULL)
-            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(i64::try_from(self.settings.chain_id)?)
-        .bind(format!("{pool_manager:#x}"))
-        .bind(V4_METADATA_HYDRATE_LIMIT)
-        .fetch_all(&self.recorder.pool)
-        .await?;
-
-        let mut stats = V4HydrateStats::default();
-        if missing_rows.is_empty() {
-            return Ok(stats);
-        }
-
-        let mut pending = HashSet::with_capacity(missing_rows.len());
-        let mut from_block = to_block;
-        for row in missing_rows {
-            let pool_uid = row
-                .try_get::<String, _>("pool_uid")
-                .context("protocol_pool_observations.pool_uid decode failed")?;
-            let normalized = normalize_topic(&pool_uid)?;
-            pending.insert(normalized);
-            let first_block = row.try_get::<i64, _>("first_block").unwrap_or(0);
-            let first_block = u64::try_from(first_block).unwrap_or(0);
-            from_block =
-                from_block.min(first_block.saturating_sub(V4_METADATA_HYDRATE_LOOKBACK_BLOCKS));
-        }
-
-        let mut cursor = from_block;
-        while cursor <= to_block {
-            let chunk_to = to_block.min(
-                cursor
-                    .saturating_add(V4_METADATA_HYDRATE_CHUNK_BLOCKS)
-                    .saturating_sub(1),
-            );
-            stats.chunks += 1;
-            let logs = match self
-                .fetch_uniswap_v4_initialize_logs(pool_manager, cursor, chunk_to)
-                .await
-            {
-                Ok(logs) => logs,
-                Err(err) => {
-                    stats.failed += pending.len();
-                    debug!(
-                        from_block = cursor,
-                        to_block = chunk_to,
-                        pending = pending.len(),
-                        error = %err,
-                        "Uniswap V4 batch metadata hydrate getLogs failed"
-                    );
-                    return Ok(stats);
-                }
-            };
-            stats.logs_seen += logs.len();
-            for raw in logs {
-                let Some(pool_uid) = raw_log_topics(&raw).get(1).cloned() else {
-                    continue;
-                };
-                if !pending.contains(&pool_uid) {
-                    continue;
-                }
-                let Some(observation) = parse_protocol_pool_observation(
-                    &self.settings,
-                    &self.provider,
-                    raw,
-                    "v4_initialize_hydrate",
-                )
-                .await?
-                else {
-                    continue;
-                };
-                self.recorder
-                    .upsert_protocol_pool_observation(observation)
-                    .await?;
-                pending.remove(&pool_uid);
-                stats.hydrated += 1;
-            }
-            if pending.is_empty() {
-                break;
-            }
-            if chunk_to == u64::MAX {
-                break;
-            }
-            cursor = chunk_to + 1;
-        }
-        stats.not_found += pending.len();
-        Ok(stats)
-    }
-
     async fn promote_quoteable_uniswap_v4_pools(&self) -> Result<V4PromoteStats> {
         let Some(pool_manager) = self.settings.uniswap_v4_pool_manager else {
             return Ok(V4PromoteStats::default());
@@ -1323,36 +1204,6 @@ where
             valid_through_block: block_number,
             updated_at: chrono::Utc::now(),
         })
-    }
-
-    async fn fetch_uniswap_v4_initialize_logs(
-        &self,
-        pool_manager: Address,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Vec<Value>> {
-        let mut ranges = vec![(from_block, to_block)];
-        let mut out = Vec::new();
-
-        while let Some((from, to)) = ranges.pop() {
-            let params = json!([{
-                "fromBlock": format!("0x{from:x}"),
-                "toBlock": format!("0x{to:x}"),
-                "address": format!("{pool_manager:#x}"),
-                "topics": [[UNISWAP_V4_INITIALIZE_TOPIC]]
-            }]);
-            match self.provider.get_logs_raw(params).await {
-                Ok(mut logs) => out.append(&mut logs),
-                Err(_) if from < to => {
-                    let mid = from + (to - from) / 2;
-                    ranges.push((mid + 1, to));
-                    ranges.push((from, mid));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(out)
     }
 
     async fn process_observed_swap_pool(
@@ -3892,26 +3743,9 @@ fn swap_family_for_topic(topic0: &str) -> &'static str {
     }
 }
 
-fn normalize_topic(raw: &str) -> Result<String> {
-    let hex = raw.trim_start_matches("0x").to_ascii_lowercase();
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        anyhow::bail!("invalid topic: {raw}");
-    }
-    Ok(format!("0x{hex}"))
-}
-
 #[derive(Debug, Clone)]
 struct PendingValidation {
     state: PoolState,
-}
-
-#[derive(Debug, Default)]
-struct V4HydrateStats {
-    hydrated: usize,
-    not_found: usize,
-    failed: usize,
-    chunks: usize,
-    logs_seen: usize,
 }
 
 #[derive(Debug, Default)]
