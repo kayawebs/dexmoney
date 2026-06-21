@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     str::FromStr,
+    time::Instant,
 };
 
 use alloy_primitives::{Address, U256};
@@ -119,6 +120,8 @@ async fn hydrate_manager_scan(
         .uniswap_v4_pool_manager
         .context("UNISWAP_V4_POOL_MANAGER is required for --manager-scan")?;
     let mut summary = HydrateSummary::default();
+    let started_at = Instant::now();
+    let total_blocks = block_span(from_block, to_block);
     let mut cursor = from_block;
     while cursor <= to_block {
         let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
@@ -135,7 +138,8 @@ async fn hydrate_manager_scan(
                 continue;
             }
         };
-        summary.logs_seen += logs.len();
+        let chunk_logs = logs.len();
+        summary.logs_seen += chunk_logs;
         let mut chunk_hydrated = 0usize;
         for raw in logs {
             let Some(observation) = parse_initialize_observation(settings, manager, raw)? else {
@@ -147,13 +151,20 @@ async fn hydrate_manager_scan(
             summary.hydrated += 1;
             chunk_hydrated += 1;
         }
-        if chunk_hydrated > 0 {
-            println!(
-                "manager_scan manager={manager:#x} blocks={cursor}..{chunk_to} hydrated={chunk_hydrated} total_hydrated={} logs_seen={}",
-                summary.hydrated,
-                summary.logs_seen
-            );
-        }
+        print_progress(
+            "manager_scan",
+            from_block,
+            to_block,
+            cursor,
+            chunk_to,
+            summary.chunks,
+            started_at,
+            total_blocks,
+            &format!(
+                "manager={manager:#x} chunk_logs={chunk_logs} chunk_hydrated={chunk_hydrated} total_hydrated={} logs_seen={} failed={}",
+                summary.hydrated, summary.logs_seen, summary.failed
+            ),
+        );
         if chunk_to == u64::MAX {
             break;
         }
@@ -231,6 +242,8 @@ async fn hydrate_batch(
     let mut summary = HydrateSummary::default();
     for (manager, rows) in groups {
         let mut pending = rows.keys().cloned().collect::<HashSet<_>>();
+        let started_at = Instant::now();
+        let total_blocks = block_span(search_from, to_block);
         let mut cursor = search_from;
         while cursor <= to_block && !pending.is_empty() {
             let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
@@ -248,7 +261,9 @@ async fn hydrate_batch(
                     break;
                 }
             };
-            summary.logs_seen += logs.len();
+            let chunk_logs = logs.len();
+            let pending_before = pending.len();
+            summary.logs_seen += chunk_logs;
             for raw in logs {
                 let Some(pool_uid) = topic_at(&raw, 1) else {
                     continue;
@@ -282,6 +297,24 @@ async fn hydrate_batch(
                 pending.remove(&pool_uid);
                 summary.hydrated += 1;
             }
+            let chunk_hydrated = pending_before.saturating_sub(pending.len());
+            print_progress(
+                "pending_scan",
+                search_from,
+                to_block,
+                cursor,
+                chunk_to,
+                summary.chunks,
+                started_at,
+                total_blocks,
+                &format!(
+                    "manager={manager:#x} chunk_logs={chunk_logs} chunk_hydrated={chunk_hydrated} total_hydrated={} pending={} logs_seen={} failed={}",
+                    summary.hydrated,
+                    pending.len(),
+                    summary.logs_seen,
+                    summary.failed
+                ),
+            );
             if chunk_to == u64::MAX {
                 break;
             }
@@ -438,6 +471,35 @@ fn print_help() {
     println!(
         "Usage: hydrate_uniswap_v4_observations [--from-block N] [--to-block N] [--lookback-blocks 2000000] [--limit 500] [--chunk-blocks 10000] [--manager-scan] [--apply]"
     );
+}
+
+fn print_progress(
+    label: &str,
+    from_block: u64,
+    to_block: u64,
+    cursor: u64,
+    chunk_to: u64,
+    chunks: usize,
+    started_at: Instant,
+    total_blocks: u64,
+    details: &str,
+) {
+    let scanned_blocks = block_span(from_block, chunk_to);
+    let elapsed_secs = started_at.elapsed().as_secs_f64().max(0.001);
+    let blocks_per_sec = scanned_blocks as f64 / elapsed_secs;
+    let remaining_blocks = to_block.saturating_sub(chunk_to);
+    let eta_secs = if blocks_per_sec > 0.0 {
+        remaining_blocks as f64 / blocks_per_sec
+    } else {
+        0.0
+    };
+    println!(
+        "{label} chunk={chunks} blocks={cursor}..{chunk_to} progress={scanned_blocks}/{total_blocks} elapsed_s={elapsed_secs:.1} blocks_per_s={blocks_per_sec:.1} eta_s={eta_secs:.1} {details}"
+    );
+}
+
+fn block_span(from_block: u64, to_block: u64) -> u64 {
+    to_block.saturating_sub(from_block).saturating_add(1)
 }
 
 fn topic_at(raw: &Value, index: usize) -> Option<String> {
