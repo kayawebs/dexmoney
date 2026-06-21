@@ -23,6 +23,7 @@ struct Cli {
     lookback_blocks: u64,
     limit: i64,
     chunk_blocks: u64,
+    manager_scan: bool,
     apply: bool,
 }
 
@@ -49,11 +50,20 @@ async fn main() -> Result<()> {
         .from_block
         .unwrap_or_else(|| to_block.saturating_sub(cli.lookback_blocks));
 
-    let missing = fetch_missing_observations(&store, settings.chain_id, cli.limit).await?;
+    let missing = if cli.manager_scan {
+        Vec::new()
+    } else {
+        fetch_missing_observations(&store, settings.chain_id, cli.limit).await?
+    };
     println!("== Uniswap V4 Observation Hydration ==");
     println!(
-        "mode={} missing={} blocks={}..{} chunk_blocks={}",
+        "mode={} scan={} missing={} blocks={}..{} chunk_blocks={}",
         if cli.apply { "apply" } else { "dry-run" },
+        if cli.manager_scan {
+            "manager"
+        } else {
+            "pending"
+        },
         missing.len(),
         from_block,
         to_block,
@@ -66,21 +76,90 @@ async fn main() -> Result<()> {
         failed,
         chunks,
         logs_seen,
-    } = hydrate_batch(
-        &settings,
-        &store,
-        &provider,
-        missing,
-        from_block,
-        to_block,
-        cli.chunk_blocks,
-        cli.apply,
-    )
-    .await?;
+    } = if cli.manager_scan {
+        hydrate_manager_scan(
+            &settings,
+            &store,
+            &provider,
+            from_block,
+            to_block,
+            cli.chunk_blocks,
+            cli.apply,
+        )
+        .await?
+    } else {
+        hydrate_batch(
+            &settings,
+            &store,
+            &provider,
+            missing,
+            from_block,
+            to_block,
+            cli.chunk_blocks,
+            cli.apply,
+        )
+        .await?
+    };
 
     println!();
     println!("hydrated={hydrated} not_found={not_found} failed={failed} chunks={chunks} logs_seen={logs_seen}");
     Ok(())
+}
+
+async fn hydrate_manager_scan(
+    settings: &Settings,
+    store: &PostgresStore,
+    provider: &ChainProvider,
+    from_block: u64,
+    to_block: u64,
+    chunk_blocks: u64,
+    apply: bool,
+) -> Result<HydrateSummary> {
+    let manager = settings
+        .uniswap_v4_pool_manager
+        .context("UNISWAP_V4_POOL_MANAGER is required for --manager-scan")?;
+    let mut summary = HydrateSummary::default();
+    let mut cursor = from_block;
+    while cursor <= to_block {
+        let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
+        summary.chunks += 1;
+        let logs = match fetch_initialize_logs_split(provider, manager, cursor, chunk_to).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                summary.failed += 1;
+                println!("failed manager={manager:#x} blocks={cursor}..{chunk_to} error={err:#}");
+                if chunk_to == u64::MAX {
+                    break;
+                }
+                cursor = chunk_to + 1;
+                continue;
+            }
+        };
+        summary.logs_seen += logs.len();
+        let mut chunk_hydrated = 0usize;
+        for raw in logs {
+            let Some(observation) = parse_initialize_observation(settings, manager, raw)? else {
+                continue;
+            };
+            if apply {
+                store.upsert_protocol_pool_observation(observation).await?;
+            }
+            summary.hydrated += 1;
+            chunk_hydrated += 1;
+        }
+        if chunk_hydrated > 0 {
+            println!(
+                "manager_scan manager={manager:#x} blocks={cursor}..{chunk_to} hydrated={chunk_hydrated} total_hydrated={} logs_seen={}",
+                summary.hydrated,
+                summary.logs_seen
+            );
+        }
+        if chunk_to == u64::MAX {
+            break;
+        }
+        cursor = chunk_to + 1;
+    }
+    Ok(summary)
 }
 
 async fn fetch_missing_observations(
@@ -315,6 +394,7 @@ where
         lookback_blocks: 2_000_000,
         limit: 500,
         chunk_blocks: 10_000,
+        manager_scan: false,
         apply: false,
     };
 
@@ -327,6 +407,7 @@ where
             }
             "--limit" => cli.limit = parse_next(&mut args, "--limit")?,
             "--chunk-blocks" => cli.chunk_blocks = parse_next(&mut args, "--chunk-blocks")?,
+            "--manager-scan" => cli.manager_scan = true,
             "--apply" => cli.apply = true,
             "--help" | "-h" => {
                 print_help();
@@ -355,7 +436,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_observations [--lookback-blocks 2000000] [--limit 500] [--chunk-blocks 10000] [--apply]"
+        "Usage: hydrate_uniswap_v4_observations [--from-block N] [--to-block N] [--lookback-blocks 2000000] [--limit 500] [--chunk-blocks 10000] [--manager-scan] [--apply]"
     );
 }
 
