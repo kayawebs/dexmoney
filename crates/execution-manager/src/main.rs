@@ -22,6 +22,44 @@ const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
 
+#[derive(Debug, Clone)]
+struct ExecutionRuntime {
+    fund_wallet: Option<tx_manager::ExecutionWallet>,
+    worker_wallets: Vec<tx_manager::ExecutionWallet>,
+    simulation_operator: Option<Address>,
+    worker_min_balance: U256,
+    worker_target_balance: U256,
+    executor_contracts: Vec<Address>,
+}
+
+impl ExecutionRuntime {
+    fn from_settings(settings: &Settings) -> Result<Self> {
+        let fund_wallet = configured_fund_wallet(settings)?;
+        let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
+        let simulation_operator = fund_wallet
+            .as_ref()
+            .map(tx_manager::ExecutionWallet::address)
+            .or(settings.eoa_address_1);
+        let worker_min_balance = parse_config_u256(
+            settings.execution_worker_min_balance_wei.as_deref(),
+            "execution_worker_min_balance_wei",
+        )?;
+        let worker_target_balance = parse_config_u256(
+            settings.execution_worker_target_balance_wei.as_deref(),
+            "execution_worker_target_balance_wei",
+        )?
+        .max(worker_min_balance);
+        Ok(Self {
+            fund_wallet,
+            worker_wallets,
+            simulation_operator,
+            worker_min_balance,
+            worker_target_balance,
+            executor_contracts: configured_executor_contracts(settings),
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -31,6 +69,7 @@ async fn main() -> Result<()> {
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
+    let runtime = ExecutionRuntime::from_settings(&settings)?;
     let cleared_candidates = redis.clear_candidates().await?;
     if cleared_candidates > 0 {
         info!(
@@ -40,17 +79,16 @@ async fn main() -> Result<()> {
     }
 
     if settings.execution_submit_enabled {
-        let fund_wallet = configured_fund_wallet(&settings)?;
-        let worker_wallets = configured_worker_wallets(&settings, fund_wallet.as_ref())?;
-        let workers = worker_wallets
+        let workers = runtime
+            .worker_wallets
             .iter()
             .map(|wallet| wallet.address().to_string())
             .collect::<Vec<_>>()
             .join(",");
         info!(
-            fund = ?fund_wallet.as_ref().map(tx_manager::ExecutionWallet::address),
+            fund = ?runtime.fund_wallet.as_ref().map(tx_manager::ExecutionWallet::address),
             workers,
-            worker_count = worker_wallets.len(),
+            worker_count = runtime.worker_wallets.len(),
             "execution EOA pool configured"
         );
     }
@@ -68,6 +106,7 @@ async fn main() -> Result<()> {
             &postgres,
             &provider,
             &settings,
+            &runtime,
             settings.min_simulated_profit_usdc,
             &mut circuit_breaker,
         )
@@ -81,6 +120,7 @@ async fn run_execution_cycle<C, E, R>(
     recorder: &R,
     provider: &ChainProvider,
     settings: &Settings,
+    runtime: &ExecutionRuntime,
     min_simulated_profit_usdc: f64,
     circuit_breaker: &mut ExecutionCircuitBreaker,
 ) -> Result<()>
@@ -89,8 +129,6 @@ where
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
-    let fund_wallet = configured_fund_wallet(settings)?;
-    let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
     let Some(current_block) = candidate_store.get_current_block().await? else {
         debug!("current block not available from market-data");
@@ -100,7 +138,7 @@ where
         pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
     if candidates.is_empty() {
         if settings.execution_submit_enabled {
-            let Some(fund_wallet) = fund_wallet.as_ref() else {
+            let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
                 anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
             };
             prepare_eoa_pool(
@@ -108,8 +146,8 @@ where
                 recorder,
                 provider,
                 settings,
+                runtime,
                 fund_wallet,
-                &worker_wallets,
                 circuit_breaker,
             )
             .await?;
@@ -119,13 +157,13 @@ where
     };
 
     let selected_wallet = if settings.execution_submit_enabled {
-        let Some(fund_wallet) = fund_wallet.as_ref() else {
+        let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
             anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
         };
         if circuit_breaker.is_halted(settings) {
             return Ok(());
         }
-        let cached = select_cached_ready_worker(eoa_store, settings, &worker_wallets).await?;
+        let cached = select_cached_ready_worker(eoa_store, runtime).await?;
         match cached {
             Some(wallet) => Some(wallet),
             None => {
@@ -134,8 +172,8 @@ where
                     recorder,
                     provider,
                     settings,
+                    runtime,
                     fund_wallet,
-                    &worker_wallets,
                     circuit_breaker,
                 )
                 .await?;
@@ -151,7 +189,8 @@ where
     let operator = selected_wallet
         .as_ref()
         .map(tx_manager::ExecutionWallet::address)
-        .unwrap_or(operator_address(settings, fund_wallet.as_ref())?);
+        .or(runtime.simulation_operator)
+        .context("EOA_ADDRESS_1 or EOA_PRIVATE_KEY_1 is required for simulation")?;
     if let Some(wallet) = selected_wallet.as_ref() {
         info!(
             worker = %wallet.address(),
@@ -192,7 +231,7 @@ where
             min_simulated_profit_usdc,
             operator,
             selected_wallet.as_ref(),
-            fund_wallet.as_ref(),
+            runtime.fund_wallet.as_ref(),
             circuit_breaker,
             &simulation_context,
             &candidate,
@@ -343,21 +382,16 @@ where
 
 async fn select_cached_ready_worker<E>(
     eoa_store: &E,
-    settings: &Settings,
-    worker_wallets: &[tx_manager::ExecutionWallet],
+    runtime: &ExecutionRuntime,
 ) -> Result<Option<tx_manager::ExecutionWallet>>
 where
     E: EoaStateStore,
 {
-    let worker_min_balance = parse_config_u256(
-        settings.execution_worker_min_balance_wei.as_deref(),
-        "execution_worker_min_balance_wei",
-    )?;
-    for worker in worker_wallets {
+    for worker in &runtime.worker_wallets {
         let Some(state) = eoa_store.get_lane_state(worker.address()).await? else {
             continue;
         };
-        if state.status == EoaLaneStatus::Idle && state.eth_balance >= worker_min_balance {
+        if state.status == EoaLaneStatus::Idle && state.eth_balance >= runtime.worker_min_balance {
             debug!(
                 worker = %worker.address(),
                 balance = %state.eth_balance,
@@ -819,19 +853,6 @@ fn derive_worker_wallet(
     anyhow::bail!("failed to derive valid worker EOA private key for index {index}")
 }
 
-fn operator_address(
-    settings: &Settings,
-    wallet: Option<&tx_manager::ExecutionWallet>,
-) -> Result<Address> {
-    if let Some(wallet) = wallet {
-        return Ok(wallet.address());
-    }
-    if let Some(address) = settings.eoa_address_1 {
-        return Ok(address);
-    }
-    anyhow::bail!("EOA_ADDRESS_1 or EOA_PRIVATE_KEY_1 is required for simulation");
-}
-
 fn parse_config_u256(raw: Option<&str>, name: &str) -> Result<U256> {
     let value = raw.with_context(|| format!("{name} is not configured"))?;
     U256::from_str_radix(value.trim_start_matches("0x"), 10)
@@ -924,8 +945,8 @@ async fn prepare_eoa_pool<E, R>(
     recorder: &R,
     provider: &ChainProvider,
     settings: &Settings,
+    runtime: &ExecutionRuntime,
     fund_wallet: &tx_manager::ExecutionWallet,
-    worker_wallets: &[tx_manager::ExecutionWallet],
     circuit_breaker: &mut ExecutionCircuitBreaker,
 ) -> Result<Option<tx_manager::ExecutionWallet>>
 where
@@ -934,7 +955,7 @@ where
 {
     reconcile_db_pending_transactions(recorder, provider, fund_wallet.address()).await?;
 
-    for worker in worker_wallets {
+    for worker in &runtime.worker_wallets {
         reconcile_db_pending_transactions(recorder, provider, worker.address()).await?;
         let mut lane = eoa_store
             .get_lane_state(worker.address())
@@ -961,20 +982,9 @@ where
     }
 
     let admin_pending = admin_has_pending_nonce(provider, fund_wallet.address()).await?;
-    let worker_min_balance = parse_config_u256(
-        settings.execution_worker_min_balance_wei.as_deref(),
-        "execution_worker_min_balance_wei",
-    )?;
-    let worker_target_balance = parse_config_u256(
-        settings.execution_worker_target_balance_wei.as_deref(),
-        "execution_worker_target_balance_wei",
-    )?
-    .max(worker_min_balance);
-    let executors = configured_executor_contracts(settings);
-
     let mut ready_worker = None;
     let mut incomplete_workers = 0u64;
-    for worker in worker_wallets {
+    for worker in &runtime.worker_wallets {
         let lane = eoa_store
             .get_lane_state(worker.address())
             .await?
@@ -984,12 +994,14 @@ where
             continue;
         }
 
-        if lane.state.eth_balance < worker_min_balance {
+        if lane.state.eth_balance < runtime.worker_min_balance {
             incomplete_workers = incomplete_workers.saturating_add(1);
             if admin_pending {
                 continue;
             }
-            let top_up = worker_target_balance.saturating_sub(lane.state.eth_balance);
+            let top_up = runtime
+                .worker_target_balance
+                .saturating_sub(lane.state.eth_balance);
             if top_up.is_zero() {
                 continue;
             }
@@ -1020,7 +1032,7 @@ where
         }
 
         let mut missing_operator = None;
-        for executor in &executors {
+        for executor in &runtime.executor_contracts {
             if !tx_manager::operator_enabled(provider, *executor, worker.address()).await? {
                 missing_operator = Some(*executor);
                 break;
