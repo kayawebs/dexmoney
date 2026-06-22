@@ -235,6 +235,7 @@ where
         max_candidate_lag_blocks,
         batch_started,
         circuit_breaker,
+        &mut maintenance.approved_allowances,
     )
     .await
 }
@@ -242,6 +243,7 @@ where
 #[derive(Default)]
 struct ExecutionMaintenance {
     last_idle_eoa_pool_maintenance: Option<Instant>,
+    approved_allowances: HashSet<(Address, Address, Address)>,
 }
 
 impl ExecutionMaintenance {
@@ -388,6 +390,7 @@ async fn run_live_submission_batch<E, R>(
     max_candidate_lag_blocks: u64,
     batch_started: Instant,
     circuit_breaker: &ExecutionCircuitBreaker,
+    approved_allowances: &mut HashSet<(Address, Address, Address)>,
 ) -> Result<()>
 where
     E: EoaStateStore,
@@ -396,7 +399,6 @@ where
     let candidate_count = candidates.len();
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut approval_ready = Vec::new();
-    let mut approved_cache = HashSet::new();
     let mut preflight_simulated = 0usize;
 
     for candidate in candidates {
@@ -427,7 +429,7 @@ where
             fund_wallet,
             &candidate,
             current_block,
-            &mut approved_cache,
+            approved_allowances,
         )
         .await?
         {
@@ -439,6 +441,7 @@ where
                         max_candidate_lag_blocks,
                         simulated = preflight_simulated,
                         skipped = skipped_by_reason.values().sum::<usize>(),
+                        approved_allowance_cache_size = approved_allowances.len(),
                         elapsed_ms = batch_started.elapsed().as_millis() as u64,
                         skipped_by_reason = ?skipped_by_reason,
                         "execution candidate batch summary"
@@ -567,6 +570,7 @@ where
         concurrency,
         submitted,
         skipped = skipped_by_reason.values().sum::<usize>(),
+        approved_allowance_cache_size = approved_allowances.len(),
         elapsed_ms = batch_started.elapsed().as_millis() as u64,
         skipped_by_reason = ?skipped_by_reason,
         "execution candidate batch summary"
