@@ -489,118 +489,138 @@ async fn hydrate_ticks_by_manager_scan(
             .unwrap_or(to_block)
     });
 
-    let selected_pools = selected.into_values().collect::<Vec<_>>();
-    let flush_pool_batch_size = flush_pool_batch_size.max(1);
-    for (batch_index, batch) in selected_pools.chunks(flush_pool_batch_size).enumerate() {
-        let mut managers = batch.iter().map(|pool| pool.manager).collect::<Vec<_>>();
-        managers.sort();
-        managers.dedup();
-        let mut selected_batch = batch
-            .iter()
-            .map(|pool| (pool.pool_uid.clone(), pool.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut ticks_by_pool = selected_batch
-            .keys()
-            .map(|pool_uid| (pool_uid.clone(), BTreeMap::<i32, TickAccumulator>::new()))
-            .collect::<BTreeMap<_, _>>();
+    let mut managers = selected
+        .values()
+        .map(|pool| pool.manager)
+        .collect::<Vec<_>>();
+    managers.sort();
+    managers.dedup();
+    let mut ticks_by_pool = selected
+        .keys()
+        .map(|pool_uid| (pool_uid.clone(), BTreeMap::<i32, TickAccumulator>::new()))
+        .collect::<BTreeMap<_, _>>();
 
-        for manager in managers {
-            let started_at = Instant::now();
-            let total_blocks = block_span(from_block, to_block);
-            let mut cursor = from_block;
-            while cursor <= to_block {
-                let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
-                summary.chunks += 1;
-                let logs = match fetch_modify_liquidity_logs_for_manager(
-                    provider, manager, cursor, chunk_to,
-                )
-                .await
+    for manager in managers {
+        let started_at = Instant::now();
+        let total_blocks = block_span(from_block, to_block);
+        let mut cursor = from_block;
+        while cursor <= to_block {
+            let chunk_to = to_block.min(cursor.saturating_add(chunk_blocks).saturating_sub(1));
+            summary.chunks += 1;
+            let logs =
+                match fetch_modify_liquidity_logs_for_manager(provider, manager, cursor, chunk_to)
+                    .await
                 {
                     Ok(logs) => logs,
                     Err(err) => {
-                        summary.failed += selected_batch.len();
+                        summary.failed += selected.len();
                         println!(
-                            "failed manager={} batch={} blocks={}..{} pending={} error={err:#}",
+                            "failed manager={} blocks={}..{} pending={} error={err:#}",
                             manager,
-                            batch_index + 1,
                             cursor,
                             chunk_to,
-                            selected_batch.len()
+                            selected.len()
                         );
                         break;
                     }
                 };
-                let chunk_logs = logs.len();
-                summary.logs_seen += chunk_logs;
-                let ignored_before = summary.ignored_logs;
-                for raw in logs {
-                    let Some(pool_uid) = topic_at(&raw, 1) else {
-                        summary.ignored_logs += 1;
-                        continue;
-                    };
-                    let Some(ticks) = ticks_by_pool.get_mut(&pool_uid) else {
-                        summary.ignored_logs += 1;
-                        continue;
-                    };
-                    let delta = match parse_modify_liquidity_delta(&raw) {
-                        Ok(Some(delta)) => delta,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            summary.invalid_logs += 1;
-                            println!(
-                                "invalid modify liquidity log skipped error={err:#} raw={raw}"
-                            );
-                            continue;
-                        }
-                    };
-                    if let Err(err) = apply_delta(ticks, delta) {
+            let chunk_logs = logs.len();
+            summary.logs_seen += chunk_logs;
+            let ignored_before = summary.ignored_logs;
+            let mut chunk_matched = 0usize;
+            for raw in logs {
+                let Some(pool_uid) = topic_at(&raw, 1) else {
+                    summary.ignored_logs += 1;
+                    continue;
+                };
+                let Some(ticks) = ticks_by_pool.get_mut(&pool_uid) else {
+                    summary.ignored_logs += 1;
+                    continue;
+                };
+                chunk_matched += 1;
+                let delta = match parse_modify_liquidity_delta(&raw) {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => continue,
+                    Err(err) => {
                         summary.invalid_logs += 1;
                         println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
+                        continue;
                     }
+                };
+                if let Err(err) = apply_delta(ticks, delta) {
+                    summary.invalid_logs += 1;
+                    println!("invalid modify liquidity log skipped error={err:#} raw={raw}");
                 }
-                let chunk_ignored = summary.ignored_logs.saturating_sub(ignored_before);
-                print_progress(
-                    "manager_tick_scan",
-                    from_block,
-                    to_block,
-                    cursor,
-                    chunk_to,
-                    summary.chunks,
-                    started_at,
-                    total_blocks,
-                    &format!(
-                        "batch={} batch_pools={} manager={} chunk_logs={chunk_logs} chunk_ignored={chunk_ignored} logs_seen={} ignored_logs={} failed={}",
-                        batch_index + 1,
-                        selected_batch.len(),
-                        manager,
-                        summary.logs_seen,
-                        summary.ignored_logs,
-                        summary.failed
-                    ),
-                );
-                if chunk_to == u64::MAX {
-                    break;
-                }
-                cursor = chunk_to + 1;
             }
+            let chunk_ignored = summary.ignored_logs.saturating_sub(ignored_before);
+            print_progress(
+                "manager_tick_scan",
+                from_block,
+                to_block,
+                cursor,
+                chunk_to,
+                summary.chunks,
+                started_at,
+                total_blocks,
+                &format!(
+                    "selected_pools={} manager={} chunk_logs={chunk_logs} chunk_matched={chunk_matched} chunk_ignored={chunk_ignored} logs_seen={} ignored_logs={} failed={}",
+                    selected.len(),
+                    manager,
+                    summary.logs_seen,
+                    summary.ignored_logs,
+                    summary.failed
+                ),
+            );
+            if chunk_to == u64::MAX {
+                break;
+            }
+            cursor = chunk_to + 1;
         }
+    }
 
+    let flush_pool_batch_size = flush_pool_batch_size.max(1);
+    let mut remaining_selected = selected;
+    let mut batch_ticks = BTreeMap::new();
+    let mut batch_index = 0usize;
+    for (pool_uid, ticks) in ticks_by_pool {
+        batch_ticks.insert(pool_uid, ticks);
+        if batch_ticks.len() >= flush_pool_batch_size {
+            batch_index += 1;
+            flush_manager_scan_batch(
+                settings,
+                store,
+                redis,
+                &mut summary,
+                &mut remaining_selected,
+                std::mem::take(&mut batch_ticks),
+                from_block,
+                to_block,
+                apply,
+                sync_redis,
+                hydration_run,
+                batch_index,
+            )
+            .await?;
+        }
+    }
+    if !batch_ticks.is_empty() {
+        batch_index += 1;
         flush_manager_scan_batch(
             settings,
             store,
             redis,
             &mut summary,
-            &mut selected_batch,
-            ticks_by_pool,
+            &mut remaining_selected,
+            batch_ticks,
             from_block,
             to_block,
             apply,
             sync_redis,
             hydration_run,
+            batch_index,
         )
         .await?;
     }
-
     Ok(summary)
 }
 
@@ -617,6 +637,7 @@ async fn flush_manager_scan_batch(
     apply: bool,
     sync_redis: bool,
     hydration_run: Option<Uuid>,
+    batch_index: usize,
 ) -> Result<()> {
     let mut changed_pools = Vec::new();
     for (pool_uid, ticks) in ticks_by_pool {
@@ -692,8 +713,8 @@ async fn flush_manager_scan_batch(
             .await?;
     }
     println!(
-        "flush summary hydrated_pools={} ticks_written={} marked_changed_pools={}",
-        summary.hydrated_pools, summary.ticks_written, summary.marked_changed_pools
+        "flush summary batch={} hydrated_pools={} ticks_written={} marked_changed_pools={}",
+        batch_index, summary.hydrated_pools, summary.ticks_written, summary.marked_changed_pools
     );
     Ok(())
 }
