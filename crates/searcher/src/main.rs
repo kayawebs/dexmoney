@@ -857,11 +857,7 @@ where
     C: CandidateStore,
 {
     let original_candidate_count = candidates.len();
-    let candidates = candidates
-        .into_iter()
-        .map(|candidate| retag_candidate_for_publish(candidate, latest_known_block))
-        .collect::<Vec<_>>();
-    let candidates = coalesce_candidates(candidates);
+    let candidates = coalesce_candidates_for_publish(candidates, latest_known_block);
     cycle_stats.candidates_coalesced +=
         original_candidate_count.saturating_sub(candidates.len()) as u64;
     let mut valid_candidates = Vec::new();
@@ -976,16 +972,6 @@ fn requires_initialized_ticks(state: &PoolState) -> bool {
     )
 }
 
-fn retag_candidate_for_publish(
-    mut candidate: base_arb_common::types::Candidate,
-    latest_known_block: u64,
-) -> base_arb_common::types::Candidate {
-    if latest_known_block != 0 {
-        candidate.block_number = latest_known_block;
-    }
-    candidate
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CandidateExecutorScope {
     TwoHop,
@@ -1000,9 +986,15 @@ struct CandidateCoalesceKey {
     executor_scope: CandidateExecutorScope,
 }
 
-fn coalesce_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
+fn coalesce_candidates_for_publish(
+    candidates: Vec<Candidate>,
+    latest_known_block: u64,
+) -> Vec<Candidate> {
     let mut best_by_key: HashMap<CandidateCoalesceKey, Candidate> = HashMap::new();
-    for candidate in candidates {
+    for mut candidate in candidates {
+        if latest_known_block != 0 {
+            candidate.block_number = latest_known_block;
+        }
         let key = CandidateCoalesceKey {
             block_number: candidate.block_number,
             token_in: candidate.token_in,
