@@ -523,11 +523,16 @@ where
     cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
     cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
 
+    let missing_tick_pools = missing_tick_pools_for_paths(
+        &runtime.pool_states,
+        &runtime.tick_states,
+        &selected_paths.path_pools,
+    );
     let tick_ready_paths = selected_paths
         .paths
         .iter()
         .copied()
-        .filter(|path| path.has_required_ticks(&runtime.pool_states, &runtime.tick_states))
+        .filter(|path| path.all_pools_not_in(&missing_tick_pools))
         .collect::<Vec<_>>();
     cycle_stats.tick_missing_filtered_paths = selected_paths
         .paths
@@ -783,6 +788,35 @@ where
         )?;
     }
     Ok(())
+}
+
+fn missing_tick_pools_for_paths(
+    pool_states: &HashMap<Address, PoolState>,
+    tick_states: &HashMap<Address, Vec<TickState>>,
+    path_pools: &HashSet<Address>,
+) -> HashSet<Address> {
+    let mut missing = HashSet::new();
+    for pool in path_pools {
+        let Some(state) = pool_states.get(pool) else {
+            continue;
+        };
+        if requires_initialized_ticks(state)
+            && !tick_states.get(pool).is_some_and(|ticks| !ticks.is_empty())
+        {
+            missing.insert(*pool);
+        }
+    }
+    missing
+}
+
+fn requires_initialized_ticks(state: &PoolState) -> bool {
+    matches!(
+        state.variant,
+        PoolVariant::AerodromeSlipstream
+            | PoolVariant::UniswapV3
+            | PoolVariant::PancakeV3
+            | PoolVariant::UniswapV4
+    )
 }
 
 fn retag_candidate_for_publish(
