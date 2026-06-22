@@ -142,6 +142,11 @@ where
             let fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
             let apply_started = Instant::now();
+            let state_index_by_pool = monitored_states
+                .iter()
+                .enumerate()
+                .map(|(index, state)| (state.pool_id.address, index))
+                .collect::<HashMap<_, _>>();
             let mut changed_pools = HashSet::new();
             let mut validation_snapshots = BTreeMap::new();
             let mut classic_fee_refreshes = HashMap::new();
@@ -172,62 +177,57 @@ where
             self.recorder.record_dex_events(event_records).await?;
 
             for (event, duplicate_log) in deduped_events {
-                for state in &mut monitored_states {
-                    if state.pool_id.address != event.pool_address {
-                        continue;
-                    }
-                    if !duplicate_log {
-                        let tick_deltas =
-                            super::state_updater::v3_tick_deltas_from_event(state, event)?;
-                        if !tick_deltas.is_empty() {
-                            self.apply_tick_deltas(
-                                &state.pool_id,
-                                &tick_deltas,
-                                event.block_number,
-                            )
+                let Some(index) = state_index_by_pool.get(&event.pool_address).copied() else {
+                    continue;
+                };
+                let Some(state) = monitored_states.get_mut(index) else {
+                    continue;
+                };
+                if !duplicate_log {
+                    let tick_deltas =
+                        super::state_updater::v3_tick_deltas_from_event(state, event)?;
+                    if !tick_deltas.is_empty() {
+                        self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
                             .await?;
-                        }
                     }
-                    if super::state_updater::is_v3_liquidity_event(state, event)? {
-                        if duplicate_log {
-                            break;
-                        }
-                        if self
-                            .refresh_v3_state_at_block(state, event.block_number)
-                            .await?
-                        {
-                            changed_pools.insert(state.pool_id.address);
-                            validation_snapshots
-                                .insert((state.block_number, state.pool_id.address), state.clone());
-                            debug!(
-                                pool = %state.pool_id.address,
-                                block_number = state.block_number,
-                                "V3 pool state refreshed from block-pinned onchain liquidity event"
-                            );
-                        }
-                    } else if super::state_updater::apply_event_to_pool_state(state, event)? {
+                }
+                if super::state_updater::is_v3_liquidity_event(state, event)? {
+                    if duplicate_log {
+                        break;
+                    }
+                    if self
+                        .refresh_v3_state_at_block(state, event.block_number)
+                        .await?
+                    {
                         changed_pools.insert(state.pool_id.address);
                         validation_snapshots
                             .insert((state.block_number, state.pool_id.address), state.clone());
-                        if matches!(
-                            (state.dex, state.variant),
-                            (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
-                        ) {
-                            slipstream_fee_refreshes
-                                .insert(state.pool_id.address, event.block_number);
-                        } else if matches!(
-                            (state.dex, state.variant),
-                            (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
-                        ) {
-                            classic_fee_refreshes.insert(state.pool_id.address, event.block_number);
-                        }
                         debug!(
                             pool = %state.pool_id.address,
                             block_number = state.block_number,
-                            "pool state locally updated from event"
+                            "V3 pool state refreshed from block-pinned onchain liquidity event"
                         );
                     }
-                    break;
+                } else if super::state_updater::apply_event_to_pool_state(state, event)? {
+                    changed_pools.insert(state.pool_id.address);
+                    validation_snapshots
+                        .insert((state.block_number, state.pool_id.address), state.clone());
+                    if matches!(
+                        (state.dex, state.variant),
+                        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream)
+                    ) {
+                        slipstream_fee_refreshes.insert(state.pool_id.address, event.block_number);
+                    } else if matches!(
+                        (state.dex, state.variant),
+                        (DexKind::Aerodrome, PoolVariant::AerodromeVolatile)
+                    ) {
+                        classic_fee_refreshes.insert(state.pool_id.address, event.block_number);
+                    }
+                    debug!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        "pool state locally updated from event"
+                    );
                 }
             }
             let apply_ms = apply_started.elapsed().as_millis() as u64;
@@ -235,10 +235,10 @@ where
             let fee_started = Instant::now();
             let mut fee_refreshed_pools = HashSet::new();
             for (pool, block_number) in classic_fee_refreshes {
-                let Some(state) = monitored_states
-                    .iter_mut()
-                    .find(|state| state.pool_id.address == pool)
-                else {
+                let Some(index) = state_index_by_pool.get(&pool).copied() else {
+                    continue;
+                };
+                let Some(state) = monitored_states.get_mut(index) else {
                     continue;
                 };
                 let fee_result = async {
@@ -280,10 +280,10 @@ where
             }
 
             for (pool, block_number) in slipstream_fee_refreshes {
-                let Some(state) = monitored_states
-                    .iter_mut()
-                    .find(|state| state.pool_id.address == pool)
-                else {
+                let Some(index) = state_index_by_pool.get(&pool).copied() else {
+                    continue;
+                };
+                let Some(state) = monitored_states.get_mut(index) else {
                     continue;
                 };
                 let fee_result = async {
