@@ -19,6 +19,12 @@ use base_arb_common::types::{
 #[async_trait]
 pub trait PoolStateStore: Send + Sync {
     async fn set_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()>;
+    async fn set_pool_states(&self, pool_states: Vec<PoolState>) -> anyhow::Result<()> {
+        for pool_state in pool_states {
+            self.set_pool_state(pool_state).await?;
+        }
+        Ok(())
+    }
     async fn get_pool_state(&self, address: Address) -> anyhow::Result<Option<PoolState>>;
     async fn get_pool_states(
         &self,
@@ -94,6 +100,17 @@ pub trait RecorderStore: Send + Sync {
     ) -> anyhow::Result<()> {
         let _ = source;
         self.record_pool_state(pool_state).await
+    }
+    async fn record_pool_states_with_source(
+        &self,
+        pool_states: Vec<PoolState>,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        for pool_state in pool_states {
+            self.record_pool_state_with_source(pool_state, source)
+                .await?;
+        }
+        Ok(())
     }
     async fn record_opportunity(&self, candidate: Candidate) -> anyhow::Result<()>;
     async fn record_opportunities(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
@@ -182,6 +199,14 @@ impl PoolStateStore for InMemoryStores {
             .lock()
             .await
             .insert(pool_state.pool_id.address, pool_state);
+        Ok(())
+    }
+
+    async fn set_pool_states(&self, pool_states: Vec<PoolState>) -> anyhow::Result<()> {
+        let mut states = self.pool_states.lock().await;
+        for pool_state in pool_states {
+            states.insert(pool_state.pool_id.address, pool_state);
+        }
         Ok(())
     }
 
@@ -390,6 +415,15 @@ impl RecorderStore for InMemoryStores {
 
     async fn record_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()> {
         self.pool_snapshots.lock().await.push(pool_state);
+        Ok(())
+    }
+
+    async fn record_pool_states_with_source(
+        &self,
+        pool_states: Vec<PoolState>,
+        _source: &str,
+    ) -> anyhow::Result<()> {
+        self.pool_snapshots.lock().await.extend(pool_states);
         Ok(())
     }
 

@@ -2265,7 +2265,7 @@ where
         source: &str,
     ) -> Result<()> {
         let mut seen = HashSet::new();
-        let mut changed_pools = Vec::new();
+        let mut publish_states = Vec::new();
         for state in states {
             if !selected.contains(&state.pool_id.address) {
                 continue;
@@ -2278,24 +2278,42 @@ where
                 );
                 continue;
             }
-            self.pool_store
-                .set_current_block(state.block_number)
-                .await?;
-            let previous = self
-                .pool_store
-                .get_pool_state(state.pool_id.address)
-                .await?;
+            publish_states.push(state.clone());
+        }
+        if publish_states.is_empty() {
+            return Ok(());
+        }
+
+        let latest_state_block = publish_states
+            .iter()
+            .map(|state| state.block_number)
+            .max()
+            .unwrap_or_default();
+        self.pool_store
+            .set_current_block(latest_state_block)
+            .await?;
+
+        let addresses = publish_states
+            .iter()
+            .map(|state| state.pool_id.address)
+            .collect::<Vec<_>>();
+        let previous_by_pool = self
+            .pool_store
+            .get_pool_states(&addresses)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let mut changed_pools = Vec::new();
+        for state in &publish_states {
+            let previous = previous_by_pool
+                .get(&state.pool_id.address)
+                .and_then(Option::as_ref);
             if previous
-                .as_ref()
                 .map(|previous| quote_relevant_pool_state_changed(previous, state))
                 .unwrap_or(true)
             {
                 changed_pools.push(state.pool_id.address);
             }
-            self.pool_store.set_pool_state(state.clone()).await?;
-            self.recorder
-                .record_pool_state_with_source(state.clone(), source)
-                .await?;
             super::state_updater::log_pool_state_update(state);
             debug!(
                     pool = %state.pool_id.address,
@@ -2305,6 +2323,12 @@ where
                 "monitoring pool logs"
             );
         }
+        self.pool_store
+            .set_pool_states(publish_states.clone())
+            .await?;
+        self.recorder
+            .record_pool_states_with_source(publish_states, source)
+            .await?;
         self.pool_store.mark_changed_pools(changed_pools).await?;
         Ok(())
     }

@@ -93,6 +93,24 @@ impl PoolStateStore for RedisStore {
         Ok(())
     }
 
+    async fn set_pool_states(&self, pool_states: Vec<PoolState>) -> Result<()> {
+        if pool_states.is_empty() {
+            return Ok(());
+        }
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        for pool_state in pool_states {
+            let key = pool_state_key(pool_state.pool_id.chain_id, pool_state.pool_id.address);
+            let index_key = pool_address_index_key(pool_state.pool_id.address);
+            let value = serde_json::to_string(&pool_state)?;
+            pipe.set(&key, value).ignore();
+            pipe.set(index_key, &key).ignore();
+            pipe.sadd(pool_state_index_key(), key).ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
     async fn get_pool_state(&self, address: Address) -> Result<Option<PoolState>> {
         let mut manager = self.manager.clone();
         let index_key = pool_address_index_key(address);

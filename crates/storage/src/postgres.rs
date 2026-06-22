@@ -1648,30 +1648,79 @@ impl RecorderStore for PostgresStore {
         pool_state: PoolState,
         source: &str,
     ) -> Result<()> {
-        sqlx::query(
+        self.record_pool_states_with_source(vec![pool_state], source)
+            .await
+    }
+
+    async fn record_pool_states_with_source(
+        &self,
+        pool_states: Vec<PoolState>,
+        source: &str,
+    ) -> Result<()> {
+        if pool_states.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(pool_states.len());
+        for pool_state in pool_states {
+            rows.push((
+                uuid::Uuid::new_v4(),
+                address_to_string(pool_state.pool_id.address),
+                dex_to_string(pool_state.dex),
+                address_to_string(pool_state.token0),
+                address_to_string(pool_state.token1),
+                i64::from(pool_state.fee_bps),
+                pool_state.reserve0.map(|v| v.to_string()),
+                pool_state.reserve1.map(|v| v.to_string()),
+                pool_state.sqrt_price_x96.map(|v| v.to_string()),
+                pool_state.liquidity.map(|v| v.to_string()),
+                pool_state.tick.map(i64::from),
+                i64::try_from(pool_state.block_number)?,
+                pool_state.updated_at,
+            ));
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO pool_states (
                 id, pool_address, dex, token0, token1, fee, reserve0, reserve1,
                 sqrt_price_x96, liquidity, tick, block_number, updated_at, source
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            )
             "#,
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(address_to_string(pool_state.pool_id.address))
-        .bind(dex_to_string(pool_state.dex))
-        .bind(address_to_string(pool_state.token0))
-        .bind(address_to_string(pool_state.token1))
-        .bind(i64::from(pool_state.fee_bps))
-        .bind(pool_state.reserve0.map(|v| v.to_string()))
-        .bind(pool_state.reserve1.map(|v| v.to_string()))
-        .bind(pool_state.sqrt_price_x96.map(|v| v.to_string()))
-        .bind(pool_state.liquidity.map(|v| v.to_string()))
-        .bind(pool_state.tick.map(i64::from))
-        .bind(i64::try_from(pool_state.block_number)?)
-        .bind(pool_state.updated_at)
-        .bind(source)
-        .execute(&self.pool)
-        .await?;
+        );
+        query.push_values(
+            rows,
+            |mut row,
+             (
+                id,
+                pool_address,
+                dex,
+                token0,
+                token1,
+                fee,
+                reserve0,
+                reserve1,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+                block_number,
+                updated_at,
+            )| {
+                row.push_bind(id)
+                    .push_bind(pool_address)
+                    .push_bind(dex)
+                    .push_bind(token0)
+                    .push_bind(token1)
+                    .push_bind(fee)
+                    .push_bind(reserve0)
+                    .push_bind(reserve1)
+                    .push_bind(sqrt_price_x96)
+                    .push_bind(liquidity)
+                    .push_bind(tick)
+                    .push_bind(block_number)
+                    .push_bind(updated_at)
+                    .push_bind(source);
+            },
+        );
+        query.build().execute(&self.pool).await?;
         Ok(())
     }
 
