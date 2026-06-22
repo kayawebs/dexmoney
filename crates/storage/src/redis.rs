@@ -1,4 +1,4 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
@@ -567,14 +567,57 @@ impl CandidateStore for RedisStore {
 }
 
 fn candidate_queue_score(candidate: &Candidate) -> f64 {
-    let created_rank = candidate.created_at.timestamp_millis().rem_euclid(100_000) as u64;
     candidate
         .block_number
         .saturating_mul(CANDIDATE_SCORE_BLOCK_SCALE) as f64
-        + created_rank as f64
+        + candidate_profit_rank(candidate.expected_profit) as f64
 }
 
 const CANDIDATE_SCORE_BLOCK_SCALE: u64 = 100_000;
+const CANDIDATE_PROFIT_SCORE_DIGITS: usize = 3;
+
+fn candidate_profit_rank(expected_profit: U256) -> u64 {
+    if expected_profit.is_zero() {
+        return 0;
+    }
+
+    // Keep the score inside the block range so block-based pruning remains a
+    // cheap ZREMRANGEBYSCORE. Execution still sorts popped candidates by the
+    // exact U256 profit; this rank only decides which same-block candidates are
+    // most likely to enter the execution batch before expiry.
+    let decimal = expected_profit.to_string();
+    let leading_len = decimal.len().min(CANDIDATE_PROFIT_SCORE_DIGITS);
+    let leading = decimal[..leading_len].parse::<u64>().unwrap_or_default();
+    let padding = CANDIDATE_PROFIT_SCORE_DIGITS - leading_len;
+    let leading = leading.saturating_mul(10u64.saturating_pow(padding as u32));
+    let magnitude_rank = decimal.len().saturating_sub(1) as u64;
+    magnitude_rank
+        .saturating_mul(10u64.saturating_pow(CANDIDATE_PROFIT_SCORE_DIGITS as u32))
+        .saturating_add(leading)
+        .min(CANDIDATE_SCORE_BLOCK_SCALE - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_profit_rank_prioritizes_larger_same_block_profit() {
+        assert!(
+            candidate_profit_rank(U256::from(2_000u64))
+                > candidate_profit_rank(U256::from(1_999u64))
+        );
+        assert!(
+            candidate_profit_rank(U256::from(10_000_000_000_000u64))
+                > candidate_profit_rank(U256::from(999_999_999_999u64))
+        );
+    }
+
+    #[test]
+    fn candidate_profit_rank_stays_inside_block_score_range() {
+        assert!(candidate_profit_rank(U256::MAX) < CANDIDATE_SCORE_BLOCK_SCALE);
+    }
+}
 
 #[async_trait]
 impl FailureStore for RedisStore {
