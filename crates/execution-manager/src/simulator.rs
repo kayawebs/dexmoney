@@ -23,9 +23,9 @@ pub struct SimulationContext {
 }
 
 impl SimulationContext {
-    pub async fn load(provider: &ChainProvider, settings: &Settings) -> Self {
+    pub async fn load(provider: &ChainProvider, settings: &Settings, observed_block: u64) -> Self {
         Self {
-            observed_block: provider.get_block_number().await.ok(),
+            observed_block: Some(observed_block),
             fees: simulation_fee_suggestion(provider, settings).await.ok(),
         }
     }

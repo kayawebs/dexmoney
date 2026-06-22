@@ -284,7 +284,8 @@ where
         );
     }
     let batch_started = Instant::now();
-    let simulation_context = simulator::SimulationContext::load(provider, settings).await;
+    let simulation_context =
+        simulator::SimulationContext::load(provider, settings, current_block).await;
     if !settings.execution_submit_enabled {
         return run_dry_run_simulation_batch(
             simulation_recorder,
