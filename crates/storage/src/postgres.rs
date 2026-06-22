@@ -450,6 +450,28 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn update_pool_tick_hydration_run_progress(
+        &self,
+        id: uuid::Uuid,
+        hydrated_pools: usize,
+        ticks_written: usize,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE pool_tick_hydration_runs
+            SET hydrated_pools = $2,
+                ticks_written = $3
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(i64::try_from(hydrated_pools)?)
+        .bind(i64::try_from(ticks_written)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn trusted_factory_registry(
         &self,
         chain_id: u64,
