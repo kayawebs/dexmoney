@@ -356,11 +356,7 @@ impl TickStateStore for InMemoryStores {
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
-        let mut out = wanted
-            .iter()
-            .copied()
-            .map(|pool| (pool, Vec::new()))
-            .collect::<HashMap<_, _>>();
+        let mut out: HashMap<Address, Vec<TickState>> = HashMap::new();
         for tick in self.ticks.lock().await.values() {
             if wanted.contains(&tick.pool_id.address) {
                 out.entry(tick.pool_id.address)

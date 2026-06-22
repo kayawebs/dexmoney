@@ -442,18 +442,14 @@ impl TickStateStore for RedisStore {
         &self,
         pools: &[Address],
     ) -> Result<HashMap<Address, Vec<TickState>>> {
-        let mut out = pools
-            .iter()
-            .copied()
-            .map(|pool| (pool, Vec::new()))
-            .collect::<HashMap<_, _>>();
         if pools.is_empty() {
-            return Ok(out);
+            return Ok(HashMap::new());
         }
 
         let mut unique_pools = pools.to_vec();
         unique_pools.sort_unstable();
         unique_pools.dedup();
+        let mut out = HashMap::new();
 
         let mut manager = self.manager.clone();
         let mut pipe = redis::pipe();
