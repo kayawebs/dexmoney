@@ -866,7 +866,7 @@ impl SearchEngine {
             .collect()
     }
 
-    pub(crate) fn build_graph_snapshot(&self, pool_states: &[PoolState]) -> GraphSnapshot {
+    pub(crate) fn build_graph_snapshot(&self, pool_states: Vec<PoolState>) -> GraphSnapshot {
         GraphSnapshot::new(pool_states)
     }
 
@@ -1299,16 +1299,17 @@ struct PoolEdge<'a> {
     token_out: Address,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct OwnedPoolEdge {
-    state: PoolState,
+    state_index: usize,
+    pool: Address,
     token_in: Address,
     token_out: Address,
 }
 
 impl OwnedPoolEdge {
     fn pool(&self) -> Address {
-        self.state.pool_id.address
+        self.pool
     }
 }
 
@@ -1320,44 +1321,54 @@ struct ScoredDynamicPath {
 
 #[derive(Clone)]
 pub(crate) struct GraphSnapshot {
+    pool_states: Vec<PoolState>,
     edges_by_token: HashMap<Address, Vec<OwnedPoolEdge>>,
     pool_to_edges: HashMap<Address, Vec<OwnedPoolEdge>>,
 }
 
 impl GraphSnapshot {
-    fn new(pool_states: &[PoolState]) -> Self {
+    fn new(pool_states: Vec<PoolState>) -> Self {
+        let mut states = Vec::new();
         let mut edges_by_token: HashMap<Address, Vec<OwnedPoolEdge>> = HashMap::new();
         let mut pool_to_edges: HashMap<Address, Vec<OwnedPoolEdge>> = HashMap::new();
-        for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
+        for state in pool_states.into_iter().filter(is_supported_pool) {
+            let state_index = states.len();
+            let pool = state.pool_id.address;
             let edges = [
                 OwnedPoolEdge {
-                    state: state.clone(),
+                    state_index,
+                    pool,
                     token_in: state.token0,
                     token_out: state.token1,
                 },
                 OwnedPoolEdge {
-                    state: state.clone(),
+                    state_index,
+                    pool,
                     token_in: state.token1,
                     token_out: state.token0,
                 },
             ];
+            states.push(state);
             for edge in edges {
-                edges_by_token
-                    .entry(edge.token_in)
-                    .or_default()
-                    .push(edge.clone());
+                edges_by_token.entry(edge.token_in).or_default().push(edge);
                 pool_to_edges.entry(edge.pool()).or_default().push(edge);
             }
         }
         for edges in edges_by_token.values_mut() {
-            edges.sort_by_key(|edge| std::cmp::Reverse(pool_depth_score(&edge.state)));
+            edges
+                .sort_by_key(|edge| std::cmp::Reverse(pool_depth_score(&states[edge.state_index])));
             edges.truncate(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN);
             edges.sort_by_key(|edge| (edge.token_out, edge.pool()));
         }
         Self {
+            pool_states: states,
             edges_by_token,
             pool_to_edges,
         }
+    }
+
+    fn state(&self, edge: &OwnedPoolEdge) -> &PoolState {
+        &self.pool_states[edge.state_index]
     }
 
     fn edges_from_token(&self, token: Address) -> Option<&[OwnedPoolEdge]> {
@@ -1448,7 +1459,8 @@ fn add_dynamic_cycles_for_changed_edge(
                     stats.dynamic_multihop_duplicate_cycle += 1;
                     continue;
                 }
-                let Some(scored_path) = score_dynamic_multihop_path(anchor, &cycle, stats) else {
+                let Some(scored_path) = score_dynamic_multihop_path(graph, anchor, &cycle, stats)
+                else {
                     continue;
                 };
                 paths.push(scored_path);
@@ -1476,6 +1488,7 @@ fn select_dynamic_paths(mut paths: Vec<ScoredDynamicPath>) -> Vec<SearchPath> {
 }
 
 fn score_dynamic_multihop_path(
+    graph: &GraphSnapshot,
     anchor: &AnchorSearchConfig,
     edges: &[OwnedPoolEdge],
     stats: &mut SearchStats,
@@ -1491,7 +1504,8 @@ fn score_dynamic_multihop_path(
         }
         let mut amount = amount_in;
         for edge in edges {
-            let next_amount = match rough_quote_edge_upper_bound(edge, amount) {
+            let state = graph.state(edge);
+            let next_amount = match rough_quote_edge_upper_bound(edge, state, amount) {
                 Ok(next_amount) => next_amount,
                 Err(reason) => {
                     quote_failure.get_or_insert(reason);
@@ -1503,7 +1517,7 @@ fn score_dynamic_multihop_path(
                         failed_pool: edge.pool(),
                         token_in: edge.token_in,
                         token_out: edge.token_out,
-                        variant: edge.state.variant,
+                        variant: state.variant,
                         path_preview: rough_path_preview(anchor.token, edges),
                     });
                     continue 'amounts;
@@ -1519,7 +1533,7 @@ fn score_dynamic_multihop_path(
                     failed_pool: edge.pool(),
                     token_in: edge.token_in,
                     token_out: edge.token_out,
-                    variant: edge.state.variant,
+                    variant: state.variant,
                     path_preview: rough_path_preview(anchor.token, edges),
                 });
                 continue 'amounts;
@@ -1551,7 +1565,7 @@ fn score_dynamic_multihop_path(
             }
             stats.dynamic_multihop_rough_quote_included += 1;
             return Some(ScoredDynamicPath {
-                path: build_dynamic_multihop_search_path(anchor, edges),
+                path: build_dynamic_multihop_search_path(graph, anchor, edges),
                 score_bps: U256::from(1u64),
                 estimated_profit: U256::ZERO,
             });
@@ -1561,7 +1575,7 @@ fn score_dynamic_multihop_path(
         return None;
     }
     Some(ScoredDynamicPath {
-        path: build_dynamic_multihop_search_path(anchor, edges),
+        path: build_dynamic_multihop_search_path(graph, anchor, edges),
         score_bps: best_score_bps,
         estimated_profit: best_profit,
     })
@@ -1648,35 +1662,28 @@ fn rough_path_preview(anchor: Address, edges: &[OwnedPoolEdge]) -> String {
 
 fn rough_quote_edge_upper_bound(
     edge: &OwnedPoolEdge,
+    state: &PoolState,
     amount_in: U256,
 ) -> Result<U256, RoughQuoteFailure> {
-    match edge.state.variant {
+    match state.variant {
         PoolVariant::AerodromeVolatile => {
-            let reserve0 = edge
-                .state
-                .reserve0
-                .ok_or(RoughQuoteFailure::MissingReserves)?;
-            let reserve1 = edge
-                .state
-                .reserve1
-                .ok_or(RoughQuoteFailure::MissingReserves)?;
-            let (reserve_in, reserve_out) = if edge.token_in == edge.state.token0 {
+            let reserve0 = state.reserve0.ok_or(RoughQuoteFailure::MissingReserves)?;
+            let reserve1 = state.reserve1.ok_or(RoughQuoteFailure::MissingReserves)?;
+            let (reserve_in, reserve_out) = if edge.token_in == state.token0 {
                 (reserve0, reserve1)
-            } else if edge.token_in == edge.state.token1 {
+            } else if edge.token_in == state.token1 {
                 (reserve1, reserve0)
             } else {
                 return Err(RoughQuoteFailure::TokenMismatch);
             };
-            if edge.state.stable.unwrap_or(false) {
-                let decimals0 = edge
-                    .state
+            if state.stable.unwrap_or(false) {
+                let decimals0 = state
                     .token0_decimals
                     .ok_or(RoughQuoteFailure::MissingDecimals)?;
-                let decimals1 = edge
-                    .state
+                let decimals1 = state
                     .token1_decimals
                     .ok_or(RoughQuoteFailure::MissingDecimals)?;
-                let (decimals_in, decimals_out) = if edge.token_in == edge.state.token0 {
+                let (decimals_in, decimals_out) = if edge.token_in == state.token0 {
                     (decimals0, decimals1)
                 } else {
                     (decimals1, decimals0)
@@ -1685,7 +1692,7 @@ fn rough_quote_edge_upper_bound(
                     reserve_in,
                     reserve_out,
                     amount_in,
-                    edge.state.fee_bps,
+                    state.fee_bps,
                     decimals_in,
                     decimals_out,
                 )
@@ -1695,7 +1702,7 @@ fn rough_quote_edge_upper_bound(
                     reserve_in,
                     reserve_out,
                     amount_in,
-                    edge.state.fee_bps,
+                    state.fee_bps,
                 )
                 .map_err(|_| RoughQuoteFailure::V2QuoteFailed)
             }
@@ -1703,7 +1710,7 @@ fn rough_quote_edge_upper_bound(
         PoolVariant::AerodromeSlipstream
         | PoolVariant::UniswapV3
         | PoolVariant::PancakeV3
-        | PoolVariant::UniswapV4 => spot_quote_exact_in(&edge.state, edge.token_in, amount_in)
+        | PoolVariant::UniswapV4 => spot_quote_exact_in(state, edge.token_in, amount_in)
             .map_err(classify_v3_spot_quote_failure),
         PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
     }
@@ -2366,12 +2373,13 @@ fn build_four_pool_search_path(
 }
 
 fn build_dynamic_multihop_search_path(
+    graph: &GraphSnapshot,
     anchor: &AnchorSearchConfig,
     edges: &[OwnedPoolEdge],
 ) -> SearchPath {
     let pools = edges
         .iter()
-        .map(|edge| pool_label(&edge.state))
+        .map(|edge| pool_label(graph.state(edge)))
         .collect::<Vec<_>>()
         .join("-");
     let name = format!(
@@ -2385,7 +2393,7 @@ fn build_dynamic_multihop_search_path(
             name,
             steps: edges
                 .iter()
-                .map(|edge| swap_step_from_pool(&edge.state, edge.token_in, edge.token_out))
+                .map(|edge| swap_step_from_pool(graph.state(edge), edge.token_in, edge.token_out))
                 .collect(),
             diagnostics: None,
         },

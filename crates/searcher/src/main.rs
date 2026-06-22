@@ -437,7 +437,7 @@ where
             .expect("searcher engine checked above");
         let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
         runtime.path_index = Some(engine.build_path_index(&pool_states));
-        runtime.graph_snapshot = Some(engine.build_graph_snapshot(&pool_states));
+        runtime.graph_snapshot = Some(engine.build_graph_snapshot(pool_states));
         info!(
             total_paths = runtime
                 .path_index
