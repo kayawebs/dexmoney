@@ -85,9 +85,9 @@ pub trait TickStateStore: Send + Sync {
 #[async_trait]
 pub trait CandidateStore: Send + Sync {
     async fn push_candidate(&self, candidate: Candidate) -> anyhow::Result<()>;
-    async fn push_candidates(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
+    async fn push_candidates(&self, candidates: &[Candidate]) -> anyhow::Result<()> {
         for candidate in candidates {
-            self.push_candidate(candidate).await?;
+            self.push_candidate(candidate.clone()).await?;
         }
         Ok(())
     }
@@ -382,8 +382,11 @@ impl CandidateStore for InMemoryStores {
         Ok(())
     }
 
-    async fn push_candidates(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
-        self.candidates.lock().await.extend(candidates);
+    async fn push_candidates(&self, candidates: &[Candidate]) -> anyhow::Result<()> {
+        self.candidates
+            .lock()
+            .await
+            .extend(candidates.iter().cloned());
         Ok(())
     }
 

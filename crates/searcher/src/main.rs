@@ -894,10 +894,9 @@ where
     }
     if !valid_candidates.is_empty() {
         cycle_stats.opportunities_created += valid_candidates.len() as u64;
-        let record_candidates = valid_candidates.clone();
-        candidate_store.push_candidates(valid_candidates).await?;
+        candidate_store.push_candidates(&valid_candidates).await?;
         cycle_stats.opportunity_record_queue_dropped +=
-            opportunity_recorder.enqueue(record_candidates) as u64;
+            opportunity_recorder.enqueue(valid_candidates) as u64;
     }
     Ok(())
 }

@@ -507,7 +507,7 @@ impl CandidateStore for RedisStore {
         Ok(())
     }
 
-    async fn push_candidates(&self, candidates: Vec<Candidate>) -> Result<()> {
+    async fn push_candidates(&self, candidates: &[Candidate]) -> Result<()> {
         if candidates.is_empty() {
             return Ok(());
         }
