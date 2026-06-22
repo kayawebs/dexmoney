@@ -173,8 +173,6 @@ where
                 }
                 deduped_events.push((event, duplicate_log));
             }
-            self.recorder.record_dex_events(event_records).await?;
-
             for (event, duplicate_log) in deduped_events {
                 let Some(index) = state_index_by_pool.get(&event.pool_address).copied() else {
                     continue;
@@ -370,18 +368,31 @@ where
             let fee_ms = fee_started.elapsed().as_millis() as u64;
 
             let publish_started = Instant::now();
-            if !changed_pools.is_empty() {
-                self.publish_selected_states(&monitored_states, &changed_pools, "local_event")
-                    .await?;
-            }
-            if !fee_refreshed_pools.is_empty() {
-                self.publish_selected_states(
-                    &monitored_states,
-                    &fee_refreshed_pools,
-                    "fee_refresh",
-                )
-                .await?;
-            }
+            tokio::try_join!(
+                self.recorder.record_dex_events(event_records),
+                async {
+                    if !changed_pools.is_empty() {
+                        self.publish_selected_states(
+                            &monitored_states,
+                            &changed_pools,
+                            "local_event",
+                        )
+                        .await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                },
+                async {
+                    if !fee_refreshed_pools.is_empty() {
+                        self.publish_selected_states(
+                            &monitored_states,
+                            &fee_refreshed_pools,
+                            "fee_refresh",
+                        )
+                        .await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+            )?;
             let publish_ms = publish_started.elapsed().as_millis() as u64;
 
             enqueue_validation_snapshots(&mut pending_validations, validation_snapshots);
