@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
                 max_cycle_ms = aggregate.max_cycle_ms,
                 config_load_ms = aggregate.config_load_ms,
                 state_load_ms = aggregate.state_load_ms,
+                state_load_pools = aggregate.state_load_pools,
                 tick_load_ms = aggregate.tick_load_ms,
                 tick_cache_hits = aggregate.tick_cache_hits,
                 tick_cache_misses = aggregate.tick_cache_misses,
@@ -162,6 +163,7 @@ struct SearchCycleStats {
     max_cycle_ms: u64,
     config_load_ms: u64,
     state_load_ms: u64,
+    state_load_pools: u64,
     tick_load_ms: u64,
     tick_cache_hits: u64,
     tick_cache_misses: u64,
@@ -197,6 +199,7 @@ impl SearchCycleStats {
         self.max_cycle_ms = self.max_cycle_ms.max(other.max_cycle_ms);
         self.config_load_ms += other.config_load_ms;
         self.state_load_ms += other.state_load_ms;
+        self.state_load_pools += other.state_load_pools;
         self.tick_load_ms += other.tick_load_ms;
         self.tick_cache_hits += other.tick_cache_hits;
         self.tick_cache_misses += other.tick_cache_misses;
@@ -377,8 +380,14 @@ where
     let now = Utc::now();
     let mut rebuild_path_index =
         config_changed || runtime.path_index.is_none() || runtime.graph_snapshot.is_none();
-    let changed_pool_addresses = changed_pools.iter().copied().collect::<Vec<_>>();
-    for (pool, state) in pool_store.get_pool_states(&changed_pool_addresses).await? {
+    let state_load_addresses = changed_pools
+        .iter()
+        .copied()
+        .filter(|pool| {
+            !tick_changed_pools.contains(pool) || !runtime.pool_states.contains_key(pool)
+        })
+        .collect::<Vec<_>>();
+    for (pool, state) in pool_store.get_pool_states(&state_load_addresses).await? {
         match state {
             Some(state) => {
                 let topology = PoolTopology::from(&state);
@@ -476,6 +485,7 @@ where
         cycles: 1,
         config_load_ms,
         state_load_ms,
+        state_load_pools: state_load_addresses.len() as u64,
         path_build_ms,
         path_pools: selected_paths.path_pools.len() as u64,
         latest_chain_block: latest_known_block,
