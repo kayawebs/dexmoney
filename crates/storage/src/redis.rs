@@ -163,15 +163,7 @@ impl PoolStateStore for RedisStore {
     async fn get_pool_state(&self, address: Address) -> Result<Option<PoolState>> {
         let mut manager = self.manager.clone();
         let index_key = pool_address_index_key(address);
-        let mut key: Option<String> = manager.get(&index_key).await?;
-        if key.is_none() {
-            let pattern = format!("pool:*:{address}");
-            let keys: Vec<String> = manager.keys(pattern).await?;
-            key = keys.into_iter().next();
-            if let Some(key) = key.as_ref() {
-                let _: () = manager.set(&index_key, key).await?;
-            }
-        }
+        let key: Option<String> = manager.get(&index_key).await?;
         let Some(key) = key else {
             return Ok(None);
         };
@@ -228,10 +220,7 @@ impl PoolStateStore for RedisStore {
 
     async fn all_pool_states(&self) -> Result<Vec<PoolState>> {
         let mut manager = self.manager.clone();
-        let mut keys: Vec<String> = manager.smembers(pool_state_index_key()).await?;
-        if keys.is_empty() {
-            keys = manager.keys("pool:*").await?;
-        }
+        let keys: Vec<String> = manager.smembers(pool_state_index_key()).await?;
         let mut out: Vec<PoolState> = Vec::with_capacity(keys.len());
         for key_chunk in keys.chunks(REDIS_MGET_CHUNK_SIZE) {
             let values: Vec<Option<String>> = redis::cmd("MGET")
@@ -425,18 +414,7 @@ impl TickStateStore for RedisStore {
     async fn get_pool_ticks(&self, pool: Address) -> Result<Vec<TickState>> {
         let mut manager = self.manager.clone();
         let index_key = tick_pool_index_key(pool);
-        let mut keys: Vec<String> = manager.smembers(&index_key).await?;
-        if keys.is_empty() {
-            let pattern = format!("ticks:*:{pool}:*");
-            keys = manager.keys(pattern).await?;
-            if !keys.is_empty() {
-                let mut pipe = redis::pipe();
-                for key in &keys {
-                    pipe.sadd(&index_key, key).ignore();
-                }
-                let _: () = pipe.query_async(&mut manager).await?;
-            }
-        }
+        let keys: Vec<String> = manager.smembers(&index_key).await?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
