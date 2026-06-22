@@ -160,6 +160,7 @@ where
     }
     let candidate_count = candidates.len();
     let batch_started = Instant::now();
+    let simulation_context = simulator::SimulationContext::load(provider, settings).await;
     let mut simulated = 0usize;
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     for candidate in candidates {
@@ -177,6 +178,7 @@ where
             selected_wallet.as_ref(),
             fund_wallet.as_ref(),
             circuit_breaker,
+            &simulation_context,
             &candidate,
             current_block,
             max_candidate_lag_blocks,
@@ -320,6 +322,7 @@ async fn handle_candidate<C, E, R>(
     wallet: Option<&tx_manager::ExecutionWallet>,
     fund_wallet: Option<&tx_manager::ExecutionWallet>,
     circuit_breaker: &ExecutionCircuitBreaker,
+    simulation_context: &simulator::SimulationContext,
     candidate: &base_arb_common::types::Candidate,
     current_block: u64,
     max_candidate_lag_blocks: u64,
@@ -539,6 +542,7 @@ where
         operator,
         &candidate,
         min_simulated_profit_usdc,
+        simulation_context,
     )
     .await;
     recorder.record_simulation(simulation.clone()).await?;

@@ -16,21 +16,36 @@ pub struct ApprovalRequirement {
     pub spender: Address,
 }
 
+#[derive(Debug, Clone)]
+pub struct SimulationContext {
+    pub observed_block: Option<u64>,
+    fees: Option<SimulationFeeSuggestion>,
+}
+
+impl SimulationContext {
+    pub async fn load(provider: &ChainProvider, settings: &Settings) -> Self {
+        Self {
+            observed_block: provider.get_block_number().await.ok(),
+            fees: simulation_fee_suggestion(provider, settings).await.ok(),
+        }
+    }
+}
+
 pub async fn simulate(
     provider: &ChainProvider,
     settings: &Settings,
     operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
+    context: &SimulationContext,
 ) -> SimulationResult {
-    let observed_block = provider.get_block_number().await.ok();
     match simulate_inner(
         provider,
         settings,
         operator,
         candidate,
         min_simulated_profit_usdc,
-        observed_block,
+        context,
     )
     .await
     {
@@ -50,7 +65,7 @@ pub async fn simulate(
                 min_profit: Some(candidate.min_profit),
                 simulated_profit: U256::ZERO,
                 gas_estimate: None,
-                block_number: observed_block,
+                block_number: context.observed_block,
                 base_fee_per_gas: None,
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
@@ -70,7 +85,7 @@ async fn simulate_inner(
     operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
-    observed_block: Option<u64>,
+    context: &SimulationContext,
 ) -> Result<SimulationResult> {
     if candidate.is_expired(Utc::now()) {
         anyhow::bail!("candidate expired");
@@ -99,7 +114,10 @@ async fn simulate_inner(
         .estimate_gas(operator, executor, &data)
         .await
         .context("failed to estimate executor tx gas after successful eth_call")?;
-    let fees = simulation_fee_suggestion(provider, settings).await?;
+    let fees = match context.fees.clone() {
+        Some(fees) => fees,
+        None => simulation_fee_suggestion(provider, settings).await?,
+    };
     let gas_cost_cap = gas_estimate.saturating_mul(fees.max_fee_per_gas);
     let gas_cost_expected = gas_estimate.saturating_mul(fees.expected_fee_per_gas);
     let net_simulated_profit = if candidate.token_in == settings.weth_address {
@@ -108,7 +126,7 @@ async fn simulate_inner(
         None
     };
     let profit_meets_threshold = simulated_profit >= min_profit_units;
-    let block_number = provider.get_block_number().await.ok().or(observed_block);
+    let block_number = context.observed_block;
 
     Ok(SimulationResult {
         id: uuid::Uuid::new_v4(),
@@ -181,6 +199,7 @@ pub fn executor_for_candidate(settings: &Settings, candidate: &Candidate) -> Res
         })
 }
 
+#[derive(Debug, Clone)]
 struct SimulationFeeSuggestion {
     base_fee_per_gas: U256,
     expected_fee_per_gas: U256,
@@ -770,6 +789,7 @@ mod tests {
             competitor_pool_discovery_lookback_blocks: 100,
             competitor_pool_discovery_max_block_span: 25,
             searcher_multihop_enabled: true,
+            searcher_config_refresh_secs: 5,
             aerodrome_fee_refresh_interval_secs: 15,
             v3_tick_refresh_interval_secs: 60,
             v3_tick_bitmap_word_radius: 8,
@@ -803,6 +823,8 @@ mod tests {
             token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
             token_out: address!("4200000000000000000000000000000000000006"),
             fee_bps: Some(5),
+            pool_key_fee_pips: None,
+            hooks_address: None,
             stable: None,
             tick_spacing: None,
             adapter_data: None,
@@ -953,6 +975,8 @@ mod tests {
                     token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
                     token_out: address!("4200000000000000000000000000000000000006"),
                     fee_bps: Some(5),
+                    pool_key_fee_pips: None,
+                    hooks_address: None,
                     stable: None,
                     tick_spacing: None,
                     adapter_data: None,
