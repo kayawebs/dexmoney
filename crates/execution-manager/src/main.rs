@@ -198,7 +198,6 @@ where
             "execution worker selected for candidate batch"
         );
     }
-    let candidate_count = candidates.len();
     let batch_started = Instant::now();
     let simulation_context = simulator::SimulationContext::load(provider, settings).await;
     if !settings.execution_submit_enabled {
@@ -216,62 +215,23 @@ where
         )
         .await;
     }
-    let mut simulated = 0usize;
-    let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for candidate in candidates {
-        if simulated >= MAX_SIMULATIONS_PER_CYCLE {
-            break;
-        }
-        match handle_candidate(
-            candidate_store,
-            eoa_store,
-            recorder,
-            provider,
-            settings,
-            min_simulated_profit_usdc,
-            operator,
-            selected_wallet.as_ref(),
-            runtime.fund_wallet.as_ref(),
-            circuit_breaker,
-            &simulation_context,
-            &candidate,
-            current_block,
-            max_candidate_lag_blocks,
-        )
-        .await?
-        {
-            CandidateAction::Submitted => {
-                info!(
-                    candidate_count,
-                    current_block,
-                    max_candidate_lag_blocks,
-                    simulated,
-                    skipped = skipped_by_reason.values().sum::<usize>(),
-                    elapsed_ms = batch_started.elapsed().as_millis() as u64,
-                    skipped_by_reason = ?skipped_by_reason,
-                    "execution candidate batch summary"
-                );
-                return Ok(());
-            }
-            CandidateAction::Simulated => simulated += 1,
-            CandidateAction::Skipped(reason) => {
-                *skipped_by_reason.entry(reason).or_insert(0) += 1;
-            }
-        }
-    }
-
-    info!(
-        candidate_count,
+    run_live_submission_batch(
+        eoa_store,
+        recorder,
+        provider,
+        settings,
+        operator,
+        selected_wallet.as_ref(),
+        runtime.fund_wallet.as_ref(),
+        candidates,
+        min_simulated_profit_usdc,
+        simulation_context,
         current_block,
         max_candidate_lag_blocks,
-        simulated,
-        skipped = skipped_by_reason.values().sum::<usize>(),
-        elapsed_ms = batch_started.elapsed().as_millis() as u64,
-        skipped_by_reason = ?skipped_by_reason,
-        "execution candidate batch summary"
-    );
-
-    Ok(())
+        batch_started,
+        circuit_breaker,
+    )
+    .await
 }
 
 async fn run_dry_run_simulation_batch<R>(
@@ -380,6 +340,530 @@ where
     Ok(())
 }
 
+#[derive(Debug)]
+struct LiveSimulationOutcome {
+    candidate: Candidate,
+    simulation: SimulationResult,
+}
+
+async fn run_live_submission_batch<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    operator: Address,
+    wallet: Option<&tx_manager::ExecutionWallet>,
+    fund_wallet: Option<&tx_manager::ExecutionWallet>,
+    candidates: Vec<Candidate>,
+    min_simulated_profit_usdc: f64,
+    simulation_context: simulator::SimulationContext,
+    current_block: u64,
+    max_candidate_lag_blocks: u64,
+    batch_started: Instant,
+    circuit_breaker: &ExecutionCircuitBreaker,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    let candidate_count = candidates.len();
+    let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut approval_ready = Vec::new();
+    let mut preflight_simulated = 0usize;
+
+    for candidate in candidates {
+        if approval_ready.len() >= MAX_SIMULATIONS_PER_CYCLE {
+            break;
+        }
+        let block_lag = current_block.saturating_sub(candidate.block_number);
+        if block_lag > max_candidate_lag_blocks {
+            *skipped_by_reason.entry("block_lag").or_insert(0) += 1;
+            warn!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                candidate_block = candidate.block_number,
+                current_block,
+                block_lag,
+                max_lag_blocks = max_candidate_lag_blocks,
+                "fresh candidate unexpectedly skipped because it is too far behind current block"
+            );
+            continue;
+        }
+
+        if let Some(action) = live_approval_preflight(
+            eoa_store,
+            recorder,
+            provider,
+            settings,
+            wallet,
+            fund_wallet,
+            &candidate,
+            current_block,
+        )
+        .await?
+        {
+            match action {
+                CandidateAction::Submitted => {
+                    info!(
+                        candidate_count,
+                        current_block,
+                        max_candidate_lag_blocks,
+                        simulated = preflight_simulated,
+                        skipped = skipped_by_reason.values().sum::<usize>(),
+                        elapsed_ms = batch_started.elapsed().as_millis() as u64,
+                        skipped_by_reason = ?skipped_by_reason,
+                        "execution candidate batch summary"
+                    );
+                    return Ok(());
+                }
+                CandidateAction::Simulated => preflight_simulated += 1,
+                CandidateAction::Skipped(reason) => {
+                    *skipped_by_reason.entry(reason).or_insert(0) += 1;
+                }
+            }
+            continue;
+        }
+
+        approval_ready.push(candidate);
+    }
+
+    let max_to_simulate = approval_ready.len().min(MAX_SIMULATIONS_PER_CYCLE);
+    let concurrency = settings
+        .execution_simulation_concurrency
+        .max(1)
+        .min(MAX_SIMULATIONS_PER_CYCLE as u64) as usize;
+    let mut candidates = approval_ready.into_iter().take(max_to_simulate);
+    let mut join_set = JoinSet::<LiveSimulationOutcome>::new();
+    let mut spawned = 0usize;
+    let mut simulated = preflight_simulated;
+    let mut simulation_successes = 0usize;
+    let mut simulation_failures = 0usize;
+    let mut join_errors = 0usize;
+    let mut successful = Vec::new();
+
+    loop {
+        while spawned < max_to_simulate && join_set.len() < concurrency {
+            let Some(candidate) = candidates.next() else {
+                break;
+            };
+            spawned += 1;
+            let provider = provider.clone();
+            let settings = settings.clone();
+            let simulation_context = simulation_context.clone();
+            join_set.spawn(async move {
+                let simulation = simulator::simulate(
+                    &provider,
+                    &settings,
+                    operator,
+                    &candidate,
+                    min_simulated_profit_usdc,
+                    &simulation_context,
+                )
+                .await;
+                LiveSimulationOutcome {
+                    candidate,
+                    simulation,
+                }
+            });
+        }
+
+        if join_set.is_empty() {
+            break;
+        }
+
+        match join_set.join_next().await {
+            Some(Ok(outcome)) => {
+                debug!(
+                    candidate_id = %outcome.simulation.opportunity_id,
+                    success = outcome.simulation.success,
+                    "simulation success/fail"
+                );
+                recorder
+                    .record_simulation(outcome.simulation.clone())
+                    .await?;
+                if outcome.simulation.success {
+                    simulation_successes += 1;
+                    successful.push(outcome);
+                } else {
+                    simulation_failures += 1;
+                }
+                simulated += 1;
+            }
+            Some(Err(err)) => {
+                join_errors += 1;
+                warn!(error = %err, "live simulation task failed");
+            }
+            None => break,
+        }
+    }
+
+    successful.sort_by(|left, right| {
+        simulation_profit_rank(&right.simulation).cmp(&simulation_profit_rank(&left.simulation))
+    });
+
+    let mut submitted = false;
+    for outcome in successful {
+        match submit_simulated_candidate(
+            eoa_store,
+            recorder,
+            provider,
+            settings,
+            wallet,
+            circuit_breaker,
+            &outcome.candidate,
+            &outcome.simulation,
+        )
+        .await?
+        {
+            CandidateAction::Submitted => {
+                submitted = true;
+                break;
+            }
+            CandidateAction::Simulated => {}
+            CandidateAction::Skipped(reason) => {
+                *skipped_by_reason.entry(reason).or_insert(0) += 1;
+            }
+        }
+    }
+
+    info!(
+        candidate_count,
+        current_block,
+        max_candidate_lag_blocks,
+        simulated,
+        simulation_successes,
+        simulation_failures,
+        join_errors,
+        concurrency,
+        submitted,
+        skipped = skipped_by_reason.values().sum::<usize>(),
+        elapsed_ms = batch_started.elapsed().as_millis() as u64,
+        skipped_by_reason = ?skipped_by_reason,
+        "execution candidate batch summary"
+    );
+
+    Ok(())
+}
+
+fn simulation_profit_rank(simulation: &SimulationResult) -> U256 {
+    simulation
+        .net_simulated_profit
+        .unwrap_or(simulation.simulated_profit)
+}
+
+async fn live_approval_preflight<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    wallet: Option<&tx_manager::ExecutionWallet>,
+    fund_wallet: Option<&tx_manager::ExecutionWallet>,
+    candidate: &Candidate,
+    current_block: u64,
+) -> Result<Option<CandidateAction>>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    if !settings.execution_submit_enabled {
+        return Ok(None);
+    }
+    if wallet.is_none() {
+        anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+    }
+
+    let approvals = simulator::required_token_approvals(candidate, settings)?;
+    let missing_approvals =
+        tx_manager::missing_approvals(provider, settings, candidate, &approvals)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    candidate_id = %candidate.id,
+                    error = %err,
+                    "failed to check route allowances; trying route approvals before tx"
+                );
+                approvals
+            });
+    if missing_approvals.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(worker_wallet) = wallet else {
+        anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
+    };
+    let Some(fund_wallet) = fund_wallet else {
+        anyhow::bail!("EOA_PRIVATE_KEY_1 is required for executor approval admin txs");
+    };
+    if admin_has_pending_nonce(provider, fund_wallet.address()).await? {
+        debug!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            "candidate skipped because fund/admin EOA has a pending tx"
+        );
+        return Ok(Some(CandidateAction::Skipped("admin_pending_approval")));
+    }
+
+    let executor = simulator::executor_for_candidate(settings, candidate)?;
+    let nonce = provider
+        .get_transaction_count(fund_wallet.address(), true)
+        .await?;
+    let approval = missing_approvals[0];
+    let calldata = simulator::build_live_execution_calldata(settings, candidate)?;
+    let synthetic_simulation = SimulationResult {
+        id: uuid::Uuid::new_v4(),
+        opportunity_id: candidate.id,
+        success: false,
+        path_name: Some(candidate.path.name.clone()),
+        token_in: Some(candidate.token_in),
+        amount_in: Some(candidate.amount_in),
+        expected_profit: Some(candidate.expected_profit),
+        min_profit: Some(candidate.min_profit),
+        simulated_profit: U256::ZERO,
+        gas_estimate: None,
+        block_number: Some(current_block),
+        base_fee_per_gas: None,
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        gas_cost_cap: None,
+        gas_cost_expected: None,
+        net_simulated_profit: None,
+        revert_reason: Some("lazy approval preflight; simulation skipped".to_string()),
+        calldata: calldata.clone(),
+    };
+    recorder
+        .record_simulation(synthetic_simulation.clone())
+        .await?;
+    match tx_manager::submit_executor_approval(
+        provider,
+        fund_wallet,
+        settings,
+        executor,
+        approval,
+        nonce,
+    )
+    .await
+    {
+        Ok(submission) => {
+            info!(
+                candidate_id = %candidate.id,
+                token = %approval.token,
+                spender = %approval.spender,
+                tx_hash = %submission.tx_hash,
+                "executor approval submitted by fund EOA; current candidate skipped"
+            );
+            recorder
+                .record_transaction(tx_manager::pending_tx_result(
+                    candidate,
+                    fund_wallet.address(),
+                    &submission,
+                ))
+                .await?;
+            let mut lane = eoa_store
+                .get_lane_state(worker_wallet.address())
+                .await?
+                .map(|state| eoa_lane::EoaLane { state })
+                .unwrap_or_else(|| eoa_lane::EoaLane::new(worker_wallet.address()));
+            let arb_nonce = lane.state.local_nonce;
+            match tx_manager::submit_candidate_unchecked(
+                provider,
+                worker_wallet,
+                settings,
+                candidate,
+                Some(synthetic_simulation.id),
+                &calldata,
+                arb_nonce,
+            )
+            .await
+            {
+                Ok(arb_submission) => {
+                    lane.mark_submitted(
+                        candidate.id,
+                        arb_submission.simulation_id,
+                        arb_submission.tx_hash,
+                        arb_submission.executor_contract,
+                        arb_submission.nonce,
+                        arb_submission.submitted_block,
+                        arb_submission.gas_limit,
+                        arb_submission.max_fee_per_gas,
+                        arb_submission.max_priority_fee_per_gas,
+                    );
+                    eoa_store.set_lane_state(lane.state.clone()).await?;
+                    recorder
+                        .record_transaction(tx_manager::pending_tx_result(
+                            candidate,
+                            worker_wallet.address(),
+                            &arb_submission,
+                        ))
+                        .await?;
+                    info!(
+                        candidate_id = %candidate.id,
+                        approval_tx_hash = %submission.tx_hash,
+                        arb_tx_hash = %arb_submission.tx_hash,
+                        worker = %worker_wallet.address(),
+                        "lazy approval submitted and arb tx fired without waiting"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        candidate_id = %candidate.id,
+                        nonce = arb_nonce,
+                        worker = %worker_wallet.address(),
+                        error = %err,
+                        "lazy approval submitted but follow-up arb tx failed before broadcast"
+                    );
+                    lane.mark_cooldown();
+                    eoa_store.set_lane_state(lane.state.clone()).await?;
+                    recorder
+                        .record_transaction(TxResult {
+                            opportunity_id: candidate.id,
+                            simulation_id: Some(synthetic_simulation.id),
+                            eoa: worker_wallet.address(),
+                            tx_hash: None,
+                            nonce: arb_nonce,
+                            status: TxStatus::Dropped,
+                            realized_profit: None,
+                            gas_used: None,
+                            effective_gas_price: None,
+                            revert_reason: Some(err.to_string()),
+                            receipt_json: None,
+                        })
+                        .await?;
+                }
+            }
+            Ok(Some(CandidateAction::Submitted))
+        }
+        Err(err) => {
+            warn!(
+                candidate_id = %candidate.id,
+                token = %approval.token,
+                spender = %approval.spender,
+                error = %err,
+                "executor approval admin tx failed"
+            );
+            recorder
+                .record_transaction(TxResult {
+                    opportunity_id: candidate.id,
+                    simulation_id: Some(synthetic_simulation.id),
+                    eoa: fund_wallet.address(),
+                    tx_hash: None,
+                    nonce,
+                    status: TxStatus::Dropped,
+                    realized_profit: None,
+                    gas_used: None,
+                    effective_gas_price: None,
+                    revert_reason: Some(err.to_string()),
+                    receipt_json: None,
+                })
+                .await?;
+            Ok(Some(CandidateAction::Simulated))
+        }
+    }
+}
+
+async fn submit_simulated_candidate<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    wallet: Option<&tx_manager::ExecutionWallet>,
+    circuit_breaker: &ExecutionCircuitBreaker,
+    candidate: &Candidate,
+    simulation: &SimulationResult,
+) -> Result<CandidateAction>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    if candidate.is_expired(Utc::now()) {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            created_at = %candidate.created_at,
+            expires_at = %candidate.expires_at,
+            "candidate expired after simulation; skipping tx submission"
+        );
+        return Ok(CandidateAction::Simulated);
+    }
+    if !settings.execution_submit_enabled {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            simulated_profit = %simulation.simulated_profit,
+            net_simulated_profit = ?simulation.net_simulated_profit,
+            gas_estimate = ?simulation.gas_estimate,
+            max_fee_per_gas = ?simulation.max_fee_per_gas,
+            max_priority_fee_per_gas = ?simulation.max_priority_fee_per_gas,
+            "simulation-only mode; skipping tx submission"
+        );
+        return Ok(CandidateAction::Simulated);
+    }
+    if circuit_breaker.is_halted(settings) {
+        return Ok(CandidateAction::Skipped("circuit_breaker"));
+    }
+
+    let Some(wallet) = wallet.as_ref() else {
+        anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+    };
+    let mut lane = eoa_store
+        .get_lane_state(wallet.address())
+        .await?
+        .map(|state| eoa_lane::EoaLane { state })
+        .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
+    let nonce = lane.state.local_nonce;
+    match tx_manager::submit_candidate(provider, wallet, settings, candidate, simulation, nonce)
+        .await
+    {
+        Ok(submission) => {
+            lane.mark_submitted(
+                candidate.id,
+                submission.simulation_id,
+                submission.tx_hash,
+                submission.executor_contract,
+                submission.nonce,
+                submission.submitted_block,
+                submission.gas_limit,
+                submission.max_fee_per_gas,
+                submission.max_priority_fee_per_gas,
+            );
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            recorder
+                .record_transaction(tx_manager::pending_tx_result(
+                    candidate,
+                    wallet.address(),
+                    &submission,
+                ))
+                .await?;
+            Ok(CandidateAction::Submitted)
+        }
+        Err(err) => {
+            warn!(
+                candidate_id = %candidate.id,
+                nonce,
+                error = %err,
+                "tx submission failed"
+            );
+            lane.mark_cooldown();
+            eoa_store.set_lane_state(lane.state.clone()).await?;
+            recorder
+                .record_transaction(TxResult {
+                    opportunity_id: candidate.id,
+                    simulation_id: Some(simulation.id),
+                    eoa: wallet.address(),
+                    tx_hash: None,
+                    nonce,
+                    status: TxStatus::Dropped,
+                    realized_profit: None,
+                    gas_used: None,
+                    effective_gas_price: None,
+                    revert_reason: Some(err.to_string()),
+                    receipt_json: None,
+                })
+                .await?;
+            Ok(CandidateAction::Simulated)
+        }
+    }
+}
+
 async fn select_cached_ready_worker<E>(
     eoa_store: &E,
     runtime: &ExecutionRuntime,
@@ -467,6 +951,7 @@ impl ExecutionCircuitBreaker {
     }
 }
 
+#[allow(dead_code)]
 async fn handle_candidate<C, E, R>(
     _candidate_store: &C,
     eoa_store: &E,
