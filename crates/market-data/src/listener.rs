@@ -89,6 +89,28 @@ where
         + Sync
         + 'static,
 {
+    fn spawn_record_pool_states(&self, states: Vec<PoolState>, source: impl Into<String>) {
+        if states.is_empty() {
+            return;
+        }
+        let source = source.into();
+        let recorder = self.recorder.clone();
+        tokio::spawn(async move {
+            let count = states.len();
+            if let Err(err) = recorder
+                .record_pool_states_with_source(states, &source)
+                .await
+            {
+                warn!(
+                    count,
+                    source = %source,
+                    error = %err,
+                    "failed to record pool states from background task"
+                );
+            }
+        });
+    }
+
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
         self.seed_default_factories().await?;
@@ -1176,12 +1198,10 @@ where
                 .max()
                 .unwrap_or_default();
             let record_states = published_states.clone();
-            tokio::try_join!(
-                self.pool_store
-                    .publish_pool_states(latest_state_block, published_states, changed),
-                self.recorder
-                    .record_pool_states_with_source(record_states, "uniswap_v4_protocol")
-            )?;
+            self.pool_store
+                .publish_pool_states(latest_state_block, published_states, changed)
+                .await?;
+            self.spawn_record_pool_states(record_states, "uniswap_v4_protocol");
         }
         Ok(stats)
     }
@@ -1317,12 +1337,10 @@ where
                 .max()
                 .unwrap_or_default();
             let record_states = published_states.clone();
-            tokio::try_join!(
-                self.pool_store
-                    .publish_pool_states(latest_state_block, published_states, changed),
-                self.recorder
-                    .record_pool_states_with_source(record_states, "balancer_v3_protocol")
-            )?;
+            self.pool_store
+                .publish_pool_states(latest_state_block, published_states, changed)
+                .await?;
+            self.spawn_record_pool_states(record_states, "balancer_v3_protocol");
         }
         Ok(stats)
     }
@@ -2245,16 +2263,16 @@ where
         }
 
         if let Some(updated_state) = updated_state {
+            let record_state = updated_state.clone();
             tokio::try_join!(
                 self.pool_store.publish_pool_states(
                     event.block_number,
                     vec![updated_state.clone()],
                     vec![updated_state.pool_id.address],
                 ),
-                self.recorder.record_dex_event(event.clone()),
-                self.recorder
-                    .record_pool_state_with_source(updated_state, "flashblock")
+                self.recorder.record_dex_event(event.clone())
             )?;
+            self.spawn_record_pool_states(vec![record_state], "flashblock");
         } else {
             tokio::try_join!(
                 self.pool_store.set_current_block(event.block_number),
@@ -2450,12 +2468,10 @@ where
             );
         }
         let record_states = publish_states.clone();
-        tokio::try_join!(
-            self.pool_store
-                .publish_pool_states(latest_state_block, publish_states, changed_pools),
-            self.recorder
-                .record_pool_states_with_source(record_states, source)
-        )?;
+        self.pool_store
+            .publish_pool_states(latest_state_block, publish_states, changed_pools)
+            .await?;
+        self.spawn_record_pool_states(record_states, source);
         Ok(())
     }
 
