@@ -593,12 +593,20 @@ where
                     success = outcome.simulation.success,
                     "simulation success/fail"
                 );
-                simulation_records.push(outcome.simulation.clone());
-                if outcome.simulation.success {
+                let LiveSimulationOutcome {
+                    candidate,
+                    simulation,
+                } = outcome;
+                if simulation.success {
                     simulation_successes += 1;
-                    successful.push(outcome);
+                    simulation_records.push(simulation.clone());
+                    successful.push(LiveSimulationOutcome {
+                        candidate,
+                        simulation,
+                    });
                 } else {
                     simulation_failures += 1;
+                    simulation_records.push(simulation);
                 }
                 simulated += 1;
             }
