@@ -54,6 +54,7 @@ pub struct Settings {
     pub competitor_pool_discovery_lookback_blocks: u64,
     pub competitor_pool_discovery_max_block_span: u64,
     pub searcher_multihop_enabled: bool,
+    pub searcher_config_refresh_secs: u64,
     pub aerodrome_fee_refresh_interval_secs: u64,
     pub v3_tick_refresh_interval_secs: u64,
     pub v3_tick_bitmap_word_radius: i32,
@@ -98,6 +99,7 @@ impl Settings {
             .set_default("competitor_pool_discovery_lookback_blocks", 100u64)?
             .set_default("competitor_pool_discovery_max_block_span", 25u64)?
             .set_default("searcher_multihop_enabled", true)?
+            .set_default("searcher_config_refresh_secs", 5u64)?
             .set_default("aerodrome_fee_refresh_interval_secs", 3u64)?
             .set_default("v3_tick_refresh_interval_secs", 60u64)?
             .set_default("v3_tick_bitmap_word_radius", 8i32)?

@@ -1,9 +1,12 @@
+use std::collections::HashSet;
+
+use alloy_primitives::Address;
 use base_arb_common::errors::{ArbBotError, Result};
-use base_arb_common::types::{Candidate, PoolState};
+use base_arb_common::types::Candidate;
 
 pub fn validate_candidate(
     candidate: &Candidate,
-    pool_states: &[PoolState],
+    available_pools: &HashSet<Address>,
     _max_pool_age_ms: i64,
     min_expected_profit: alloy_primitives::U256,
     max_price_impact_bps: u64,
@@ -26,11 +29,12 @@ pub fn validate_candidate(
         return Err(ArbBotError::RiskGate("path_not_whitelisted".into()));
     }
 
-    if candidate.path.steps.iter().any(|step| {
-        !pool_states
-            .iter()
-            .any(|state| state.pool_id.address == step.pool)
-    }) {
+    if candidate
+        .path
+        .steps
+        .iter()
+        .any(|step| !available_pools.contains(&step.pool))
+    {
         return Err(ArbBotError::RiskGate("pool_state_missing".into()));
     }
 
@@ -39,6 +43,8 @@ pub fn validate_candidate(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use alloy_primitives::{address, U256};
     use chrono::Utc;
 
@@ -111,7 +117,7 @@ mod tests {
 
         let result = validate_candidate(
             &candidate,
-            &[sample_pool_state()],
+            &HashSet::from([sample_pool_state().pool_id.address]),
             5_000,
             U256::from(1u64),
             50,

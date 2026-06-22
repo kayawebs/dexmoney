@@ -7,7 +7,9 @@ use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::constants::{AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES};
 use base_arb_common::errors::ArbBotError;
-use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, TickState};
+use base_arb_common::types::{
+    Candidate, DexKind, PoolState, PoolVariant, TickState, TokenPairSearchConfig,
+};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore,
     PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
@@ -57,6 +59,7 @@ async fn main() -> Result<()> {
                 cycles = aggregate.cycles,
                 total_cycle_ms = aggregate.total_cycle_ms,
                 max_cycle_ms = aggregate.max_cycle_ms,
+                config_load_ms = aggregate.config_load_ms,
                 state_load_ms = aggregate.state_load_ms,
                 tick_load_ms = aggregate.tick_load_ms,
                 tick_cache_hits = aggregate.tick_cache_hits,
@@ -152,6 +155,7 @@ struct SearchCycleStats {
     cycles: u64,
     total_cycle_ms: u64,
     max_cycle_ms: u64,
+    config_load_ms: u64,
     state_load_ms: u64,
     tick_load_ms: u64,
     tick_cache_hits: u64,
@@ -183,6 +187,7 @@ impl SearchCycleStats {
         self.cycles += other.cycles;
         self.total_cycle_ms += other.total_cycle_ms;
         self.max_cycle_ms = self.max_cycle_ms.max(other.max_cycle_ms);
+        self.config_load_ms += other.config_load_ms;
         self.state_load_ms += other.state_load_ms;
         self.tick_load_ms += other.tick_load_ms;
         self.tick_cache_hits += other.tick_cache_hits;
@@ -232,6 +237,9 @@ struct SearchRuntime {
     pool_states: HashMap<Address, PoolState>,
     tick_states: HashMap<Address, Vec<TickState>>,
     pool_topology: HashMap<Address, PoolTopology>,
+    engine: Option<strategy::SearchEngine>,
+    pair_configs: Vec<TokenPairSearchConfig>,
+    last_config_refresh: Option<Instant>,
     path_index: Option<strategy::PathIndex>,
     graph_snapshot: Option<strategy::GraphSnapshot>,
     bootstrapped: bool,
@@ -316,16 +324,42 @@ where
         });
     }
 
-    let engine = strategy::engine_from_settings(
-        settings,
-        candidate_ttl_ms,
-        max_price_impact_bps,
-        strategy::usdc_to_units(min_expected_profit_usdc),
-        recorder.enabled_pair_search_configs().await?,
-    )?;
+    let config_load_started = Instant::now();
+    let config_refresh_interval = Duration::from_secs(settings.searcher_config_refresh_secs.max(1));
+    let config_refresh_due = runtime
+        .last_config_refresh
+        .is_none_or(|last_refresh| last_refresh.elapsed() >= config_refresh_interval);
+    let mut config_changed = false;
+    if runtime.engine.is_none() || config_refresh_due {
+        let pair_configs = recorder.enabled_pair_search_configs().await?;
+        if runtime.engine.is_none() || runtime.pair_configs != pair_configs {
+            runtime.engine = Some(strategy::engine_from_settings(
+                settings,
+                candidate_ttl_ms,
+                max_price_impact_bps,
+                strategy::usdc_to_units(min_expected_profit_usdc),
+                pair_configs.clone(),
+            )?);
+            runtime.pair_configs = pair_configs;
+            runtime.path_index = None;
+            runtime.graph_snapshot = None;
+            config_changed = true;
+            info!(
+                pair_configs = runtime.pair_configs.len(),
+                "searcher config refreshed"
+            );
+        }
+        runtime.last_config_refresh = Some(Instant::now());
+    }
+    let config_load_ms = config_load_started.elapsed().as_millis() as u64;
+    if runtime.engine.is_none() {
+        debug!("searcher config unavailable");
+        return Ok(SearchCycleStats::default());
+    }
 
     let state_load_started = Instant::now();
-    let mut rebuild_path_index = runtime.path_index.is_none();
+    let mut rebuild_path_index =
+        config_changed || runtime.path_index.is_none() || runtime.graph_snapshot.is_none();
     let changed_pool_addresses = changed_pools.iter().copied().collect::<Vec<_>>();
     for (pool, state) in pool_store.get_pool_states(&changed_pool_addresses).await? {
         match state {
@@ -348,13 +382,13 @@ where
     }
     let state_load_ms = state_load_started.elapsed().as_millis() as u64;
 
-    let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
-    if pool_states.is_empty() {
+    if runtime.pool_states.is_empty() {
         debug!("no pool states available in searcher cache");
         return Ok(SearchCycleStats::default());
     }
-    let latest_pool_state_block = pool_states
-        .iter()
+    let latest_pool_state_block = runtime
+        .pool_states
+        .values()
         .map(|state| state.block_number)
         .max()
         .unwrap_or(0);
@@ -364,13 +398,9 @@ where
     };
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
     let now = Utc::now();
-    let active_pool_addresses = active_pool_addresses(&pool_states, now, max_pool_state_age_ms);
-    let active_pool_states = pool_states
-        .iter()
-        .filter(|state| active_pool_addresses.contains(&state.pool_id.address))
-        .cloned()
-        .collect::<Vec<_>>();
-    if active_pool_states.is_empty() {
+    let active_pool_addresses =
+        active_pool_addresses(runtime.pool_states.values(), now, max_pool_state_age_ms);
+    if active_pool_addresses.is_empty() {
         debug!(
             latest_known_block,
             latest_pool_state_block,
@@ -380,6 +410,11 @@ where
         return Ok(SearchCycleStats::default());
     }
     if rebuild_path_index {
+        let engine = runtime
+            .engine
+            .as_ref()
+            .expect("searcher engine checked above");
+        let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
         runtime.path_index = Some(engine.build_path_index(&pool_states));
         runtime.graph_snapshot = Some(engine.build_graph_snapshot(&pool_states));
         info!(
@@ -399,6 +434,10 @@ where
         return Ok(SearchCycleStats::default());
     };
     let path_build_started = Instant::now();
+    let engine = runtime
+        .engine
+        .as_ref()
+        .expect("searcher engine checked above");
     let (dynamic_paths, dynamic_stats) =
         engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
     let search_paths_raw =
@@ -414,6 +453,7 @@ where
 
     let mut cycle_stats = SearchCycleStats {
         cycles: 1,
+        config_load_ms,
         state_load_ms,
         path_build_ms,
         path_pools: path_pools.len() as u64,
@@ -427,26 +467,34 @@ where
     cycle_stats.search.total_paths = path_index.total_paths();
     cycle_stats.search.merge(&dynamic_stats);
     let mut refreshed_tick_pools = HashSet::new();
+    let tick_load_started = Instant::now();
+    let (tick_states, tick_load_stats) = load_tick_states_for_pools(
+        runtime,
+        pool_store,
+        &tick_changed_pools,
+        &mut refreshed_tick_pools,
+        &path_pools,
+    )
+    .await?;
+    cycle_stats.tick_load_ms += tick_load_started.elapsed().as_millis() as u64;
+    cycle_stats.tick_cache_hits += tick_load_stats.cache_hits;
+    cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
+    cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
+
+    let quote_context = strategy::QuoteContext::from_pool_map(
+        &runtime.pool_states,
+        &active_pool_addresses,
+        &tick_states,
+    );
+    let engine = runtime
+        .engine
+        .as_ref()
+        .expect("searcher engine checked above");
 
     for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
-        let batch_path_pools = engine.path_pool_addresses_for_search_paths(path_batch);
-        let tick_load_started = Instant::now();
-        let (tick_states, tick_load_stats) = load_tick_states_for_pools(
-            runtime,
-            pool_store,
-            &tick_changed_pools,
-            &mut refreshed_tick_pools,
-            &batch_path_pools,
-        )
-        .await?;
-        cycle_stats.tick_load_ms += tick_load_started.elapsed().as_millis() as u64;
-        cycle_stats.tick_cache_hits += tick_load_stats.cache_hits;
-        cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
-        cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
-
         let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
-            .search_with_stats_for_paths(&active_pool_states, &tick_states, path_batch)
+            .search_with_stats_for_paths_with_context(&quote_context, path_batch)
             .await?;
         cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
         search_stats.total_paths = 0;
@@ -457,7 +505,7 @@ where
             recorder,
             &mut cycle_stats,
             &engine,
-            &pool_states,
+            &active_pool_addresses,
             max_pool_state_age_ms,
             max_price_impact_bps,
             latest_known_block,
@@ -475,13 +523,12 @@ where
     Ok(cycle_stats)
 }
 
-fn active_pool_addresses(
-    pool_states: &[PoolState],
+fn active_pool_addresses<'a>(
+    pool_states: impl Iterator<Item = &'a PoolState>,
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
 ) -> HashSet<Address> {
     pool_states
-        .iter()
         .filter(|state| is_pool_state_active(state, now, max_pool_state_age_ms))
         .map(|state| state.pool_id.address)
         .collect()
@@ -603,7 +650,7 @@ async fn publish_candidates<C, R>(
     recorder: &R,
     cycle_stats: &mut SearchCycleStats,
     engine: &strategy::SearchEngine,
-    pool_states: &[PoolState],
+    available_pools: &HashSet<Address>,
     max_pool_state_age_ms: i64,
     max_price_impact_bps: u64,
     latest_known_block: u64,
@@ -638,7 +685,7 @@ where
         debug!(candidate_id = %candidate.id, "quote generated");
         match risk::validate_candidate(
             &candidate,
-            pool_states,
+            available_pools,
             max_pool_state_age_ms,
             engine.min_expected_profit,
             max_price_impact_bps,

@@ -709,10 +709,9 @@ impl SearchEngine {
             .collect()
     }
 
-    pub(crate) async fn search_with_stats_for_paths(
+    pub(crate) async fn search_with_stats_for_paths_with_context(
         &self,
-        pool_states: &[PoolState],
-        tick_states: &[TickState],
+        quote_context: &QuoteContext<'_>,
         paths: &[SearchPath],
     ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
         let mut stats = SearchStats {
@@ -720,10 +719,9 @@ impl SearchEngine {
             ..SearchStats::default()
         };
         let mut out = Vec::new();
-        let quote_context = QuoteContext::new(pool_states, tick_states);
 
         for search_path in paths {
-            self.quote_search_path(search_path, &quote_context, &mut stats, &mut out)
+            self.quote_search_path(search_path, quote_context, &mut stats, &mut out)
                 .await;
         }
 
@@ -1143,16 +1141,39 @@ pub fn engine_from_settings(
     })
 }
 
-struct QuoteContext<'a> {
+pub(crate) struct QuoteContext<'a> {
     pool_states: HashMap<Address, &'a PoolState>,
     tick_states: HashMap<Address, Vec<TickState>>,
 }
 
 impl<'a> QuoteContext<'a> {
+    #[allow(dead_code)]
     fn new(pool_states: &'a [PoolState], tick_states: &[TickState]) -> Self {
         let pool_states = pool_states
             .iter()
             .map(|state| (state.pool_id.address, state))
+            .collect::<HashMap<_, _>>();
+        let mut ticks_by_pool: HashMap<Address, Vec<TickState>> = HashMap::new();
+        for tick in tick_states {
+            ticks_by_pool
+                .entry(tick.pool_id.address)
+                .or_default()
+                .push(tick.clone());
+        }
+        Self {
+            pool_states,
+            tick_states: ticks_by_pool,
+        }
+    }
+
+    pub(crate) fn from_pool_map(
+        pool_states: &'a HashMap<Address, PoolState>,
+        active_pools: &HashSet<Address>,
+        tick_states: &[TickState],
+    ) -> Self {
+        let pool_states = active_pools
+            .iter()
+            .filter_map(|pool| pool_states.get(pool).map(|state| (*pool, state)))
             .collect::<HashMap<_, _>>();
         let mut ticks_by_pool: HashMap<Address, Vec<TickState>> = HashMap::new();
         for tick in tick_states {
