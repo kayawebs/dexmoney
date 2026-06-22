@@ -746,10 +746,11 @@ where
     }
     if !valid_candidates.is_empty() {
         cycle_stats.opportunities_created += valid_candidates.len() as u64;
-        recorder
-            .record_opportunities(valid_candidates.clone())
-            .await?;
-        candidate_store.push_candidates(valid_candidates).await?;
+        let record_candidates = valid_candidates.clone();
+        tokio::try_join!(
+            candidate_store.push_candidates(valid_candidates),
+            recorder.record_opportunities(record_candidates)
+        )?;
     }
     Ok(())
 }
