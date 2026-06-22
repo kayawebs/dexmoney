@@ -424,20 +424,22 @@ impl TickStateStore for RedisStore {
             return Ok(out);
         }
 
-        let values: Vec<Option<String>> = redis::cmd("MGET")
-            .arg(&all_keys)
-            .query_async(&mut manager)
-            .await?;
-        for (key, value) in all_keys.into_iter().zip(values) {
-            let Some(raw) = value else {
-                continue;
-            };
-            let tick: TickState = serde_json::from_str(&raw)?;
-            let pool = key_to_pool
-                .get(&key)
-                .copied()
-                .unwrap_or(tick.pool_id.address);
-            out.entry(pool).or_default().push(tick);
+        for key_chunk in all_keys.chunks(REDIS_MGET_CHUNK_SIZE) {
+            let values: Vec<Option<String>> = redis::cmd("MGET")
+                .arg(key_chunk)
+                .query_async(&mut manager)
+                .await?;
+            for (key, value) in key_chunk.iter().zip(values) {
+                let Some(raw) = value else {
+                    continue;
+                };
+                let tick: TickState = serde_json::from_str(&raw)?;
+                let pool = key_to_pool
+                    .get(key)
+                    .copied()
+                    .unwrap_or(tick.pool_id.address);
+                out.entry(pool).or_default().push(tick);
+            }
         }
         for ticks in out.values_mut() {
             ticks.sort_by_key(|tick| tick.tick);
