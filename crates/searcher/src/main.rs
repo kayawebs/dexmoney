@@ -448,28 +448,37 @@ where
             "searcher path index rebuilt"
         );
     }
-    let Some(path_index) = runtime.path_index.as_ref() else {
-        return Ok(SearchCycleStats::default());
-    };
-    let Some(graph_snapshot) = runtime.graph_snapshot.as_ref() else {
-        return Ok(SearchCycleStats::default());
-    };
     let path_build_started = Instant::now();
-    let engine = runtime
-        .engine
-        .as_ref()
-        .expect("searcher engine checked above");
-    let (dynamic_paths, dynamic_stats) =
-        engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
-    let search_paths_raw =
-        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
-    let raw_search_path_count = search_paths_raw.len();
-    let search_paths = search_paths_raw
-        .into_iter()
-        .filter(|path| path.all_pools_in(&runtime.active_pool_addresses))
-        .collect::<Vec<_>>();
-    let inactive_pool_filtered_paths = raw_search_path_count.saturating_sub(search_paths.len());
-    let path_pools = engine.path_pool_addresses_for_search_paths(&search_paths);
+    let (dynamic_paths, dynamic_stats, total_paths, inactive_pool_filtered_paths, path_pools) = {
+        let Some(path_index) = runtime.path_index.as_ref() else {
+            return Ok(SearchCycleStats::default());
+        };
+        let Some(graph_snapshot) = runtime.graph_snapshot.as_ref() else {
+            return Ok(SearchCycleStats::default());
+        };
+        let engine = runtime
+            .engine
+            .as_ref()
+            .expect("searcher engine checked above");
+        let (dynamic_paths, dynamic_stats) =
+            engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
+        let search_paths_raw =
+            engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
+        let raw_search_path_count = search_paths_raw.len();
+        let search_paths = search_paths_raw
+            .into_iter()
+            .filter(|path| path.all_pools_in(&runtime.active_pool_addresses))
+            .collect::<Vec<_>>();
+        let inactive_pool_filtered_paths = raw_search_path_count.saturating_sub(search_paths.len());
+        let path_pools = engine.path_pool_addresses_for_search_paths(&search_paths);
+        (
+            dynamic_paths,
+            dynamic_stats,
+            path_index.total_paths(),
+            inactive_pool_filtered_paths,
+            path_pools,
+        )
+    };
     let path_build_ms = path_build_started.elapsed().as_millis() as u64;
 
     let mut cycle_stats = SearchCycleStats {
@@ -487,7 +496,7 @@ where
         changed_pools: changed_pools.len() as u64,
         ..SearchCycleStats::default()
     };
-    cycle_stats.search.total_paths = path_index.total_paths();
+    cycle_stats.search.total_paths = total_paths;
     cycle_stats.search.merge(&dynamic_stats);
     let mut refreshed_tick_pools = HashSet::new();
     let tick_load_started = Instant::now();
@@ -510,6 +519,15 @@ where
         .engine
         .as_ref()
         .expect("searcher engine checked above");
+    let Some(path_index) = runtime.path_index.as_ref() else {
+        return Ok(SearchCycleStats::default());
+    };
+    let search_paths_raw =
+        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
+    let search_paths = search_paths_raw
+        .into_iter()
+        .filter(|path| path.all_pools_in(&runtime.active_pool_addresses))
+        .collect::<Vec<_>>();
 
     for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
         let quote_started = Instant::now();

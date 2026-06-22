@@ -707,24 +707,24 @@ impl SearchEngine {
         Ok((out, stats))
     }
 
-    pub(crate) fn search_paths_for_path_index(
+    pub(crate) fn search_paths_for_path_index<'a>(
         &self,
-        path_index: &PathIndex,
+        path_index: &'a PathIndex,
         changed_pools: &HashSet<Address>,
-        dynamic_paths: &[SearchPath],
-    ) -> Vec<SearchPath> {
+        dynamic_paths: &'a [SearchPath],
+    ) -> Vec<&'a SearchPath> {
         let path_indices = path_index.path_indices_for_changed_pools(changed_pools);
         path_indices
             .into_iter()
-            .map(|index| path_index.paths[index].clone())
-            .chain(dynamic_paths.iter().cloned())
+            .map(|index| &path_index.paths[index])
+            .chain(dynamic_paths.iter())
             .collect()
     }
 
     pub(crate) async fn search_with_stats_for_paths_with_context(
         &self,
         quote_context: &QuoteContext<'_>,
-        paths: &[SearchPath],
+        paths: &[&SearchPath],
     ) -> anyhow::Result<(Vec<Candidate>, SearchStats)> {
         let mut stats = SearchStats {
             paths: paths.len(),
@@ -858,7 +858,7 @@ impl SearchEngine {
 
     pub(crate) fn path_pool_addresses_for_search_paths(
         &self,
-        paths: &[SearchPath],
+        paths: &[&SearchPath],
     ) -> HashSet<Address> {
         paths
             .iter()
