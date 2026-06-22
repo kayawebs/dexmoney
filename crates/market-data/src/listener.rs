@@ -111,6 +111,23 @@ where
         });
     }
 
+    fn spawn_record_dex_events(&self, events: Vec<DexEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let recorder = self.recorder.clone();
+        tokio::spawn(async move {
+            let count = events.len();
+            if let Err(err) = recorder.record_dex_events(events).await {
+                warn!(
+                    count,
+                    error = %err,
+                    "failed to record dex events from background task"
+                );
+            }
+        });
+    }
+
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
         self.seed_default_factories().await?;
@@ -390,8 +407,8 @@ where
             let fee_ms = fee_started.elapsed().as_millis() as u64;
 
             let publish_started = Instant::now();
+            self.spawn_record_dex_events(event_records);
             tokio::try_join!(
-                self.recorder.record_dex_events(event_records),
                 async {
                     if !changed_pools.is_empty() {
                         self.publish_selected_states(
@@ -2264,20 +2281,19 @@ where
 
         if let Some(updated_state) = updated_state {
             let record_state = updated_state.clone();
-            tokio::try_join!(
-                self.pool_store.publish_pool_states(
+            self.spawn_record_dex_events(vec![event.clone()]);
+            self.pool_store
+                .publish_pool_states(
                     event.block_number,
                     vec![updated_state.clone()],
                     vec![updated_state.pool_id.address],
-                ),
-                self.recorder.record_dex_event(event.clone())
-            )?;
+                )
+                .await?;
             self.spawn_record_pool_states(vec![record_state], "flashblock");
         } else {
-            tokio::try_join!(
-                self.pool_store.set_current_block(event.block_number),
-                self.recorder.record_dex_event(event)
-            )?;
+            let block_number = event.block_number;
+            self.spawn_record_dex_events(vec![event]);
+            self.pool_store.set_current_block(block_number).await?;
         }
 
         Ok(())
