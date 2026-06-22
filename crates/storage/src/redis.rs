@@ -457,10 +457,10 @@ impl TickStateStore for RedisStore {
         let key_sets: Vec<Vec<String>> = pipe.query_async(&mut manager).await?;
 
         let mut all_keys = Vec::new();
-        let mut key_to_pool = HashMap::new();
+        let mut key_pools = Vec::new();
         for (pool, keys) in unique_pools.iter().zip(key_sets) {
             for key in keys {
-                key_to_pool.insert(key.clone(), *pool);
+                key_pools.push(*pool);
                 all_keys.push(key);
             }
         }
@@ -469,21 +469,20 @@ impl TickStateStore for RedisStore {
             return Ok(out);
         }
 
+        let mut offset = 0;
         for key_chunk in all_keys.chunks(REDIS_MGET_CHUNK_SIZE) {
             let values: Vec<Option<String>> = redis::cmd("MGET")
                 .arg(key_chunk)
                 .query_async(&mut manager)
                 .await?;
-            for (key, value) in key_chunk.iter().zip(values) {
+            let pool_chunk = &key_pools[offset..offset + key_chunk.len()];
+            offset += key_chunk.len();
+            for (pool, value) in pool_chunk.iter().zip(values) {
                 let Some(raw) = value else {
                     continue;
                 };
                 let tick: TickState = serde_json::from_str(&raw)?;
-                let pool = key_to_pool
-                    .get(key)
-                    .copied()
-                    .unwrap_or(tick.pool_id.address);
-                out.entry(pool).or_default().push(tick);
+                out.entry(*pool).or_default().push(tick);
             }
         }
         for ticks in out.values_mut() {
