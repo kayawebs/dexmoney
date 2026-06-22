@@ -6,13 +6,14 @@ use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
-use base_arb_common::types::{EoaLaneStatus, TxResult, TxStatus};
+use base_arb_common::types::{Candidate, EoaLaneStatus, SimulationResult, TxResult, TxStatus};
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore, EoaStateStore,
     PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
 use std::collections::BTreeMap;
+use tokio::task::JoinSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -161,6 +162,21 @@ where
     let candidate_count = candidates.len();
     let batch_started = Instant::now();
     let simulation_context = simulator::SimulationContext::load(provider, settings).await;
+    if !settings.execution_submit_enabled {
+        return run_dry_run_simulation_batch(
+            recorder,
+            provider,
+            settings,
+            operator,
+            candidates,
+            min_simulated_profit_usdc,
+            simulation_context,
+            current_block,
+            max_candidate_lag_blocks,
+            batch_started,
+        )
+        .await;
+    }
     let mut simulated = 0usize;
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     for candidate in candidates {
@@ -213,6 +229,112 @@ where
         skipped = skipped_by_reason.values().sum::<usize>(),
         elapsed_ms = batch_started.elapsed().as_millis() as u64,
         skipped_by_reason = ?skipped_by_reason,
+        "execution candidate batch summary"
+    );
+
+    Ok(())
+}
+
+async fn run_dry_run_simulation_batch<R>(
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    operator: Address,
+    candidates: Vec<Candidate>,
+    min_simulated_profit_usdc: f64,
+    simulation_context: simulator::SimulationContext,
+    current_block: u64,
+    max_candidate_lag_blocks: u64,
+    batch_started: Instant,
+) -> Result<()>
+where
+    R: RecorderStore,
+{
+    let candidate_count = candidates.len();
+    let max_to_simulate = candidate_count.min(MAX_SIMULATIONS_PER_CYCLE);
+    let concurrency = settings
+        .execution_simulation_concurrency
+        .max(1)
+        .min(MAX_SIMULATIONS_PER_CYCLE as u64) as usize;
+    let mut candidates = candidates.into_iter().take(max_to_simulate);
+    let mut join_set = JoinSet::<SimulationResult>::new();
+    let mut spawned = 0usize;
+    let mut simulated = 0usize;
+    let mut simulation_successes = 0usize;
+    let mut simulation_failures = 0usize;
+    let mut join_errors = 0usize;
+
+    loop {
+        while spawned < max_to_simulate && join_set.len() < concurrency {
+            let Some(candidate) = candidates.next() else {
+                break;
+            };
+            spawned += 1;
+            let provider = provider.clone();
+            let settings = settings.clone();
+            let simulation_context = simulation_context.clone();
+            join_set.spawn(async move {
+                simulator::simulate(
+                    &provider,
+                    &settings,
+                    operator,
+                    &candidate,
+                    min_simulated_profit_usdc,
+                    &simulation_context,
+                )
+                .await
+            });
+        }
+
+        if join_set.is_empty() {
+            break;
+        }
+
+        match join_set.join_next().await {
+            Some(Ok(simulation)) => {
+                debug!(
+                    candidate_id = %simulation.opportunity_id,
+                    success = simulation.success,
+                    "simulation success/fail"
+                );
+                if simulation.success {
+                    simulation_successes += 1;
+                    info!(
+                        candidate_id = %simulation.opportunity_id,
+                        path = ?simulation.path_name,
+                        simulated_profit = %simulation.simulated_profit,
+                        net_simulated_profit = ?simulation.net_simulated_profit,
+                        gas_estimate = ?simulation.gas_estimate,
+                        max_fee_per_gas = ?simulation.max_fee_per_gas,
+                        max_priority_fee_per_gas = ?simulation.max_priority_fee_per_gas,
+                        "simulation-only mode; skipping tx submission"
+                    );
+                } else {
+                    simulation_failures += 1;
+                }
+                recorder.record_simulation(simulation).await?;
+                simulated += 1;
+            }
+            Some(Err(err)) => {
+                join_errors += 1;
+                warn!(error = %err, "dry-run simulation task failed");
+            }
+            None => break,
+        }
+    }
+
+    info!(
+        candidate_count,
+        current_block,
+        max_candidate_lag_blocks,
+        simulated,
+        simulation_successes,
+        simulation_failures,
+        join_errors,
+        concurrency,
+        skipped = candidate_count.saturating_sub(simulated),
+        elapsed_ms = batch_started.elapsed().as_millis() as u64,
+        skipped_by_reason = ?BTreeMap::<&'static str, usize>::new(),
         "execution candidate batch summary"
     );
 
