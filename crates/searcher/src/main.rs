@@ -461,15 +461,12 @@ where
         .expect("searcher engine checked above");
     let (dynamic_paths, dynamic_stats) =
         engine.dynamic_multihop_paths_for_changed_pools(graph_snapshot, &changed_pools);
-    let search_paths_raw =
-        engine.search_paths_for_path_index(path_index, &changed_pools, &dynamic_paths);
-    let raw_search_path_count = search_paths_raw.len();
-    let search_paths = search_paths_raw
-        .into_iter()
-        .filter(|path| path.all_pools_in(&runtime.active_pool_addresses))
-        .collect::<Vec<_>>();
-    let inactive_pool_filtered_paths = raw_search_path_count.saturating_sub(search_paths.len());
-    let path_pools = engine.path_pool_addresses_for_search_paths(&search_paths);
+    let selected_paths = engine.select_search_paths_for_path_index(
+        path_index,
+        &changed_pools,
+        &dynamic_paths,
+        &runtime.active_pool_addresses,
+    );
     let path_build_ms = path_build_started.elapsed().as_millis() as u64;
 
     let mut cycle_stats = SearchCycleStats {
@@ -477,10 +474,10 @@ where
         config_load_ms,
         state_load_ms,
         path_build_ms,
-        path_pools: path_pools.len() as u64,
+        path_pools: selected_paths.path_pools.len() as u64,
         latest_chain_block: latest_known_block,
         latest_pool_state_block,
-        inactive_pool_filtered_paths: inactive_pool_filtered_paths as u64,
+        inactive_pool_filtered_paths: selected_paths.inactive_pool_filtered_paths as u64,
         active_pool_sweeps: u64::from(active_pool_swept),
         active_pools: runtime.active_pool_addresses.len() as u64,
         changed_pool_scans: 1,
@@ -497,7 +494,7 @@ where
         pool_store,
         &tick_changed_pools,
         &mut refreshed_tick_pools,
-        &path_pools,
+        &selected_paths.path_pools,
     )
     .await?;
     cycle_stats.tick_load_ms += tick_load_started.elapsed().as_millis() as u64;
@@ -508,7 +505,7 @@ where
     let quote_context =
         strategy::QuoteContext::from_pool_map(&runtime.pool_states, &runtime.tick_states);
 
-    for path_batch in search_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
+    for path_batch in selected_paths.paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
         let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
             .search_with_stats_for_paths_with_context(&quote_context, path_batch)

@@ -592,10 +592,15 @@ impl SearchEngine {
             paths: paths.len(),
             ..SearchStats::default()
         };
-        let mut out = Vec::new();
+        let estimated_attempts = paths
+            .iter()
+            .map(|path| path.amount_sizes.len())
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(estimated_attempts.min(1024));
         let quote_context = QuoteContext::new(pool_states, tick_states);
 
         for search_path in &paths {
+            let required_profit = self.required_profit_for_path(search_path);
             for amount_in in &search_path.amount_sizes {
                 stats.quote_attempts += 1;
                 let quote = match quote_path(
@@ -645,11 +650,6 @@ impl SearchEngine {
                     let expected_profit = expected_amount_out.saturating_sub(*amount_in);
                     stats.best_profit_before_impact =
                         stats.best_profit_before_impact.max(expected_profit);
-                    let required_profit = if search_path.min_profit.is_zero() {
-                        self.min_expected_profit
-                    } else {
-                        search_path.min_profit
-                    };
                     if expected_profit < required_profit {
                         stats.record_min_profit_rejected(
                             &search_path.path,
@@ -707,18 +707,38 @@ impl SearchEngine {
         Ok((out, stats))
     }
 
-    pub(crate) fn search_paths_for_path_index<'a>(
+    pub(crate) fn select_search_paths_for_path_index<'a>(
         &self,
         path_index: &'a PathIndex,
         changed_pools: &HashSet<Address>,
         dynamic_paths: &'a [SearchPath],
-    ) -> Vec<&'a SearchPath> {
+        active_pools: &HashSet<Address>,
+    ) -> SelectedSearchPaths<'a> {
         let path_indices = path_index.path_indices_for_changed_pools(changed_pools);
-        path_indices
+        let mut paths = Vec::with_capacity(path_indices.len() + dynamic_paths.len());
+        let mut path_pools = HashSet::new();
+        let mut inactive_pool_filtered_paths = 0usize;
+
+        for search_path in path_indices
             .into_iter()
             .map(|index| &path_index.paths[index])
             .chain(dynamic_paths.iter())
-            .collect()
+        {
+            if !search_path.all_pools_in(active_pools) {
+                inactive_pool_filtered_paths += 1;
+                continue;
+            }
+            for step in &search_path.path.steps {
+                path_pools.insert(step.pool);
+            }
+            paths.push(search_path);
+        }
+
+        SelectedSearchPaths {
+            paths,
+            path_pools,
+            inactive_pool_filtered_paths,
+        }
     }
 
     pub(crate) async fn search_with_stats_for_paths_with_context(
@@ -730,7 +750,11 @@ impl SearchEngine {
             paths: paths.len(),
             ..SearchStats::default()
         };
-        let mut out = Vec::new();
+        let estimated_attempts = paths
+            .iter()
+            .map(|path| path.amount_sizes.len())
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(estimated_attempts.min(1024));
 
         for search_path in paths {
             self.quote_search_path(search_path, quote_context, &mut stats, &mut out)
@@ -747,6 +771,7 @@ impl SearchEngine {
         stats: &mut SearchStats,
         out: &mut Vec<Candidate>,
     ) {
+        let required_profit = self.required_profit_for_path(search_path);
         for amount_in in &search_path.amount_sizes {
             stats.quote_attempts += 1;
             let quote = match quote_path(
@@ -794,11 +819,6 @@ impl SearchEngine {
             let (expected_amount_out, price_impact_bps, diagnostics) = quote;
             let expected_profit = expected_amount_out.saturating_sub(*amount_in);
             stats.best_profit_before_impact = stats.best_profit_before_impact.max(expected_profit);
-            let required_profit = if search_path.min_profit.is_zero() {
-                self.min_expected_profit
-            } else {
-                search_path.min_profit
-            };
             if expected_profit < required_profit {
                 stats.record_min_profit_rejected(
                     &search_path.path,
@@ -852,18 +872,16 @@ impl SearchEngine {
         }
     }
 
-    pub(crate) fn build_path_index(&self, pool_states: &[PoolState]) -> PathIndex {
-        PathIndex::new(self.two_hop_paths_for_pool_states(pool_states))
+    fn required_profit_for_path(&self, search_path: &SearchPath) -> U256 {
+        if search_path.min_profit.is_zero() {
+            self.min_expected_profit
+        } else {
+            search_path.min_profit
+        }
     }
 
-    pub(crate) fn path_pool_addresses_for_search_paths(
-        &self,
-        paths: &[&SearchPath],
-    ) -> HashSet<Address> {
-        paths
-            .iter()
-            .flat_map(|path| path.path.steps.iter().map(|step| step.pool))
-            .collect()
+    pub(crate) fn build_path_index(&self, pool_states: &[PoolState]) -> PathIndex {
+        PathIndex::new(self.two_hop_paths_for_pool_states(pool_states))
     }
 
     pub(crate) fn build_graph_snapshot(&self, pool_states: Vec<PoolState>) -> GraphSnapshot {
@@ -1240,6 +1258,12 @@ impl SearchPath {
             .iter()
             .all(|step| pools.contains(&step.pool))
     }
+}
+
+pub(crate) struct SelectedSearchPaths<'a> {
+    pub(crate) paths: Vec<&'a SearchPath>,
+    pub(crate) path_pools: HashSet<Address>,
+    pub(crate) inactive_pool_filtered_paths: usize,
 }
 
 #[derive(Clone)]
