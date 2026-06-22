@@ -483,7 +483,7 @@ where
 
     let quote_context = strategy::QuoteContext::from_pool_map(
         &runtime.pool_states,
-        &active_pool_addresses,
+        &path_pools,
         &runtime.tick_states,
     );
     let engine = runtime
