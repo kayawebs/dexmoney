@@ -1,5 +1,6 @@
 use alloy_primitives::{hex, Address, U256};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -905,6 +906,7 @@ impl SearchEngine {
 
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
+        let mut segment_cache = SegmentPathCache::default();
         for anchor in anchors {
             for changed_pool in changed_pools {
                 let Some(changed_edges) = graph.pool_edges(*changed_pool) else {
@@ -918,6 +920,7 @@ impl SearchEngine {
                         &anchor,
                         changed_edge,
                         3,
+                        &mut segment_cache,
                         &mut stats,
                     );
                     add_dynamic_cycles_for_changed_edge(
@@ -927,6 +930,7 @@ impl SearchEngine {
                         &anchor,
                         changed_edge,
                         4,
+                        &mut segment_cache,
                         &mut stats,
                     );
                     if candidates.len() >= MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN {
@@ -1466,25 +1470,26 @@ fn add_dynamic_cycles_for_changed_edge(
     anchor: &AnchorSearchConfig,
     changed_edge: &OwnedPoolEdge,
     cycle_len: usize,
+    segment_cache: &mut SegmentPathCache,
     stats: &mut SearchStats,
 ) {
     stats.dynamic_multihop_changed_edges += 1;
     for changed_position in 0..cycle_len {
         let prefix_len = changed_position;
         let suffix_len = cycle_len - changed_position - 1;
-        let prefixes = edge_paths_between(graph, anchor.token, changed_edge.token_in, prefix_len);
+        let prefixes = segment_cache.get(graph, anchor.token, changed_edge.token_in, prefix_len);
         if prefixes.is_empty() {
             stats.dynamic_multihop_prefix_empty += 1;
             continue;
         }
-        let suffixes = edge_paths_between(graph, changed_edge.token_out, anchor.token, suffix_len);
+        let suffixes = segment_cache.get(graph, changed_edge.token_out, anchor.token, suffix_len);
         if suffixes.is_empty() {
             stats.dynamic_multihop_suffix_empty += 1;
             continue;
         }
 
-        for prefix in &prefixes {
-            for suffix in &suffixes {
+        for prefix in prefixes.iter() {
+            for suffix in suffixes.iter() {
                 let mut cycle = Vec::with_capacity(cycle_len);
                 cycle.extend(prefix.iter().cloned());
                 cycle.push(changed_edge.clone());
@@ -1508,6 +1513,38 @@ fn add_dynamic_cycles_for_changed_edge(
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SegmentPathKey {
+    start: Address,
+    end: Address,
+    edge_count: usize,
+}
+
+#[derive(Default)]
+struct SegmentPathCache {
+    paths: HashMap<SegmentPathKey, Arc<Vec<Vec<OwnedPoolEdge>>>>,
+}
+
+impl SegmentPathCache {
+    fn get(
+        &mut self,
+        graph: &GraphSnapshot,
+        start: Address,
+        end: Address,
+        edge_count: usize,
+    ) -> Arc<Vec<Vec<OwnedPoolEdge>>> {
+        let key = SegmentPathKey {
+            start,
+            end,
+            edge_count,
+        };
+        self.paths
+            .entry(key)
+            .or_insert_with(|| Arc::new(edge_paths_between(graph, start, end, edge_count)))
+            .clone()
     }
 }
 
