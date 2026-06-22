@@ -623,44 +623,49 @@ where
         &runtime.tick_states,
         &selected_paths.path_pools,
     );
-    let tick_ready_paths = selected_paths
-        .paths
-        .iter()
-        .copied()
-        .filter(|path| path.all_pools_not_in(&missing_tick_pools))
-        .collect::<Vec<_>>();
-    cycle_stats.tick_missing_filtered_paths = selected_paths
-        .paths
-        .len()
-        .saturating_sub(tick_ready_paths.len())
-        as u64;
-
     let quote_context =
         strategy::QuoteContext::from_pool_map(&runtime.pool_states, &runtime.tick_states);
 
-    for path_batch in tick_ready_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
-        let quote_started = Instant::now();
-        let (candidates, mut search_stats) = engine
-            .search_with_stats_for_paths_with_context(&quote_context, path_batch)
+    let mut path_batch = Vec::with_capacity(SEARCHER_PUBLISH_BATCH_PATHS);
+    for path in selected_paths.paths.iter().copied() {
+        if !path.all_pools_not_in(&missing_tick_pools) {
+            cycle_stats.tick_missing_filtered_paths += 1;
+            continue;
+        }
+        path_batch.push(path);
+        if path_batch.len() >= SEARCHER_PUBLISH_BATCH_PATHS {
+            quote_and_publish_path_batch(
+                candidate_store,
+                opportunity_recorder,
+                &mut cycle_stats,
+                engine,
+                &quote_context,
+                &runtime.active_pool_addresses,
+                max_pool_state_age_ms,
+                max_price_impact_bps,
+                latest_known_block,
+                max_candidate_lag_blocks,
+                &path_batch,
+            )
             .await?;
-        cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
-        search_stats.total_paths = 0;
-        cycle_stats.search.merge(&search_stats);
-        let publish_started = Instant::now();
-        publish_candidates(
+            path_batch.clear();
+        }
+    }
+    if !path_batch.is_empty() {
+        quote_and_publish_path_batch(
             candidate_store,
             opportunity_recorder,
             &mut cycle_stats,
-            &engine,
+            engine,
+            &quote_context,
             &runtime.active_pool_addresses,
             max_pool_state_age_ms,
             max_price_impact_bps,
             latest_known_block,
             max_candidate_lag_blocks,
-            candidates,
+            &path_batch,
         )
         .await?;
-        cycle_stats.publish_ms += publish_started.elapsed().as_millis() as u64;
     }
 
     let elapsed_ms = cycle_started.elapsed().as_millis() as u64;
@@ -898,6 +903,47 @@ where
         cycle_stats.opportunity_record_queue_dropped +=
             opportunity_recorder.enqueue(valid_candidates) as u64;
     }
+    Ok(())
+}
+
+async fn quote_and_publish_path_batch<C>(
+    candidate_store: &C,
+    opportunity_recorder: &OpportunityRecordQueue,
+    cycle_stats: &mut SearchCycleStats,
+    engine: &strategy::SearchEngine,
+    quote_context: &strategy::QuoteContext<'_>,
+    available_pools: &HashSet<Address>,
+    max_pool_state_age_ms: i64,
+    max_price_impact_bps: u64,
+    latest_known_block: u64,
+    max_candidate_lag_blocks: u64,
+    path_batch: &[&strategy::SearchPath],
+) -> Result<()>
+where
+    C: CandidateStore,
+{
+    let quote_started = Instant::now();
+    let (candidates, mut search_stats) = engine
+        .search_with_stats_for_paths_with_context(quote_context, path_batch)
+        .await?;
+    cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
+    search_stats.total_paths = 0;
+    cycle_stats.search.merge(&search_stats);
+    let publish_started = Instant::now();
+    publish_candidates(
+        candidate_store,
+        opportunity_recorder,
+        cycle_stats,
+        engine,
+        available_pools,
+        max_pool_state_age_ms,
+        max_price_impact_bps,
+        latest_known_block,
+        max_candidate_lag_blocks,
+        candidates,
+    )
+    .await?;
+    cycle_stats.publish_ms += publish_started.elapsed().as_millis() as u64;
     Ok(())
 }
 
