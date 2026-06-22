@@ -2187,13 +2187,16 @@ where
                 );
             } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
                 state.valid_through_block = state.valid_through_block.max(event.block_number);
-                self.pool_store.set_pool_state(state.clone()).await?;
-                self.pool_store
-                    .mark_changed_pools(vec![state.pool_id.address])
-                    .await?;
-                self.recorder
-                    .record_pool_state_with_source(state.clone(), "flashblock")
-                    .await?;
+                let updated_state = state.clone();
+                tokio::try_join!(
+                    self.pool_store.publish_pool_states(
+                        event.block_number,
+                        vec![updated_state.clone()],
+                        vec![updated_state.pool_id.address],
+                    ),
+                    self.recorder
+                        .record_pool_state_with_source(updated_state, "flashblock")
+                )?;
                 debug!(
                     pool = %state.pool_id.address,
                     block_number = state.block_number,
