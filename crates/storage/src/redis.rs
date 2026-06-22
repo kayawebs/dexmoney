@@ -112,18 +112,22 @@ fn queue_tick_entries(
         return;
     }
 
+    queue_mset_entries(pipe, key_values);
+
+    for (pool, keys) in keys_by_pool {
+        if !keys.is_empty() {
+            pipe.sadd(tick_pool_index_key(pool), keys).ignore();
+        }
+    }
+}
+
+fn queue_mset_entries(pipe: &mut redis::Pipeline, key_values: &[(String, String)]) {
     for chunk in key_values.chunks(REDIS_MSET_CHUNK_SIZE) {
         pipe.cmd("MSET");
         for (key, value) in chunk {
             pipe.arg(key).arg(value);
         }
         pipe.ignore();
-    }
-
-    for (pool, keys) in keys_by_pool {
-        if !keys.is_empty() {
-            pipe.sadd(tick_pool_index_key(pool), keys).ignore();
-        }
     }
 }
 
@@ -146,15 +150,24 @@ impl PoolStateStore for RedisStore {
         if pool_states.is_empty() {
             return Ok(());
         }
-        let mut manager = self.manager.clone();
-        let mut pipe = redis::pipe();
+        let mut state_key_values = Vec::with_capacity(pool_states.len());
+        let mut index_key_values = Vec::with_capacity(pool_states.len());
+        let mut state_keys = Vec::with_capacity(pool_states.len());
         for pool_state in pool_states {
             let key = pool_state_key(pool_state.pool_id.chain_id, pool_state.pool_id.address);
             let index_key = pool_address_index_key(pool_state.pool_id.address);
             let value = serde_json::to_string(&pool_state)?;
-            pipe.set(&key, value).ignore();
-            pipe.set(index_key, &key).ignore();
-            pipe.sadd(pool_state_index_key(), key).ignore();
+            state_key_values.push((key.clone(), value));
+            index_key_values.push((index_key, key.clone()));
+            state_keys.push(key);
+        }
+
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        queue_mset_entries(&mut pipe, &state_key_values);
+        queue_mset_entries(&mut pipe, &index_key_values);
+        for state_key_chunk in state_keys.chunks(REDIS_MSET_CHUNK_SIZE) {
+            pipe.sadd(pool_state_index_key(), state_key_chunk).ignore();
         }
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
