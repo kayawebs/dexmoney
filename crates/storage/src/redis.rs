@@ -473,6 +473,21 @@ impl CandidateStore for RedisStore {
         Ok(())
     }
 
+    async fn prune_candidates_before_block(&self, block_number: u64) -> Result<usize> {
+        if block_number == 0 {
+            return Ok(0);
+        }
+        let max_stale_score = block_number.saturating_mul(CANDIDATE_SCORE_BLOCK_SCALE) - 1;
+        let mut manager = self.manager.clone();
+        let removed: usize = redis::cmd("ZREMRANGEBYSCORE")
+            .arg(candidates_key())
+            .arg("-inf")
+            .arg(max_stale_score)
+            .query_async(&mut manager)
+            .await?;
+        Ok(removed)
+    }
+
     async fn pop_candidate(&self) -> Result<Option<Candidate>> {
         let mut manager = self.manager.clone();
         let result: Vec<(String, f64)> = redis::cmd("ZPOPMAX")
@@ -505,8 +520,13 @@ impl CandidateStore for RedisStore {
 
 fn candidate_queue_score(candidate: &Candidate) -> f64 {
     let created_rank = candidate.created_at.timestamp_millis().rem_euclid(100_000) as u64;
-    candidate.block_number.saturating_mul(100_000) as f64 + created_rank as f64
+    candidate
+        .block_number
+        .saturating_mul(CANDIDATE_SCORE_BLOCK_SCALE) as f64
+        + created_rank as f64
 }
+
+const CANDIDATE_SCORE_BLOCK_SCALE: u64 = 100_000;
 
 #[async_trait]
 impl FailureStore for RedisStore {

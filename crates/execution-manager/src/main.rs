@@ -1039,6 +1039,10 @@ where
     let mut max_fresh_lag = 0u64;
     let mut min_stale_lag = u64::MAX;
     let mut max_stale_lag = 0u64;
+    let first_fresh_block = current_block.saturating_sub(max_lag_blocks);
+    let pruned_stale_by_score = candidate_store
+        .prune_candidates_before_block(first_fresh_block)
+        .await?;
 
     for candidate in candidate_store
         .pop_candidates(MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE)
@@ -1064,7 +1068,7 @@ where
         }
     }
 
-    if popped > 0 {
+    if popped > 0 || pruned_stale_by_score > 0 {
         let min_fresh_lag = if candidates.is_empty() {
             None
         } else {
@@ -1090,6 +1094,7 @@ where
             fresh = candidates.len(),
             expired,
             stale_by_block,
+            pruned_stale_by_score,
             current_block,
             max_lag_blocks,
             ?min_fresh_lag,

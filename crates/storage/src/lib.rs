@@ -70,6 +70,9 @@ pub trait CandidateStore: Send + Sync {
         }
         Ok(())
     }
+    async fn prune_candidates_before_block(&self, _block_number: u64) -> anyhow::Result<usize> {
+        Ok(0)
+    }
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>>;
     async fn pop_candidates(&self, limit: usize) -> anyhow::Result<Vec<Candidate>>;
 }
@@ -334,6 +337,16 @@ impl CandidateStore for InMemoryStores {
     async fn push_candidates(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
         self.candidates.lock().await.extend(candidates);
         Ok(())
+    }
+
+    async fn prune_candidates_before_block(&self, block_number: u64) -> anyhow::Result<usize> {
+        if block_number == 0 {
+            return Ok(0);
+        }
+        let mut candidates = self.candidates.lock().await;
+        let before = candidates.len();
+        candidates.retain(|candidate| candidate.block_number >= block_number);
+        Ok(before.saturating_sub(candidates.len()))
     }
 
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>> {
