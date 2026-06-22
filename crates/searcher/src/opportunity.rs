@@ -57,8 +57,11 @@ mod tests {
                 token_in: token,
                 token_out: token,
                 fee_bps: Some(30),
+                pool_key_fee_pips: None,
+                hooks_address: None,
                 stable: Some(false),
                 tick_spacing: None,
+                adapter_data: None,
             }],
             diagnostics: None,
         };

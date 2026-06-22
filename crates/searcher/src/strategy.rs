@@ -478,8 +478,11 @@ impl SearchEngine {
                             token_in: usdc,
                             token_out: weth,
                             fee_bps: Some(30),
+                            pool_key_fee_pips: None,
+                            hooks_address: None,
                             stable: Some(false),
                             tick_spacing: None,
+                            adapter_data: None,
                         },
                         SwapStep {
                             dex: DexKind::UniswapV3,
@@ -489,8 +492,11 @@ impl SearchEngine {
                             token_in: weth,
                             token_out: usdc,
                             fee_bps: Some(30),
+                            pool_key_fee_pips: None,
+                            hooks_address: None,
                             stable: None,
                             tick_spacing: None,
+                            adapter_data: None,
                         },
                     ],
                     diagnostics: None,
@@ -506,8 +512,11 @@ impl SearchEngine {
                             token_in: usdc,
                             token_out: weth,
                             fee_bps: Some(30),
+                            pool_key_fee_pips: None,
+                            hooks_address: None,
                             stable: None,
                             tick_spacing: None,
+                            adapter_data: None,
                         },
                         SwapStep {
                             dex: DexKind::Aerodrome,
@@ -517,8 +526,11 @@ impl SearchEngine {
                             token_in: weth,
                             token_out: usdc,
                             fee_bps: Some(30),
+                            pool_key_fee_pips: None,
+                            hooks_address: None,
                             stable: Some(false),
                             tick_spacing: None,
+                            adapter_data: None,
                         },
                     ],
                     diagnostics: None,
@@ -1867,6 +1879,8 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             token1_decimals: Some(18),
             fee_bps: 30,
             fee_pips: None,
+            pool_key_fee_pips: None,
+            hooks_address: None,
             stable: Some(false),
             reserve0: Some(U256::from(200_000_000_000u64)),
             reserve1: Some(U256::from(100_000_000_000_000_000_000u128)),
@@ -1892,6 +1906,8 @@ pub fn demo_pool_states(usdc: Address) -> Vec<PoolState> {
             token1_decimals: Some(6),
             fee_bps: 30,
             fee_pips: Some(3_000),
+            pool_key_fee_pips: None,
+            hooks_address: None,
             stable: None,
             reserve0: None,
             reserve1: None,
@@ -2563,7 +2579,7 @@ fn short_token(token: Address) -> String {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{address, Address, U256};
     use base_arb_common::types::{PoolId, PoolVariant, TickState, TokenPairSearchConfig};
     use chrono::Utc;
 
@@ -2817,6 +2833,8 @@ mod tests {
             token1_decimals: Some(18),
             fee_bps: 1,
             fee_pips: Some(100),
+            pool_key_fee_pips: None,
+            hooks_address: None,
             stable: None,
             reserve0: None,
             reserve1: None,
