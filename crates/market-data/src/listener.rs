@@ -1079,6 +1079,7 @@ where
 
         let mut stats = V4PromoteStats::default();
         let mut changed = Vec::new();
+        let mut published_states = Vec::new();
         for row in rows {
             let state = match self.uniswap_v4_state_from_row(&row).await {
                 Ok(state) => state,
@@ -1143,16 +1144,24 @@ where
             .execute(&self.recorder.pool)
             .await?;
 
-            self.pool_store.set_pool_state(state.clone()).await?;
-            self.recorder
-                .record_pool_state_with_source(state.clone(), "uniswap_v4_protocol")
-                .await?;
             changed.push(state.pool_id.address);
+            published_states.push(state);
             stats.promoted += 1;
             stats.published_states += 1;
         }
-        if !changed.is_empty() {
-            self.pool_store.mark_changed_pools(changed).await?;
+        if !published_states.is_empty() {
+            let latest_state_block = published_states
+                .iter()
+                .map(|state| state.block_number)
+                .max()
+                .unwrap_or_default();
+            let record_states = published_states.clone();
+            tokio::try_join!(
+                self.pool_store
+                    .publish_pool_states(latest_state_block, published_states, changed),
+                self.recorder
+                    .record_pool_states_with_source(record_states, "uniswap_v4_protocol")
+            )?;
         }
         Ok(stats)
     }
@@ -1199,6 +1208,7 @@ where
 
         let mut stats = V4PromoteStats::default();
         let mut changed = Vec::new();
+        let mut published_states = Vec::new();
         for row in rows {
             let state = match self.balancer_v3_state_from_row(&row).await {
                 Ok(state) => state,
@@ -1269,16 +1279,24 @@ where
             .execute(&self.recorder.pool)
             .await?;
 
-            self.pool_store.set_pool_state(state.clone()).await?;
-            self.recorder
-                .record_pool_state_with_source(state.clone(), "balancer_v3_protocol")
-                .await?;
             changed.push(state.pool_id.address);
+            published_states.push(state);
             stats.promoted += 1;
             stats.published_states += 1;
         }
-        if !changed.is_empty() {
-            self.pool_store.mark_changed_pools(changed).await?;
+        if !published_states.is_empty() {
+            let latest_state_block = published_states
+                .iter()
+                .map(|state| state.block_number)
+                .max()
+                .unwrap_or_default();
+            let record_states = published_states.clone();
+            tokio::try_join!(
+                self.pool_store
+                    .publish_pool_states(latest_state_block, published_states, changed),
+                self.recorder
+                    .record_pool_states_with_source(record_states, "balancer_v3_protocol")
+            )?;
         }
         Ok(stats)
     }
