@@ -100,6 +100,12 @@ pub trait RecorderStore: Send + Sync {
         Ok(())
     }
     async fn record_simulation(&self, simulation: SimulationResult) -> anyhow::Result<()>;
+    async fn record_simulations(&self, simulations: Vec<SimulationResult>) -> anyhow::Result<()> {
+        for simulation in simulations {
+            self.record_simulation(simulation).await?;
+        }
+        Ok(())
+    }
     async fn record_transaction(&self, tx: TxResult) -> anyhow::Result<()>;
 }
 
@@ -386,6 +392,11 @@ impl RecorderStore for InMemoryStores {
 
     async fn record_simulation(&self, simulation: SimulationResult) -> anyhow::Result<()> {
         self.simulations.lock().await.push(simulation);
+        Ok(())
+    }
+
+    async fn record_simulations(&self, simulations: Vec<SimulationResult>) -> anyhow::Result<()> {
+        self.simulations.lock().await.extend(simulations);
         Ok(())
     }
 

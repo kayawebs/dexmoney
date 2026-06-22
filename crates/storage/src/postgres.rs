@@ -1737,59 +1737,71 @@ impl RecorderStore for PostgresStore {
     }
 
     async fn record_simulation(&self, simulation: SimulationResult) -> Result<()> {
-        let calldata_hex = format!("0x{}", hex::encode(&simulation.calldata));
-        sqlx::query(
+        self.record_simulations(vec![simulation]).await
+    }
+
+    async fn record_simulations(&self, simulations: Vec<SimulationResult>) -> Result<()> {
+        if simulations.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(simulations.len());
+        for simulation in simulations {
+            let calldata_hex = format!("0x{}", hex::encode(&simulation.calldata));
+            let raw_result = sqlx::types::Json(serde_json::json!({
+                "success": simulation.success,
+                "gas_estimate": simulation.gas_estimate.map(|v| v.to_string()),
+                "block_number": simulation.block_number,
+                "token_in": simulation.token_in.map(address_to_string),
+                "amount_in": simulation.amount_in.map(|v| v.to_string()),
+                "expected_profit": simulation.expected_profit.map(|v| v.to_string()),
+                "min_profit": simulation.min_profit.map(|v| v.to_string()),
+                "path_name": simulation.path_name.clone(),
+                "base_fee_per_gas": simulation.base_fee_per_gas.map(|v| v.to_string()),
+                "max_fee_per_gas": simulation.max_fee_per_gas.map(|v| v.to_string()),
+                "max_priority_fee_per_gas": simulation.max_priority_fee_per_gas.map(|v| v.to_string()),
+                "gas_cost_cap": simulation.gas_cost_cap.map(|v| v.to_string()),
+                "gas_cost_expected": simulation.gas_cost_expected.map(|v| v.to_string()),
+                "net_simulated_profit": simulation.net_simulated_profit.map(|v| v.to_string()),
+            }));
+            let block_number = simulation.block_number.map(i64::try_from).transpose()?;
+            rows.push((simulation, calldata_hex, raw_result, block_number));
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO simulations (
                 id, opportunity_id, created_at, success, simulated_profit, gas_estimate,
                 revert_reason, calldata, raw_result, block_number, token_in, amount_in,
                 expected_profit, min_profit, path_name, base_fee_per_gas, max_fee_per_gas,
                 max_priority_fee_per_gas, gas_cost_cap, gas_cost_expected, net_simulated_profit
-            ) VALUES ($1,$2,NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            )
             "#,
-        )
-        .bind(simulation.id)
-        .bind(simulation.opportunity_id)
-        .bind(simulation.success)
-        .bind(simulation.simulated_profit.to_string())
-        .bind(simulation.gas_estimate.map(|v| v.to_string()))
-        .bind(simulation.revert_reason.clone())
-        .bind(calldata_hex)
-        .bind(sqlx::types::Json(serde_json::json!({
-            "success": simulation.success,
-            "gas_estimate": simulation.gas_estimate.map(|v| v.to_string()),
-            "block_number": simulation.block_number,
-            "token_in": simulation.token_in.map(address_to_string),
-            "amount_in": simulation.amount_in.map(|v| v.to_string()),
-            "expected_profit": simulation.expected_profit.map(|v| v.to_string()),
-            "min_profit": simulation.min_profit.map(|v| v.to_string()),
-            "path_name": simulation.path_name.clone(),
-            "base_fee_per_gas": simulation.base_fee_per_gas.map(|v| v.to_string()),
-            "max_fee_per_gas": simulation.max_fee_per_gas.map(|v| v.to_string()),
-            "max_priority_fee_per_gas": simulation.max_priority_fee_per_gas.map(|v| v.to_string()),
-            "gas_cost_cap": simulation.gas_cost_cap.map(|v| v.to_string()),
-            "gas_cost_expected": simulation.gas_cost_expected.map(|v| v.to_string()),
-            "net_simulated_profit": simulation.net_simulated_profit.map(|v| v.to_string()),
-        })))
-        .bind(
-            simulation
-                .block_number
-                .map(|v| i64::try_from(v))
-                .transpose()?,
-        )
-        .bind(simulation.token_in.map(address_to_string))
-        .bind(simulation.amount_in.map(|v| v.to_string()))
-        .bind(simulation.expected_profit.map(|v| v.to_string()))
-        .bind(simulation.min_profit.map(|v| v.to_string()))
-        .bind(simulation.path_name.clone())
-        .bind(simulation.base_fee_per_gas.map(|v| v.to_string()))
-        .bind(simulation.max_fee_per_gas.map(|v| v.to_string()))
-        .bind(simulation.max_priority_fee_per_gas.map(|v| v.to_string()))
-        .bind(simulation.gas_cost_cap.map(|v| v.to_string()))
-        .bind(simulation.gas_cost_expected.map(|v| v.to_string()))
-        .bind(simulation.net_simulated_profit.map(|v| v.to_string()))
-        .execute(&self.pool)
-        .await?;
+        );
+        query.push_values(
+            rows,
+            |mut row, (simulation, calldata_hex, raw_result, block_number)| {
+                row.push_bind(simulation.id)
+                    .push_bind(simulation.opportunity_id)
+                    .push_bind(simulation.success)
+                    .push_bind(simulation.simulated_profit.to_string())
+                    .push_bind(simulation.gas_estimate.map(|v| v.to_string()))
+                    .push_bind(simulation.revert_reason.clone())
+                    .push_bind(calldata_hex)
+                    .push_bind(raw_result)
+                    .push_bind(block_number)
+                    .push_bind(simulation.token_in.map(address_to_string))
+                    .push_bind(simulation.amount_in.map(|v| v.to_string()))
+                    .push_bind(simulation.expected_profit.map(|v| v.to_string()))
+                    .push_bind(simulation.min_profit.map(|v| v.to_string()))
+                    .push_bind(simulation.path_name.clone())
+                    .push_bind(simulation.base_fee_per_gas.map(|v| v.to_string()))
+                    .push_bind(simulation.max_fee_per_gas.map(|v| v.to_string()))
+                    .push_bind(simulation.max_priority_fee_per_gas.map(|v| v.to_string()))
+                    .push_bind(simulation.gas_cost_cap.map(|v| v.to_string()))
+                    .push_bind(simulation.gas_cost_expected.map(|v| v.to_string()))
+                    .push_bind(simulation.net_simulated_profit.map(|v| v.to_string()));
+            },
+        );
+        query.build().execute(&self.pool).await?;
         Ok(())
     }
 

@@ -262,6 +262,7 @@ where
     let mut simulation_successes = 0usize;
     let mut simulation_failures = 0usize;
     let mut join_errors = 0usize;
+    let mut simulation_records = Vec::with_capacity(max_to_simulate);
 
     loop {
         while spawned < max_to_simulate && join_set.len() < concurrency {
@@ -311,7 +312,7 @@ where
                 } else {
                     simulation_failures += 1;
                 }
-                recorder.record_simulation(simulation).await?;
+                simulation_records.push(simulation);
                 simulated += 1;
             }
             Some(Err(err)) => {
@@ -321,6 +322,8 @@ where
             None => break,
         }
     }
+
+    recorder.record_simulations(simulation_records).await?;
 
     info!(
         candidate_count,
@@ -442,6 +445,7 @@ where
     let mut simulation_failures = 0usize;
     let mut join_errors = 0usize;
     let mut successful = Vec::new();
+    let mut simulation_records = Vec::with_capacity(max_to_simulate);
 
     loop {
         while spawned < max_to_simulate && join_set.len() < concurrency {
@@ -480,9 +484,7 @@ where
                     success = outcome.simulation.success,
                     "simulation success/fail"
                 );
-                recorder
-                    .record_simulation(outcome.simulation.clone())
-                    .await?;
+                simulation_records.push(outcome.simulation.clone());
                 if outcome.simulation.success {
                     simulation_successes += 1;
                     successful.push(outcome);
@@ -498,6 +500,8 @@ where
             None => break,
         }
     }
+
+    recorder.record_simulations(simulation_records).await?;
 
     successful.sort_by(|left, right| {
         simulation_profit_rank(&right.simulation).cmp(&simulation_profit_rank(&left.simulation))
