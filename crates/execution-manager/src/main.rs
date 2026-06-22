@@ -12,7 +12,7 @@ use base_arb_storage::{
     PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use tokio::task::JoinSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -369,6 +369,7 @@ where
     let candidate_count = candidates.len();
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut approval_ready = Vec::new();
+    let mut approved_cache = HashSet::new();
     let mut preflight_simulated = 0usize;
 
     for candidate in candidates {
@@ -399,6 +400,7 @@ where
             fund_wallet,
             &candidate,
             current_block,
+            &mut approved_cache,
         )
         .await?
         {
@@ -560,6 +562,7 @@ async fn live_approval_preflight<E, R>(
     fund_wallet: Option<&tx_manager::ExecutionWallet>,
     candidate: &Candidate,
     current_block: u64,
+    approved_cache: &mut HashSet<(Address, Address, Address)>,
 ) -> Result<Option<CandidateAction>>
 where
     E: EoaStateStore,
@@ -573,17 +576,22 @@ where
     }
 
     let approvals = simulator::required_token_approvals(candidate, settings)?;
-    let missing_approvals =
-        tx_manager::missing_approvals(provider, settings, candidate, &approvals)
-            .await
-            .unwrap_or_else(|err| {
-                warn!(
-                    candidate_id = %candidate.id,
-                    error = %err,
-                    "failed to check route allowances; trying route approvals before tx"
-                );
-                approvals
-            });
+    let missing_approvals = tx_manager::missing_approvals_cached(
+        provider,
+        settings,
+        candidate,
+        &approvals,
+        approved_cache,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        warn!(
+            candidate_id = %candidate.id,
+            error = %err,
+            "failed to check route allowances; trying route approvals before tx"
+        );
+        approvals
+    });
     if missing_approvals.is_empty() {
         return Ok(None);
     }
