@@ -13,6 +13,7 @@ use base_arb_storage::{
 };
 use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -23,6 +24,9 @@ const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
 const CANDIDATE_POP_CHUNK_SIZE: usize = 128;
 const IDLE_EOA_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+const SIMULATION_RECORD_QUEUE_CAPACITY: usize = 1_024;
+const SIMULATION_RECORD_FLUSH_MS: u64 = 100;
+const SIMULATION_RECORD_MAX_BATCH: usize = 512;
 
 #[derive(Debug, Clone)]
 struct ExecutionRuntime {
@@ -62,6 +66,79 @@ impl ExecutionRuntime {
     }
 }
 
+#[derive(Clone)]
+struct SimulationRecordQueue {
+    sender: mpsc::Sender<Vec<SimulationResult>>,
+}
+
+impl SimulationRecordQueue {
+    fn spawn(store: PostgresStore) -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<Vec<SimulationResult>>(SIMULATION_RECORD_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            let mut flush_interval = interval(Duration::from_millis(SIMULATION_RECORD_FLUSH_MS));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    maybe_simulations = receiver.recv() => {
+                        let Some(mut simulations) = maybe_simulations else {
+                            flush_simulation_records(&store, &mut pending).await;
+                            break;
+                        };
+                        pending.append(&mut simulations);
+                        if pending.len() >= SIMULATION_RECORD_MAX_BATCH {
+                            flush_simulation_records(&store, &mut pending).await;
+                        }
+                    }
+                    _ = flush_interval.tick(), if !pending.is_empty() => {
+                        flush_simulation_records(&store, &mut pending).await;
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    fn enqueue(&self, simulations: Vec<SimulationResult>) -> usize {
+        if simulations.is_empty() {
+            return 0;
+        }
+        match self.sender.try_send(simulations) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(simulations)) => {
+                warn!(
+                    dropped = simulations.len(),
+                    "simulation record queue full; dropping diagnostic records"
+                );
+                simulations.len()
+            }
+            Err(mpsc::error::TrySendError::Closed(simulations)) => {
+                warn!(
+                    dropped = simulations.len(),
+                    "simulation record queue closed; dropping diagnostic records"
+                );
+                simulations.len()
+            }
+        }
+    }
+}
+
+async fn flush_simulation_records(store: &PostgresStore, pending: &mut Vec<SimulationResult>) {
+    if pending.is_empty() {
+        return;
+    }
+    let simulations = std::mem::take(pending);
+    let count = simulations.len();
+    if let Err(err) = store.record_simulations(simulations).await {
+        warn!(
+            count,
+            error = %err,
+            "failed to record simulations from background queue"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -72,6 +149,7 @@ async fn main() -> Result<()> {
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
     let runtime = ExecutionRuntime::from_settings(&settings)?;
+    let simulation_recorder = SimulationRecordQueue::spawn(postgres.clone());
     let cleared_candidates = redis.clear_candidates().await?;
     if cleared_candidates > 0 {
         info!(
@@ -110,6 +188,7 @@ async fn main() -> Result<()> {
             &provider,
             &settings,
             &runtime,
+            &simulation_recorder,
             settings.min_simulated_profit_usdc,
             &mut circuit_breaker,
             &mut maintenance,
@@ -125,6 +204,7 @@ async fn run_execution_cycle<C, E, R>(
     provider: &ChainProvider,
     settings: &Settings,
     runtime: &ExecutionRuntime,
+    simulation_recorder: &SimulationRecordQueue,
     min_simulated_profit_usdc: f64,
     circuit_breaker: &mut ExecutionCircuitBreaker,
     maintenance: &mut ExecutionMaintenance,
@@ -207,7 +287,7 @@ where
     let simulation_context = simulator::SimulationContext::load(provider, settings).await;
     if !settings.execution_submit_enabled {
         return run_dry_run_simulation_batch(
-            recorder,
+            simulation_recorder,
             provider,
             settings,
             operator,
@@ -223,6 +303,7 @@ where
     run_live_submission_batch(
         eoa_store,
         recorder,
+        simulation_recorder,
         provider,
         settings,
         operator,
@@ -260,8 +341,8 @@ impl ExecutionMaintenance {
     }
 }
 
-async fn run_dry_run_simulation_batch<R>(
-    recorder: &R,
+async fn run_dry_run_simulation_batch(
+    simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
     operator: Address,
@@ -271,10 +352,7 @@ async fn run_dry_run_simulation_batch<R>(
     current_block: u64,
     max_candidate_lag_blocks: u64,
     batch_started: Instant,
-) -> Result<()>
-where
-    R: RecorderStore,
-{
+) -> Result<()> {
     let candidate_count = candidates.len();
     let max_to_simulate = candidate_count.min(MAX_SIMULATIONS_PER_CYCLE);
     let concurrency = settings
@@ -349,7 +427,7 @@ where
         }
     }
 
-    recorder.record_simulations(simulation_records).await?;
+    let simulation_record_queue_dropped = simulation_recorder.enqueue(simulation_records);
 
     info!(
         candidate_count,
@@ -360,6 +438,7 @@ where
         simulation_failures,
         join_errors,
         concurrency,
+        simulation_record_queue_dropped,
         skipped = candidate_count.saturating_sub(simulated),
         elapsed_ms = batch_started.elapsed().as_millis() as u64,
         skipped_by_reason = ?BTreeMap::<&'static str, usize>::new(),
@@ -378,6 +457,7 @@ struct LiveSimulationOutcome {
 async fn run_live_submission_batch<E, R>(
     eoa_store: &E,
     recorder: &R,
+    simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
     operator: Address,
@@ -423,6 +503,7 @@ where
         if let Some(action) = live_approval_preflight(
             eoa_store,
             recorder,
+            simulation_recorder,
             provider,
             settings,
             wallet,
@@ -528,7 +609,7 @@ where
         }
     }
 
-    recorder.record_simulations(simulation_records).await?;
+    let simulation_record_queue_dropped = simulation_recorder.enqueue(simulation_records);
 
     successful.sort_by(|left, right| {
         simulation_profit_rank(&right.simulation).cmp(&simulation_profit_rank(&left.simulation))
@@ -568,6 +649,7 @@ where
         simulation_failures,
         join_errors,
         concurrency,
+        simulation_record_queue_dropped,
         submitted,
         skipped = skipped_by_reason.values().sum::<usize>(),
         approved_allowance_cache_size = approved_allowances.len(),
@@ -588,6 +670,7 @@ fn simulation_profit_rank(simulation: &SimulationResult) -> U256 {
 async fn live_approval_preflight<E, R>(
     eoa_store: &E,
     recorder: &R,
+    simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
     wallet: Option<&tx_manager::ExecutionWallet>,
@@ -670,9 +753,15 @@ where
         revert_reason: Some("lazy approval preflight; simulation skipped".to_string()),
         calldata: calldata.clone(),
     };
-    recorder
-        .record_simulation(synthetic_simulation.clone())
-        .await?;
+    let simulation_record_queue_dropped =
+        simulation_recorder.enqueue(vec![synthetic_simulation.clone()]);
+    if simulation_record_queue_dropped > 0 {
+        warn!(
+            candidate_id = %candidate.id,
+            simulation_record_queue_dropped,
+            "lazy approval synthetic simulation record dropped"
+        );
+    }
     match tx_manager::submit_executor_approval(
         provider,
         fund_wallet,
