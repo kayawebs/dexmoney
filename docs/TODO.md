@@ -61,6 +61,10 @@
   - Store pool-specific balances, scaling factors, fees, and rate-provider data.
   - Quote only pool types with fully implemented local math.
 - [ ] Extend competitor reports to separate `unsupported_protocol`, `missing_state`, `hooked_v4`, and `dynamic_fee_v4` gaps.
+- [ ] Audit V3-style tick availability:
+  - Explain every persistent `MissingTicks` skip by variant and discovery source.
+  - Distinguish async warmup lag, RPC failures, tick bitmap radius misses, and genuinely empty/out-of-range liquidity.
+  - Add a repair path that backfills missing initialized ticks without blocking live market-data.
 
 ## Immediate
 
@@ -75,6 +79,9 @@
 - Make `searcher` read only live Redis pool state, without demo fallback.
 - Add explicit candidate priority scoring beyond raw expected profit.
 - Record quote inputs and outputs for replay/debug.
+- Deep-dive high-profit candidates rejected by price-impact checks:
+  - Compare local expected profit, impact model inputs, exact replay output, and competitor execution size.
+  - Decide whether the current impact guard is over-conservative or whether the quote is structurally stale/optimistic.
 
 ## Execution Path
 

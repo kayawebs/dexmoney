@@ -562,6 +562,7 @@ where
             base_arb_common::types::PoolVariant::AerodromeSlipstream
                 | base_arb_common::types::PoolVariant::UniswapV3
                 | base_arb_common::types::PoolVariant::PancakeV3
+                | base_arb_common::types::PoolVariant::UniswapV4
         ) {
             continue;
         }
