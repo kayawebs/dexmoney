@@ -93,7 +93,9 @@ docker_compose_logs() {
 } >"$OUT_FILE"
 
 SEARCHER_LOG="$TMP_DIR/searcher.log"
-docker_compose_logs searcher >"$SEARCHER_LOG" 2>&1 || true
+RAW_SEARCHER_LOG="$TMP_DIR/searcher.raw.log"
+docker_compose_logs searcher >"$RAW_SEARCHER_LOG" 2>&1 || true
+perl -pe 's/\e\[[0-9;]*m//g' "$RAW_SEARCHER_LOG" >"$SEARCHER_LOG"
 
 section "1. searcher cycle summaries"
 grep "searcher cycle summary" "$SEARCHER_LOG" >>"$OUT_FILE" || true

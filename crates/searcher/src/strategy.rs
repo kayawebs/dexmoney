@@ -2165,7 +2165,11 @@ fn estimate_price_impact_bps(
     }
 
     let Ok(spot_out) = spot_quote_exact_in(pool_state, token_in, quote.amount_in) else {
-        return u64::MAX;
+        // Exact V3-style quotes already used initialized ticks. If the separate
+        // spot-only impact model cannot represent an extreme/ill-conditioned
+        // pool, do not treat that as infinite market impact and block the
+        // candidate before simulation.
+        return 0;
     };
     impact_from_spot(spot_out, quote.amount_out)
 }
