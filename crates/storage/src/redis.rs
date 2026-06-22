@@ -14,6 +14,7 @@ use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
 const REDIS_MGET_CHUNK_SIZE: usize = 1_000;
 const REDIS_MSET_CHUNK_SIZE: usize = 1_000;
+const REDIS_ZADD_CHUNK_SIZE: usize = 512;
 const SET_CURRENT_BLOCK_IF_NEWER_SCRIPT: &str = r#"
 local current = redis.call('GET', KEYS[1])
 local next_block = tonumber(ARGV[1])
@@ -512,13 +513,15 @@ impl CandidateStore for RedisStore {
             return Ok(());
         }
         let mut manager = self.manager.clone();
-        let mut pipe = redis::pipe();
-        for candidate in candidates {
-            let score = candidate_queue_score(&candidate);
-            let member = serde_json::to_string(&candidate)?;
-            pipe.zadd(candidates_key(), member, score).ignore();
+        for chunk in candidates.chunks(REDIS_ZADD_CHUNK_SIZE) {
+            let mut cmd = redis::cmd("ZADD");
+            cmd.arg(candidates_key());
+            for candidate in chunk {
+                cmd.arg(candidate_queue_score(candidate))
+                    .arg(serde_json::to_string(candidate)?);
+            }
+            let _: usize = cmd.query_async(&mut manager).await?;
         }
-        let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
 
