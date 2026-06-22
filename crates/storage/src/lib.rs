@@ -64,6 +64,12 @@ pub trait TickStateStore: Send + Sync {
 #[async_trait]
 pub trait CandidateStore: Send + Sync {
     async fn push_candidate(&self, candidate: Candidate) -> anyhow::Result<()>;
+    async fn push_candidates(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
+        for candidate in candidates {
+            self.push_candidate(candidate).await?;
+        }
+        Ok(())
+    }
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>>;
     async fn pop_candidates(&self, limit: usize) -> anyhow::Result<Vec<Candidate>>;
 }
@@ -87,6 +93,12 @@ pub trait RecorderStore: Send + Sync {
         self.record_pool_state(pool_state).await
     }
     async fn record_opportunity(&self, candidate: Candidate) -> anyhow::Result<()>;
+    async fn record_opportunities(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
+        for candidate in candidates {
+            self.record_opportunity(candidate).await?;
+        }
+        Ok(())
+    }
     async fn record_simulation(&self, simulation: SimulationResult) -> anyhow::Result<()>;
     async fn record_transaction(&self, tx: TxResult) -> anyhow::Result<()>;
 }
@@ -313,6 +325,11 @@ impl CandidateStore for InMemoryStores {
         Ok(())
     }
 
+    async fn push_candidates(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
+        self.candidates.lock().await.extend(candidates);
+        Ok(())
+    }
+
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>> {
         Ok(self.candidates.lock().await.pop_front())
     }
@@ -359,6 +376,11 @@ impl RecorderStore for InMemoryStores {
 
     async fn record_opportunity(&self, candidate: Candidate) -> anyhow::Result<()> {
         self.opportunities.lock().await.push(candidate);
+        Ok(())
+    }
+
+    async fn record_opportunities(&self, candidates: Vec<Candidate>) -> anyhow::Result<()> {
+        self.opportunities.lock().await.extend(candidates);
         Ok(())
     }
 

@@ -456,6 +456,21 @@ impl CandidateStore for RedisStore {
         Ok(())
     }
 
+    async fn push_candidates(&self, candidates: Vec<Candidate>) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        for candidate in candidates {
+            let score = candidate_queue_score(&candidate);
+            let member = serde_json::to_string(&candidate)?;
+            pipe.zadd(candidates_key(), member, score).ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
     async fn pop_candidate(&self) -> Result<Option<Candidate>> {
         let mut manager = self.manager.clone();
         let result: Vec<(String, f64)> = redis::cmd("ZPOPMAX")

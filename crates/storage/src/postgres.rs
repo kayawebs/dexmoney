@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use tracing::info;
 
 use crate::{
@@ -1698,6 +1698,41 @@ impl RecorderStore for PostgresStore {
         .bind(format!("{:?}", candidate.status))
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn record_opportunities(&self, candidates: Vec<Candidate>) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let block_number = i64::try_from(candidate.block_number)?;
+            rows.push((candidate, block_number));
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO opportunities (
+                id, created_at, block_number, strategy, token_in, amount_in,
+                expected_amount_out, expected_profit, min_profit, path_json, status
+            )
+            "#,
+        );
+        query.push_values(rows, |mut row, (candidate, block_number)| {
+            row.push_bind(candidate.id)
+                .push_bind(candidate.created_at)
+                .push_bind(block_number)
+                .push_bind(candidate.strategy)
+                .push_bind(address_to_string(candidate.token_in))
+                .push_bind(candidate.amount_in.to_string())
+                .push_bind(candidate.expected_amount_out.to_string())
+                .push_bind(candidate.expected_profit.to_string())
+                .push_bind(candidate.min_profit.to_string())
+                .push_bind(sqlx::types::Json(candidate.path))
+                .push_bind(format!("{:?}", candidate.status));
+        });
+        query.push(" ON CONFLICT (id) DO NOTHING");
+        query.build().execute(&self.pool).await?;
         Ok(())
     }
 

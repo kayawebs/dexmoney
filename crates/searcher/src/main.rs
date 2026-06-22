@@ -711,6 +711,7 @@ where
     let candidates = coalesce_candidates(candidates);
     cycle_stats.candidates_coalesced +=
         original_candidate_count.saturating_sub(candidates.len()) as u64;
+    let mut valid_candidates = Vec::new();
     for candidate in candidates {
         let candidate_lag = latest_known_block.saturating_sub(candidate.block_number);
         if candidate_lag > max_candidate_lag_blocks {
@@ -734,16 +735,21 @@ where
             &engine.whitelist_paths,
         ) {
             Ok(()) => {
-                recorder.record_opportunity(candidate.clone()).await?;
-                candidate_store.push_candidate(candidate.clone()).await?;
-                cycle_stats.opportunities_created += 1;
                 debug!(candidate_id = %candidate.id, "candidate created");
+                valid_candidates.push(candidate);
             }
             Err(err) => {
                 cycle_stats.record_risk_rejection(&err);
                 debug!(candidate_id = %candidate.id, reason = %err, "candidate rejected");
             }
         }
+    }
+    if !valid_candidates.is_empty() {
+        cycle_stats.opportunities_created += valid_candidates.len() as u64;
+        recorder
+            .record_opportunities(valid_candidates.clone())
+            .await?;
+        candidate_store.push_candidates(valid_candidates).await?;
     }
     Ok(())
 }
