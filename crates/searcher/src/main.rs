@@ -479,10 +479,14 @@ where
         match state {
             Some(state) => {
                 let topology = PoolTopology::from(&state);
+                let was_active = runtime.active_pool_addresses.contains(&pool);
                 if is_pool_state_active(&state, now, max_pool_state_age_ms) {
                     runtime.active_pool_addresses.insert(pool);
                 } else {
                     runtime.active_pool_addresses.remove(&pool);
+                }
+                if was_active != runtime.active_pool_addresses.contains(&pool) {
+                    rebuild_path_index = true;
                 }
                 if runtime.pool_topology.get(&pool) != Some(&topology) {
                     rebuild_path_index = true;
@@ -504,7 +508,9 @@ where
                     runtime.latest_pool_state_block = latest_pool_state_block(&runtime.pool_states);
                 }
                 runtime.tick_states.remove(&pool);
-                runtime.active_pool_addresses.remove(&pool);
+                if runtime.active_pool_addresses.remove(&pool) {
+                    rebuild_path_index = true;
+                }
             }
         }
     }
@@ -520,7 +526,10 @@ where
         return Ok(SearchCycleStats::default());
     };
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
-    let active_pool_swept = refresh_active_pool_cache_if_due(runtime, now, max_pool_state_age_ms);
+    let active_pool_refresh = refresh_active_pool_cache_if_due(runtime, now, max_pool_state_age_ms);
+    if active_pool_refresh.changed {
+        rebuild_path_index = true;
+    }
     if runtime.active_pool_addresses.is_empty() {
         debug!(
             latest_known_block,
@@ -537,11 +546,12 @@ where
             .engine
             .as_ref()
             .expect("searcher engine checked above");
-        let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
+        let pool_states = active_pool_states(runtime);
         runtime.path_index = Some(engine.build_path_index(&pool_states));
         runtime.graph_snapshot = Some(engine.build_graph_snapshot(pool_states));
         path_index_rebuild_ms = rebuild_started.elapsed().as_millis() as u64;
         info!(
+            active_pools = runtime.active_pool_addresses.len(),
             total_paths = runtime
                 .path_index
                 .as_ref()
@@ -584,7 +594,7 @@ where
         latest_chain_block: latest_known_block,
         latest_pool_state_block,
         inactive_pool_filtered_paths: selected_paths.inactive_pool_filtered_paths as u64,
-        active_pool_sweeps: u64::from(active_pool_swept),
+        active_pool_sweeps: u64::from(active_pool_refresh.swept),
         active_pools: runtime.active_pool_addresses.len() as u64,
         changed_pool_scans: 1,
         changed_pools: changed_pools.len() as u64,
@@ -679,22 +689,41 @@ fn latest_pool_state_block(pool_states: &HashMap<Address, PoolState>) -> u64 {
         .unwrap_or(0)
 }
 
+fn active_pool_states(runtime: &SearchRuntime) -> Vec<PoolState> {
+    runtime
+        .active_pool_addresses
+        .iter()
+        .filter_map(|pool| runtime.pool_states.get(pool).cloned())
+        .collect()
+}
+
+#[derive(Clone, Copy, Default)]
+struct ActivePoolRefresh {
+    swept: bool,
+    changed: bool,
+}
+
 fn refresh_active_pool_cache_if_due(
     runtime: &mut SearchRuntime,
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
-) -> bool {
+) -> ActivePoolRefresh {
     let interval = active_pool_sweep_interval(max_pool_state_age_ms);
     if runtime
         .last_active_pool_sweep
         .is_some_and(|last_sweep| last_sweep.elapsed() < interval)
     {
-        return false;
+        return ActivePoolRefresh::default();
     }
-    runtime.active_pool_addresses =
+    let active_pool_addresses =
         active_pool_addresses(runtime.pool_states.values(), now, max_pool_state_age_ms);
+    let changed = active_pool_addresses != runtime.active_pool_addresses;
+    runtime.active_pool_addresses = active_pool_addresses;
     runtime.last_active_pool_sweep = Some(Instant::now());
-    true
+    ActivePoolRefresh {
+        swept: true,
+        changed,
+    }
 }
 
 fn active_pool_sweep_interval(max_pool_state_age_ms: i64) -> Duration {
