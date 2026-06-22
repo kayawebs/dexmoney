@@ -9,6 +9,7 @@ members = [
     "crates/searcher",
     "crates/execution-manager",
     "crates/monitor-web",
+    "crates/health-monitor",
 ]
 resolver = "2"
 

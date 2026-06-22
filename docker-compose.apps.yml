@@ -82,6 +82,16 @@ services:
     ports:
       - "${MONITOR_WEB_BIND:-127.0.0.1}:${MONITOR_WEB_PORT:-8085}:8085"
 
+  health-monitor:
+    <<: *app-common
+    container_name: dexmoney-health-monitor
+    image: dexmoney-health-monitor:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_PACKAGE: health-monitor
+        APP_BIN: health-monitor
+
   execution-manager:
     <<: *app-common
     container_name: dexmoney-execution-manager

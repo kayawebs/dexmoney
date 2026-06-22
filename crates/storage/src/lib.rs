@@ -2,7 +2,7 @@ pub mod postgres;
 pub mod redis;
 pub mod schema;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
@@ -55,6 +55,10 @@ pub trait TickStateStore: Send + Sync {
         tick_states: Vec<TickState>,
     ) -> anyhow::Result<()>;
     async fn get_pool_ticks(&self, pool: Address) -> anyhow::Result<Vec<TickState>>;
+    async fn get_pool_ticks_many(
+        &self,
+        pools: &[Address],
+    ) -> anyhow::Result<HashMap<Address, Vec<TickState>>>;
 }
 
 #[async_trait]
@@ -273,6 +277,32 @@ impl TickStateStore for InMemoryStores {
             .filter(|tick| tick.pool_id.address == pool)
             .cloned()
             .collect())
+    }
+
+    async fn get_pool_ticks_many(
+        &self,
+        pools: &[Address],
+    ) -> anyhow::Result<HashMap<Address, Vec<TickState>>> {
+        let wanted = pools
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut out = wanted
+            .iter()
+            .copied()
+            .map(|pool| (pool, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        for tick in self.ticks.lock().await.values() {
+            if wanted.contains(&tick.pool_id.address) {
+                out.entry(tick.pool_id.address)
+                    .or_default()
+                    .push(tick.clone());
+            }
+        }
+        for ticks in out.values_mut() {
+            ticks.sort_by_key(|tick| tick.tick);
+        }
+        Ok(out)
     }
 }
 

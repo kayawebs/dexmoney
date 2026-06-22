@@ -3,6 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use std::collections::HashMap;
 use tracing::info;
 
 use crate::{
@@ -369,6 +370,64 @@ impl TickStateStore for RedisStore {
             }
         }
         out.sort_by_key(|tick| tick.tick);
+        Ok(out)
+    }
+
+    async fn get_pool_ticks_many(
+        &self,
+        pools: &[Address],
+    ) -> Result<HashMap<Address, Vec<TickState>>> {
+        let mut out = pools
+            .iter()
+            .copied()
+            .map(|pool| (pool, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        if pools.is_empty() {
+            return Ok(out);
+        }
+
+        let mut unique_pools = pools.to_vec();
+        unique_pools.sort_unstable();
+        unique_pools.dedup();
+
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        for pool in &unique_pools {
+            pipe.smembers(tick_pool_index_key(*pool));
+        }
+        let key_sets: Vec<Vec<String>> = pipe.query_async(&mut manager).await?;
+
+        let mut all_keys = Vec::new();
+        let mut key_to_pool = HashMap::new();
+        for (pool, keys) in unique_pools.iter().zip(key_sets) {
+            for key in keys {
+                key_to_pool.insert(key.clone(), *pool);
+                all_keys.push(key);
+            }
+        }
+
+        if all_keys.is_empty() {
+            return Ok(out);
+        }
+
+        let values: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&all_keys)
+            .query_async(&mut manager)
+            .await?;
+        for (key, value) in all_keys.into_iter().zip(values) {
+            let Some(raw) = value else {
+                continue;
+            };
+            let tick: TickState = serde_json::from_str(&raw)?;
+            let pool = key_to_pool
+                .get(&key)
+                .copied()
+                .unwrap_or(tick.pool_id.address);
+            out.entry(pool).or_default().push(tick);
+        }
+        for ticks in out.values_mut() {
+            ticks.sort_by_key(|tick| tick.tick);
+        }
         Ok(out)
     }
 }

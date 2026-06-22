@@ -554,6 +554,7 @@ where
 {
     let mut tick_states = Vec::new();
     let mut stats = TickLoadStats::default();
+    let mut pools_to_refresh = Vec::new();
     for pool in path_pools {
         let Some(state) = runtime.pool_states.get(pool) else {
             continue;
@@ -571,14 +572,25 @@ where
         let should_refresh = !runtime.tick_states.contains_key(pool)
             || (tick_changed_pools.contains(pool) && !refreshed_tick_pools.contains(pool));
         if should_refresh {
-            let loaded_ticks = pool_store.get_pool_ticks(*pool).await?;
             stats.cache_misses += 1;
             stats.cache_refreshes += 1;
-            runtime.tick_states.insert(*pool, loaded_ticks);
-            refreshed_tick_pools.insert(*pool);
+            pools_to_refresh.push(*pool);
         } else {
             stats.cache_hits += 1;
         }
+    }
+
+    if !pools_to_refresh.is_empty() {
+        let loaded = pool_store.get_pool_ticks_many(&pools_to_refresh).await?;
+        for pool in pools_to_refresh {
+            runtime
+                .tick_states
+                .insert(pool, loaded.get(&pool).cloned().unwrap_or_default());
+            refreshed_tick_pools.insert(pool);
+        }
+    }
+
+    for pool in path_pools {
         if let Some(cached_ticks) = runtime.tick_states.get(pool) {
             tick_states.extend(cached_ticks.iter().cloned());
         }

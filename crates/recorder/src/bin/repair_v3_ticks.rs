@@ -1,0 +1,343 @@
+use std::collections::HashSet;
+use std::env;
+
+use alloy_primitives::{Address, U256};
+use anyhow::{anyhow, Context, Result};
+use base_arb_chain::provider::ChainProvider;
+use base_arb_common::config::Settings;
+use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
+use base_arb_storage::postgres::PostgresStore;
+use base_arb_storage::{redis::RedisStore, TickChangeStore, TickStateStore};
+use chrono::{DateTime, Utc};
+use sqlx::Row;
+
+#[derive(Debug, Clone)]
+struct Args {
+    apply: bool,
+    force: bool,
+    limit: i64,
+    max_age_hours: i64,
+    word_radius: i32,
+    pools: HashSet<Address>,
+}
+
+#[derive(Debug, Clone)]
+struct RepairPool {
+    state: PoolState,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().init();
+    let args = parse_args()?;
+    let settings = Settings::load()?;
+    let provider = ChainProvider::from_settings(&settings);
+    let postgres = PostgresStore::connect(&settings.postgres_url).await?;
+    let redis = RedisStore::connect(&settings.redis_url).await?;
+
+    let pools = load_repair_pools(&postgres, &args).await?;
+    println!("== V3-style Tick Repair ==");
+    println!(
+        "mode={} pools={} limit={} max_age_hours={} word_radius={} force={}",
+        if args.apply { "apply" } else { "dry-run" },
+        pools.len(),
+        args.limit,
+        args.max_age_hours,
+        args.word_radius,
+        args.force
+    );
+
+    let mut checked = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut repaired = 0usize;
+    let mut zero_ticks = 0usize;
+    let mut failed = 0usize;
+    let mut ticks_written = 0usize;
+
+    for pool in pools {
+        checked += 1;
+        let address = pool.state.pool_id.address;
+        let existing_ticks = redis.get_pool_ticks(address).await?;
+        if !args.force && !existing_ticks.is_empty() {
+            skipped_existing += 1;
+            println!(
+                "skip existing pool={address:#x} ticks={}",
+                existing_ticks.len()
+            );
+            continue;
+        }
+
+        match provider
+            .fetch_initialized_ticks_around_state(&pool.state, args.word_radius)
+            .await
+        {
+            Ok(ticks) => {
+                if ticks.is_empty() {
+                    zero_ticks += 1;
+                    println!(
+                        "zero ticks pool={address:#x} variant={:?} block={} tick={:?}",
+                        pool.state.variant, pool.state.block_number, pool.state.tick
+                    );
+                    continue;
+                }
+                ticks_written += ticks.len();
+                if args.apply {
+                    postgres
+                        .replace_pool_ticks_current(
+                            pool.state.pool_id.chain_id,
+                            address,
+                            &ticks,
+                            "v3_tick_repair",
+                        )
+                        .await?;
+                    redis.replace_pool_ticks(address, ticks.clone()).await?;
+                    redis.mark_tick_changed_pools(vec![address]).await?;
+                }
+                repaired += 1;
+                println!(
+                    "repaired pool={address:#x} variant={:?} ticks={} block={} tick={:?}",
+                    pool.state.variant,
+                    ticks.len(),
+                    pool.state.block_number,
+                    pool.state.tick
+                );
+            }
+            Err(err) => {
+                failed += 1;
+                println!(
+                    "failed pool={address:#x} variant={:?} block={} error={err:#}",
+                    pool.state.variant, pool.state.block_number
+                );
+            }
+        }
+    }
+
+    println!(
+        "checked={checked} repaired={repaired} skipped_existing={skipped_existing} zero_ticks={zero_ticks} ticks_written={ticks_written} failed={failed}"
+    );
+    Ok(())
+}
+
+fn parse_args() -> Result<Args> {
+    let mut args = Args {
+        apply: false,
+        force: false,
+        limit: 100,
+        max_age_hours: 24,
+        word_radius: 8,
+        pools: HashSet::new(),
+    };
+    let mut iter = env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--apply" => args.apply = true,
+            "--force" => args.force = true,
+            "--limit" => {
+                args.limit = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--limit requires a value"))?
+                    .parse()
+                    .context("invalid --limit")?;
+            }
+            "--max-age-hours" => {
+                args.max_age_hours = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--max-age-hours requires a value"))?
+                    .parse()
+                    .context("invalid --max-age-hours")?;
+            }
+            "--word-radius" => {
+                args.word_radius = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--word-radius requires a value"))?
+                    .parse()
+                    .context("invalid --word-radius")?;
+            }
+            "--pool" => {
+                let pool = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--pool requires an address"))?
+                    .parse::<Address>()
+                    .context("invalid --pool address")?;
+                args.pools.insert(pool);
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => anyhow::bail!("unknown argument: {arg}"),
+        }
+    }
+    if args.limit <= 0 {
+        anyhow::bail!("--limit must be positive");
+    }
+    if args.max_age_hours <= 0 {
+        anyhow::bail!("--max-age-hours must be positive");
+    }
+    if args.word_radius < 0 {
+        anyhow::bail!("--word-radius must be non-negative");
+    }
+    Ok(args)
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: repair_v3_ticks [--apply] [--force] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
+    );
+}
+
+async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<RepairPool>> {
+    let pool_filter = args
+        .pools
+        .iter()
+        .map(|pool| format!("{pool:#x}"))
+        .collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
+        WITH latest_state AS (
+          SELECT DISTINCT ON (lower(pool_address))
+            pool_address,
+            reserve0,
+            reserve1,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            block_number,
+            updated_at
+          FROM pool_states
+          WHERE updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
+          ORDER BY lower(pool_address), updated_at DESC
+        )
+        SELECT
+          p.chain_id,
+          p.pool_address,
+          p.dex,
+          p.variant,
+          p.factory_address,
+          p.token0,
+          p.token1,
+          p.fee_bps,
+          p.tick_spacing,
+          p.stable,
+          ls.reserve0,
+          ls.reserve1,
+          ls.sqrt_price_x96,
+          ls.liquidity,
+          ls.tick,
+          ls.block_number,
+          ls.updated_at
+        FROM pools p
+        JOIN latest_state ls ON lower(ls.pool_address) = lower(p.pool_address)
+        WHERE p.enabled
+          AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
+          AND ls.sqrt_price_x96 IS NOT NULL
+          AND ls.liquidity IS NOT NULL
+          AND ls.tick IS NOT NULL
+          AND (
+            cardinality($3::TEXT[]) = 0
+            OR EXISTS (
+              SELECT 1
+              FROM unnest($3::TEXT[]) AS filter(pool_address)
+              WHERE lower(filter.pool_address) = lower(p.pool_address)
+            )
+          )
+        ORDER BY ls.updated_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(args.limit)
+    .bind(args.max_age_hours)
+    .bind(&pool_filter)
+    .fetch_all(&postgres.pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let chain_id: i64 = row.try_get("chain_id")?;
+            let pool_address: String = row.try_get("pool_address")?;
+            let dex: String = row.try_get("dex")?;
+            let variant: String = row.try_get("variant")?;
+            let factory_address: Option<String> = row.try_get("factory_address")?;
+            let token0: String = row.try_get("token0")?;
+            let token1: String = row.try_get("token1")?;
+            let fee_bps: Option<i64> = row.try_get("fee_bps")?;
+            let tick_spacing: Option<i64> = row.try_get("tick_spacing")?;
+            let stable: Option<bool> = row.try_get("stable")?;
+            let reserve0: Option<String> = row.try_get("reserve0")?;
+            let reserve1: Option<String> = row.try_get("reserve1")?;
+            let sqrt_price_x96: Option<String> = row.try_get("sqrt_price_x96")?;
+            let liquidity: Option<String> = row.try_get("liquidity")?;
+            let tick: Option<i64> = row.try_get("tick")?;
+            let block_number: i64 = row.try_get("block_number")?;
+            let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+
+            let state = PoolState {
+                pool_id: PoolId {
+                    chain_id: u64::try_from(chain_id)?,
+                    address: parse_address(&pool_address)?,
+                },
+                dex: parse_dex(&dex)?,
+                variant: parse_variant(&variant)?,
+                factory_address: parse_optional_address(factory_address.as_deref())?,
+                token0: parse_address(&token0)?,
+                token1: parse_address(&token1)?,
+                token0_decimals: None,
+                token1_decimals: None,
+                fee_bps: u32::try_from(fee_bps.unwrap_or_default())?,
+                fee_pips: None,
+                pool_key_fee_pips: None,
+                hooks_address: None,
+                stable,
+                reserve0: parse_optional_u256(reserve0.as_deref())?,
+                reserve1: parse_optional_u256(reserve1.as_deref())?,
+                sqrt_price_x96: parse_optional_u256(sqrt_price_x96.as_deref())?,
+                liquidity: parse_optional_u256(liquidity.as_deref())?,
+                tick: tick.map(i32::try_from).transpose()?,
+                tick_spacing: tick_spacing.map(i32::try_from).transpose()?,
+                block_number: u64::try_from(block_number)?,
+                valid_through_block: u64::try_from(block_number)?,
+                updated_at,
+            };
+            Ok(RepairPool { state })
+        })
+        .collect()
+}
+
+fn parse_address(value: &str) -> Result<Address> {
+    value
+        .parse::<Address>()
+        .with_context(|| format!("invalid address {value}"))
+}
+
+fn parse_optional_address(value: Option<&str>) -> Result<Option<Address>> {
+    value.map(parse_address).transpose()
+}
+
+fn parse_optional_u256(value: Option<&str>) -> Result<Option<U256>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<U256>()
+                .with_context(|| format!("invalid U256 {value}"))
+        })
+        .transpose()
+}
+
+fn parse_dex(value: &str) -> Result<DexKind> {
+    match value {
+        "Aerodrome" => Ok(DexKind::Aerodrome),
+        "UniswapV3" => Ok(DexKind::UniswapV3),
+        "PancakeSwap" => Ok(DexKind::PancakeSwap),
+        other => anyhow::bail!("unsupported dex {other}"),
+    }
+}
+
+fn parse_variant(value: &str) -> Result<PoolVariant> {
+    match value {
+        "AerodromeSlipstream" => Ok(PoolVariant::AerodromeSlipstream),
+        "UniswapV3" => Ok(PoolVariant::UniswapV3),
+        "PancakeV3" => Ok(PoolVariant::PancakeV3),
+        other => anyhow::bail!("unsupported variant {other}"),
+    }
+}

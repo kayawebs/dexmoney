@@ -1631,6 +1631,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "health-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base-arb-chain",
+ "base-arb-common",
+ "chrono",
+ "redis",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
