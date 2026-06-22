@@ -321,35 +321,6 @@ async fn submit_contract_call(
     })
 }
 
-pub async fn missing_approvals(
-    provider: &ChainProvider,
-    settings: &Settings,
-    candidate: &Candidate,
-    requirements: &[ApprovalRequirement],
-) -> Result<Vec<ApprovalRequirement>> {
-    let executor = executor_for_candidate(settings, candidate)?;
-    let mut missing = Vec::new();
-    for requirement in requirements.iter().copied() {
-        if requirement.token == Address::ZERO || requirement.spender == Address::ZERO {
-            continue;
-        }
-        let data = encode_two_address_call(ERC20_ALLOWANCE_SELECTOR, executor, requirement.spender);
-        let raw = provider
-            .eth_call_from(
-                None,
-                requirement.token,
-                &hex_data(&data),
-                "ERC20 allowance for lazy approval",
-            )
-            .await?;
-        let allowance = decode_u256_result(&raw)?;
-        if allowance < U256::from(MIN_EXISTING_ALLOWANCE) {
-            missing.push(requirement);
-        }
-    }
-    Ok(missing)
-}
-
 pub async fn missing_approvals_cached(
     provider: &ChainProvider,
     settings: &Settings,
