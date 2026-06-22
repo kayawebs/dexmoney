@@ -52,6 +52,21 @@ pub trait CurrentBlockStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait PoolRuntimeStore: PoolStateStore + PoolChangeStore + CurrentBlockStore {
+    async fn publish_pool_states(
+        &self,
+        current_block: u64,
+        pool_states: Vec<PoolState>,
+        changed_pools: Vec<Address>,
+    ) -> anyhow::Result<()> {
+        self.set_current_block(current_block).await?;
+        self.set_pool_states(pool_states).await?;
+        self.mark_changed_pools(changed_pools).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 pub trait TickStateStore: Send + Sync {
     async fn set_tick_state(&self, tick_state: TickState) -> anyhow::Result<()>;
     async fn set_tick_states(&self, tick_states: Vec<TickState>) -> anyhow::Result<()>;
@@ -288,6 +303,8 @@ impl CurrentBlockStore for InMemoryStores {
         Ok(*self.current_block.lock().await)
     }
 }
+
+impl PoolRuntimeStore for InMemoryStores {}
 
 #[async_trait]
 impl TickStateStore for InMemoryStores {

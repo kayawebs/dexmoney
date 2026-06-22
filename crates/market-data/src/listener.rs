@@ -12,8 +12,8 @@ use base_arb_common::types::{
 };
 use base_arb_storage::{
     postgres::{FactoryRegistryRecord, PostgresStore, ProtocolPoolObservation},
-    CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
-    TickStateStore,
+    CurrentBlockStore, PoolChangeStore, PoolRuntimeStore, PoolStateStore, RecorderStore,
+    TickChangeStore, TickStateStore,
 };
 use futures_util::{stream, SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -80,6 +80,7 @@ where
     P: PoolStateStore
         + PoolChangeStore
         + CurrentBlockStore
+        + PoolRuntimeStore
         + TickChangeStore
         + TickStateStore
         + Clone
@@ -2341,10 +2342,6 @@ where
             .map(|state| state.block_number)
             .max()
             .unwrap_or_default();
-        self.pool_store
-            .set_current_block(latest_state_block)
-            .await?;
-
         let addresses = publish_states
             .iter()
             .map(|state| state.pool_id.address)
@@ -2375,13 +2372,13 @@ where
                 "monitoring pool logs"
             );
         }
-        self.pool_store
-            .set_pool_states(publish_states.clone())
-            .await?;
-        self.recorder
-            .record_pool_states_with_source(publish_states, source)
-            .await?;
-        self.pool_store.mark_changed_pools(changed_pools).await?;
+        let record_states = publish_states.clone();
+        tokio::try_join!(
+            self.pool_store
+                .publish_pool_states(latest_state_block, publish_states, changed_pools),
+            self.recorder
+                .record_pool_states_with_source(record_states, source)
+        )?;
         Ok(())
     }
 
@@ -3047,6 +3044,7 @@ where
     P: PoolStateStore
         + PoolChangeStore
         + CurrentBlockStore
+        + PoolRuntimeStore
         + TickChangeStore
         + TickStateStore
         + Clone

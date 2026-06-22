@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     CandidateStore, CurrentBlockStore, EoaStateStore, FailureStore, PoolChangeStore,
-    PoolStateStore, TickChangeStore, TickStateStore,
+    PoolRuntimeStore, PoolStateStore, TickChangeStore, TickStateStore,
 };
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
@@ -301,6 +301,39 @@ impl CurrentBlockStore for RedisStore {
     async fn get_current_block(&self) -> Result<Option<u64>> {
         let mut manager = self.manager.clone();
         Ok(manager.get(current_block_key()).await?)
+    }
+}
+
+#[async_trait]
+impl PoolRuntimeStore for RedisStore {
+    async fn publish_pool_states(
+        &self,
+        current_block: u64,
+        pool_states: Vec<PoolState>,
+        changed_pools: Vec<Address>,
+    ) -> Result<()> {
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        pipe.cmd("EVAL")
+            .arg(SET_CURRENT_BLOCK_IF_NEWER_SCRIPT)
+            .arg(1)
+            .arg(current_block_key())
+            .arg(current_block)
+            .ignore();
+        for pool_state in pool_states {
+            let key = pool_state_key(pool_state.pool_id.chain_id, pool_state.pool_id.address);
+            let index_key = pool_address_index_key(pool_state.pool_id.address);
+            let value = serde_json::to_string(&pool_state)?;
+            pipe.set(&key, value).ignore();
+            pipe.set(index_key, &key).ignore();
+            pipe.sadd(pool_state_index_key(), key).ignore();
+        }
+        for pool in changed_pools {
+            pipe.sadd(changed_pools_key(), format!("{pool:#x}"))
+                .ignore();
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
     }
 }
 
