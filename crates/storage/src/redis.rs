@@ -12,6 +12,8 @@ use crate::{
 };
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
+const REDIS_MGET_CHUNK_SIZE: usize = 1_000;
+
 #[derive(Clone)]
 pub struct RedisStore {
     pub manager: ConnectionManager,
@@ -177,10 +179,15 @@ impl PoolStateStore for RedisStore {
         let mut manager = self.manager.clone();
         let keys: Vec<String> = manager.keys("pool:*").await?;
         let mut out: Vec<PoolState> = Vec::with_capacity(keys.len());
-        for key in keys {
-            let value: Option<String> = manager.get(key).await?;
-            if let Some(raw) = value {
-                out.push(serde_json::from_str(&raw)?);
+        for key_chunk in keys.chunks(REDIS_MGET_CHUNK_SIZE) {
+            let values: Vec<Option<String>> = redis::cmd("MGET")
+                .arg(key_chunk)
+                .query_async(&mut manager)
+                .await?;
+            for value in values {
+                if let Some(raw) = value {
+                    out.push(serde_json::from_str(&raw)?);
+                }
             }
         }
         if !out.is_empty() {
