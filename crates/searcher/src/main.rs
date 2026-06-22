@@ -468,7 +468,7 @@ where
     cycle_stats.search.merge(&dynamic_stats);
     let mut refreshed_tick_pools = HashSet::new();
     let tick_load_started = Instant::now();
-    let (tick_states, tick_load_stats) = load_tick_states_for_pools(
+    let tick_load_stats = load_tick_states_for_pools(
         runtime,
         pool_store,
         &tick_changed_pools,
@@ -484,7 +484,7 @@ where
     let quote_context = strategy::QuoteContext::from_pool_map(
         &runtime.pool_states,
         &active_pool_addresses,
-        &tick_states,
+        &runtime.tick_states,
     );
     let engine = runtime
         .engine
@@ -595,11 +595,10 @@ async fn load_tick_states_for_pools<P>(
     tick_changed_pools: &HashSet<Address>,
     refreshed_tick_pools: &mut HashSet<Address>,
     path_pools: &HashSet<Address>,
-) -> Result<(Vec<TickState>, TickLoadStats)>
+) -> Result<TickLoadStats>
 where
     P: TickStateStore,
 {
-    let mut tick_states = Vec::new();
     let mut stats = TickLoadStats::default();
     let mut pools_to_refresh = Vec::new();
     for pool in path_pools {
@@ -637,12 +636,7 @@ where
         }
     }
 
-    for pool in path_pools {
-        if let Some(cached_ticks) = runtime.tick_states.get(pool) {
-            tick_states.extend(cached_ticks.iter().cloned());
-        }
-    }
-    Ok((tick_states, stats))
+    Ok(stats)
 }
 
 async fn publish_candidates<C, R>(

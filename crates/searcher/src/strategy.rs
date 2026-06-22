@@ -1155,7 +1155,21 @@ pub fn engine_from_settings(
 
 pub(crate) struct QuoteContext<'a> {
     pool_states: HashMap<Address, &'a PoolState>,
-    tick_states: HashMap<Address, Vec<TickState>>,
+    tick_states: TickContext<'a>,
+}
+
+enum TickContext<'a> {
+    Owned(HashMap<Address, Vec<TickState>>),
+    Borrowed(&'a HashMap<Address, Vec<TickState>>),
+}
+
+impl TickContext<'_> {
+    fn get(&self, pool: &Address) -> Option<&Vec<TickState>> {
+        match self {
+            Self::Owned(ticks) => ticks.get(pool),
+            Self::Borrowed(ticks) => ticks.get(pool),
+        }
+    }
 }
 
 impl<'a> QuoteContext<'a> {
@@ -1174,29 +1188,22 @@ impl<'a> QuoteContext<'a> {
         }
         Self {
             pool_states,
-            tick_states: ticks_by_pool,
+            tick_states: TickContext::Owned(ticks_by_pool),
         }
     }
 
     pub(crate) fn from_pool_map(
         pool_states: &'a HashMap<Address, PoolState>,
         active_pools: &HashSet<Address>,
-        tick_states: &[TickState],
+        tick_states: &'a HashMap<Address, Vec<TickState>>,
     ) -> Self {
         let pool_states = active_pools
             .iter()
             .filter_map(|pool| pool_states.get(pool).map(|state| (*pool, state)))
             .collect::<HashMap<_, _>>();
-        let mut ticks_by_pool: HashMap<Address, Vec<TickState>> = HashMap::new();
-        for tick in tick_states {
-            ticks_by_pool
-                .entry(tick.pool_id.address)
-                .or_default()
-                .push(tick.clone());
-        }
         Self {
             pool_states,
-            tick_states: ticks_by_pool,
+            tick_states: TickContext::Borrowed(tick_states),
         }
     }
 
