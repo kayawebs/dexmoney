@@ -975,14 +975,22 @@ impl SearchEngine {
             .iter()
             .map(|config| ((config.token0, config.token1), config))
             .collect::<HashMap<_, _>>();
+        let mut pools_by_pair: HashMap<(Address, Address), Vec<&PoolState>> = HashMap::new();
+        for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
+            pools_by_pair
+                .entry(canonical_token_pair(state.token0, state.token1))
+                .or_default()
+                .push(state);
+        }
 
         for config in configs.values() {
-            let pools = pool_states
-                .iter()
-                .filter(|state| is_supported_config_pool(state, config))
-                .collect::<Vec<_>>();
-            for first in &pools {
-                for second in &pools {
+            let Some(pools) =
+                pools_by_pair.get(&canonical_token_pair(config.token0, config.token1))
+            else {
+                continue;
+            };
+            for first in pools {
+                for second in pools {
                     if first.pool_id.address == second.pool_id.address {
                         continue;
                     }
@@ -2576,6 +2584,7 @@ fn merge_anchor_config(
         });
 }
 
+#[cfg(test)]
 fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -> bool {
     let has_pair = (state.token0 == config.token0 && state.token1 == config.token1)
         || (state.token0 == config.token1 && state.token1 == config.token0);
@@ -2583,6 +2592,14 @@ fn is_supported_config_pool(state: &PoolState, config: &TokenPairSearchConfig) -
         return false;
     }
     is_supported_pool(state)
+}
+
+fn canonical_token_pair(a: Address, b: Address) -> (Address, Address) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 fn is_supported_pool(state: &PoolState) -> bool {

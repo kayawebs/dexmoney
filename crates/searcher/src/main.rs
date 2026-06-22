@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
                 tick_cache_hits = aggregate.tick_cache_hits,
                 tick_cache_misses = aggregate.tick_cache_misses,
                 tick_cache_refreshes = aggregate.tick_cache_refreshes,
+                path_index_rebuild_ms = aggregate.path_index_rebuild_ms,
                 path_build_ms = aggregate.path_build_ms,
                 quote_ms = aggregate.quote_ms,
                 publish_ms = aggregate.publish_ms,
@@ -168,6 +169,7 @@ struct SearchCycleStats {
     tick_cache_hits: u64,
     tick_cache_misses: u64,
     tick_cache_refreshes: u64,
+    path_index_rebuild_ms: u64,
     path_build_ms: u64,
     quote_ms: u64,
     publish_ms: u64,
@@ -204,6 +206,7 @@ impl SearchCycleStats {
         self.tick_cache_hits += other.tick_cache_hits;
         self.tick_cache_misses += other.tick_cache_misses;
         self.tick_cache_refreshes += other.tick_cache_refreshes;
+        self.path_index_rebuild_ms += other.path_index_rebuild_ms;
         self.path_build_ms += other.path_build_ms;
         self.quote_ms += other.quote_ms;
         self.publish_ms += other.publish_ms;
@@ -442,7 +445,9 @@ where
         );
         return Ok(SearchCycleStats::default());
     }
+    let mut path_index_rebuild_ms = 0;
     if rebuild_path_index {
+        let rebuild_started = Instant::now();
         let engine = runtime
             .engine
             .as_ref()
@@ -450,12 +455,14 @@ where
         let pool_states = runtime.pool_states.values().cloned().collect::<Vec<_>>();
         runtime.path_index = Some(engine.build_path_index(&pool_states));
         runtime.graph_snapshot = Some(engine.build_graph_snapshot(pool_states));
+        path_index_rebuild_ms = rebuild_started.elapsed().as_millis() as u64;
         info!(
             total_paths = runtime
                 .path_index
                 .as_ref()
                 .map(|index| index.total_paths())
                 .unwrap_or_default(),
+            rebuild_ms = path_index_rebuild_ms,
             multihop_enabled = engine.multihop_enabled,
             "searcher path index rebuilt"
         );
@@ -486,6 +493,7 @@ where
         config_load_ms,
         state_load_ms,
         state_load_pools: state_load_addresses.len() as u64,
+        path_index_rebuild_ms,
         path_build_ms,
         path_pools: selected_paths.path_pools.len() as u64,
         latest_chain_block: latest_known_block,
