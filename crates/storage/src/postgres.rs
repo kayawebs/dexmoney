@@ -10,7 +10,7 @@ use crate::{
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{
     Candidate, DexKind, DiscoveredPool, PoolRegistryEntry, PoolState, PoolStateValidation,
-    PoolStateWarning, PoolVariant, SimulationResult, TokenPairSearchConfig, TxResult,
+    PoolStateWarning, PoolVariant, SimulationResult, TickState, TokenPairSearchConfig, TxResult,
     V3LiquidityUpdate,
 };
 
@@ -297,6 +297,154 @@ impl PostgresStore {
         .bind(observation.import_status)
         .bind(observation.import_reason)
         .bind(sqlx::types::Json(observation.raw_json))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn replace_pool_ticks_current(
+        &self,
+        chain_id: u64,
+        pool_address: Address,
+        tick_states: &[TickState],
+        source: &str,
+    ) -> Result<()> {
+        let chain_id = i64::try_from(chain_id)?;
+        let pool_address = address_to_string(pool_address);
+        let Some(first) = tick_states.first() else {
+            sqlx::query(
+                r#"
+                DELETE FROM pool_ticks_current
+                WHERE chain_id = $1
+                  AND lower(pool_address) = lower($2)
+                "#,
+            )
+            .bind(chain_id)
+            .bind(pool_address)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        };
+
+        debug_assert_eq!(i64::try_from(first.pool_id.chain_id).ok(), Some(chain_id));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            DELETE FROM pool_ticks_current
+            WHERE chain_id = $1
+              AND lower(pool_address) = lower($2)
+            "#,
+        )
+        .bind(chain_id)
+        .bind(&pool_address)
+        .execute(&mut *tx)
+        .await?;
+
+        let chain_ids = vec![chain_id; tick_states.len()];
+        let pool_addresses = vec![pool_address.clone(); tick_states.len()];
+        let ticks = tick_states.iter().map(|tick| tick.tick).collect::<Vec<_>>();
+        let liquidity_nets = tick_states
+            .iter()
+            .map(|tick| tick.liquidity_net.to_string())
+            .collect::<Vec<_>>();
+        let liquidity_grosses = tick_states
+            .iter()
+            .map(|tick| tick.liquidity_gross.to_string())
+            .collect::<Vec<_>>();
+        let block_numbers = tick_states
+            .iter()
+            .map(|tick| i64::try_from(tick.block_number))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sources = vec![source.to_string(); tick_states.len()];
+        let updated_ats = tick_states
+            .iter()
+            .map(|tick| tick.updated_at)
+            .collect::<Vec<_>>();
+        sqlx::query(
+            r#"
+            INSERT INTO pool_ticks_current (
+                chain_id, pool_address, tick, liquidity_net, liquidity_gross,
+                block_number, source, updated_at
+            )
+            SELECT *
+            FROM UNNEST(
+                $1::BIGINT[],
+                $2::TEXT[],
+                $3::INTEGER[],
+                $4::TEXT[],
+                $5::TEXT[],
+                $6::BIGINT[],
+                $7::TEXT[],
+                $8::TIMESTAMPTZ[]
+            )
+            "#,
+        )
+        .bind(chain_ids)
+        .bind(pool_addresses)
+        .bind(ticks)
+        .bind(liquidity_nets)
+        .bind(liquidity_grosses)
+        .bind(block_numbers)
+        .bind(sources)
+        .bind(updated_ats)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn start_pool_tick_hydration_run(
+        &self,
+        chain_id: u64,
+        protocol: &str,
+        manager_address: Option<Address>,
+        from_block: u64,
+        to_block: u64,
+        selected_pools: usize,
+    ) -> Result<uuid::Uuid> {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO pool_tick_hydration_runs (
+                chain_id, protocol, manager_address, from_block, to_block,
+                selected_pools, hydrated_pools, ticks_written, status,
+                started_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 0, 0, 'running', NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(protocol)
+        .bind(manager_address.map(address_to_string))
+        .bind(i64::try_from(from_block)?)
+        .bind(i64::try_from(to_block)?)
+        .bind(i64::try_from(selected_pools)?)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn finish_pool_tick_hydration_run(
+        &self,
+        id: uuid::Uuid,
+        hydrated_pools: usize,
+        ticks_written: usize,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE pool_tick_hydration_runs
+            SET hydrated_pools = $2,
+                ticks_written = $3,
+                status = $4,
+                finished_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(i64::try_from(hydrated_pools)?)
+        .bind(i64::try_from(ticks_written)?)
+        .bind(status)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1232,6 +1380,35 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             WHERE pool_address IS NOT NULL"#,
         r#"ALTER TABLE protocol_pool_observations
             ADD COLUMN IF NOT EXISTS pool_key_fee_pips BIGINT"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_ticks_current (
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            tick INTEGER NOT NULL,
+            liquidity_net TEXT NOT NULL,
+            liquidity_gross TEXT NOT NULL,
+            block_number BIGINT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chain_id, pool_address, tick)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_ticks_current_pool_idx
+            ON pool_ticks_current (chain_id, lower(pool_address))"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_tick_hydration_runs (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL,
+            protocol TEXT NOT NULL,
+            manager_address TEXT,
+            from_block BIGINT NOT NULL,
+            to_block BIGINT NOT NULL,
+            selected_pools BIGINT NOT NULL,
+            hydrated_pools BIGINT NOT NULL DEFAULT 0,
+            ticks_written BIGINT NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at TIMESTAMPTZ
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_tick_hydration_runs_status_idx
+            ON pool_tick_hydration_runs (chain_id, protocol, status, started_at DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS factory_registry (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,

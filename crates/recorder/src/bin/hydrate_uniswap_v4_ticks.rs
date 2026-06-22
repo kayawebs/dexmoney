@@ -29,6 +29,7 @@ struct Cli {
     chunk_blocks: u64,
     manager_scan: bool,
     apply: bool,
+    sync_redis: bool,
     refresh_existing: bool,
 }
 
@@ -81,17 +82,41 @@ async fn main() -> Result<()> {
     let pools = fetch_quoteable_v4_pools(&store, settings.chain_id, cli.limit).await?;
     println!("== Uniswap V4 Tick Hydration ==");
     println!(
-        "mode={} pools={} to_block={} chunk_blocks={}",
+        "mode={} pools={} to_block={} chunk_blocks={} sync_redis={}",
         if cli.apply { "apply" } else { "dry-run" },
         pools.len(),
         to_block,
-        cli.chunk_blocks
+        cli.chunk_blocks,
+        cli.sync_redis
     );
+    let run_from_block = cli.from_block.unwrap_or_else(|| {
+        cli.max_lookback_blocks
+            .map(|lookback| to_block.saturating_sub(lookback))
+            .or_else(|| pools.iter().map(|pool| pool.first_block).min())
+            .unwrap_or(to_block)
+    });
+    let hydration_run = if cli.apply {
+        Some(
+            store
+                .start_pool_tick_hydration_run(
+                    settings.chain_id,
+                    "uniswap-v4",
+                    settings.uniswap_v4_pool_manager,
+                    run_from_block,
+                    to_block,
+                    pools.len(),
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
 
     let summary = if cli.manager_scan {
         hydrate_ticks_by_manager_scan(
             &settings,
             &provider,
+            &store,
             &redis,
             pools,
             cli.from_block,
@@ -99,6 +124,7 @@ async fn main() -> Result<()> {
             to_block,
             cli.chunk_blocks,
             cli.apply,
+            cli.sync_redis,
             cli.refresh_existing,
         )
         .await?
@@ -106,6 +132,7 @@ async fn main() -> Result<()> {
         hydrate_ticks(
             &settings,
             &provider,
+            &store,
             &redis,
             pools,
             cli.from_block,
@@ -113,10 +140,25 @@ async fn main() -> Result<()> {
             to_block,
             cli.chunk_blocks,
             cli.apply,
+            cli.sync_redis,
             cli.refresh_existing,
         )
         .await?
     };
+    if let Some(run_id) = hydration_run {
+        store
+            .finish_pool_tick_hydration_run(
+                run_id,
+                summary.hydrated_pools,
+                summary.ticks_written,
+                if summary.failed == 0 {
+                    "completed"
+                } else {
+                    "completed_with_failures"
+                },
+            )
+            .await?;
+    }
 
     println!();
     println!(
@@ -166,11 +208,9 @@ async fn fetch_quoteable_v4_pools(
         {limit_clause}
         "#
     );
-    let rows = sqlx::query(
-        &query,
-    )
-    .bind(i64::try_from(chain_id)?)
-    .bind(ZERO_ADDRESS);
+    let rows = sqlx::query(&query)
+        .bind(i64::try_from(chain_id)?)
+        .bind(ZERO_ADDRESS);
     let rows = if limit > 0 {
         rows.bind(limit).fetch_all(&store.pool).await?
     } else {
@@ -198,6 +238,7 @@ async fn fetch_quoteable_v4_pools(
 async fn hydrate_ticks(
     settings: &Settings,
     provider: &ChainProvider,
+    store: &PostgresStore,
     redis: &RedisStore,
     pools: Vec<V4Pool>,
     from_block_override: Option<u64>,
@@ -205,6 +246,7 @@ async fn hydrate_ticks(
     to_block: u64,
     chunk_blocks: u64,
     apply: bool,
+    sync_redis: bool,
     refresh_existing: bool,
 ) -> Result<Summary> {
     let mut summary = Summary {
@@ -340,10 +382,20 @@ async fn hydrate_ticks(
             summary.nonzero_tick_pools += 1;
         }
         if apply {
-            redis
-                .replace_pool_ticks(pool.pool_address, tick_states.clone())
+            store
+                .replace_pool_ticks_current(
+                    settings.chain_id,
+                    pool.pool_address,
+                    &tick_states,
+                    "uniswap_v4_tick_hydrator",
+                )
                 .await?;
-            if !tick_states.is_empty() {
+            if sync_redis {
+                redis
+                    .replace_pool_ticks(pool.pool_address, tick_states.clone())
+                    .await?;
+            }
+            if sync_redis && !tick_states.is_empty() {
                 redis
                     .mark_tick_changed_pools(vec![pool.pool_address])
                     .await?;
@@ -359,6 +411,7 @@ async fn hydrate_ticks(
 async fn hydrate_ticks_by_manager_scan(
     settings: &Settings,
     provider: &ChainProvider,
+    store: &PostgresStore,
     redis: &RedisStore,
     pools: Vec<V4Pool>,
     from_block_override: Option<u64>,
@@ -366,6 +419,7 @@ async fn hydrate_ticks_by_manager_scan(
     to_block: u64,
     chunk_blocks: u64,
     apply: bool,
+    sync_redis: bool,
     refresh_existing: bool,
 ) -> Result<Summary> {
     let mut summary = Summary {
@@ -543,10 +597,20 @@ async fn hydrate_ticks_by_manager_scan(
             summary.nonzero_tick_pools += 1;
         }
         if apply {
-            redis
-                .replace_pool_ticks(pool.pool_address, tick_states.clone())
+            store
+                .replace_pool_ticks_current(
+                    settings.chain_id,
+                    pool.pool_address,
+                    &tick_states,
+                    "uniswap_v4_tick_hydrator",
+                )
                 .await?;
-            if !tick_states.is_empty() {
+            if sync_redis {
+                redis
+                    .replace_pool_ticks(pool.pool_address, tick_states.clone())
+                    .await?;
+            }
+            if sync_redis && !tick_states.is_empty() {
                 redis
                     .mark_tick_changed_pools(vec![pool.pool_address])
                     .await?;
@@ -696,6 +760,7 @@ where
         chunk_blocks: 10_000,
         manager_scan: false,
         apply: false,
+        sync_redis: true,
         refresh_existing: false,
     };
 
@@ -710,6 +775,7 @@ where
             "--chunk-blocks" => cli.chunk_blocks = parse_next(&mut args, "--chunk-blocks")?,
             "--manager-scan" => cli.manager_scan = true,
             "--apply" => cli.apply = true,
+            "--no-redis" => cli.sync_redis = false,
             "--refresh-existing" => cli.refresh_existing = true,
             "--help" | "-h" => {
                 print_help();
@@ -738,7 +804,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--refresh-existing] [--apply]\n\nUse --limit 0 to select all quoteable V4 pools."
+        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--refresh-existing] [--apply] [--no-redis]\n\nUse --limit 0 to select all quoteable V4 pools. With --apply, ticks are written to Postgres pool_ticks_current and, unless --no-redis is set, synced to Redis for search."
     );
 }
 
