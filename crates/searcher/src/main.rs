@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
                 candidates_emitted = aggregate.search.candidates_emitted,
                 candidates_coalesced = aggregate.candidates_coalesced,
                 inactive_pool_filtered_paths = aggregate.inactive_pool_filtered_paths,
+                tick_missing_filtered_paths = aggregate.tick_missing_filtered_paths,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 dynamic_multihop_anchors = aggregate.search.dynamic_multihop_anchors,
                 dynamic_multihop_changed_edges = aggregate.search.dynamic_multihop_changed_edges,
@@ -184,6 +185,7 @@ struct SearchCycleStats {
     risk_other_rejected: u64,
     candidates_coalesced: u64,
     inactive_pool_filtered_paths: u64,
+    tick_missing_filtered_paths: u64,
     opportunities_created: u64,
 }
 
@@ -220,6 +222,7 @@ impl SearchCycleStats {
         self.risk_other_rejected += other.risk_other_rejected;
         self.candidates_coalesced += other.candidates_coalesced;
         self.inactive_pool_filtered_paths += other.inactive_pool_filtered_paths;
+        self.tick_missing_filtered_paths += other.tick_missing_filtered_paths;
         self.opportunities_created += other.opportunities_created;
     }
 
@@ -502,10 +505,22 @@ where
     cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
     cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
 
+    let tick_ready_paths = selected_paths
+        .paths
+        .iter()
+        .copied()
+        .filter(|path| path.has_required_ticks(&runtime.pool_states, &runtime.tick_states))
+        .collect::<Vec<_>>();
+    cycle_stats.tick_missing_filtered_paths = selected_paths
+        .paths
+        .len()
+        .saturating_sub(tick_ready_paths.len())
+        as u64;
+
     let quote_context =
         strategy::QuoteContext::from_pool_map(&runtime.pool_states, &runtime.tick_states);
 
-    for path_batch in selected_paths.paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
+    for path_batch in tick_ready_paths.chunks(SEARCHER_PUBLISH_BATCH_PATHS) {
         let quote_started = Instant::now();
         let (candidates, mut search_stats) = engine
             .search_with_stats_for_paths_with_context(&quote_context, path_batch)

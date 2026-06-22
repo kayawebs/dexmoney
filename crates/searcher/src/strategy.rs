@@ -1258,6 +1258,22 @@ impl SearchPath {
             .iter()
             .all(|step| pools.contains(&step.pool))
     }
+
+    pub(crate) fn has_required_ticks(
+        &self,
+        pool_states: &HashMap<Address, PoolState>,
+        tick_states: &HashMap<Address, Vec<TickState>>,
+    ) -> bool {
+        self.path.steps.iter().all(|step| {
+            let Some(state) = pool_states.get(&step.pool) else {
+                return true;
+            };
+            !is_v3_style_variant(state.variant)
+                || tick_states
+                    .get(&step.pool)
+                    .is_some_and(|ticks| !ticks.is_empty())
+        })
+    }
 }
 
 pub(crate) struct SelectedSearchPaths<'a> {
