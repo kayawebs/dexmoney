@@ -42,6 +42,10 @@ pub fn pool_address_index_key(pool_address: alloy_primitives::Address) -> String
     format!("pool_index:{pool_address}")
 }
 
+pub fn pool_state_index_key() -> &'static str {
+    "pools:index"
+}
+
 pub fn tick_state_key(chain_id: u64, pool_address: alloy_primitives::Address, tick: i32) -> String {
     format!("ticks:{chain_id}:{pool_address}:{tick}")
 }
@@ -83,7 +87,8 @@ impl PoolStateStore for RedisStore {
         let mut manager = self.manager.clone();
         let mut pipe = redis::pipe();
         pipe.set(&key, value).ignore();
-        pipe.set(index_key, key).ignore();
+        pipe.set(index_key, &key).ignore();
+        pipe.sadd(pool_state_index_key(), key).ignore();
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
@@ -177,7 +182,10 @@ impl PoolStateStore for RedisStore {
 
     async fn all_pool_states(&self) -> Result<Vec<PoolState>> {
         let mut manager = self.manager.clone();
-        let keys: Vec<String> = manager.keys("pool:*").await?;
+        let mut keys: Vec<String> = manager.smembers(pool_state_index_key()).await?;
+        if keys.is_empty() {
+            keys = manager.keys("pool:*").await?;
+        }
         let mut out: Vec<PoolState> = Vec::with_capacity(keys.len());
         for key_chunk in keys.chunks(REDIS_MGET_CHUNK_SIZE) {
             let values: Vec<Option<String>> = redis::cmd("MGET")
@@ -193,11 +201,10 @@ impl PoolStateStore for RedisStore {
         if !out.is_empty() {
             let mut pipe = redis::pipe();
             for state in &out {
-                pipe.set(
-                    pool_address_index_key(state.pool_id.address),
-                    pool_state_key(state.pool_id.chain_id, state.pool_id.address),
-                )
-                .ignore();
+                let key = pool_state_key(state.pool_id.chain_id, state.pool_id.address);
+                pipe.set(pool_address_index_key(state.pool_id.address), &key)
+                    .ignore();
+                pipe.sadd(pool_state_index_key(), key).ignore();
             }
             let _: () = pipe.query_async(&mut manager).await?;
         }
