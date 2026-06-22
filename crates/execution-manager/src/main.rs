@@ -22,6 +22,7 @@ const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
 const CANDIDATE_POP_CHUNK_SIZE: usize = 128;
+const IDLE_EOA_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct ExecutionRuntime {
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
     let mut ticker = interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut circuit_breaker = ExecutionCircuitBreaker::new(settings.execution_failure_rate_min_txs);
+    let mut maintenance = ExecutionMaintenance::default();
 
     loop {
         ticker.tick().await;
@@ -110,6 +112,7 @@ async fn main() -> Result<()> {
             &runtime,
             settings.min_simulated_profit_usdc,
             &mut circuit_breaker,
+            &mut maintenance,
         )
         .await?;
     }
@@ -124,6 +127,7 @@ async fn run_execution_cycle<C, E, R>(
     runtime: &ExecutionRuntime,
     min_simulated_profit_usdc: f64,
     circuit_breaker: &mut ExecutionCircuitBreaker,
+    maintenance: &mut ExecutionMaintenance,
 ) -> Result<()>
 where
     C: CandidateStore + CurrentBlockStore,
@@ -138,7 +142,7 @@ where
     let candidates =
         pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
     if candidates.is_empty() {
-        if settings.execution_submit_enabled {
+        if settings.execution_submit_enabled && maintenance.should_run_idle_eoa_pool_maintenance() {
             let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
                 anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
             };
@@ -233,6 +237,25 @@ where
         circuit_breaker,
     )
     .await
+}
+
+#[derive(Default)]
+struct ExecutionMaintenance {
+    last_idle_eoa_pool_maintenance: Option<Instant>,
+}
+
+impl ExecutionMaintenance {
+    fn should_run_idle_eoa_pool_maintenance(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_idle_eoa_pool_maintenance
+            .is_some_and(|last| now.duration_since(last) < IDLE_EOA_POOL_MAINTENANCE_INTERVAL)
+        {
+            return false;
+        }
+        self.last_idle_eoa_pool_maintenance = Some(now);
+        true
+    }
 }
 
 async fn run_dry_run_simulation_batch<R>(
