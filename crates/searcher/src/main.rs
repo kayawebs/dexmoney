@@ -21,7 +21,7 @@ use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-const SEARCHER_PUBLISH_BATCH_PATHS: usize = 32;
+const SEARCHER_PUBLISH_BATCH_PATHS: usize = 256;
 const ACTIVE_POOL_SWEEP_MIN_MS: u64 = 100;
 const ACTIVE_POOL_SWEEP_MAX_MS: u64 = 1_000;
 
