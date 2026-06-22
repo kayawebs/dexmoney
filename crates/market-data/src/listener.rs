@@ -234,6 +234,7 @@ where
 
             let fee_started = Instant::now();
             let mut fee_refreshed_pools = HashSet::new();
+            let mut block_hash_cache = HashMap::new();
             for (pool, block_number) in classic_fee_refreshes {
                 let Some(index) = state_index_by_pool.get(&pool).copied() else {
                     continue;
@@ -242,7 +243,9 @@ where
                     continue;
                 };
                 let fee_result = async {
-                    let block_hash = self.provider.get_block_hash(block_number).await?;
+                    let block_hash =
+                        cached_block_hash(&self.provider, &mut block_hash_cache, block_number)
+                            .await?;
                     self.provider
                         .fetch_aerodrome_classic_fee_bps_at_block_hash(
                             state.factory_address,
@@ -287,7 +290,9 @@ where
                     continue;
                 };
                 let fee_result = async {
-                    let block_hash = self.provider.get_block_hash(block_number).await?;
+                    let block_hash =
+                        cached_block_hash(&self.provider, &mut block_hash_cache, block_number)
+                            .await?;
                     self.provider
                         .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
                             state.factory_address,
@@ -3030,6 +3035,19 @@ fn quote_relevant_pool_state_changed(previous: &PoolState, next: &PoolState) -> 
         || previous.liquidity != next.liquidity
         || previous.tick != next.tick
         || previous.tick_spacing != next.tick_spacing
+}
+
+async fn cached_block_hash(
+    provider: &ChainProvider,
+    cache: &mut HashMap<u64, String>,
+    block_number: u64,
+) -> Result<String> {
+    if let Some(block_hash) = cache.get(&block_number) {
+        return Ok(block_hash.clone());
+    }
+    let block_hash = provider.get_block_hash(block_number).await?;
+    cache.insert(block_number, block_hash.clone());
+    Ok(block_hash)
 }
 
 fn tick_states_changed(previous: &[TickState], next: &[TickState]) -> bool {
