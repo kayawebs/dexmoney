@@ -284,8 +284,9 @@ where
         );
     }
     let batch_started = Instant::now();
-    let simulation_context =
-        simulator::SimulationContext::load(provider, settings, current_block).await;
+    let simulation_context = maintenance
+        .simulation_context(provider, settings, current_block)
+        .await;
     if !settings.execution_submit_enabled {
         return run_dry_run_simulation_batch(
             simulation_recorder,
@@ -326,6 +327,7 @@ where
 struct ExecutionMaintenance {
     last_idle_eoa_pool_maintenance: Option<Instant>,
     approved_allowances: HashSet<(Address, Address, Address)>,
+    simulation_context: Option<(u64, simulator::SimulationContext)>,
 }
 
 impl ExecutionMaintenance {
@@ -339,6 +341,22 @@ impl ExecutionMaintenance {
         }
         self.last_idle_eoa_pool_maintenance = Some(now);
         true
+    }
+
+    async fn simulation_context(
+        &mut self,
+        provider: &ChainProvider,
+        settings: &Settings,
+        current_block: u64,
+    ) -> simulator::SimulationContext {
+        if let Some((block, context)) = &self.simulation_context {
+            if *block == current_block {
+                return context.clone();
+            }
+        }
+        let context = simulator::SimulationContext::load(provider, settings, current_block).await;
+        self.simulation_context = Some((current_block, context.clone()));
+        context
     }
 }
 
