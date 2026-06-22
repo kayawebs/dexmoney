@@ -146,6 +146,8 @@ where
             let mut validation_snapshots = BTreeMap::new();
             let mut classic_fee_refreshes = HashMap::new();
             let mut slipstream_fee_refreshes = HashMap::new();
+            let mut deduped_events = Vec::with_capacity(events.len());
+            let mut event_records = Vec::new();
             for event in &events {
                 let duplicate_log = !recent_logs.insert(event.tx_hash.clone(), event.log_index);
                 if duplicate_log {
@@ -163,8 +165,13 @@ where
                     "event received"
                 );
                 if !duplicate_log {
-                    self.recorder.record_dex_event(event.clone()).await?;
+                    event_records.push(event.clone());
                 }
+                deduped_events.push((event, duplicate_log));
+            }
+            self.recorder.record_dex_events(event_records).await?;
+
+            for (event, duplicate_log) in deduped_events {
                 for state in &mut monitored_states {
                     if state.pool_id.address != event.pool_address {
                         continue;

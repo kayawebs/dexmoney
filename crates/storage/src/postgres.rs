@@ -1613,28 +1613,53 @@ fn normalize_executor_scope(scope: &str) -> Result<&'static str> {
 #[async_trait]
 impl RecorderStore for PostgresStore {
     async fn record_dex_event(&self, event: DexEvent) -> Result<()> {
-        sqlx::query(
+        self.record_dex_events(vec![event]).await
+    }
+
+    async fn record_dex_events(&self, events: Vec<DexEvent>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            rows.push((
+                i64::try_from(event.block_number)?,
+                event.tx_hash,
+                i64::try_from(event.log_index)?,
+                address_to_string(event.pool_address),
+                dex_to_string(event.dex),
+                event.event_type,
+                sqlx::types::Json(event.raw_data_json),
+            ));
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO dex_events (
                 id, chain_id, block_number, tx_hash, log_index, pool_address, dex,
                 event_type, token0, token1, raw_data_json, created_at
-            ) VALUES (uuid_generate_v4(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-            ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING
+            )
             "#,
-        )
-        // $1..$10 map exactly to the non-id/created_at insert columns above.
-        .bind(8453_i64)
-        .bind(i64::try_from(event.block_number)?)
-        .bind(event.tx_hash)
-        .bind(i64::try_from(event.log_index)?)
-        .bind(address_to_string(event.pool_address))
-        .bind(dex_to_string(event.dex))
-        .bind(event.event_type)
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(sqlx::types::Json(event.raw_data_json))
-        .execute(&self.pool)
-        .await?;
+        );
+        query.push_values(
+            rows,
+            |mut row,
+             (block_number, tx_hash, log_index, pool_address, dex, event_type, raw_data_json)| {
+                row.push("uuid_generate_v4()")
+                    .push_bind(8453_i64)
+                    .push_bind(block_number)
+                    .push_bind(tx_hash)
+                    .push_bind(log_index)
+                    .push_bind(pool_address)
+                    .push_bind(dex)
+                    .push_bind(event_type)
+                    .push_bind(Option::<String>::None)
+                    .push_bind(Option::<String>::None)
+                    .push_bind(raw_data_json)
+                    .push("NOW()");
+            },
+        );
+        query.push(" ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING");
+        query.build().execute(&self.pool).await?;
         Ok(())
     }
 

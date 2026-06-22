@@ -92,6 +92,12 @@ pub trait FailureStore: Send + Sync {
 #[async_trait]
 pub trait RecorderStore: Send + Sync {
     async fn record_dex_event(&self, event: DexEvent) -> anyhow::Result<()>;
+    async fn record_dex_events(&self, events: Vec<DexEvent>) -> anyhow::Result<()> {
+        for event in events {
+            self.record_dex_event(event).await?;
+        }
+        Ok(())
+    }
     async fn record_pool_state(&self, pool_state: PoolState) -> anyhow::Result<()>;
     async fn record_pool_state_with_source(
         &self,
@@ -410,6 +416,11 @@ impl FailureStore for InMemoryStores {
 impl RecorderStore for InMemoryStores {
     async fn record_dex_event(&self, event: DexEvent) -> anyhow::Result<()> {
         self.events.lock().await.push(event);
+        Ok(())
+    }
+
+    async fn record_dex_events(&self, events: Vec<DexEvent>) -> anyhow::Result<()> {
+        self.events.lock().await.extend(events);
         Ok(())
     }
 
