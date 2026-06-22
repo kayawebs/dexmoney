@@ -200,19 +200,19 @@ impl PoolStateStore for RedisStore {
                 .query_async(&mut manager)
                 .await?
         };
-        let mut values_by_key = existing_keys
-            .into_iter()
-            .zip(values.into_iter())
-            .collect::<std::collections::HashMap<_, _>>();
+        let mut values = values.into_iter();
 
         addresses
             .iter()
             .zip(pool_keys.into_iter())
             .map(|(address, key)| {
-                let state = key
-                    .and_then(|key| values_by_key.remove(&key).flatten())
-                    .map(|raw| serde_json::from_str(&raw))
-                    .transpose()?;
+                let state = if key.is_some() {
+                    values.next().flatten()
+                } else {
+                    None
+                }
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?;
                 Ok((*address, state))
             })
             .collect()
