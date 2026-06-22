@@ -1,6 +1,7 @@
 use alloy_primitives::{hex, Address, U256};
 use std::collections::{HashMap, HashSet};
 
+use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{
     ArbPath, Candidate, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult,
@@ -46,6 +47,9 @@ pub struct SearchEngine {
     pub v3_quote_safety_bps: u64,
     pub quote_max_state_block_lag: u64,
     pub multihop_enabled: bool,
+    pub balancer_v3_router: Option<Address>,
+    pub balancer_query_sender: Address,
+    pub chain_provider: Option<ChainProvider>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -450,6 +454,9 @@ impl SearchEngine {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 1,
             multihop_enabled: false,
+            balancer_v3_router: None,
+            balancer_query_sender: Address::ZERO,
+            chain_provider: None,
         }
     }
 
@@ -507,6 +514,9 @@ impl SearchEngine {
                     *amount_in,
                     self.v3_quote_safety_bps,
                     self.quote_max_state_block_lag,
+                    self.balancer_v3_router,
+                    self.balancer_query_sender,
+                    self.chain_provider.as_ref(),
                 )
                 .await
                 {
@@ -652,6 +662,9 @@ impl SearchEngine {
                 *amount_in,
                 self.v3_quote_safety_bps,
                 self.quote_max_state_block_lag,
+                self.balancer_v3_router,
+                self.balancer_query_sender,
+                self.chain_provider.as_ref(),
             )
             .await
             {
@@ -1030,6 +1043,15 @@ pub fn engine_from_settings(
         v3_quote_safety_bps: settings.v3_quote_safety_bps,
         quote_max_state_block_lag: settings.quote_max_state_block_lag,
         multihop_enabled: settings.searcher_multihop_enabled,
+        balancer_v3_router: settings.balancer_v3_router,
+        balancer_query_sender: settings
+            .executor_contract_multihop
+            .or(settings.executor_contract_2hop)
+            .or(settings.executor_contract)
+            .unwrap_or(Address::ZERO),
+        chain_provider: settings
+            .balancer_v3_router
+            .map(|_| ChainProvider::from_settings(settings)),
     })
 }
 
@@ -1246,7 +1268,7 @@ fn pool_depth_score(state: &PoolState) -> U256 {
         | PoolVariant::UniswapV3
         | PoolVariant::PancakeV3
         | PoolVariant::UniswapV4 => state.liquidity.unwrap_or_default(),
-        PoolVariant::BalancerV3 => U256::ZERO,
+        PoolVariant::BalancerV3 => U256::from(1u64),
     }
 }
 
@@ -1781,6 +1803,9 @@ async fn quote_path(
     amount_in: U256,
     v3_quote_safety_bps: u64,
     _quote_max_state_block_lag: u64,
+    balancer_v3_router: Option<Address>,
+    balancer_query_sender: Address,
+    chain_provider: Option<&ChainProvider>,
 ) -> std::result::Result<Option<(U256, u64, QuoteDiagnostics)>, QuoteSkip> {
     let aero_stable = AerodromeStableQuoter;
     let aero_volatile = AerodromeVolatileQuoter;
@@ -1882,10 +1907,30 @@ async fn quote_path(
                 }
             }
             PoolVariant::BalancerV3 => {
-                return Err(QuoteSkip::quote_error(format!(
-                    "quote not implemented for {:?}",
-                    pool_state.variant
-                )));
+                let router = balancer_v3_router.ok_or_else(|| {
+                    QuoteSkip::quote_error("BALANCER_V3_ROUTER is required for Balancer V3 quote")
+                })?;
+                let provider = chain_provider.ok_or_else(|| {
+                    QuoteSkip::quote_error("chain provider is required for Balancer V3 quote")
+                })?;
+                let amount_out = provider
+                    .query_balancer_v3_swap_exact_in(
+                        router,
+                        pool_state.pool_id.address,
+                        step.token_in,
+                        step.token_out,
+                        amount,
+                        balancer_query_sender,
+                    )
+                    .await
+                    .map_err(|err| QuoteSkip::quote_error(err.to_string()))?;
+                mode = "balancer_v3_router_query".into();
+                diagnostics.modes.push(mode.clone());
+                QuoteResult {
+                    amount_in: amount,
+                    amount_out,
+                    gas_estimate: None,
+                }
             }
         };
         let amount_out_raw = quote.amount_out;
@@ -2012,6 +2057,9 @@ fn estimate_price_impact_bps(
     token_in: Address,
     quote: &QuoteResult,
 ) -> u64 {
+    if matches!(pool_state.variant, PoolVariant::BalancerV3) {
+        return 0;
+    }
     if let (Some(reserve0), Some(reserve1)) = (pool_state.reserve0, pool_state.reserve1) {
         let (reserve_in, reserve_out) = if token_in == pool_state.token0 {
             (reserve0, reserve1)
@@ -2375,7 +2423,7 @@ fn is_supported_pool(state: &PoolState) -> bool {
                 _ => false,
             }
         }
-        PoolVariant::BalancerV3 => false,
+        PoolVariant::BalancerV3 => state.token0 != Address::ZERO && state.token1 != Address::ZERO,
     }
 }
 
@@ -2532,6 +2580,9 @@ mod tests {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
             multihop_enabled: true,
+            balancer_v3_router: None,
+            balancer_query_sender: Address::ZERO,
+            chain_provider: None,
         };
         let states = vec![
             test_v3_pool(
@@ -2588,6 +2639,9 @@ mod tests {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
             multihop_enabled: true,
+            balancer_v3_router: None,
+            balancer_query_sender: Address::ZERO,
+            chain_provider: None,
         };
         let states = vec![
             test_v3_pool(

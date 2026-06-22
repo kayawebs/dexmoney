@@ -31,6 +31,7 @@ const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
 const V4_PROMOTE_INTERVAL: Duration = Duration::from_secs(30);
 const V4_PROMOTE_LIMIT: i64 = 1_000;
+const BALANCER_PROMOTE_LIMIT: i64 = 1_000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
@@ -386,6 +387,7 @@ where
             if Instant::now() >= next_v4_promotion {
                 let promote_started = Instant::now();
                 let promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
+                let balancer_promote_stats = self.promote_quoteable_balancer_v3_pools().await?;
                 if promote_stats.promoted > 0
                     || promote_stats.published_states > 0
                     || promote_stats.skipped > 0
@@ -396,6 +398,18 @@ where
                         skipped = promote_stats.skipped,
                         promote_ms = promote_started.elapsed().as_millis() as u64,
                         "Uniswap V4 quoteable pool promotion processed observations"
+                    );
+                }
+                if balancer_promote_stats.promoted > 0
+                    || balancer_promote_stats.published_states > 0
+                    || balancer_promote_stats.skipped > 0
+                {
+                    info!(
+                        promoted = balancer_promote_stats.promoted,
+                        published_states = balancer_promote_stats.published_states,
+                        skipped = balancer_promote_stats.skipped,
+                        promote_ms = promote_started.elapsed().as_millis() as u64,
+                        "Balancer V3 quoteable pool promotion processed observations"
                     );
                 }
                 next_v4_promotion = Instant::now() + V4_PROMOTE_INTERVAL;
@@ -1090,6 +1104,132 @@ where
         Ok(stats)
     }
 
+    async fn promote_quoteable_balancer_v3_pools(&self) -> Result<V4PromoteStats> {
+        let Some(vault) = self.settings.balancer_v3_vault else {
+            return Ok(V4PromoteStats::default());
+        };
+        if self.settings.balancer_v3_router.is_none() {
+            return Ok(V4PromoteStats::default());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                pool_address, manager_address, token0, token1, symbol,
+                factory_address, fee_bps, latest_block
+            FROM protocol_pool_observations
+            WHERE chain_id = $1
+              AND protocol = 'balancer-v3'
+              AND lower(manager_address) = lower($2)
+              AND pool_address IS NOT NULL
+              AND token0 IS NOT NULL
+              AND token1 IS NOT NULL
+              AND fee_bps IS NOT NULL
+              AND (
+                  updated_at >= NOW() - INTERVAL '2 minutes'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM pools p
+                      WHERE p.chain_id = protocol_pool_observations.chain_id
+                        AND lower(p.pool_address) = lower(protocol_pool_observations.pool_address)
+                  )
+              )
+            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(i64::try_from(self.settings.chain_id)?)
+        .bind(format!("{vault:#x}"))
+        .bind(BALANCER_PROMOTE_LIMIT)
+        .fetch_all(&self.recorder.pool)
+        .await?;
+
+        let mut stats = V4PromoteStats::default();
+        let mut changed = Vec::new();
+        for row in rows {
+            let state = match self.balancer_v3_state_from_row(&row).await {
+                Ok(state) => state,
+                Err(err) => {
+                    stats.skipped += 1;
+                    debug!(error = %err, "quoteable Balancer V3 observation skipped during promotion");
+                    continue;
+                }
+            };
+            let symbol = row
+                .try_get::<Option<String>, _>("symbol")
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}/{}",
+                        short_address_suffix(state.token0),
+                        short_address_suffix(state.token1)
+                    )
+                });
+            self.recorder
+                .upsert_token_registry(
+                    self.settings.chain_id,
+                    state.token0,
+                    &token_symbol(&self.provider, state.token0).await,
+                )
+                .await?;
+            self.recorder
+                .upsert_token_registry(
+                    self.settings.chain_id,
+                    state.token1,
+                    &token_symbol(&self.provider, state.token1).await,
+                )
+                .await?;
+            let (token0, token1) = canonical_pair(state.token0, state.token1);
+            let pair_id = self
+                .recorder
+                .upsert_token_pair(self.settings.chain_id, token0, token1, &symbol)
+                .await?;
+            let discovered = base_arb_common::types::DiscoveredPool {
+                factory_address: state.factory_address,
+                tick_spacing: None,
+                stable: None,
+                source: "balancer_v3_protocol_observation".to_string(),
+                state: state.clone(),
+            };
+            self.recorder
+                .upsert_discovered_pool(pair_id, &discovered)
+                .await?;
+            sqlx::query(
+                r#"
+                UPDATE protocol_pool_observations
+                SET import_status = 'imported',
+                    import_reason = 'Balancer V3 swap edge promoted for router-query quote/search',
+                    updated_at = NOW()
+                WHERE chain_id = $1
+                  AND protocol = 'balancer-v3'
+                  AND lower(pool_address) = lower($2)
+                  AND lower(token0) = lower($3)
+                  AND lower(token1) = lower($4)
+                "#,
+            )
+            .bind(i64::try_from(self.settings.chain_id)?)
+            .bind(format!("{:#x}", state.pool_id.address))
+            .bind(format!("{:#x}", state.token0))
+            .bind(format!("{:#x}", state.token1))
+            .execute(&self.recorder.pool)
+            .await?;
+
+            self.pool_store.set_pool_state(state.clone()).await?;
+            self.recorder
+                .record_pool_state_with_source(state.clone(), "balancer_v3_protocol")
+                .await?;
+            changed.push(state.pool_id.address);
+            stats.promoted += 1;
+            stats.published_states += 1;
+        }
+        if !changed.is_empty() {
+            self.pool_store.mark_changed_pools(changed).await?;
+        }
+        Ok(stats)
+    }
+
     async fn fetch_registry_pool_state(&self, entry: &PoolRegistryEntry) -> Result<PoolState> {
         match (entry.dex, entry.variant) {
             (DexKind::UniswapV4, PoolVariant::UniswapV4) => {
@@ -1200,6 +1340,58 @@ where
             liquidity: Some(liquidity),
             tick: Some(tick),
             tick_spacing: Some(tick_spacing),
+            block_number,
+            valid_through_block: block_number,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn balancer_v3_state_from_row(&self, row: &sqlx::postgres::PgRow) -> Result<PoolState> {
+        let pool_address = row
+            .try_get::<String, _>("pool_address")?
+            .parse::<Address>()?;
+        let manager_address = row
+            .try_get::<String, _>("manager_address")?
+            .parse::<Address>()?;
+        let token0 = row.try_get::<String, _>("token0")?.parse::<Address>()?;
+        let token1 = row.try_get::<String, _>("token1")?.parse::<Address>()?;
+        let fee_bps = row
+            .try_get::<Option<i64>, _>("fee_bps")?
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default();
+        let block_number = row
+            .try_get::<Option<i64>, _>("latest_block")?
+            .and_then(|value| u64::try_from(value).ok())
+            .context("Balancer V3 observation missing latest_block")?;
+        let factory_address = row
+            .try_get::<Option<String>, _>("factory_address")?
+            .map(|value| value.parse::<Address>())
+            .transpose()?
+            .or(Some(manager_address));
+
+        Ok(PoolState {
+            pool_id: PoolId {
+                chain_id: self.settings.chain_id,
+                address: pool_address,
+            },
+            dex: DexKind::Balancer,
+            variant: PoolVariant::BalancerV3,
+            factory_address,
+            token0,
+            token1,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps,
+            fee_pips: None,
+            pool_key_fee_pips: None,
+            hooks_address: None,
+            stable: None,
+            reserve0: None,
+            reserve1: None,
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            tick_spacing: None,
             block_number,
             valid_through_block: block_number,
             updated_at: chrono::Utc::now(),

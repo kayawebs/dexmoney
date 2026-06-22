@@ -1870,6 +1870,32 @@ impl ChainProvider {
             .await
     }
 
+    pub async fn query_balancer_v3_swap_exact_in(
+        &self,
+        router: Address,
+        pool: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        sender: Address,
+    ) -> Result<U256> {
+        let data =
+            encode_balancer_query_swap_exact_in(pool, token_in, token_out, amount_in, sender);
+        let raw = self
+            .eth_call_from(
+                Some(sender),
+                router,
+                &data,
+                "BalancerV3 querySwapSingleTokenExactIn",
+            )
+            .await?;
+        let words = decode_32byte_words(&raw)?;
+        if words.is_empty() {
+            anyhow::bail!("BalancerV3 query returned no words");
+        }
+        parse_word_u256(&words[0])
+    }
+
     pub async fn eth_call_from_at_block(
         &self,
         from: Option<Address>,
@@ -2386,6 +2412,25 @@ fn encode_get_pool_int24(token_a: Address, token_b: Address, tick_spacing: i32) 
     )
 }
 
+fn encode_balancer_query_swap_exact_in(
+    pool: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    sender: Address,
+) -> String {
+    format!(
+        "0x3ebc54e5{}{}{}{}{}{}{}",
+        encode_address_word(pool),
+        encode_address_word(token_in),
+        encode_address_word(token_out),
+        encode_u256_word(amount_in),
+        encode_address_word(sender),
+        encode_u32_word(192),
+        encode_u32_word(0),
+    )
+}
+
 fn encode_address_word(address: Address) -> String {
     let clean = format!("{address:#x}").trim_start_matches("0x").to_string();
     format!("{clean:0>64}")
@@ -2396,6 +2441,10 @@ fn encode_bool_word(value: bool) -> String {
 }
 
 fn encode_u32_word(value: u32) -> String {
+    format!("{value:064x}")
+}
+
+fn encode_u256_word(value: U256) -> String {
     format!("{value:064x}")
 }
 

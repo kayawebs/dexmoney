@@ -510,7 +510,7 @@ fn is_pool_state_active(state: &PoolState, now: DateTime<Utc>, max_pool_state_ag
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
-        PoolVariant::BalancerV3 => false,
+        PoolVariant::BalancerV3 => state.token0 != Address::ZERO && state.token1 != Address::ZERO,
     }
 }
 
