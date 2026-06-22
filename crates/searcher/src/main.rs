@@ -246,6 +246,7 @@ struct SearchRuntime {
     tick_states: HashMap<Address, Vec<TickState>>,
     active_pool_addresses: HashSet<Address>,
     pool_topology: HashMap<Address, PoolTopology>,
+    latest_pool_state_block: u64,
     engine: Option<strategy::SearchEngine>,
     pair_configs: Vec<TokenPairSearchConfig>,
     last_config_refresh: Option<Instant>,
@@ -301,6 +302,8 @@ where
     let cycle_started = Instant::now();
     if !runtime.bootstrapped {
         for state in pool_store.all_pool_states().await? {
+            runtime.latest_pool_state_block =
+                runtime.latest_pool_state_block.max(state.block_number);
             runtime
                 .pool_topology
                 .insert(state.pool_id.address, PoolTopology::from(&state));
@@ -385,13 +388,21 @@ where
                     rebuild_path_index = true;
                     runtime.pool_topology.insert(pool, topology);
                 }
+                runtime.latest_pool_state_block =
+                    runtime.latest_pool_state_block.max(state.block_number);
                 runtime.pool_states.insert(pool, state);
             }
             None => {
                 if runtime.pool_topology.remove(&pool).is_some() {
                     rebuild_path_index = true;
                 }
-                runtime.pool_states.remove(&pool);
+                if runtime
+                    .pool_states
+                    .remove(&pool)
+                    .is_some_and(|state| state.block_number == runtime.latest_pool_state_block)
+                {
+                    runtime.latest_pool_state_block = latest_pool_state_block(&runtime.pool_states);
+                }
                 runtime.tick_states.remove(&pool);
                 runtime.active_pool_addresses.remove(&pool);
             }
@@ -403,12 +414,7 @@ where
         debug!("no pool states available in searcher cache");
         return Ok(SearchCycleStats::default());
     }
-    let latest_pool_state_block = runtime
-        .pool_states
-        .values()
-        .map(|state| state.block_number)
-        .max()
-        .unwrap_or(0);
+    let latest_pool_state_block = runtime.latest_pool_state_block;
     let Some(latest_known_block) = pool_store.get_current_block().await? else {
         debug!("current block not available from market-data");
         return Ok(SearchCycleStats::default());
@@ -546,6 +552,14 @@ fn active_pool_addresses<'a>(
         .filter(|state| is_pool_state_active(state, now, max_pool_state_age_ms))
         .map(|state| state.pool_id.address)
         .collect()
+}
+
+fn latest_pool_state_block(pool_states: &HashMap<Address, PoolState>) -> u64 {
+    pool_states
+        .values()
+        .map(|state| state.block_number)
+        .max()
+        .unwrap_or(0)
 }
 
 fn refresh_active_pool_cache_if_due(
