@@ -36,6 +36,7 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const FEE_REFRESH_CONCURRENCY: usize = 16;
+const FLASHBLOCK_FALLBACK_BLOCK_CACHE_TTL: Duration = Duration::from_millis(250);
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
@@ -144,11 +145,7 @@ where
             let fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
             let apply_started = Instant::now();
-            let state_index_by_pool = monitored_states
-                .iter()
-                .enumerate()
-                .map(|(index, state)| (state.pool_id.address, index))
-                .collect::<HashMap<_, _>>();
+            let state_index_by_pool = pool_state_index_by_address(&monitored_states);
             let mut changed_pools = HashSet::new();
             let mut validation_snapshots = BTreeMap::new();
             let mut classic_fee_refreshes = HashMap::new();
@@ -2037,9 +2034,11 @@ where
 
     async fn run_flashblocks_session(&self, ws_url: &str) -> Result<()> {
         let mut monitored_states = self.load_monitored_states().await?;
+        let mut state_index_by_pool = pool_state_index_by_address(&monitored_states);
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut recent_logs = RecentLogCache::new(20_000);
         let mut fallback_log_index = 0u64;
+        let mut fallback_block_cache: Option<(Instant, u64)> = None;
 
         let mut subscribed_addresses = address_set(&monitored_states);
         let addresses = unique_pool_addresses(&monitored_states);
@@ -2070,6 +2069,7 @@ where
         while let Some(message) = ws.next().await {
             if Instant::now() >= next_registry_reload {
                 monitored_states = self.reload_if_changed(monitored_states).await?;
+                state_index_by_pool = pool_state_index_by_address(&monitored_states);
                 let next_addresses = address_set(&monitored_states);
                 if next_addresses != subscribed_addresses {
                     info!("Flashblocks monitored pool set changed; reconnecting subscription");
@@ -2130,7 +2130,10 @@ where
             let fallback_block = if result.get("blockNumber").and_then(Value::as_str).is_some() {
                 None
             } else {
-                Some(self.provider.get_block_number().await?.saturating_add(1))
+                Some(
+                    self.cached_flashblock_fallback_block(&mut fallback_block_cache)
+                        .await?,
+                )
             };
             let event = match self.provider.decode_relevant_log_for_pools(
                 &monitored_states,
@@ -2146,16 +2149,37 @@ where
                 }
             };
 
-            self.process_flashblock_event(&mut monitored_states, event, &mut recent_logs)
-                .await?;
+            self.process_flashblock_event(
+                &mut monitored_states,
+                &state_index_by_pool,
+                event,
+                &mut recent_logs,
+            )
+            .await?;
         }
 
         Ok(())
     }
 
+    async fn cached_flashblock_fallback_block(
+        &self,
+        fallback_block_cache: &mut Option<(Instant, u64)>,
+    ) -> Result<u64> {
+        let now = Instant::now();
+        if let Some((cached_at, block_number)) = fallback_block_cache {
+            if now.duration_since(*cached_at) <= FLASHBLOCK_FALLBACK_BLOCK_CACHE_TTL {
+                return Ok(*block_number);
+            }
+        }
+        let block_number = self.provider.get_block_number().await?.saturating_add(1);
+        *fallback_block_cache = Some((now, block_number));
+        Ok(block_number)
+    }
+
     async fn process_flashblock_event(
         &self,
         monitored_states: &mut [PoolState],
+        state_index_by_pool: &HashMap<Address, usize>,
         event: DexEvent,
         recent_logs: &mut RecentLogCache,
     ) -> Result<()> {
@@ -2169,41 +2193,44 @@ where
             event_type = %event.event_type,
             "Flashblocks pending event received"
         );
-        self.pool_store
-            .set_current_block(event.block_number)
-            .await?;
-        self.recorder.record_dex_event(event.clone()).await?;
 
-        for state in monitored_states {
-            if state.pool_id.address != event.pool_address {
-                continue;
+        let mut updated_state = None;
+        if let Some(index) = state_index_by_pool.get(&event.pool_address).copied() {
+            if let Some(state) = monitored_states.get_mut(index) {
+                if super::state_updater::is_v3_liquidity_event(state, &event)? {
+                    debug!(
+                        pool = %state.pool_id.address,
+                        block_number = event.block_number,
+                        "Flashblocks V3 liquidity event waits for sealed block state/tick refresh"
+                    );
+                } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
+                    state.valid_through_block = state.valid_through_block.max(event.block_number);
+                    updated_state = Some(state.clone());
+                    debug!(
+                        pool = %state.pool_id.address,
+                        block_number = state.block_number,
+                        "pool state locally updated from Flashblocks pending event"
+                    );
+                }
             }
+        }
 
-            if super::state_updater::is_v3_liquidity_event(state, &event)? {
-                debug!(
-                    pool = %state.pool_id.address,
-                    block_number = event.block_number,
-                    "Flashblocks V3 liquidity event waits for sealed block state/tick refresh"
-                );
-            } else if super::state_updater::apply_event_to_pool_state(state, &event)? {
-                state.valid_through_block = state.valid_through_block.max(event.block_number);
-                let updated_state = state.clone();
-                tokio::try_join!(
-                    self.pool_store.publish_pool_states(
-                        event.block_number,
-                        vec![updated_state.clone()],
-                        vec![updated_state.pool_id.address],
-                    ),
-                    self.recorder
-                        .record_pool_state_with_source(updated_state, "flashblock")
-                )?;
-                debug!(
-                    pool = %state.pool_id.address,
-                    block_number = state.block_number,
-                    "pool state locally updated from Flashblocks pending event"
-                );
-            }
-            break;
+        if let Some(updated_state) = updated_state {
+            tokio::try_join!(
+                self.pool_store.publish_pool_states(
+                    event.block_number,
+                    vec![updated_state.clone()],
+                    vec![updated_state.pool_id.address],
+                ),
+                self.recorder.record_dex_event(event.clone()),
+                self.recorder
+                    .record_pool_state_with_source(updated_state, "flashblock")
+            )?;
+        } else {
+            tokio::try_join!(
+                self.pool_store.set_current_block(event.block_number),
+                self.recorder.record_dex_event(event)
+            )?;
         }
 
         Ok(())
@@ -3235,6 +3262,14 @@ fn address_set(states: &[PoolState]) -> HashSet<String> {
     states
         .iter()
         .map(|state| format!("{:#x}", state.pool_id.address))
+        .collect()
+}
+
+fn pool_state_index_by_address(states: &[PoolState]) -> HashMap<Address, usize> {
+    states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| (state.pool_id.address, index))
         .collect()
 }
 
