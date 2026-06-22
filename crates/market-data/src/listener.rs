@@ -1088,6 +1088,8 @@ where
         let mut stats = V4PromoteStats::default();
         let mut changed = Vec::new();
         let mut published_states = Vec::new();
+        let mut token_symbols = HashMap::new();
+        let mut registered_tokens = HashSet::new();
         for row in rows {
             let state = match self.uniswap_v4_state_from_row(&row).await {
                 Ok(state) => state,
@@ -1105,22 +1107,32 @@ where
             {
                 symbol
             } else {
-                pair_symbol(&self.provider, state.token0, state.token1).await
-            };
-            self.recorder
-                .upsert_token_registry(
-                    self.settings.chain_id,
+                cached_pair_symbol(
+                    &self.provider,
+                    &mut token_symbols,
                     state.token0,
-                    &token_symbol(&self.provider, state.token0).await,
-                )
-                .await?;
-            self.recorder
-                .upsert_token_registry(
-                    self.settings.chain_id,
                     state.token1,
-                    &token_symbol(&self.provider, state.token1).await,
                 )
-                .await?;
+                .await
+            };
+            upsert_token_registry_once(
+                &self.recorder,
+                &self.provider,
+                self.settings.chain_id,
+                state.token0,
+                &mut token_symbols,
+                &mut registered_tokens,
+            )
+            .await?;
+            upsert_token_registry_once(
+                &self.recorder,
+                &self.provider,
+                self.settings.chain_id,
+                state.token1,
+                &mut token_symbols,
+                &mut registered_tokens,
+            )
+            .await?;
             let (token0, token1) = canonical_pair(state.token0, state.token1);
             let pair_id = self
                 .recorder
@@ -1217,6 +1229,8 @@ where
         let mut stats = V4PromoteStats::default();
         let mut changed = Vec::new();
         let mut published_states = Vec::new();
+        let mut token_symbols = HashMap::new();
+        let mut registered_tokens = HashSet::new();
         for row in rows {
             let state = match self.balancer_v3_state_from_row(&row).await {
                 Ok(state) => state,
@@ -1238,20 +1252,24 @@ where
                         short_address_suffix(state.token1)
                     )
                 });
-            self.recorder
-                .upsert_token_registry(
-                    self.settings.chain_id,
-                    state.token0,
-                    &token_symbol(&self.provider, state.token0).await,
-                )
-                .await?;
-            self.recorder
-                .upsert_token_registry(
-                    self.settings.chain_id,
-                    state.token1,
-                    &token_symbol(&self.provider, state.token1).await,
-                )
-                .await?;
+            upsert_token_registry_once(
+                &self.recorder,
+                &self.provider,
+                self.settings.chain_id,
+                state.token0,
+                &mut token_symbols,
+                &mut registered_tokens,
+            )
+            .await?;
+            upsert_token_registry_once(
+                &self.recorder,
+                &self.provider,
+                self.settings.chain_id,
+                state.token1,
+                &mut token_symbols,
+                &mut registered_tokens,
+            )
+            .await?;
             let (token0, token1) = canonical_pair(state.token0, state.token1);
             let pair_id = self
                 .recorder
@@ -3989,11 +4007,56 @@ async fn pair_symbol(provider: &ChainProvider, token0: Address, token1: Address)
     )
 }
 
+async fn cached_pair_symbol(
+    provider: &ChainProvider,
+    cache: &mut HashMap<Address, String>,
+    token0: Address,
+    token1: Address,
+) -> String {
+    let token0_symbol = cached_token_symbol(provider, cache, token0).await;
+    let token1_symbol = cached_token_symbol(provider, cache, token1).await;
+    format!(
+        "{}/{}",
+        token_label(&token0_symbol, token0),
+        token_label(&token1_symbol, token1)
+    )
+}
+
 async fn token_symbol(provider: &ChainProvider, token: Address) -> String {
     provider
         .fetch_erc20_symbol(token)
         .await
         .unwrap_or_else(|_| "token".to_string())
+}
+
+async fn cached_token_symbol(
+    provider: &ChainProvider,
+    cache: &mut HashMap<Address, String>,
+    token: Address,
+) -> String {
+    if let Some(symbol) = cache.get(&token) {
+        return symbol.clone();
+    }
+    let symbol = token_symbol(provider, token).await;
+    cache.insert(token, symbol.clone());
+    symbol
+}
+
+async fn upsert_token_registry_once(
+    recorder: &PostgresStore,
+    provider: &ChainProvider,
+    chain_id: u64,
+    token: Address,
+    symbol_cache: &mut HashMap<Address, String>,
+    registered_tokens: &mut HashSet<Address>,
+) -> Result<()> {
+    if !registered_tokens.insert(token) {
+        return Ok(());
+    }
+    let symbol = cached_token_symbol(provider, symbol_cache, token).await;
+    recorder
+        .upsert_token_registry(chain_id, token, &symbol)
+        .await
 }
 
 fn token_label(symbol: &str, address: Address) -> String {
