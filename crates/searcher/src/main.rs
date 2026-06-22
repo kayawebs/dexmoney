@@ -17,13 +17,17 @@ use base_arb_storage::{
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const SEARCHER_PUBLISH_BATCH_PATHS: usize = 256;
 const ACTIVE_POOL_SWEEP_MIN_MS: u64 = 100;
 const ACTIVE_POOL_SWEEP_MAX_MS: u64 = 1_000;
+const OPPORTUNITY_RECORD_QUEUE_CAPACITY: usize = 1_024;
+const OPPORTUNITY_RECORD_FLUSH_MS: u64 = 100;
+const OPPORTUNITY_RECORD_MAX_BATCH: usize = 512;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,6 +37,7 @@ async fn main() -> Result<()> {
     let settings = Settings::load()?;
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
+    let opportunity_recorder = OpportunityRecordQueue::spawn(postgres.clone());
 
     info!("searcher initialized");
     let mut ticker = interval(Duration::from_millis(100));
@@ -48,6 +53,7 @@ async fn main() -> Result<()> {
             &redis,
             &redis,
             &postgres,
+            &opportunity_recorder,
             &settings,
             settings.candidate_ttl_ms,
             settings.max_pool_state_age_ms,
@@ -97,6 +103,7 @@ async fn main() -> Result<()> {
                 candidates_coalesced = aggregate.candidates_coalesced,
                 inactive_pool_filtered_paths = aggregate.inactive_pool_filtered_paths,
                 tick_missing_filtered_paths = aggregate.tick_missing_filtered_paths,
+                opportunity_record_queue_dropped = aggregate.opportunity_record_queue_dropped,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 dynamic_multihop_anchors = aggregate.search.dynamic_multihop_anchors,
                 dynamic_multihop_changed_edges = aggregate.search.dynamic_multihop_changed_edges,
@@ -190,6 +197,7 @@ struct SearchCycleStats {
     candidates_coalesced: u64,
     inactive_pool_filtered_paths: u64,
     tick_missing_filtered_paths: u64,
+    opportunity_record_queue_dropped: u64,
     opportunities_created: u64,
 }
 
@@ -229,6 +237,7 @@ impl SearchCycleStats {
         self.candidates_coalesced += other.candidates_coalesced;
         self.inactive_pool_filtered_paths += other.inactive_pool_filtered_paths;
         self.tick_missing_filtered_paths += other.tick_missing_filtered_paths;
+        self.opportunity_record_queue_dropped += other.opportunity_record_queue_dropped;
         self.opportunities_created += other.opportunities_created;
     }
 
@@ -246,6 +255,81 @@ impl SearchCycleStats {
         } else {
             self.risk_other_rejected += 1;
         }
+    }
+}
+
+#[derive(Clone)]
+struct OpportunityRecordQueue {
+    sender: mpsc::Sender<Vec<Candidate>>,
+}
+
+impl OpportunityRecordQueue {
+    fn spawn(store: PostgresStore) -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<Vec<Candidate>>(OPPORTUNITY_RECORD_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            let mut flush_interval = interval(Duration::from_millis(OPPORTUNITY_RECORD_FLUSH_MS));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    maybe_candidates = receiver.recv() => {
+                        let Some(mut candidates) = maybe_candidates else {
+                            flush_opportunity_records(&store, &mut pending).await;
+                            break;
+                        };
+                        pending.append(&mut candidates);
+                        if pending.len() >= OPPORTUNITY_RECORD_MAX_BATCH {
+                            flush_opportunity_records(&store, &mut pending).await;
+                        }
+                    }
+                    _ = flush_interval.tick(), if !pending.is_empty() => {
+                        flush_opportunity_records(&store, &mut pending).await;
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    fn enqueue(&self, candidates: Vec<Candidate>) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let count = candidates.len();
+        match self.sender.try_send(candidates) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(candidates)) => {
+                warn!(
+                    dropped = candidates.len(),
+                    "opportunity record queue full; dropping diagnostic records"
+                );
+                candidates.len()
+            }
+            Err(mpsc::error::TrySendError::Closed(candidates)) => {
+                warn!(
+                    dropped = candidates.len(),
+                    "opportunity record queue closed; dropping diagnostic records"
+                );
+                candidates.len()
+            }
+        }
+        .min(count)
+    }
+}
+
+async fn flush_opportunity_records(store: &PostgresStore, pending: &mut Vec<Candidate>) {
+    if pending.is_empty() {
+        return;
+    }
+    let candidates = std::mem::take(pending);
+    let count = candidates.len();
+    if let Err(err) = store.record_opportunities(candidates).await {
+        warn!(
+            count,
+            error = %err,
+            "failed to record opportunities from background queue"
+        );
     }
 }
 
@@ -296,7 +380,8 @@ async fn run_search_cycle<P, C, R>(
     runtime: &mut SearchRuntime,
     pool_store: &P,
     candidate_store: &C,
-    recorder: &R,
+    config_store: &R,
+    opportunity_recorder: &OpportunityRecordQueue,
     settings: &Settings,
     candidate_ttl_ms: i64,
     max_pool_state_age_ms: i64,
@@ -306,7 +391,7 @@ async fn run_search_cycle<P, C, R>(
 where
     P: PoolStateStore + PoolChangeStore + CurrentBlockStore + TickChangeStore + TickStateStore,
     C: CandidateStore,
-    R: RecorderStore + PairSearchConfigStore,
+    R: PairSearchConfigStore,
 {
     let cycle_started = Instant::now();
     if !runtime.bootstrapped {
@@ -353,7 +438,7 @@ where
         .is_none_or(|last_refresh| last_refresh.elapsed() >= config_refresh_interval);
     let mut config_changed = false;
     if runtime.engine.is_none() || config_refresh_due {
-        let pair_configs = recorder.enabled_pair_search_configs().await?;
+        let pair_configs = config_store.enabled_pair_search_configs().await?;
         if runtime.engine.is_none() || runtime.pair_configs != pair_configs {
             runtime.engine = Some(strategy::engine_from_settings(
                 settings,
@@ -554,7 +639,7 @@ where
         let publish_started = Instant::now();
         publish_candidates(
             candidate_store,
-            recorder,
+            opportunity_recorder,
             &mut cycle_stats,
             &engine,
             &runtime.active_pool_addresses,
@@ -722,9 +807,9 @@ where
     Ok(stats)
 }
 
-async fn publish_candidates<C, R>(
+async fn publish_candidates<C>(
     candidate_store: &C,
-    recorder: &R,
+    opportunity_recorder: &OpportunityRecordQueue,
     cycle_stats: &mut SearchCycleStats,
     engine: &strategy::SearchEngine,
     available_pools: &HashSet<Address>,
@@ -736,7 +821,6 @@ async fn publish_candidates<C, R>(
 ) -> Result<()>
 where
     C: CandidateStore,
-    R: RecorderStore,
 {
     let original_candidate_count = candidates.len();
     let candidates = candidates
@@ -782,10 +866,9 @@ where
     if !valid_candidates.is_empty() {
         cycle_stats.opportunities_created += valid_candidates.len() as u64;
         let record_candidates = valid_candidates.clone();
-        tokio::try_join!(
-            candidate_store.push_candidates(valid_candidates),
-            recorder.record_opportunities(record_candidates)
-        )?;
+        candidate_store.push_candidates(valid_candidates).await?;
+        cycle_stats.opportunity_record_queue_dropped +=
+            opportunity_recorder.enqueue(record_candidates) as u64;
     }
     Ok(())
 }
