@@ -1154,8 +1154,22 @@ pub fn engine_from_settings(
 }
 
 pub(crate) struct QuoteContext<'a> {
-    pool_states: HashMap<Address, &'a PoolState>,
+    pool_states: PoolContext<'a>,
     tick_states: TickContext<'a>,
+}
+
+enum PoolContext<'a> {
+    Owned(HashMap<Address, &'a PoolState>),
+    Borrowed(&'a HashMap<Address, PoolState>),
+}
+
+impl<'a> PoolContext<'a> {
+    fn get(&self, pool: &Address) -> Option<&'a PoolState> {
+        match self {
+            Self::Owned(states) => states.get(pool).copied(),
+            Self::Borrowed(states) => states.get(pool),
+        }
+    }
 }
 
 enum TickContext<'a> {
@@ -1187,28 +1201,23 @@ impl<'a> QuoteContext<'a> {
                 .push(tick.clone());
         }
         Self {
-            pool_states,
+            pool_states: PoolContext::Owned(pool_states),
             tick_states: TickContext::Owned(ticks_by_pool),
         }
     }
 
     pub(crate) fn from_pool_map(
         pool_states: &'a HashMap<Address, PoolState>,
-        active_pools: &HashSet<Address>,
         tick_states: &'a HashMap<Address, Vec<TickState>>,
     ) -> Self {
-        let pool_states = active_pools
-            .iter()
-            .filter_map(|pool| pool_states.get(pool).map(|state| (*pool, state)))
-            .collect::<HashMap<_, _>>();
         Self {
-            pool_states,
+            pool_states: PoolContext::Borrowed(pool_states),
             tick_states: TickContext::Borrowed(tick_states),
         }
     }
 
     fn pool_state(&self, pool: Address) -> Option<&'a PoolState> {
-        self.pool_states.get(&pool).copied()
+        self.pool_states.get(&pool)
     }
 
     fn pool_ticks(&self, pool: Address) -> Option<&[TickState]> {

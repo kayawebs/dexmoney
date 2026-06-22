@@ -481,11 +481,8 @@ where
     cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
     cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
 
-    let quote_context = strategy::QuoteContext::from_pool_map(
-        &runtime.pool_states,
-        &path_pools,
-        &runtime.tick_states,
-    );
+    let quote_context =
+        strategy::QuoteContext::from_pool_map(&runtime.pool_states, &runtime.tick_states);
     let engine = runtime
         .engine
         .as_ref()
