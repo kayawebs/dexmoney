@@ -41,6 +41,8 @@ pub struct SearchEngine {
     pub amount_sizes: Vec<U256>,
     pub paths: Vec<ArbPath>,
     pub pair_configs: Vec<TokenPairSearchConfig>,
+    pair_config_index: HashMap<(Address, Address), usize>,
+    anchor_configs: Vec<AnchorSearchConfig>,
     pub min_expected_profit: U256,
     pub max_price_impact_bps: u64,
     pub whitelist_paths: Vec<String>,
@@ -538,6 +540,8 @@ impl SearchEngine {
                 },
             ],
             pair_configs: Vec::new(),
+            pair_config_index: HashMap::new(),
+            anchor_configs: Vec::new(),
             min_expected_profit,
             max_price_impact_bps,
             whitelist_paths: vec![name1, name2],
@@ -898,16 +902,15 @@ impl SearchEngine {
         if !self.multihop_enabled || changed_pools.is_empty() {
             return (Vec::new(), stats);
         }
-        let anchors = anchor_search_configs(&self.pair_configs);
-        stats.dynamic_multihop_anchors = anchors.len() as u64;
-        if anchors.is_empty() {
+        stats.dynamic_multihop_anchors = self.anchor_configs.len() as u64;
+        if self.anchor_configs.is_empty() {
             return (Vec::new(), stats);
         }
 
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         let mut segment_cache = SegmentPathCache::default();
-        for anchor in anchors {
+        for anchor in &self.anchor_configs {
             for changed_pool in changed_pools {
                 let Some(changed_edges) = graph.pool_edges(*changed_pool) else {
                     continue;
@@ -917,7 +920,7 @@ impl SearchEngine {
                         &mut candidates,
                         &mut seen,
                         graph,
-                        &anchor,
+                        anchor,
                         changed_edge,
                         3,
                         &mut segment_cache,
@@ -927,7 +930,7 @@ impl SearchEngine {
                         &mut candidates,
                         &mut seen,
                         graph,
-                        &anchor,
+                        anchor,
                         changed_edge,
                         4,
                         &mut segment_cache,
@@ -974,11 +977,6 @@ impl SearchEngine {
         }
 
         let mut paths = Vec::new();
-        let configs = self
-            .pair_configs
-            .iter()
-            .map(|config| ((config.token0, config.token1), config))
-            .collect::<HashMap<_, _>>();
         let mut pools_by_pair: HashMap<(Address, Address), Vec<&PoolState>> = HashMap::new();
         for state in pool_states.iter().filter(|state| is_supported_pool(state)) {
             pools_by_pair
@@ -987,7 +985,8 @@ impl SearchEngine {
                 .push(state);
         }
 
-        for config in configs.values() {
+        for config_index in self.pair_config_index.values().copied() {
+            let config = &self.pair_configs[config_index];
             let Some(pools) =
                 pools_by_pair.get(&canonical_token_pair(config.token0, config.token1))
             else {
@@ -1158,12 +1157,16 @@ pub fn engine_from_settings(
     min_expected_profit: U256,
     pair_configs: Vec<TokenPairSearchConfig>,
 ) -> anyhow::Result<SearchEngine> {
+    let pair_config_index = pair_config_index(&pair_configs);
+    let anchor_configs = anchor_search_configs(&pair_configs);
     Ok(SearchEngine {
         amount_sizes: expand_max_amounts(&parse_search_amounts(
             settings.search_amount_usdc.as_deref(),
         )?),
         paths: Vec::new(),
         pair_configs,
+        pair_config_index,
+        anchor_configs,
         min_expected_profit,
         max_price_impact_bps,
         whitelist_paths: Vec::new(),
@@ -2588,6 +2591,14 @@ fn anchor_search_configs(configs: &[TokenPairSearchConfig]) -> Vec<AnchorSearchC
     by_token.into_values().collect()
 }
 
+fn pair_config_index(configs: &[TokenPairSearchConfig]) -> HashMap<(Address, Address), usize> {
+    let mut out = HashMap::with_capacity(configs.len());
+    for (index, config) in configs.iter().enumerate() {
+        out.insert((config.token0, config.token1), index);
+    }
+    out
+}
+
 fn merge_anchor_config(
     by_token: &mut HashMap<Address, AnchorSearchConfig>,
     token: Address,
@@ -2693,7 +2704,8 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        demo_pool_states, expand_max_amounts, is_supported_config_pool, SearchEngine, SearchPath,
+        anchor_search_configs, demo_pool_states, expand_max_amounts, is_supported_config_pool,
+        pair_config_index, SearchEngine, SearchPath,
     };
 
     #[test]
@@ -2807,10 +2819,13 @@ mod tests {
             token0_multihop_min_profit: U256::from(1_000_000_000_000u64),
             token1_multihop_min_profit: U256::ZERO,
         };
+        let pair_configs = vec![config];
         let engine = SearchEngine {
             amount_sizes: Vec::new(),
             paths: Vec::new(),
-            pair_configs: vec![config],
+            pair_config_index: pair_config_index(&pair_configs),
+            anchor_configs: anchor_search_configs(&pair_configs),
+            pair_configs,
             min_expected_profit: U256::ONE,
             max_price_impact_bps: 10_000,
             whitelist_paths: Vec::new(),
@@ -2866,10 +2881,13 @@ mod tests {
             token0_multihop_min_profit: U256::from(1_000_000_000_000u64),
             token1_multihop_min_profit: U256::ZERO,
         };
+        let pair_configs = vec![config];
         let engine = SearchEngine {
             amount_sizes: Vec::new(),
             paths: Vec::new(),
-            pair_configs: vec![config],
+            pair_config_index: pair_config_index(&pair_configs),
+            anchor_configs: anchor_search_configs(&pair_configs),
+            pair_configs,
             min_expected_profit: U256::ONE,
             max_price_impact_bps: 10_000,
             whitelist_paths: Vec::new(),
