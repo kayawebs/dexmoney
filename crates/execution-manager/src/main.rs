@@ -21,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
+const CANDIDATE_POP_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
 struct ExecutionRuntime {
@@ -1044,27 +1045,39 @@ where
         .prune_candidates_before_block(first_fresh_block)
         .await?;
 
-    for candidate in candidate_store
-        .pop_candidates(MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE)
-        .await?
+    while candidates.len() < MAX_CANDIDATE_DRAIN_PER_CYCLE
+        && popped < MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE
     {
-        popped += 1;
-        if candidate.is_expired(now) {
-            expired += 1;
-            continue;
-        }
-        let block_lag = current_block.saturating_sub(candidate.block_number);
-        if block_lag > max_lag_blocks {
-            stale_by_block += 1;
-            min_stale_lag = min_stale_lag.min(block_lag);
-            max_stale_lag = max_stale_lag.max(block_lag);
-            continue;
-        }
-        min_fresh_lag = min_fresh_lag.min(block_lag);
-        max_fresh_lag = max_fresh_lag.max(block_lag);
-        candidates.push(candidate);
-        if candidates.len() >= MAX_CANDIDATE_DRAIN_PER_CYCLE {
+        let remaining_drain = MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE - popped;
+        let remaining_fresh = MAX_CANDIDATE_DRAIN_PER_CYCLE - candidates.len();
+        let pop_limit = CANDIDATE_POP_CHUNK_SIZE
+            .min(remaining_drain)
+            .min(remaining_fresh);
+        if pop_limit == 0 {
             break;
+        }
+
+        let popped_candidates = candidate_store.pop_candidates(pop_limit).await?;
+        if popped_candidates.is_empty() {
+            break;
+        }
+
+        for candidate in popped_candidates {
+            popped += 1;
+            if candidate.is_expired(now) {
+                expired += 1;
+                continue;
+            }
+            let block_lag = current_block.saturating_sub(candidate.block_number);
+            if block_lag > max_lag_blocks {
+                stale_by_block += 1;
+                min_stale_lag = min_stale_lag.min(block_lag);
+                max_stale_lag = max_stale_lag.max(block_lag);
+                continue;
+            }
+            min_fresh_lag = min_fresh_lag.min(block_lag);
+            max_fresh_lag = max_fresh_lag.max(block_lag);
+            candidates.push(candidate);
         }
     }
 
