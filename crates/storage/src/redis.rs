@@ -411,11 +411,7 @@ impl TickStateStore for RedisStore {
         let (key_values, keys_by_pool) = serialize_tick_entries(tick_states)?;
         let mut manager = self.manager.clone();
         let index_key = tick_pool_index_key(pool);
-        let mut existing_keys: Vec<String> = manager.smembers(&index_key).await?;
-        if existing_keys.is_empty() {
-            let pattern = format!("ticks:*:{pool}:*");
-            existing_keys = manager.keys(pattern).await?;
-        }
+        let existing_keys: Vec<String> = manager.smembers(&index_key).await?;
         let mut pipe = redis::pipe();
         if !existing_keys.is_empty() {
             pipe.del(existing_keys).ignore();
