@@ -13,6 +13,15 @@ use crate::{
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
 const REDIS_MGET_CHUNK_SIZE: usize = 1_000;
+const SET_CURRENT_BLOCK_IF_NEWER_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+local next_block = tonumber(ARGV[1])
+if current == false or tonumber(current) == nil or next_block > tonumber(current) then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return 1
+end
+return 0
+"#;
 
 #[derive(Clone)]
 pub struct RedisStore {
@@ -145,31 +154,10 @@ impl PoolStateStore for RedisStore {
             .iter()
             .map(|address| pool_address_index_key(*address))
             .collect::<Vec<_>>();
-        let mut pool_keys: Vec<Option<String>> = redis::cmd("MGET")
+        let pool_keys: Vec<Option<String>> = redis::cmd("MGET")
             .arg(&index_keys)
             .query_async(&mut manager)
             .await?;
-
-        let mut missing_indexes = Vec::new();
-        for (idx, key) in pool_keys.iter_mut().enumerate() {
-            if key.is_some() {
-                continue;
-            }
-            let address = addresses[idx];
-            let pattern = format!("pool:*:{address}");
-            let keys: Vec<String> = manager.keys(pattern).await?;
-            if let Some(found) = keys.into_iter().next() {
-                *key = Some(found.clone());
-                missing_indexes.push((idx, found));
-            }
-        }
-        if !missing_indexes.is_empty() {
-            let mut pipe = redis::pipe();
-            for (idx, key) in &missing_indexes {
-                pipe.set(&index_keys[*idx], key).ignore();
-            }
-            let _: () = pipe.query_async(&mut manager).await?;
-        }
 
         let existing_keys = pool_keys.iter().flatten().cloned().collect::<Vec<_>>();
         let values: Vec<Option<String>> = if existing_keys.is_empty() {
@@ -300,10 +288,13 @@ impl TickChangeStore for RedisStore {
 impl CurrentBlockStore for RedisStore {
     async fn set_current_block(&self, block_number: u64) -> Result<()> {
         let mut manager = self.manager.clone();
-        let current: Option<u64> = manager.get(current_block_key()).await?;
-        if current.map_or(true, |current| block_number > current) {
-            let _: () = manager.set(current_block_key(), block_number).await?;
-        }
+        let _: i64 = redis::cmd("EVAL")
+            .arg(SET_CURRENT_BLOCK_IF_NEWER_SCRIPT)
+            .arg(1)
+            .arg(current_block_key())
+            .arg(block_number)
+            .query_async(&mut manager)
+            .await?;
         Ok(())
     }
 
