@@ -19,6 +19,7 @@ use futures_util::{stream, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
@@ -38,6 +39,10 @@ const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
 const FEE_REFRESH_CONCURRENCY: usize = 16;
 const FLASHBLOCK_FALLBACK_BLOCK_CACHE_TTL: Duration = Duration::from_millis(250);
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
+const POOL_STATE_RECORD_QUEUE_CAPACITY: usize = 128;
+const DEX_EVENT_RECORD_QUEUE_CAPACITY: usize = 128;
+const BACKGROUND_RECORD_FLUSH_MS: u64 = 100;
+const BACKGROUND_RECORD_MAX_BATCH: usize = 512;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
     "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118";
@@ -74,6 +79,188 @@ pub struct MarketDataService<P> {
     pub provider: ChainProvider,
     pub pool_store: P,
     pub recorder: PostgresStore,
+    pool_state_recorder: PoolStateRecordQueue,
+    dex_event_recorder: DexEventRecordQueue,
+}
+
+#[derive(Clone)]
+struct PoolStateRecordQueue {
+    sender: mpsc::Sender<PoolStateRecordBatch>,
+}
+
+struct PoolStateRecordBatch {
+    states: Vec<PoolState>,
+    source: String,
+}
+
+#[derive(Clone)]
+struct DexEventRecordQueue {
+    sender: mpsc::Sender<Vec<DexEvent>>,
+}
+
+impl<P> MarketDataService<P> {
+    pub fn new(
+        settings: Settings,
+        provider: ChainProvider,
+        pool_store: P,
+        recorder: PostgresStore,
+    ) -> Self {
+        Self {
+            settings,
+            provider,
+            pool_store,
+            pool_state_recorder: PoolStateRecordQueue::spawn(recorder.clone()),
+            dex_event_recorder: DexEventRecordQueue::spawn(recorder.clone()),
+            recorder,
+        }
+    }
+}
+
+impl PoolStateRecordQueue {
+    fn spawn(store: PostgresStore) -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<PoolStateRecordBatch>(POOL_STATE_RECORD_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending: HashMap<String, Vec<PoolState>> = HashMap::new();
+            let mut flush_interval = interval(Duration::from_millis(BACKGROUND_RECORD_FLUSH_MS));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    maybe_batch = receiver.recv() => {
+                        let Some(batch) = maybe_batch else {
+                            flush_pool_state_records(&store, &mut pending).await;
+                            break;
+                        };
+                        pending.entry(batch.source).or_default().extend(batch.states);
+                        let pending_len = pending.values().map(Vec::len).sum::<usize>();
+                        if pending_len >= BACKGROUND_RECORD_MAX_BATCH {
+                            flush_pool_state_records(&store, &mut pending).await;
+                        }
+                    }
+                    _ = flush_interval.tick(), if !pending.is_empty() => {
+                        flush_pool_state_records(&store, &mut pending).await;
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    fn enqueue(&self, states: Vec<PoolState>, source: String) -> usize {
+        if states.is_empty() {
+            return 0;
+        }
+        let count = states.len();
+        match self
+            .sender
+            .try_send(PoolStateRecordBatch { states, source })
+        {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(batch)) => {
+                warn!(
+                    dropped = batch.states.len(),
+                    source = %batch.source,
+                    "pool state record queue full; dropping diagnostic records"
+                );
+                count
+            }
+            Err(mpsc::error::TrySendError::Closed(batch)) => {
+                warn!(
+                    dropped = batch.states.len(),
+                    source = %batch.source,
+                    "pool state record queue closed; dropping diagnostic records"
+                );
+                count
+            }
+        }
+    }
+}
+
+impl DexEventRecordQueue {
+    fn spawn(store: PostgresStore) -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<Vec<DexEvent>>(DEX_EVENT_RECORD_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            let mut flush_interval = interval(Duration::from_millis(BACKGROUND_RECORD_FLUSH_MS));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    maybe_events = receiver.recv() => {
+                        let Some(mut events) = maybe_events else {
+                            flush_dex_event_records(&store, &mut pending).await;
+                            break;
+                        };
+                        pending.append(&mut events);
+                        if pending.len() >= BACKGROUND_RECORD_MAX_BATCH {
+                            flush_dex_event_records(&store, &mut pending).await;
+                        }
+                    }
+                    _ = flush_interval.tick(), if !pending.is_empty() => {
+                        flush_dex_event_records(&store, &mut pending).await;
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    fn enqueue(&self, events: Vec<DexEvent>) -> usize {
+        if events.is_empty() {
+            return 0;
+        }
+        let count = events.len();
+        match self.sender.try_send(events) {
+            Ok(()) => 0,
+            Err(mpsc::error::TrySendError::Full(events)) => {
+                warn!(
+                    dropped = events.len(),
+                    "dex event record queue full; dropping diagnostic records"
+                );
+                count
+            }
+            Err(mpsc::error::TrySendError::Closed(events)) => {
+                warn!(
+                    dropped = events.len(),
+                    "dex event record queue closed; dropping diagnostic records"
+                );
+                count
+            }
+        }
+    }
+}
+
+async fn flush_pool_state_records(
+    store: &PostgresStore,
+    pending: &mut HashMap<String, Vec<PoolState>>,
+) {
+    let batches = std::mem::take(pending);
+    for (source, states) in batches {
+        let count = states.len();
+        if let Err(err) = store.record_pool_states_with_source(states, &source).await {
+            warn!(
+                count,
+                source = %source,
+                error = %err,
+                "failed to record pool states from background queue"
+            );
+        }
+    }
+}
+
+async fn flush_dex_event_records(store: &PostgresStore, pending: &mut Vec<DexEvent>) {
+    if pending.is_empty() {
+        return;
+    }
+    let events = std::mem::take(pending);
+    let count = events.len();
+    if let Err(err) = store.record_dex_events(events).await {
+        warn!(
+            count,
+            error = %err,
+            "failed to record dex events from background queue"
+        );
+    }
 }
 
 impl<P> MarketDataService<P>
@@ -90,42 +277,12 @@ where
         + 'static,
 {
     fn spawn_record_pool_states(&self, states: Vec<PoolState>, source: impl Into<String>) {
-        if states.is_empty() {
-            return;
-        }
         let source = source.into();
-        let recorder = self.recorder.clone();
-        tokio::spawn(async move {
-            let count = states.len();
-            if let Err(err) = recorder
-                .record_pool_states_with_source(states, &source)
-                .await
-            {
-                warn!(
-                    count,
-                    source = %source,
-                    error = %err,
-                    "failed to record pool states from background task"
-                );
-            }
-        });
+        self.pool_state_recorder.enqueue(states, source);
     }
 
     fn spawn_record_dex_events(&self, events: Vec<DexEvent>) {
-        if events.is_empty() {
-            return;
-        }
-        let recorder = self.recorder.clone();
-        tokio::spawn(async move {
-            let count = events.len();
-            if let Err(err) = recorder.record_dex_events(events).await {
-                warn!(
-                    count,
-                    error = %err,
-                    "failed to record dex events from background task"
-                );
-            }
-        });
+        self.dex_event_recorder.enqueue(events);
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -725,12 +882,12 @@ where
             return;
         }
 
-        let service = MarketDataService {
-            settings: self.settings.clone(),
-            provider: self.provider.clone(),
-            pool_store: self.pool_store.clone(),
-            recorder: self.recorder.clone(),
-        };
+        let service = MarketDataService::new(
+            self.settings.clone(),
+            self.provider.clone(),
+            self.pool_store.clone(),
+            self.recorder.clone(),
+        );
         tokio::spawn(async move {
             service.run_flashblocks_listener().await;
         });
@@ -2852,12 +3009,12 @@ where
             return;
         }
 
-        let service = MarketDataService {
-            settings: self.settings.clone(),
-            provider: self.provider.clone(),
-            pool_store: self.pool_store.clone(),
-            recorder: self.recorder.clone(),
-        };
+        let service = MarketDataService::new(
+            self.settings.clone(),
+            self.provider.clone(),
+            self.pool_store.clone(),
+            self.recorder.clone(),
+        );
         tokio::spawn(async move {
             let started = Instant::now();
             let total = v3_states.len();
