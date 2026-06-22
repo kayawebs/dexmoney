@@ -15,7 +15,7 @@ use base_arb_storage::{
     CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
     TickStateStore,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -35,6 +35,7 @@ const BALANCER_PROMOTE_LIMIT: i64 = 1_000;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
+const FEE_REFRESH_CONCURRENCY: usize = 16;
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
 const V3_POOL_CREATED_TOPIC: &str =
@@ -234,30 +235,95 @@ where
 
             let fee_started = Instant::now();
             let mut fee_refreshed_pools = HashSet::new();
-            let mut block_hash_cache = HashMap::new();
+            let mut fee_refresh_jobs = Vec::new();
             for (pool, block_number) in classic_fee_refreshes {
+                let Some(index) = state_index_by_pool.get(&pool).copied() else {
+                    continue;
+                };
+                let Some(state) = monitored_states.get(index) else {
+                    continue;
+                };
+                fee_refresh_jobs.push(FeeRefreshJob {
+                    pool,
+                    block_number,
+                    factory_address: state.factory_address,
+                    kind: FeeRefreshKind::Classic {
+                        stable: state.stable.unwrap_or(false),
+                    },
+                });
+            }
+            for (pool, block_number) in slipstream_fee_refreshes {
+                let Some(index) = state_index_by_pool.get(&pool).copied() else {
+                    continue;
+                };
+                let Some(state) = monitored_states.get(index) else {
+                    continue;
+                };
+                fee_refresh_jobs.push(FeeRefreshJob {
+                    pool,
+                    block_number,
+                    factory_address: state.factory_address,
+                    kind: FeeRefreshKind::Slipstream,
+                });
+            }
+
+            let mut block_hash_cache = HashMap::new();
+            let mut fee_refresh_results = Vec::new();
+            let mut fee_rpc_jobs = Vec::new();
+            for job in fee_refresh_jobs {
+                match cached_block_hash(&self.provider, &mut block_hash_cache, job.block_number)
+                    .await
+                {
+                    Ok(block_hash) => fee_rpc_jobs.push((job, block_hash)),
+                    Err(err) => fee_refresh_results.push(FeeRefreshOutcome {
+                        job,
+                        result: Err(err),
+                    }),
+                }
+            }
+            fee_refresh_results.extend(
+                stream::iter(fee_rpc_jobs)
+                    .map(|(job, block_hash)| {
+                        let provider = self.provider.clone();
+                        async move {
+                            let result = match job.kind {
+                                FeeRefreshKind::Classic { stable } => provider
+                                    .fetch_aerodrome_classic_fee_bps_at_block_hash(
+                                        job.factory_address,
+                                        job.pool,
+                                        stable,
+                                        &block_hash,
+                                    )
+                                    .await
+                                    .map(FeeRefreshValue::Classic),
+                                FeeRefreshKind::Slipstream => provider
+                                    .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
+                                        job.factory_address,
+                                        job.pool,
+                                        &block_hash,
+                                    )
+                                    .await
+                                    .map(FeeRefreshValue::Slipstream),
+                            };
+                            FeeRefreshOutcome { job, result }
+                        }
+                    })
+                    .buffer_unordered(FEE_REFRESH_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await,
+            );
+
+            for outcome in fee_refresh_results {
+                let pool = outcome.job.pool;
+                let block_number = outcome.job.block_number;
                 let Some(index) = state_index_by_pool.get(&pool).copied() else {
                     continue;
                 };
                 let Some(state) = monitored_states.get_mut(index) else {
                     continue;
                 };
-                let fee_result = async {
-                    let block_hash =
-                        cached_block_hash(&self.provider, &mut block_hash_cache, block_number)
-                            .await?;
-                    self.provider
-                        .fetch_aerodrome_classic_fee_bps_at_block_hash(
-                            state.factory_address,
-                            pool,
-                            state.stable.unwrap_or(false),
-                            &block_hash,
-                        )
-                        .await
-                }
-                .await;
-                match fee_result {
-                    Ok(fee_bps) => {
+                match outcome.result {
+                    Ok(FeeRefreshValue::Classic(fee_bps)) => {
                         state.fee_bps = fee_bps;
                         fee_refreshed_pools.insert(pool);
                         validation_snapshots
@@ -269,41 +335,7 @@ where
                             "Aerodrome Classic factory fee refreshed after reserve event"
                         );
                     }
-                    Err(err) => {
-                        changed_pools.remove(&pool);
-                        validation_snapshots.retain(|(_, address), _| *address != pool);
-                        warn!(
-                            pool = %pool,
-                            block_number,
-                            error = %err,
-                            "Classic state update withheld because factory fee refresh failed"
-                        );
-                    }
-                }
-            }
-
-            for (pool, block_number) in slipstream_fee_refreshes {
-                let Some(index) = state_index_by_pool.get(&pool).copied() else {
-                    continue;
-                };
-                let Some(state) = monitored_states.get_mut(index) else {
-                    continue;
-                };
-                let fee_result = async {
-                    let block_hash =
-                        cached_block_hash(&self.provider, &mut block_hash_cache, block_number)
-                            .await?;
-                    self.provider
-                        .fetch_aerodrome_slipstream_fee_pips_at_block_hash(
-                            state.factory_address,
-                            pool,
-                            &block_hash,
-                        )
-                        .await
-                }
-                .await;
-                match fee_result {
-                    Ok(fee_pips) => {
+                    Ok(FeeRefreshValue::Slipstream(fee_pips)) => {
                         state.fee_pips = Some(fee_pips);
                         state.fee_bps = fee_pips / 100;
                         fee_refreshed_pools.insert(pool);
@@ -319,12 +351,20 @@ where
                     Err(err) => {
                         changed_pools.remove(&pool);
                         validation_snapshots.retain(|(_, address), _| *address != pool);
-                        warn!(
-                            pool = %pool,
-                            block_number,
-                            error = %err,
-                            "Slipstream state update withheld because dynamic fee refresh failed"
-                        );
+                        match outcome.job.kind {
+                            FeeRefreshKind::Classic { .. } => warn!(
+                                pool = %pool,
+                                block_number,
+                                error = %err,
+                                "Classic state update withheld because factory fee refresh failed"
+                            ),
+                            FeeRefreshKind::Slipstream => warn!(
+                                pool = %pool,
+                                block_number,
+                                error = %err,
+                                "Slipstream state update withheld because dynamic fee refresh failed"
+                            ),
+                        }
                     }
                 }
             }
@@ -3035,6 +3075,32 @@ fn quote_relevant_pool_state_changed(previous: &PoolState, next: &PoolState) -> 
         || previous.liquidity != next.liquidity
         || previous.tick != next.tick
         || previous.tick_spacing != next.tick_spacing
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeeRefreshJob {
+    pool: Address,
+    block_number: u64,
+    factory_address: Option<Address>,
+    kind: FeeRefreshKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FeeRefreshKind {
+    Classic { stable: bool },
+    Slipstream,
+}
+
+#[derive(Debug)]
+enum FeeRefreshValue {
+    Classic(u32),
+    Slipstream(u32),
+}
+
+#[derive(Debug)]
+struct FeeRefreshOutcome {
+    job: FeeRefreshJob,
+    result: Result<FeeRefreshValue>,
 }
 
 async fn cached_block_hash(
