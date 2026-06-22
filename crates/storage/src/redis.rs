@@ -88,6 +88,17 @@ pub fn failures_key(path_hash: &str) -> String {
     format!("failures:{path_hash}")
 }
 
+fn queue_sadd_addresses(pipe: &mut redis::Pipeline, key: &str, pools: &[Address]) {
+    if pools.is_empty() {
+        return;
+    }
+    let members = pools
+        .iter()
+        .map(|pool| format!("{pool:#x}"))
+        .collect::<Vec<_>>();
+    pipe.cmd("SADD").arg(key).arg(members).ignore();
+}
+
 fn serialize_tick_entries(
     tick_states: Vec<TickState>,
 ) -> Result<(Vec<(String, String)>, HashMap<Address, Vec<String>>)> {
@@ -258,10 +269,7 @@ impl PoolChangeStore for RedisStore {
         }
         let mut manager = self.manager.clone();
         let mut pipe = redis::pipe();
-        for pool in pools {
-            pipe.sadd(changed_pools_key(), format!("{pool:#x}"))
-                .ignore();
-        }
+        queue_sadd_addresses(&mut pipe, changed_pools_key(), &pools);
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
@@ -291,10 +299,7 @@ impl TickChangeStore for RedisStore {
         }
         let mut manager = self.manager.clone();
         let mut pipe = redis::pipe();
-        for pool in pools {
-            pipe.sadd(changed_tick_pools_key(), format!("{pool:#x}"))
-                .ignore();
-        }
+        queue_sadd_addresses(&mut pipe, changed_tick_pools_key(), &pools);
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
@@ -360,10 +365,7 @@ impl PoolRuntimeStore for RedisStore {
             pipe.set(index_key, &key).ignore();
             pipe.sadd(pool_state_index_key(), key).ignore();
         }
-        for pool in changed_pools {
-            pipe.sadd(changed_pools_key(), format!("{pool:#x}"))
-                .ignore();
-        }
+        queue_sadd_addresses(&mut pipe, changed_pools_key(), &changed_pools);
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
