@@ -233,16 +233,6 @@ impl PoolStateStore for RedisStore {
                 }
             }
         }
-        if !out.is_empty() {
-            let mut pipe = redis::pipe();
-            for state in &out {
-                let key = pool_state_key(state.pool_id.chain_id, state.pool_id.address);
-                pipe.set(pool_address_index_key(state.pool_id.address), &key)
-                    .ignore();
-                pipe.sadd(pool_state_index_key(), key).ignore();
-            }
-            let _: () = pipe.query_async(&mut manager).await?;
-        }
         Ok(out)
     }
 }
