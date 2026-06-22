@@ -93,6 +93,7 @@ pub struct SearchStats {
     pub best_profit_rejected_by_model_edge: U256,
     pub best_profit: U256,
     pub top_min_profit_rejected: Vec<RejectedQuoteSample>,
+    pub top_price_impact_rejected: Vec<PriceImpactRejectedSample>,
     pub top_quote_skipped: Vec<QuoteSkipSample>,
     pub top_rough_quote_failures: Vec<RoughQuoteFailureSample>,
 }
@@ -104,6 +105,18 @@ pub struct RejectedQuoteSample {
     pub amount_in: U256,
     pub expected_profit: U256,
     pub required_profit: U256,
+    pub step_count: usize,
+    pub modes: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriceImpactRejectedSample {
+    pub path_name: String,
+    pub token_in: Address,
+    pub amount_in: U256,
+    pub expected_profit: U256,
+    pub price_impact_bps: u64,
+    pub max_price_impact_bps: u64,
     pub step_count: usize,
     pub modes: String,
 }
@@ -185,6 +198,9 @@ impl SearchStats {
         self.best_profit = self.best_profit.max(other.best_profit);
         for sample in &other.top_min_profit_rejected {
             self.record_min_profit_rejected_sample(sample.clone());
+        }
+        for sample in &other.top_price_impact_rejected {
+            self.record_price_impact_rejected_sample(sample.clone());
         }
         for sample in &other.top_quote_skipped {
             self.record_quote_skip_sample(sample.clone());
@@ -268,6 +284,45 @@ impl SearchStats {
         self.top_min_profit_rejected.truncate(TOP_REJECTED_SAMPLES);
     }
 
+    fn record_price_impact_rejected(
+        &mut self,
+        path: &ArbPath,
+        amount_in: U256,
+        expected_profit: U256,
+        price_impact_bps: u64,
+        max_price_impact_bps: u64,
+        diagnostics: &QuoteDiagnostics,
+    ) {
+        self.price_impact_rejected += 1;
+        self.best_profit_rejected_by_impact =
+            self.best_profit_rejected_by_impact.max(expected_profit);
+        self.record_price_impact_rejected_sample(PriceImpactRejectedSample {
+            path_name: path.name.clone(),
+            token_in: path
+                .steps
+                .first()
+                .map(|step| step.token_in)
+                .unwrap_or(Address::ZERO),
+            amount_in,
+            expected_profit,
+            price_impact_bps,
+            max_price_impact_bps,
+            step_count: path.steps.len(),
+            modes: diagnostics.modes.join("+"),
+        });
+    }
+
+    fn record_price_impact_rejected_sample(&mut self, sample: PriceImpactRejectedSample) {
+        self.top_price_impact_rejected.push(sample);
+        self.top_price_impact_rejected.sort_by(|a, b| {
+            b.expected_profit
+                .cmp(&a.expected_profit)
+                .then_with(|| b.price_impact_bps.cmp(&a.price_impact_bps))
+        });
+        self.top_price_impact_rejected
+            .truncate(TOP_REJECTED_SAMPLES);
+    }
+
     pub fn top_min_profit_rejected_summary(&self) -> String {
         if self.top_min_profit_rejected.is_empty() {
             return "-".to_string();
@@ -290,6 +345,29 @@ impl SearchStats {
                     sample.expected_profit,
                     sample.required_profit,
                     ratio_bps,
+                    sample.modes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    pub fn top_price_impact_rejected_summary(&self) -> String {
+        if self.top_price_impact_rejected.is_empty() {
+            return "-".to_string();
+        }
+        self.top_price_impact_rejected
+            .iter()
+            .map(|sample| {
+                format!(
+                    "path={} token_in={:#x} steps={} amount={} profit={} impact_bps={} max_impact_bps={} modes={}",
+                    sample.path_name,
+                    sample.token_in,
+                    sample.step_count,
+                    sample.amount_in,
+                    sample.expected_profit,
+                    sample.price_impact_bps,
+                    sample.max_price_impact_bps,
                     sample.modes
                 )
             })
@@ -571,9 +649,14 @@ impl SearchEngine {
                         continue;
                     }
                     if price_impact_bps > self.max_price_impact_bps {
-                        stats.price_impact_rejected += 1;
-                        stats.best_profit_rejected_by_impact =
-                            stats.best_profit_rejected_by_impact.max(expected_profit);
+                        stats.record_price_impact_rejected(
+                            &search_path.path,
+                            *amount_in,
+                            expected_profit,
+                            price_impact_bps,
+                            self.max_price_impact_bps,
+                            &diagnostics,
+                        );
                         continue;
                     }
                     stats.best_profit = stats.best_profit.max(expected_profit);
@@ -717,9 +800,14 @@ impl SearchEngine {
                 continue;
             }
             if price_impact_bps > self.max_price_impact_bps {
-                stats.price_impact_rejected += 1;
-                stats.best_profit_rejected_by_impact =
-                    stats.best_profit_rejected_by_impact.max(expected_profit);
+                stats.record_price_impact_rejected(
+                    &search_path.path,
+                    *amount_in,
+                    expected_profit,
+                    price_impact_bps,
+                    self.max_price_impact_bps,
+                    &diagnostics,
+                );
                 continue;
             }
             stats.best_profit = stats.best_profit.max(expected_profit);
