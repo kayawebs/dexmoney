@@ -1843,7 +1843,7 @@ impl RecorderStore for PostgresStore {
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO simulations (
-                id, opportunity_id, created_at, success, simulated_profit, gas_estimate,
+                id, opportunity_id, success, simulated_profit, gas_estimate,
                 revert_reason, calldata, raw_result, block_number, token_in, amount_in,
                 expected_profit, min_profit, path_name, base_fee_per_gas, max_fee_per_gas,
                 max_priority_fee_per_gas, gas_cost_cap, gas_cost_expected, net_simulated_profit
