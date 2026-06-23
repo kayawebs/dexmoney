@@ -355,6 +355,7 @@ struct AuthQuery {
     password: Option<String>,
     q: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
     include_pair_tokens: Option<bool>,
 }
 
@@ -495,10 +496,11 @@ async fn registry_tokens_page(
     if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
         return Ok(Html(render_login()));
     }
-    let limit = auth.limit.unwrap_or(300).clamp(50, 1000);
+    let limit = auth.limit.unwrap_or(50).clamp(20, 200);
+    let offset = auth.offset.unwrap_or(0).max(0);
     let query = auth.q.as_deref().unwrap_or_default().trim();
     let include_pair_tokens = auth.include_pair_tokens.unwrap_or(false);
-    let rows = fetch_token_search_defaults(&state.pool, query, limit, include_pair_tokens)
+    let rows = fetch_token_search_defaults(&state.pool, query, limit, offset, include_pair_tokens)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let content = format!(
@@ -512,6 +514,7 @@ async fn registry_tokens_page(
             auth.password.as_deref(),
             query,
             limit,
+            offset,
             include_pair_tokens,
             rows.len(),
         ),
@@ -1818,6 +1821,7 @@ async fn fetch_token_search_defaults(
     pool: &PgPool,
     query: &str,
     limit: i64,
+    offset: i64,
     include_pair_tokens: bool,
 ) -> Result<Vec<TokenSearchDefaultRow>> {
     Ok(sqlx::query_as::<_, TokenSearchDefaultRow>(
@@ -1922,11 +1926,13 @@ async fn fetch_token_search_defaults(
             MIN(token_set.symbol),
             token_set.token_address
         LIMIT $3
+        OFFSET $4
         "#,
     )
     .bind(query)
     .bind(include_pair_tokens)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?)
 }
@@ -3226,10 +3232,40 @@ fn render_token_search_controls(
     auth_password: Option<&str>,
     query: &str,
     limit: i64,
+    offset: i64,
     include_pair_tokens: bool,
     shown: usize,
 ) -> String {
     let checked = if include_pair_tokens { " checked" } else { "" };
+    let previous_offset = offset.saturating_sub(limit);
+    let next_offset = offset + shown as i64;
+    let password_param = auth_password
+        .map(|password| format!("&password={}", url_query_encode(password)))
+        .unwrap_or_default();
+    let include_pair_param = if include_pair_tokens {
+        "&include_pair_tokens=true"
+    } else {
+        ""
+    };
+    let query_param = if query.is_empty() {
+        String::new()
+    } else {
+        format!("&q={}", url_query_encode(query))
+    };
+    let previous_link = if offset > 0 {
+        format!(
+            r#"<a class="button-link" href="/registry/tokens?limit={limit}&offset={previous_offset}{query_param}{include_pair_param}{password_param}">Prev</a>"#
+        )
+    } else {
+        r#"<span class="muted">Prev</span>"#.to_string()
+    };
+    let next_link = if shown as i64 >= limit {
+        format!(
+            r#"<a class="button-link" href="/registry/tokens?limit={limit}&offset={next_offset}{query_param}{include_pair_param}{password_param}">Next</a>"#
+        )
+    } else {
+        r#"<span class="muted">Next</span>"#.to_string()
+    };
     format!(
         r#"<form method="get" action="/registry/tokens" class="filter-form">
   {password_input}
@@ -3237,13 +3273,17 @@ fn render_token_search_controls(
     <input class="compact-input" name="q" value="{query}" placeholder="symbol or address">
   </label>
   <label>Limit
-    <input class="compact-input tiny-input" name="limit" value="{limit}" placeholder="300">
+    <input class="compact-input tiny-input" name="limit" value="{limit}" placeholder="50">
+  </label>
+  <label>Offset
+    <input class="compact-input tiny-input" name="offset" value="{offset}" placeholder="0">
   </label>
   <label class="inline-check">
     <input type="checkbox" name="include_pair_tokens" value="true"{checked}> include pair-token candidates
   </label>
   <button type="submit">Filter</button>
-  <span class="muted">Showing {shown} rows. Default view only loads configured token defaults; search to edit unconfigured tokens.</span>
+  <span class="muted">Showing {shown} rows from offset {offset}. Default view only loads configured token defaults; search to edit unconfigured tokens.</span>
+  <span class="pager">{previous_link} {next_link}</span>
 </form>"#,
         password_input = auth_password
             .map(|password| format!(
@@ -3253,8 +3293,11 @@ fn render_token_search_controls(
             .unwrap_or_default(),
         query = escape(query),
         limit = limit,
+        offset = offset,
         checked = checked,
         shown = shown,
+        previous_link = previous_link,
+        next_link = next_link,
     )
 }
 
@@ -3782,6 +3825,20 @@ fn escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn url_query_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn escape_js_string(value: &str) -> String {
