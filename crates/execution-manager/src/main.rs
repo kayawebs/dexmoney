@@ -718,6 +718,7 @@ where
     }
 
     let approvals = simulator::required_token_approvals(candidate, settings)?;
+    let approval_count = approvals.len();
     let missing_approvals = tx_manager::missing_approvals_cached(
         provider,
         settings,
@@ -734,6 +735,17 @@ where
         );
         approvals
     });
+    if approval_count > 0 {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            approvals = approval_count,
+            missing_approvals = missing_approvals.len(),
+            submit_enabled = settings.execution_submit_enabled,
+            auto_approve_enabled = settings.execution_auto_approve_enabled,
+            "executor approval preflight checked route allowances"
+        );
+    }
     if missing_approvals.is_empty() {
         return Ok(None);
     }
@@ -742,9 +754,11 @@ where
         anyhow::bail!("EOA_PRIVATE_KEY_1 is required for executor approval admin txs");
     };
     if admin_has_pending_nonce(provider, fund_wallet.address()).await? {
-        debug!(
+        info!(
             candidate_id = %candidate.id,
             path = %candidate.path.name,
+            fund = %fund_wallet.address(),
+            missing_approvals = missing_approvals.len(),
             "candidate skipped because fund/admin EOA has a pending tx"
         );
         return Ok(Some(CandidateAction::Skipped("admin_pending_approval")));
