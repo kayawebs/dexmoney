@@ -2,6 +2,7 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use std::collections::HashSet;
 use tracing::{info, warn};
 
 use crate::{
@@ -1823,8 +1824,34 @@ impl RecorderStore for PostgresStore {
         if simulations.is_empty() {
             return Ok(());
         }
+        let opportunity_ids = simulations
+            .iter()
+            .map(|simulation| simulation.opportunity_id)
+            .collect::<Vec<_>>();
+        let existing_opportunities = sqlx::query_scalar::<_, uuid::Uuid>(
+            r#"SELECT id FROM opportunities WHERE id = ANY($1)"#,
+        )
+        .bind(&opportunity_ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let dropped_missing_opportunities = simulations
+            .iter()
+            .filter(|simulation| !existing_opportunities.contains(&simulation.opportunity_id))
+            .count();
+        if dropped_missing_opportunities > 0 {
+            warn!(
+                dropped = dropped_missing_opportunities,
+                total = simulations.len(),
+                "dropping simulations whose opportunity record is missing"
+            );
+        }
         let mut rows = Vec::with_capacity(simulations.len());
         for simulation in simulations {
+            if !existing_opportunities.contains(&simulation.opportunity_id) {
+                continue;
+            }
             let calldata_hex = format!("0x{}", hex::encode(&simulation.calldata));
             let raw_result = sqlx::types::Json(serde_json::json!({
                 "success": simulation.success,
@@ -1844,6 +1871,9 @@ impl RecorderStore for PostgresStore {
             }));
             let block_number = simulation.block_number.map(i64::try_from).transpose()?;
             rows.push((simulation, calldata_hex, raw_result, block_number));
+        }
+        if rows.is_empty() {
+            return Ok(());
         }
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
