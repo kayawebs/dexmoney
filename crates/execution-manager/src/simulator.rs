@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::constants::{
-    AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER,
+    AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, AERODROME_SLIPSTREAM_ROUTER,
+    PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER, UNISWAP_V3_FACTORY,
 };
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
@@ -403,13 +404,14 @@ fn step_execution_kind(
             let default_factory = settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
-            reject_untrusted_factory(step.factory_address, default_factory, "Aerodrome Classic")?;
+            reject_untrusted_factory(step.factory_address, default_factory, &[], "Aerodrome Classic")?;
             Ok(ExecutorStepKind::AerodromeClassic)
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
             reject_untrusted_factory(
                 step.factory_address,
                 settings.aerodrome_slipstream_factory,
+                &AERODROME_SLIPSTREAM_FACTORIES,
                 "Aerodrome Slipstream",
             )?;
             Ok(ExecutorStepKind::AerodromeSlipstream)
@@ -418,6 +420,7 @@ fn step_execution_kind(
             reject_untrusted_factory(
                 step.factory_address,
                 settings.uniswap_v3_factory,
+                &[UNISWAP_V3_FACTORY],
                 "Uniswap V3",
             )?;
             Ok(ExecutorStepKind::UniswapV3Router)
@@ -426,13 +429,14 @@ fn step_execution_kind(
             let pancake_factory = settings
                 .pancake_v3_factory
                 .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
-            reject_untrusted_factory(step.factory_address, pancake_factory, "Pancake V3")?;
+            reject_untrusted_factory(step.factory_address, pancake_factory, &[], "Pancake V3")?;
             Ok(ExecutorStepKind::PancakeV3Router)
         }
         (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => {
             reject_untrusted_factory(
                 step.factory_address,
                 settings.uniswap_v4_pool_manager,
+                &[],
                 "Uniswap V4 PoolManager",
             )?;
             Ok(ExecutorStepKind::Adapter)
@@ -441,6 +445,7 @@ fn step_execution_kind(
             reject_untrusted_factory(
                 step.factory_address,
                 settings.balancer_v3_vault,
+                &[],
                 "Balancer V3 Vault",
             )?;
             Ok(ExecutorStepKind::Adapter)
@@ -452,20 +457,26 @@ fn step_execution_kind(
 fn reject_untrusted_factory(
     step_factory: Option<Address>,
     configured_factory: Option<Address>,
+    fallback_factories: &[&str],
     label: &str,
 ) -> Result<()> {
     let Some(factory) = step_factory else {
         return Ok(());
     };
-    let Some(configured) = configured_factory else {
-        anyhow::bail!("{label} factory is not configured; refusing untrusted factory {factory:#x}");
-    };
-    if factory != configured {
+    if configured_factory == Some(factory)
+        || fallback_factories
+            .iter()
+            .any(|expected| expected.parse::<Address>().is_ok_and(|expected| expected == factory))
+    {
+        return Ok(());
+    }
+
+    if let Some(configured) = configured_factory {
         anyhow::bail!(
             "{label} factory {factory:#x} is not trusted; configured factory is {configured:#x}"
         );
     }
-    Ok(())
+    anyhow::bail!("{label} factory is not configured; refusing untrusted factory {factory:#x}")
 }
 
 fn router_fee_for_step(
@@ -520,6 +531,7 @@ fn factory_for_step(
             settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok()),
+            &[],
             "Aerodrome Classic",
         )?;
         if let Some(factory) = step.factory_address {
@@ -527,6 +539,7 @@ fn factory_for_step(
         }
         settings
             .aerodrome_pool_factory
+            .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok())
             .context("AERODROME_POOL_FACTORY is required for Aerodrome Classic execution")
     } else if matches!(
         (dex, variant),
@@ -535,14 +548,17 @@ fn factory_for_step(
         reject_untrusted_factory(
             step.factory_address,
             settings.aerodrome_slipstream_factory,
+            &AERODROME_SLIPSTREAM_FACTORIES,
             "Aerodrome Slipstream",
         )?;
         if let Some(factory) = step.factory_address {
             return Ok(factory);
         }
-        Ok(settings
-            .aerodrome_slipstream_factory
-            .unwrap_or(Address::ZERO))
+        Ok(settings.aerodrome_slipstream_factory.unwrap_or_else(|| {
+            AERODROME_SLIPSTREAM_FACTORIES[0]
+                .parse()
+                .expect("valid Aerodrome Slipstream factory")
+        }))
     } else if matches!(
         (dex, variant),
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None)
@@ -550,12 +566,17 @@ fn factory_for_step(
         reject_untrusted_factory(
             step.factory_address,
             settings.uniswap_v3_factory,
+            &[UNISWAP_V3_FACTORY],
             "Uniswap V3",
         )?;
         if let Some(factory) = step.factory_address {
             return Ok(factory);
         }
-        Ok(settings.uniswap_v3_factory.unwrap_or(Address::ZERO))
+        Ok(settings.uniswap_v3_factory.unwrap_or_else(|| {
+            UNISWAP_V3_FACTORY
+                .parse()
+                .expect("valid Uniswap V3 factory")
+        }))
     } else if matches!(
         (dex, variant),
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None)
@@ -563,7 +584,7 @@ fn factory_for_step(
         let pancake_factory = settings
             .pancake_v3_factory
             .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
-        reject_untrusted_factory(step.factory_address, pancake_factory, "Pancake V3")?;
+        reject_untrusted_factory(step.factory_address, pancake_factory, &[], "Pancake V3")?;
         if let Some(factory) = step.factory_address {
             return Ok(factory);
         }
@@ -578,6 +599,7 @@ fn factory_for_step(
         reject_untrusted_factory(
             step.factory_address,
             settings.uniswap_v4_pool_manager,
+            &[],
             "Uniswap V4 PoolManager",
         )?;
         settings
@@ -590,6 +612,7 @@ fn factory_for_step(
         reject_untrusted_factory(
             step.factory_address,
             settings.balancer_v3_vault,
+            &[],
             "Balancer V3 Vault",
         )?;
         settings
