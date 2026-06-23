@@ -404,7 +404,12 @@ fn step_execution_kind(
             let default_factory = settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
-            reject_untrusted_factory(step.factory_address, default_factory, &[], "Aerodrome Classic")?;
+            reject_untrusted_factory(
+                step.factory_address,
+                default_factory,
+                &[],
+                "Aerodrome Classic",
+            )?;
             Ok(ExecutorStepKind::AerodromeClassic)
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
@@ -464,9 +469,11 @@ fn reject_untrusted_factory(
         return Ok(());
     };
     if configured_factory == Some(factory)
-        || fallback_factories
-            .iter()
-            .any(|expected| expected.parse::<Address>().is_ok_and(|expected| expected == factory))
+        || fallback_factories.iter().any(|expected| {
+            expected
+                .parse::<Address>()
+                .is_ok_and(|expected| expected == factory)
+        })
     {
         return Ok(());
     }
