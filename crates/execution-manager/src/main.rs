@@ -710,10 +710,10 @@ where
     E: EoaStateStore,
     R: RecorderStore + PendingTransactionStore,
 {
-    if !settings.execution_submit_enabled {
+    if !settings.execution_submit_enabled && !settings.execution_auto_approve_enabled {
         return Ok(None);
     }
-    if wallet.is_none() {
+    if settings.execution_submit_enabled && wallet.is_none() {
         anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
     }
 
@@ -738,9 +738,6 @@ where
         return Ok(None);
     }
 
-    let Some(worker_wallet) = wallet else {
-        anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
-    };
     let Some(fund_wallet) = fund_wallet else {
         anyhow::bail!("EOA_PRIVATE_KEY_1 is required for executor approval admin txs");
     };
@@ -805,7 +802,8 @@ where
                 token = %approval.token,
                 spender = %approval.spender,
                 tx_hash = %submission.tx_hash,
-                "executor approval submitted by fund EOA; current candidate skipped"
+                submit_enabled = settings.execution_submit_enabled,
+                "executor approval submitted by fund EOA"
             );
             recorder
                 .record_transaction(tx_manager::pending_tx_result(
@@ -814,6 +812,12 @@ where
                     &submission,
                 ))
                 .await?;
+            if !settings.execution_submit_enabled {
+                return Ok(Some(CandidateAction::Simulated));
+            }
+            let Some(worker_wallet) = wallet else {
+                anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
+            };
             let mut lane = eoa_store
                 .get_lane_state(worker_wallet.address())
                 .await?

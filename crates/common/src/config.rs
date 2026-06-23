@@ -70,6 +70,7 @@ pub struct Settings {
     pub execution_gas_profit_buffer_bps: u64,
     pub execution_max_candidate_lag_blocks: u64,
     pub execution_submit_enabled: bool,
+    pub execution_auto_approve_enabled: bool,
     pub execution_simulation_concurrency: u64,
     pub execution_eoa_pool_size: u64,
     pub execution_worker_min_balance_wei: Option<String>,
@@ -116,6 +117,7 @@ impl Settings {
             .set_default("execution_gas_profit_buffer_bps", 15_000u64)?
             .set_default("execution_max_candidate_lag_blocks", 1u64)?
             .set_default("execution_submit_enabled", false)?
+            .set_default("execution_auto_approve_enabled", false)?
             .set_default("execution_simulation_concurrency", 8u64)?
             .set_default("execution_eoa_pool_size", 5u64)?
             .set_default("execution_worker_min_balance_wei", "200000000000000")?
