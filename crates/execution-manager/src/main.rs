@@ -819,13 +819,6 @@ where
                 submit_enabled = settings.execution_submit_enabled,
                 "executor approval submitted by fund EOA"
             );
-            recorder
-                .record_transaction(tx_manager::pending_tx_result(
-                    candidate,
-                    fund_wallet.address(),
-                    &submission,
-                ))
-                .await?;
             if !settings.execution_submit_enabled {
                 return Ok(Some(CandidateAction::Simulated));
             }
