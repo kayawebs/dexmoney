@@ -35,6 +35,7 @@ struct Cli {
     lookback_blocks: u64,
     limit: usize,
     output: Option<PathBuf>,
+    include_opportunity_lookup: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,7 @@ struct PoolCoverage {
     discovery_source: Option<String>,
     dex_event_logs_same_block: i64,
     opportunities_near_block: i64,
+    opportunity_lookup_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -324,6 +326,7 @@ async fn main() -> Result<()> {
                     tx.block_number,
                     &pool,
                     &topic0,
+                    cli.include_opportunity_lookup,
                 )
                 .await?,
             );
@@ -408,6 +411,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut lookback_blocks = 500u64;
     let mut limit = 50usize;
     let mut output = None;
+    let mut include_opportunity_lookup = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -434,8 +438,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
                     args.next().context("--output requires a value")?,
                 ));
             }
+            "--include-opportunity-lookup" => {
+                include_opportunity_lookup = true;
+            }
             "--help" | "-h" => {
-                println!("Usage: cargo run -p base-arb-recorder --bin competitor_live_compare -- --address <collector> [--lookback-blocks 500] [--limit 50] [--output report.txt]");
+                println!("Usage: cargo run -p base-arb-recorder --bin competitor_live_compare -- --address <collector> [--lookback-blocks 500] [--limit 50] [--output report.txt] [--include-opportunity-lookup]");
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
@@ -446,6 +453,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli> {
         lookback_blocks,
         limit,
         output,
+        include_opportunity_lookup,
     })
 }
 
@@ -551,8 +559,21 @@ async fn load_pool_coverage(
     block_number: u64,
     pool_address: &str,
     topic0: &str,
+    include_opportunity_lookup: bool,
 ) -> Result<PoolCoverage> {
-    let row = sqlx::query(
+    let opportunities_expr = if include_opportunity_lookup {
+        r#"
+            (
+                SELECT count(*)
+                FROM opportunities o, target t
+                WHERE o.block_number BETWEEN GREATEST($2 - 1, 0) AND $2 + 1
+                  AND lower(o.path_json::text) LIKE '%' || t.pool || '%'
+            )
+        "#
+    } else {
+        "0::bigint"
+    };
+    let sql = format!(
         r#"
         WITH target AS (SELECT lower($1::text) AS pool)
         SELECT
@@ -577,12 +598,7 @@ async fn load_pool_coverage(
                 WHERE lower(e.pool_address) = t.pool
                   AND e.block_number = $2
             ) AS dex_event_logs_same_block,
-            (
-                SELECT count(*)
-                FROM opportunities o, target t
-                WHERE o.block_number BETWEEN GREATEST($2 - 1, 0) AND $2 + 1
-                  AND lower(o.path_json::text) LIKE '%' || t.pool || '%'
-            ) AS opportunities_near_block
+            {opportunities_expr} AS opportunities_near_block
         FROM target t
         LEFT JOIN pools p ON lower(p.pool_address) = t.pool
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
@@ -598,12 +614,13 @@ async fn load_pool_coverage(
         LEFT JOIN protocol_pool_observations po
             ON po.chain_id = $3 AND lower(po.pool_address) = t.pool
         "#,
-    )
-    .bind(pool_address)
-    .bind(i64::try_from(block_number)?)
-    .bind(i64::try_from(chain_id)?)
-    .fetch_one(pool)
-    .await?;
+    );
+    let row = sqlx::query(&sql)
+        .bind(pool_address)
+        .bind(i64::try_from(block_number)?)
+        .bind(i64::try_from(chain_id)?)
+        .fetch_one(pool)
+        .await?;
 
     Ok(PoolCoverage {
         pool: pool_address.to_string(),
@@ -625,6 +642,7 @@ async fn load_pool_coverage(
         discovery_source: row.try_get("discovery_source")?,
         dex_event_logs_same_block: row.try_get("dex_event_logs_same_block")?,
         opportunities_near_block: row.try_get("opportunities_near_block")?,
+        opportunity_lookup_enabled: include_opportunity_lookup,
     })
 }
 
@@ -675,6 +693,9 @@ fn classify_tx(coverages: &[PoolCoverage]) -> String {
     if coverages.iter().any(|row| row.latest_state_block.is_none()) {
         return "missing_pool_state".into();
     }
+    if coverages.iter().any(|row| !row.opportunity_lookup_enabled) {
+        return "opportunity_lookup_skipped".into();
+    }
     if coverages
         .iter()
         .all(|row| row.opportunities_near_block == 0)
@@ -695,11 +716,15 @@ fn tx_diagnostics(
     let anchors_touched = anchors_touched(coverages, anchor_tokens);
     let anchor_cycles = anchor_cycles(coverages, anchor_tokens, 4);
     let recognized_anchor_cycle = !anchor_cycles.is_empty();
-    let has_opportunity = coverages.iter().any(|row| row.opportunities_near_block > 0);
+    let opportunity_lookup_enabled = coverages.iter().all(|row| row.opportunity_lookup_enabled);
+    let has_opportunity =
+        opportunity_lookup_enabled && coverages.iter().any(|row| row.opportunities_near_block > 0);
     let searcher_gap = if recognized_swap_pools == 0 {
         "no_supported_swap_logs"
     } else if !recognized_anchor_cycle {
         "recognized_swaps_do_not_form_anchor_cycle"
+    } else if !opportunity_lookup_enabled {
+        "opportunity_lookup_skipped"
     } else if !has_opportunity {
         "recognized_anchor_cycle_but_no_opportunity"
     } else {
@@ -1226,7 +1251,7 @@ fn write_tx(
     for row in coverages {
         writeln!(
             writer,
-            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} fee_pips={} tick_spacing={} hooks={} enabled={} state_block={} state_source={} first_seen_block={} age_blocks={} logs_30d={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
+            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} fee_pips={} tick_spacing={} hooks={} enabled={} state_block={} state_source={} first_seen_block={} age_blocks={} logs_30d={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={} opportunity_lookup={}",
             short_addr(&row.pool),
             topic_family(&row.topic0),
             row.token0
@@ -1270,6 +1295,7 @@ fn write_tx(
             row.discovery_source.as_deref().unwrap_or("-"),
             row.dex_event_logs_same_block,
             row.opportunities_near_block,
+            row.opportunity_lookup_enabled,
         )?;
     }
     writeln!(writer)?;
