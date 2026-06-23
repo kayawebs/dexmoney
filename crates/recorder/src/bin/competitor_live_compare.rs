@@ -595,24 +595,33 @@ async fn load_pool_coverage(
             (
                 SELECT count(*)
                 FROM dex_events e, target t
-                WHERE lower(e.pool_address) = t.pool
+                WHERE e.pool_address = t.pool
                   AND e.block_number = $2
             ) AS dex_event_logs_same_block,
             {opportunities_expr} AS opportunities_near_block
         FROM target t
-        LEFT JOIN pools p ON lower(p.pool_address) = t.pool
+        LEFT JOIN pools p ON p.pool_address = t.pool
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         LEFT JOIN LATERAL (
             SELECT block_number, source
             FROM pool_states ps
-            WHERE lower(ps.pool_address) = t.pool
+            WHERE ps.pool_address = t.pool
             ORDER BY block_number DESC
             LIMIT 1
         ) ps ON true
         LEFT JOIN observed_pools op
-            ON op.chain_id = $3 AND lower(op.pool_address) = t.pool
-        LEFT JOIN protocol_pool_observations po
-            ON po.chain_id = $3 AND lower(po.pool_address) = t.pool
+            ON op.chain_id = $3 AND op.pool_address = t.pool
+        LEFT JOIN LATERAL (
+            SELECT
+                token0, token1, symbol, factory_address, dex, variant, fee_bps,
+                fee_pips, tick_spacing, hooks_address, first_block, latest_block,
+                logs_30d, discovery_source, import_status
+            FROM protocol_pool_observations po
+            WHERE po.chain_id = $3
+              AND lower(po.pool_address) = t.pool
+            ORDER BY po.updated_at DESC
+            LIMIT 1
+        ) po ON true
         "#,
     );
     let row = sqlx::query(&sql)
