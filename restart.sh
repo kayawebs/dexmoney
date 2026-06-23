@@ -7,16 +7,17 @@ ENV_FILE="${ROOT_DIR}/.env.docker"
 
 usage() {
   cat <<'EOF'
-Usage: ./restart.sh <all|market-data|pool-discovery|v4-metadata-hydrator|searcher|health-monitor|execution-manager>
+Usage: ./restart.sh <all|market-data|pool-discovery|v4-metadata-hydrator|searcher|monitor-web|health-monitor|execution-manager>
 
 Restarts dexmoney app containers with docker compose rebuilds.
 
 Targets:
-  all                 Restart market-data, pool-discovery, v4-metadata-hydrator, searcher, health-monitor, and execution-manager
+  all                 Restart market-data, pool-discovery, v4-metadata-hydrator, searcher, monitor-web, health-monitor, and execution-manager
   market-data         Restart market-data only
   pool-discovery      Restart pool-discovery only
   v4-metadata-hydrator Restart V4 metadata hydrator only
   searcher            Restart searcher only
+  monitor-web         Restart monitor-web only
   health-monitor      Restart health-monitor only
   execution-manager   Restart execution-manager only
 EOF
@@ -34,7 +35,7 @@ services=()
 case "${target}" in
   all)
     profile_args=(--profile executor)
-    services=(market-data pool-discovery v4-metadata-hydrator searcher health-monitor execution-manager)
+    services=(market-data pool-discovery v4-metadata-hydrator searcher monitor-web health-monitor execution-manager)
     ;;
   market-data)
     services=(market-data)
@@ -47,6 +48,9 @@ case "${target}" in
     ;;
   searcher)
     services=(searcher)
+    ;;
+  monitor-web)
+    services=(monitor-web)
     ;;
   health-monitor)
     services=(health-monitor)
