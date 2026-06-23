@@ -58,6 +58,8 @@ struct PoolCoverage {
     pool_enabled: Option<bool>,
     latest_state_block: Option<i64>,
     latest_state_source: Option<String>,
+    first_seen_block: Option<i64>,
+    logs_30d: Option<i64>,
     observed_status: Option<String>,
     discovery_source: Option<String>,
     dex_event_logs_same_block: i64,
@@ -83,6 +85,160 @@ struct AnchorAmountConfig {
     all_min_profit: Option<String>,
     multihop_amounts: Option<String>,
     multihop_min_profit: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PoolReuseSample {
+    symbol: String,
+    dex: String,
+    variant: String,
+    first_seen_block: Option<i64>,
+    logs_30d: Option<i64>,
+    discovery_source: String,
+}
+
+#[derive(Default)]
+struct PoolReuseStats {
+    txs: usize,
+    pool_refs: usize,
+    pool_tx_counts: BTreeMap<String, usize>,
+    pool_samples: BTreeMap<String, PoolReuseSample>,
+    ref_age_buckets: BTreeMap<String, usize>,
+    unique_age_buckets: BTreeMap<String, usize>,
+}
+
+impl PoolReuseStats {
+    fn record_tx(&mut self, tx: &CollectorTx, coverages: &[PoolCoverage]) {
+        self.txs += 1;
+        let mut seen_in_tx = BTreeSet::new();
+        for coverage in coverages {
+            let pool = coverage.pool.to_ascii_lowercase();
+            if !seen_in_tx.insert(pool.clone()) {
+                continue;
+            }
+            self.pool_refs += 1;
+            *self.pool_tx_counts.entry(pool.clone()).or_default() += 1;
+            let age_bucket = pool_age_bucket(tx.block_number, coverage.first_seen_block);
+            *self.ref_age_buckets.entry(age_bucket).or_default() += 1;
+            if !self.pool_samples.contains_key(&pool) {
+                *self
+                    .unique_age_buckets
+                    .entry(pool_age_bucket(tx.block_number, coverage.first_seen_block))
+                    .or_default() += 1;
+                self.pool_samples.insert(
+                    pool.clone(),
+                    PoolReuseSample {
+                        symbol: coverage.symbol.clone().unwrap_or_else(|| "-".into()),
+                        dex: coverage.dex.clone().unwrap_or_else(|| "-".into()),
+                        variant: coverage.variant.clone().unwrap_or_else(|| "-".into()),
+                        first_seen_block: coverage.first_seen_block,
+                        logs_30d: coverage.logs_30d,
+                        discovery_source: coverage
+                            .discovery_source
+                            .clone()
+                            .unwrap_or_else(|| "-".into()),
+                    },
+                );
+            }
+        }
+    }
+
+    fn write(&self, writer: &mut BufWriter<File>) -> Result<()> {
+        writeln!(writer)?;
+        writeln!(writer, "== Pool Reuse Summary ==")?;
+        writeln!(writer, "sample_txs\t{}", self.txs)?;
+        writeln!(writer, "pool_refs\t{}", self.pool_refs)?;
+        writeln!(writer, "unique_pools\t{}", self.pool_samples.len())?;
+        let reused_unique = self
+            .pool_tx_counts
+            .values()
+            .filter(|tx_count| **tx_count >= 2)
+            .count();
+        let reused_refs = self
+            .pool_tx_counts
+            .values()
+            .filter(|tx_count| **tx_count >= 2)
+            .sum::<usize>();
+        writeln!(writer, "reused_unique_pools_ge_2_txs\t{reused_unique}")?;
+        writeln!(writer, "reused_pool_refs_ge_2_txs\t{reused_refs}")?;
+        writeln!(writer)?;
+        writeln!(writer, "ref_age_buckets:")?;
+        write_bucket_counts(writer, &self.ref_age_buckets)?;
+        writeln!(writer, "unique_age_buckets:")?;
+        write_bucket_counts(writer, &self.unique_age_buckets)?;
+        writeln!(writer)?;
+        writeln!(writer, "top_reused_pools:")?;
+        let mut pools = self.pool_tx_counts.iter().collect::<Vec<_>>();
+        pools.sort_by(|(left_pool, left_count), (right_pool, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_pool.cmp(right_pool))
+        });
+        for (pool, tx_count) in pools.into_iter().take(25) {
+            let sample = self.pool_samples.get(pool.as_str());
+            writeln!(
+                writer,
+                "{}\ttxs={}\tsymbol={}\tdex={}\tvariant={}\tfirst_seen_block={}\tlogs_30d={}\tdiscovery={}",
+                short_addr(pool),
+                tx_count,
+                sample.map(|sample| sample.symbol.as_str()).unwrap_or("-"),
+                sample.map(|sample| sample.dex.as_str()).unwrap_or("-"),
+                sample.map(|sample| sample.variant.as_str()).unwrap_or("-"),
+                sample
+                    .and_then(|sample| sample.first_seen_block)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                sample
+                    .and_then(|sample| sample.logs_30d)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                sample
+                    .map(|sample| sample.discovery_source.as_str())
+                    .unwrap_or("-"),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn write_bucket_counts(
+    writer: &mut BufWriter<File>,
+    buckets: &BTreeMap<String, usize>,
+) -> Result<()> {
+    for bucket in [
+        "unknown",
+        "same_block_or_next",
+        "age_2_10_blocks",
+        "age_11_100_blocks",
+        "age_101_1000_blocks",
+        "age_gt_1000_blocks",
+    ] {
+        writeln!(
+            writer,
+            "{}\t{}",
+            bucket,
+            buckets.get(bucket).copied().unwrap_or_default()
+        )?;
+    }
+    Ok(())
+}
+
+fn pool_age_bucket(tx_block: u64, first_seen_block: Option<i64>) -> String {
+    let Some(first_seen_block) = first_seen_block else {
+        return "unknown".into();
+    };
+    let age = tx_block as i64 - first_seen_block;
+    if age <= 1 {
+        "same_block_or_next".into()
+    } else if age <= 10 {
+        "age_2_10_blocks".into()
+    } else if age <= 100 {
+        "age_11_100_blocks".into()
+    } else if age <= 1_000 {
+        "age_101_1000_blocks".into()
+    } else {
+        "age_gt_1000_blocks".into()
+    }
 }
 
 #[tokio::main]
@@ -147,6 +303,7 @@ async fn main() -> Result<()> {
     let mut gap_summary = BTreeMap::<String, usize>::new();
     let mut v4_feature_summary = BTreeMap::<String, usize>::new();
     let mut unrecognized_counterparty_summary = BTreeMap::<String, usize>::new();
+    let mut pool_reuse = PoolReuseStats::default();
     for tx in txs {
         let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {
             *summary.entry("receipt_missing".into()).or_default() += 1;
@@ -171,6 +328,7 @@ async fn main() -> Result<()> {
                 .await?,
             );
         }
+        pool_reuse.record_tx(&tx, &coverages);
         let classification = classify_tx(&coverages);
         let diagnostics = tx_diagnostics(
             &receipt,
@@ -238,6 +396,7 @@ async fn main() -> Result<()> {
     for (address, n) in counterparties {
         writeln!(writer, "{}\t{}", address, n)?;
     }
+    pool_reuse.write(&mut writer)?;
     writer.flush()?;
 
     println!("wrote {}", out_path.display());
@@ -408,6 +567,8 @@ async fn load_pool_coverage(
             p.enabled AS pool_enabled,
             ps.block_number AS latest_state_block,
             ps.source AS latest_state_source,
+            COALESCE(op.first_block, po.first_block) AS first_seen_block,
+            COALESCE(op.logs_30d, po.logs_30d) AS logs_30d,
             COALESCE(op.import_status, po.import_status) AS observed_status,
             COALESCE(op.discovery_source, po.discovery_source) AS discovery_source,
             (
@@ -458,6 +619,8 @@ async fn load_pool_coverage(
         pool_enabled: row.try_get("pool_enabled")?,
         latest_state_block: row.try_get("latest_state_block")?,
         latest_state_source: row.try_get("latest_state_source")?,
+        first_seen_block: row.try_get("first_seen_block")?,
+        logs_30d: row.try_get("logs_30d")?,
         observed_status: row.try_get("observed_status")?,
         discovery_source: row.try_get("discovery_source")?,
         dex_event_logs_same_block: row.try_get("dex_event_logs_same_block")?,
@@ -1063,7 +1226,7 @@ fn write_tx(
     for row in coverages {
         writeln!(
             writer,
-            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} fee_pips={} tick_spacing={} hooks={} enabled={} state_block={} state_source={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
+            "  - pool={} topic={} tokens={}/{} symbol={} dex={} variant={} fee_pips={} tick_spacing={} hooks={} enabled={} state_block={} state_source={} first_seen_block={} age_blocks={} logs_30d={} observed={} discovery={} dex_events_same_block={} opportunities_near_block={}",
             short_addr(&row.pool),
             topic_family(&row.topic0),
             row.token0
@@ -1094,6 +1257,15 @@ fn write_tx(
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
             row.latest_state_source.as_deref().unwrap_or("-"),
+            row.first_seen_block
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.first_seen_block
+                .map(|value| (tx.block_number as i64 - value).to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.logs_30d
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
             row.observed_status.as_deref().unwrap_or("-"),
             row.discovery_source.as_deref().unwrap_or("-"),
             row.dex_event_logs_same_block,
