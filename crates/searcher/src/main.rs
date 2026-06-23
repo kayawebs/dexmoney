@@ -5,7 +5,10 @@ mod strategy;
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use base_arb_common::config::Settings;
-use base_arb_common::constants::{AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES};
+use base_arb_common::constants::{
+    AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, PANCAKE_V3_FACTORY,
+    UNISWAP_V3_FACTORY,
+};
 use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{
     Candidate, DexKind, PoolState, PoolVariant, TickState, TokenPairSearchConfig,
@@ -480,7 +483,7 @@ where
             Some(state) => {
                 let topology = PoolTopology::from(&state);
                 let was_active = runtime.active_pool_addresses.contains(&pool);
-                if is_pool_state_active(&state, now, max_pool_state_age_ms) {
+                if is_pool_state_active(&state, now, max_pool_state_age_ms, settings) {
                     runtime.active_pool_addresses.insert(pool);
                 } else {
                     runtime.active_pool_addresses.remove(&pool);
@@ -526,7 +529,8 @@ where
         return Ok(SearchCycleStats::default());
     };
     let max_candidate_lag_blocks = settings.execution_max_candidate_lag_blocks.max(1);
-    let active_pool_refresh = refresh_active_pool_cache_if_due(runtime, now, max_pool_state_age_ms);
+    let active_pool_refresh =
+        refresh_active_pool_cache_if_due(runtime, now, max_pool_state_age_ms, settings);
     if active_pool_refresh.changed {
         rebuild_path_index = true;
     }
@@ -679,9 +683,10 @@ fn active_pool_addresses<'a>(
     pool_states: impl Iterator<Item = &'a PoolState>,
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
+    settings: &Settings,
 ) -> HashSet<Address> {
     pool_states
-        .filter(|state| is_pool_state_active(state, now, max_pool_state_age_ms))
+        .filter(|state| is_pool_state_active(state, now, max_pool_state_age_ms, settings))
         .map(|state| state.pool_id.address)
         .collect()
 }
@@ -712,6 +717,7 @@ fn refresh_active_pool_cache_if_due(
     runtime: &mut SearchRuntime,
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
+    settings: &Settings,
 ) -> ActivePoolRefresh {
     let interval = active_pool_sweep_interval(max_pool_state_age_ms);
     if runtime
@@ -720,8 +726,12 @@ fn refresh_active_pool_cache_if_due(
     {
         return ActivePoolRefresh::default();
     }
-    let active_pool_addresses =
-        active_pool_addresses(runtime.pool_states.values(), now, max_pool_state_age_ms);
+    let active_pool_addresses = active_pool_addresses(
+        runtime.pool_states.values(),
+        now,
+        max_pool_state_age_ms,
+        settings,
+    );
     let changed = active_pool_addresses != runtime.active_pool_addresses;
     runtime.active_pool_addresses = active_pool_addresses;
     runtime.last_active_pool_sweep = Some(Instant::now());
@@ -737,41 +747,91 @@ fn active_pool_sweep_interval(max_pool_state_age_ms: i64) -> Duration {
     Duration::from_millis(sweep_ms)
 }
 
-fn is_pool_state_active(state: &PoolState, now: DateTime<Utc>, max_pool_state_age_ms: i64) -> bool {
+fn is_pool_state_active(
+    state: &PoolState,
+    now: DateTime<Utc>,
+    max_pool_state_age_ms: i64,
+    settings: &Settings,
+) -> bool {
     if state.is_stale(now, max_pool_state_age_ms) {
         return false;
     }
     match state.variant {
         PoolVariant::AerodromeVolatile => {
-            if !is_supported_aerodrome_factory(state, &[AERODROME_CLASSIC_FACTORY]) {
+            if !is_supported_factory(
+                state,
+                settings.aerodrome_pool_factory,
+                &[AERODROME_CLASSIC_FACTORY],
+            ) {
                 return false;
             }
             is_nonzero_u256(state.reserve0) && is_nonzero_u256(state.reserve1)
         }
         PoolVariant::AerodromeSlipstream => {
-            if !is_supported_aerodrome_factory(state, &AERODROME_SLIPSTREAM_FACTORIES) {
+            if !is_supported_factory(
+                state,
+                settings.aerodrome_slipstream_factory,
+                &AERODROME_SLIPSTREAM_FACTORIES,
+            ) {
                 return false;
             }
             state.sqrt_price_x96.is_some()
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
-        PoolVariant::UniswapV3 | PoolVariant::PancakeV3 | PoolVariant::UniswapV4 => {
+        PoolVariant::UniswapV3 => {
+            if !is_supported_factory(state, settings.uniswap_v3_factory, &[UNISWAP_V3_FACTORY]) {
+                return false;
+            }
             state.sqrt_price_x96.is_some()
                 && is_nonzero_u256(state.liquidity)
                 && state.tick.is_some()
         }
-        PoolVariant::BalancerV3 => state.token0 != Address::ZERO && state.token1 != Address::ZERO,
+        PoolVariant::PancakeV3 => {
+            if !is_supported_factory(state, settings.pancake_v3_factory, &[PANCAKE_V3_FACTORY]) {
+                return false;
+            }
+            state.sqrt_price_x96.is_some()
+                && is_nonzero_u256(state.liquidity)
+                && state.tick.is_some()
+        }
+        PoolVariant::UniswapV4 => {
+            if !is_supported_manager(state, settings.uniswap_v4_pool_manager) {
+                return false;
+            }
+            state.sqrt_price_x96.is_some()
+                && is_nonzero_u256(state.liquidity)
+                && state.tick.is_some()
+        }
+        PoolVariant::BalancerV3 => {
+            is_supported_manager(state, settings.balancer_v3_vault)
+                && state.token0 != Address::ZERO
+                && state.token1 != Address::ZERO
+        }
     }
 }
 
-fn is_supported_aerodrome_factory(state: &PoolState, supported: &[&str]) -> bool {
+fn is_supported_factory(
+    state: &PoolState,
+    configured: Option<Address>,
+    fallback_supported: &[&str],
+) -> bool {
     let Some(factory) = state.factory_address else {
         return false;
     };
-    supported
+    if configured == Some(factory) {
+        return true;
+    }
+    fallback_supported
         .iter()
         .any(|expected| address_eq_str(factory, expected))
+}
+
+fn is_supported_manager(state: &PoolState, configured: Option<Address>) -> bool {
+    let Some(factory) = state.factory_address else {
+        return false;
+    };
+    configured == Some(factory)
 }
 
 fn address_eq_str(address: Address, expected: &str) -> bool {
