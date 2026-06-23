@@ -845,7 +845,7 @@ where
                 worker_wallet,
                 settings,
                 candidate,
-                Some(synthetic_simulation.id),
+                None,
                 &calldata,
                 arb_nonce,
             )
@@ -892,7 +892,7 @@ where
                     recorder
                         .record_transaction(TxResult {
                             opportunity_id: candidate.id,
-                            simulation_id: Some(synthetic_simulation.id),
+                            simulation_id: None,
                             eoa: worker_wallet.address(),
                             tx_hash: None,
                             nonce: arb_nonce,
@@ -919,7 +919,7 @@ where
             recorder
                 .record_transaction(TxResult {
                     opportunity_id: candidate.id,
-                    simulation_id: Some(synthetic_simulation.id),
+                    simulation_id: None,
                     eoa: fund_wallet.address(),
                     tx_hash: None,
                     nonce,
