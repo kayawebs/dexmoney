@@ -499,6 +499,7 @@ where
     let mut skipped_by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut approval_ready = Vec::new();
     let mut preflight_simulated = 0usize;
+    recorder.record_opportunities(candidates.clone()).await?;
 
     for candidate in candidates {
         if approval_ready.len() >= MAX_SIMULATIONS_PER_CYCLE {
