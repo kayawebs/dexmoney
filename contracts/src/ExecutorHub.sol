@@ -144,6 +144,10 @@ contract ExecutorHub {
 
     address public owner;
     bool public paused;
+    address private activeV3CallbackPool;
+    address private activeV3CallbackTokenIn;
+    uint256 private activeV3CallbackMaxAmount;
+    bool private activeV3CallbackUsed;
 
     mapping(address => bool) public operators;
     mapping(address => bool) public adapters;
@@ -345,6 +349,10 @@ contract ExecutorHub {
         if (step.fee != 0 && pool.fee() != step.fee) revert PoolMismatch();
 
         uint160 sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
+        activeV3CallbackPool = step.pool;
+        activeV3CallbackTokenIn = step.tokenIn;
+        activeV3CallbackMaxAmount = amountIn;
+        activeV3CallbackUsed = false;
         pool.swap(
             address(this),
             zeroForOne,
@@ -352,6 +360,7 @@ contract ExecutorHub {
             sqrtPriceLimitX96,
             abi.encode(V3CallbackData({pool: step.pool, tokenIn: step.tokenIn}))
         );
+        _clearActiveV3Callback();
     }
 
     function _swapDirectV2(SwapStep calldata step, uint256 amountIn) internal {
@@ -409,7 +418,10 @@ contract ExecutorHub {
 
     function _v3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) internal {
         V3CallbackData memory decoded = abi.decode(data, (V3CallbackData));
-        if (msg.sender != decoded.pool) revert UnauthorizedCallback();
+        if (
+            msg.sender != decoded.pool || msg.sender != activeV3CallbackPool
+                || decoded.tokenIn != activeV3CallbackTokenIn || activeV3CallbackUsed
+        ) revert UnauthorizedCallback();
 
         address tokenToPay;
         uint256 amountToPay;
@@ -423,7 +435,16 @@ contract ExecutorHub {
             revert InvalidCallback();
         }
         if (tokenToPay != decoded.tokenIn) revert InvalidCallback();
+        if (amountToPay > activeV3CallbackMaxAmount) revert InvalidCallback();
+        activeV3CallbackUsed = true;
         _safeTransfer(tokenToPay, msg.sender, amountToPay);
+    }
+
+    function _clearActiveV3Callback() internal {
+        activeV3CallbackPool = address(0);
+        activeV3CallbackTokenIn = address(0);
+        activeV3CallbackMaxAmount = 0;
+        activeV3CallbackUsed = false;
     }
 
     function _validatePool(SwapStep calldata step) internal view {
