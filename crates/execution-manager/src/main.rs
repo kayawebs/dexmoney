@@ -829,6 +829,15 @@ where
             if !settings.execution_submit_enabled {
                 return Ok(Some(CandidateAction::Simulated));
             }
+            if missing_approvals.len() > 1 {
+                info!(
+                    candidate_id = %candidate.id,
+                    path = %candidate.path.name,
+                    remaining_missing_approvals = missing_approvals.len().saturating_sub(1),
+                    "lazy approval submitted one route approval; skipping arb tx until remaining approvals are present"
+                );
+                return Ok(Some(CandidateAction::Simulated));
+            }
             let Some(worker_wallet) = wallet else {
                 anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
             };
