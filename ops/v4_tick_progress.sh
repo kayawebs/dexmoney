@@ -86,7 +86,35 @@ SELECT
 FROM v4_pools vp
 LEFT JOIN tick_pools tp ON tp.pool_address = vp.pool_address;
 
-WITH missing AS (
+WITH v4_pool_rows AS (
+  SELECT
+    lower(pool_address) AS pool_address,
+    bool_or(token0 IS NOT NULL AND token1 IS NOT NULL) AS has_tokens,
+    bool_or(coalesce(pool_key_fee_pips, fee_pips) IS NOT NULL) AS has_fee,
+    bool_or(tick_spacing IS NOT NULL) AS has_tick_spacing,
+    bool_or(hooks_address IS NOT NULL) AS has_hooks,
+    bool_or(liquidity IS NOT NULL AND sqrt_price_x96 IS NOT NULL AND tick IS NOT NULL) AS has_state,
+    max(latest_block) AS latest_block
+  FROM protocol_pool_observations
+  WHERE protocol = 'uniswap-v4'
+    AND pool_address IS NOT NULL
+  GROUP BY lower(pool_address)
+),
+tick_pools AS (
+  SELECT lower(pool_address) AS pool_address, count(*) AS ticks
+  FROM pool_ticks_current
+  GROUP BY 1
+)
+SELECT
+  count(*) FILTER (WHERE NOT (has_tokens AND has_fee AND has_tick_spacing AND has_hooks)) AS pools_missing_metadata,
+  count(*) FILTER (WHERE NOT has_state) AS pools_missing_state,
+  count(*) FILTER (WHERE has_state AND coalesce(tp.ticks, 0) = 0) AS state_ready_without_ticks,
+  count(*) FILTER (WHERE coalesce(tp.ticks, 0) > 0) AS pools_with_ticks,
+  max(latest_block) AS latest_block
+FROM v4_pool_rows vp
+LEFT JOIN tick_pools tp ON tp.pool_address = vp.pool_address;
+
+WITH event_rows AS (
   SELECT
     event_type,
     count(*) FILTER (
@@ -97,12 +125,13 @@ WITH missing AS (
       WHERE pool_address IS NOT NULL
         AND (liquidity IS NULL OR sqrt_price_x96 IS NULL OR tick IS NULL)
     ) AS missing_state,
+    count(*) AS rows,
     max(latest_block) AS latest_block
   FROM protocol_pool_observations
   WHERE protocol = 'uniswap-v4'
   GROUP BY event_type
 )
 SELECT *
-FROM missing
+FROM event_rows
 ORDER BY missing_metadata DESC, missing_state DESC, event_type;
 SQL
