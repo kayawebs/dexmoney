@@ -2,7 +2,7 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     PairSearchConfigStore, PendingTransactionRecord, PendingTransactionStore, RecorderStore,
@@ -1885,6 +1885,27 @@ impl RecorderStore for PostgresStore {
     }
 
     async fn record_transaction(&self, tx: TxResult) -> Result<()> {
+        let simulation_id = match tx.simulation_id {
+            Some(simulation_id) => {
+                let exists: bool = sqlx::query_scalar(
+                    r#"SELECT EXISTS(SELECT 1 FROM simulations WHERE id = $1)"#,
+                )
+                .bind(simulation_id)
+                .fetch_one(&self.pool)
+                .await?;
+                if exists {
+                    Some(simulation_id)
+                } else {
+                    warn!(
+                        opportunity_id = %tx.opportunity_id,
+                        simulation_id = %simulation_id,
+                        "dropping transaction simulation_id because referenced simulation is missing"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
         let tx_hash = tx.tx_hash.map(|v| format!("{v:#x}"));
         if tx_hash.is_some() {
             sqlx::query(
@@ -1910,7 +1931,7 @@ impl RecorderStore for PostgresStore {
             )
             .bind(uuid::Uuid::new_v4())
             .bind(tx.opportunity_id)
-            .bind(tx.simulation_id)
+            .bind(simulation_id)
             .bind(address_to_string(tx.eoa))
             .bind(tx_hash)
             .bind(i64::try_from(tx.nonce)?)
@@ -1935,7 +1956,7 @@ impl RecorderStore for PostgresStore {
             )
             .bind(uuid::Uuid::new_v4())
             .bind(tx.opportunity_id)
-            .bind(tx.simulation_id)
+            .bind(simulation_id)
             .bind(address_to_string(tx.eoa))
             .bind(tx_hash)
             .bind(i64::try_from(tx.nonce)?)
