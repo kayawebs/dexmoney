@@ -1670,6 +1670,7 @@ pub enum RoughQuoteFailure {
     MissingV3State,
     V3SpotQuoteFailed,
     V3SpotOverflow,
+    #[allow(dead_code)]
     UnsupportedPool,
     ZeroOutput,
 }
@@ -1791,8 +1792,51 @@ fn rough_quote_edge_upper_bound(
         | PoolVariant::PancakeV3
         | PoolVariant::UniswapV4 => spot_quote_exact_in(state, edge.token_in, amount_in)
             .map_err(classify_v3_spot_quote_failure),
-        PoolVariant::BalancerV3 => Err(RoughQuoteFailure::UnsupportedPool),
+        PoolVariant::BalancerV3 => {
+            decimal_normalized_optimistic_quote(state, edge.token_in, edge.token_out, amount_in)
+        }
     }
+}
+
+fn decimal_normalized_optimistic_quote(
+    state: &PoolState,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> Result<U256, RoughQuoteFailure> {
+    if !((token_in == state.token0 && token_out == state.token1)
+        || (token_in == state.token1 && token_out == state.token0))
+    {
+        return Err(RoughQuoteFailure::TokenMismatch);
+    }
+    let decimals0 = state
+        .token0_decimals
+        .ok_or(RoughQuoteFailure::MissingDecimals)?;
+    let decimals1 = state
+        .token1_decimals
+        .ok_or(RoughQuoteFailure::MissingDecimals)?;
+    let (decimals_in, decimals_out) = if token_in == state.token0 {
+        (decimals0, decimals1)
+    } else {
+        (decimals1, decimals0)
+    };
+    let input_unit = pow10_u256(decimals_in);
+    let output_unit = pow10_u256(decimals_out);
+    let normalized = amount_in
+        .saturating_mul(output_unit)
+        .checked_div(input_unit)
+        .unwrap_or(U256::MAX);
+    Ok(normalized
+        .saturating_mul(U256::from(1_000u64))
+        .max(U256::from(1u64)))
+}
+
+fn pow10_u256(decimals: u8) -> U256 {
+    let mut value = U256::from(1u64);
+    for _ in 0..decimals {
+        value = value.saturating_mul(U256::from(10u64));
+    }
+    value
 }
 
 fn classify_v3_spot_quote_failure(err: base_arb_common::errors::ArbBotError) -> RoughQuoteFailure {
