@@ -385,9 +385,9 @@ async fn load_pool_coverage(
             COALESCE(op.logs_30d, po.logs_30d) AS logs_30d,
             {opportunities_expr} AS opportunities_near_block
         FROM target t
-        LEFT JOIN pools p ON p.chain_id = $3 AND lower(p.pool_address) = t.pool
+        LEFT JOIN pools p ON p.chain_id = $3 AND p.pool_address = t.pool
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
-        LEFT JOIN observed_pools op ON op.chain_id = $3 AND lower(op.pool_address) = t.pool
+        LEFT JOIN observed_pools op ON op.chain_id = $3 AND op.pool_address = t.pool
         LEFT JOIN LATERAL (
             SELECT
                 protocol, token0, token1, symbol, factory_address, dex, variant,
@@ -395,14 +395,14 @@ async fn load_pool_coverage(
                 discovery_source, import_status
             FROM protocol_pool_observations po
             WHERE po.chain_id = $3
-              AND lower(po.pool_address) = t.pool
+              AND po.pool_address = t.pool
             ORDER BY po.updated_at DESC
             LIMIT 1
         ) po ON true
         LEFT JOIN LATERAL (
             SELECT block_number, source
             FROM pool_states ps
-            WHERE lower(ps.pool_address) = t.pool
+            WHERE ps.pool_address = t.pool
             ORDER BY block_number DESC
             LIMIT 1
         ) ps ON true
@@ -410,7 +410,7 @@ async fn load_pool_coverage(
             SELECT count(*) AS tick_count, max(block_number) AS latest_tick_block
             FROM pool_ticks_current pt
             WHERE pt.chain_id = $3
-              AND lower(pt.pool_address) = t.pool
+              AND pt.pool_address = t.pool
         ) pt ON true
         "#,
     );
