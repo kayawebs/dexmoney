@@ -127,63 +127,6 @@ pub async fn submit_candidate(
     })
 }
 
-pub async fn submit_candidate_unchecked(
-    provider: &ChainProvider,
-    wallet: &ExecutionWallet,
-    settings: &Settings,
-    candidate: &Candidate,
-    simulation_id: Option<uuid::Uuid>,
-    calldata: &[u8],
-    nonce: u64,
-) -> Result<Submission> {
-    let executor = executor_for_candidate(settings, candidate)?;
-    if calldata.is_empty() {
-        anyhow::bail!("unchecked candidate calldata is empty");
-    }
-
-    let gas_limit = U256::from(UNCHECKED_ARB_FALLBACK_GAS_LIMIT);
-    let fees = aggressive_fee_suggestion(provider, settings).await?;
-    if candidate.is_expired(Utc::now()) {
-        anyhow::bail!("candidate expired before unchecked tx broadcast");
-    }
-
-    let submitted_block = candidate.block_number;
-    let tx_hash = sign_and_send(
-        provider,
-        wallet,
-        settings,
-        executor,
-        calldata,
-        nonce,
-        gas_limit,
-        fees.max_fee_per_gas,
-        fees.max_priority_fee_per_gas,
-    )
-    .await?;
-
-    tracing::info!(
-        candidate_id = %candidate.id,
-        tx_hash = %tx_hash,
-        nonce,
-        gas_limit = %gas_limit,
-        max_fee_per_gas = %fees.max_fee_per_gas,
-        max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
-        submitted_block,
-        "unchecked tx submitted after lazy approval"
-    );
-
-    Ok(Submission {
-        tx_hash,
-        nonce,
-        simulation_id,
-        executor_contract: executor,
-        submitted_block,
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
-    })
-}
-
 pub async fn operator_enabled(
     provider: &ChainProvider,
     executor: Address,

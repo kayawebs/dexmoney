@@ -696,12 +696,12 @@ fn simulation_profit_rank(simulation: &SimulationResult) -> U256 {
 }
 
 async fn live_approval_preflight<E, R>(
-    eoa_store: &E,
+    _eoa_store: &E,
     recorder: &R,
     simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
-    wallet: Option<&tx_manager::ExecutionWallet>,
+    _wallet: Option<&tx_manager::ExecutionWallet>,
     fund_wallet: Option<&tx_manager::ExecutionWallet>,
     candidate: &Candidate,
     current_block: u64,
@@ -713,9 +713,6 @@ where
 {
     if !settings.execution_submit_enabled && !settings.execution_auto_approve_enabled {
         return Ok(None);
-    }
-    if settings.execution_submit_enabled && wallet.is_none() {
-        anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
     }
 
     let approvals = simulator::required_token_approvals(candidate, settings)?;
@@ -818,96 +815,10 @@ where
                 spender = %approval.spender,
                 tx_hash = %submission.tx_hash,
                 submit_enabled = settings.execution_submit_enabled,
-                "executor approval submitted by fund EOA"
+                missing_approvals = missing_approvals.len(),
+                "executor approval submitted by fund EOA; skipping arb tx until allowance is live"
             );
-            if !settings.execution_submit_enabled {
-                return Ok(Some(CandidateAction::Simulated));
-            }
-            if missing_approvals.len() > 1 {
-                info!(
-                    candidate_id = %candidate.id,
-                    path = %candidate.path.name,
-                    remaining_missing_approvals = missing_approvals.len().saturating_sub(1),
-                    "lazy approval submitted one route approval; skipping arb tx until remaining approvals are present"
-                );
-                return Ok(Some(CandidateAction::Simulated));
-            }
-            let Some(worker_wallet) = wallet else {
-                anyhow::bail!("execution worker EOA is required for lazy approval follow-up tx");
-            };
-            let mut lane = eoa_store
-                .get_lane_state(worker_wallet.address())
-                .await?
-                .map(|state| eoa_lane::EoaLane { state })
-                .unwrap_or_else(|| eoa_lane::EoaLane::new(worker_wallet.address()));
-            let arb_nonce = lane.state.local_nonce;
-            match tx_manager::submit_candidate_unchecked(
-                provider,
-                worker_wallet,
-                settings,
-                candidate,
-                None,
-                &calldata,
-                arb_nonce,
-            )
-            .await
-            {
-                Ok(arb_submission) => {
-                    lane.mark_submitted(
-                        candidate.id,
-                        arb_submission.simulation_id,
-                        arb_submission.tx_hash,
-                        arb_submission.executor_contract,
-                        arb_submission.nonce,
-                        arb_submission.submitted_block,
-                        arb_submission.gas_limit,
-                        arb_submission.max_fee_per_gas,
-                        arb_submission.max_priority_fee_per_gas,
-                    );
-                    eoa_store.set_lane_state(lane.state.clone()).await?;
-                    recorder
-                        .record_transaction(tx_manager::pending_tx_result(
-                            candidate,
-                            worker_wallet.address(),
-                            &arb_submission,
-                        ))
-                        .await?;
-                    info!(
-                        candidate_id = %candidate.id,
-                        approval_tx_hash = %submission.tx_hash,
-                        arb_tx_hash = %arb_submission.tx_hash,
-                        worker = %worker_wallet.address(),
-                        "lazy approval submitted and arb tx fired without waiting"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        candidate_id = %candidate.id,
-                        nonce = arb_nonce,
-                        worker = %worker_wallet.address(),
-                        error = %err,
-                        "lazy approval submitted but follow-up arb tx failed before broadcast"
-                    );
-                    lane.mark_cooldown();
-                    eoa_store.set_lane_state(lane.state.clone()).await?;
-                    recorder
-                        .record_transaction(TxResult {
-                            opportunity_id: candidate.id,
-                            simulation_id: None,
-                            eoa: worker_wallet.address(),
-                            tx_hash: None,
-                            nonce: arb_nonce,
-                            status: TxStatus::Dropped,
-                            realized_profit: None,
-                            gas_used: None,
-                            effective_gas_price: None,
-                            revert_reason: Some(err.to_string()),
-                            receipt_json: None,
-                        })
-                        .await?;
-                }
-            }
-            Ok(Some(CandidateAction::Submitted))
+            Ok(Some(CandidateAction::Simulated))
         }
         Err(err) => {
             warn!(
