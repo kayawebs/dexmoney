@@ -359,8 +359,6 @@ enum ExecutorStepKind {
     AerodromeSlipstream,
     UniswapV3Router,
     PancakeV3Router,
-    DirectV2,
-    DirectV3,
     Adapter,
 }
 
@@ -371,22 +369,20 @@ impl ExecutorStepKind {
             Self::AerodromeSlipstream => 1,
             Self::UniswapV3Router => 2,
             Self::PancakeV3Router => 3,
-            Self::DirectV2 => 4,
-            Self::DirectV3 => 5,
             Self::Adapter => 6,
         }
     }
 
     fn is_direct(self) -> bool {
-        matches!(self, Self::DirectV2 | Self::DirectV3)
+        false
     }
 
     fn needs_router_approval(self) -> bool {
-        !matches!(self, Self::DirectV2 | Self::DirectV3 | Self::Adapter)
+        !matches!(self, Self::Adapter)
     }
 
     fn requires_hub(self) -> bool {
-        matches!(self, Self::DirectV2 | Self::DirectV3 | Self::Adapter)
+        matches!(self, Self::Adapter)
     }
 }
 
@@ -407,55 +403,69 @@ fn step_execution_kind(
             let default_factory = settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
-            if !step.stable.unwrap_or(false)
-                && is_unknown_router_factory(step.factory_address, default_factory)
-            {
-                Ok(ExecutorStepKind::DirectV2)
-            } else {
-                Ok(ExecutorStepKind::AerodromeClassic)
-            }
+            reject_untrusted_factory(step.factory_address, default_factory, "Aerodrome Classic")?;
+            Ok(ExecutorStepKind::AerodromeClassic)
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
+            reject_untrusted_factory(
+                step.factory_address,
+                settings.aerodrome_slipstream_factory,
+                "Aerodrome Slipstream",
+            )?;
             Ok(ExecutorStepKind::AerodromeSlipstream)
         }
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => {
-            if is_unknown_router_factory(step.factory_address, settings.uniswap_v3_factory) {
-                Ok(ExecutorStepKind::DirectV3)
-            } else {
-                Ok(ExecutorStepKind::UniswapV3Router)
-            }
+            reject_untrusted_factory(
+                step.factory_address,
+                settings.uniswap_v3_factory,
+                "Uniswap V3",
+            )?;
+            Ok(ExecutorStepKind::UniswapV3Router)
         }
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
             let pancake_factory = settings
                 .pancake_v3_factory
                 .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
-            if is_unknown_router_factory(step.factory_address, pancake_factory) {
-                Ok(ExecutorStepKind::DirectV3)
-            } else {
-                Ok(ExecutorStepKind::PancakeV3Router)
-            }
+            reject_untrusted_factory(step.factory_address, pancake_factory, "Pancake V3")?;
+            Ok(ExecutorStepKind::PancakeV3Router)
         }
         (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => {
+            reject_untrusted_factory(
+                step.factory_address,
+                settings.uniswap_v4_pool_manager,
+                "Uniswap V4 PoolManager",
+            )?;
             Ok(ExecutorStepKind::Adapter)
         }
         (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => {
+            reject_untrusted_factory(
+                step.factory_address,
+                settings.balancer_v3_vault,
+                "Balancer V3 Vault",
+            )?;
             Ok(ExecutorStepKind::Adapter)
         }
         _ => anyhow::bail!("dex and pool variant mismatch"),
     }
 }
 
-fn is_unknown_router_factory(
+fn reject_untrusted_factory(
     step_factory: Option<Address>,
     configured_factory: Option<Address>,
-) -> bool {
+    label: &str,
+) -> Result<()> {
     let Some(factory) = step_factory else {
-        return false;
+        return Ok(());
     };
     let Some(configured) = configured_factory else {
-        return true;
+        anyhow::bail!("{label} factory is not configured; refusing untrusted factory {factory:#x}");
     };
-    factory != configured
+    if factory != configured {
+        anyhow::bail!(
+            "{label} factory {factory:#x} is not trusted; configured factory is {configured:#x}"
+        );
+    }
+    Ok(())
 }
 
 fn router_fee_for_step(
@@ -499,16 +509,22 @@ fn factory_for_step(
     step: &base_arb_common::types::SwapStep,
     settings: &Settings,
 ) -> Result<Address> {
-    if let Some(factory) = step.factory_address {
-        return Ok(factory);
-    }
-
     let dex = step.dex;
     let variant = step.variant;
     if matches!(
         (dex, variant),
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
     ) {
+        reject_untrusted_factory(
+            step.factory_address,
+            settings
+                .aerodrome_pool_factory
+                .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok()),
+            "Aerodrome Classic",
+        )?;
+        if let Some(factory) = step.factory_address {
+            return Ok(factory);
+        }
         settings
             .aerodrome_pool_factory
             .context("AERODROME_POOL_FACTORY is required for Aerodrome Classic execution")
@@ -516,6 +532,14 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream))
     ) {
+        reject_untrusted_factory(
+            step.factory_address,
+            settings.aerodrome_slipstream_factory,
+            "Aerodrome Slipstream",
+        )?;
+        if let Some(factory) = step.factory_address {
+            return Ok(factory);
+        }
         Ok(settings
             .aerodrome_slipstream_factory
             .unwrap_or(Address::ZERO))
@@ -523,11 +547,26 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None)
     ) {
+        reject_untrusted_factory(
+            step.factory_address,
+            settings.uniswap_v3_factory,
+            "Uniswap V3",
+        )?;
+        if let Some(factory) = step.factory_address {
+            return Ok(factory);
+        }
         Ok(settings.uniswap_v3_factory.unwrap_or(Address::ZERO))
     } else if matches!(
         (dex, variant),
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None)
     ) {
+        let pancake_factory = settings
+            .pancake_v3_factory
+            .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
+        reject_untrusted_factory(step.factory_address, pancake_factory, "Pancake V3")?;
+        if let Some(factory) = step.factory_address {
+            return Ok(factory);
+        }
         Ok(settings
             .pancake_v3_factory
             .or_else(|| PANCAKE_V3_FACTORY.parse().ok())
@@ -536,6 +575,11 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None)
     ) {
+        reject_untrusted_factory(
+            step.factory_address,
+            settings.uniswap_v4_pool_manager,
+            "Uniswap V4 PoolManager",
+        )?;
         settings
             .uniswap_v4_pool_manager
             .context("UNISWAP_V4_POOL_MANAGER is required for Uniswap V4 adapter execution")
@@ -543,6 +587,11 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None)
     ) {
+        reject_untrusted_factory(
+            step.factory_address,
+            settings.balancer_v3_vault,
+            "Balancer V3 Vault",
+        )?;
         settings
             .balancer_v3_vault
             .context("BALANCER_V3_VAULT is required for Balancer V3 adapter execution")
@@ -876,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_v3_uses_multihop_executor_and_needs_no_router_approval() {
+    fn untrusted_v3_factory_is_rejected_before_encoding() {
         let mut settings = settings();
         settings.uniswap_v3_factory = Some(address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         settings.executor_contract = Some(address!("3333333333333333333333333333333333333333"));
@@ -891,25 +940,16 @@ mod tests {
         candidate.path.steps[1].factory_address =
             Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 
-        assert_eq!(
-            executor_for_candidate(&settings, &candidate).unwrap(),
-            address!("4444444444444444444444444444444444444444")
-        );
-        assert!(required_token_approvals(&candidate, &settings)
-            .unwrap()
-            .is_empty());
+        let approvals_err = required_token_approvals(&candidate, &settings)
+            .expect_err("untrusted V3 factory should not build approvals")
+            .to_string();
+        assert!(approvals_err.contains("not trusted"), "{approvals_err}");
 
-        let calldata =
+        let calldata_err =
             build_execute_calldata(&candidate, U256::from(5_000u64), U256::from(123), &settings)
-                .unwrap();
-        let array_start = 4 + 5 * 32;
-        let first_element_offset =
-            U256::from_be_slice(&calldata[array_start + 32..array_start + 64]).to::<usize>();
-        let first_step_kind_offset = array_start + 32 + first_element_offset;
-        assert_eq!(
-            U256::from_be_slice(&calldata[first_step_kind_offset..first_step_kind_offset + 32]),
-            U256::from(5u64)
-        );
+                .expect_err("untrusted V3 factory should not build calldata")
+                .to_string();
+        assert!(calldata_err.contains("not trusted"), "{calldata_err}");
     }
 
     #[test]

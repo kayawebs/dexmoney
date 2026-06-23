@@ -47,9 +47,7 @@ contract MaliciousV3CallbackCaller {
 
     function attack(ExecutorHub hub, address tokenIn, uint256 amount) external {
         hub.uniswapV3SwapCallback(
-            int256(amount),
-            0,
-            abi.encode(ExecutorHub.V3CallbackData({pool: address(this), tokenIn: tokenIn}))
+            int256(amount), 0, abi.encode(ExecutorHub.V3CallbackData({pool: address(this), tokenIn: tokenIn}))
         );
     }
 }
@@ -74,6 +72,30 @@ contract ExecutorHubTest is Test {
     function testRejectsExternalV3CallbackTheft() public {
         vm.expectRevert(ExecutorHub.UnauthorizedCallback.selector);
         maliciousPool.attack(hub, address(usdc), 100_000);
+
+        assertEq(usdc.balanceOf(address(hub)), 1_000_000);
+        assertEq(usdc.balanceOf(address(maliciousPool)), 0);
+    }
+
+    function testRejectsDirectV3WithoutFactory() public {
+        ExecutorHub.SwapStep[] memory steps = new ExecutorHub.SwapStep[](2);
+        for (uint256 i = 0; i < steps.length; i++) {
+            steps[i] = ExecutorHub.SwapStep({
+                dex: ExecutorHub.StepKind.DirectV3,
+                router: address(0),
+                pool: address(maliciousPool),
+                tokenIn: address(usdc),
+                tokenOut: address(weth),
+                fee: 500,
+                stable: false,
+                factory: address(0),
+                data: ""
+            });
+        }
+
+        vm.prank(owner);
+        vm.expectRevert(ExecutorHub.MissingFactory.selector);
+        hub.executeWithOwnFunds(address(usdc), 100_000, steps, 1, block.timestamp + 1);
 
         assertEq(usdc.balanceOf(address(hub)), 1_000_000);
         assertEq(usdc.balanceOf(address(maliciousPool)), 0);

@@ -92,9 +92,13 @@ interface IV3PoolHub {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function fee() external view returns (uint24);
-    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
-        external
-        returns (int256 amount0, int256 amount1);
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
 }
 
 interface IExecutorAdapterHub {
@@ -178,6 +182,7 @@ contract ExecutorHub {
     error InvalidCallback();
     error BalanceDidNotIncrease();
     error AdapterNotWhitelisted();
+    error MissingFactory();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -285,56 +290,58 @@ contract ExecutorHub {
         if (step.dex == StepKind.AerodromeClassic) {
             IAerodromeClassicRouterHub.Route[] memory routes = new IAerodromeClassicRouterHub.Route[](1);
             routes[0] = IAerodromeClassicRouterHub.Route({
-                from: step.tokenIn,
-                to: step.tokenOut,
-                stable: step.stable,
-                factory: step.factory
+                from: step.tokenIn, to: step.tokenOut, stable: step.stable, factory: step.factory
             });
-            IAerodromeClassicRouterHub(step.router).swapExactTokensForTokens(amountIn, 0, routes, address(this), deadline);
+            IAerodromeClassicRouterHub(step.router)
+                .swapExactTokensForTokens(amountIn, 0, routes, address(this), deadline);
         } else if (step.dex == StepKind.AerodromeSlipstream) {
-            ISlipstreamRouterHub(step.router).exactInputSingle(
-                ISlipstreamRouterHub.ExactInputSingleParams({
-                    tokenIn: step.tokenIn,
-                    tokenOut: step.tokenOut,
-                    tickSpacing: _decodeTickSpacing(step.fee),
-                    recipient: address(this),
-                    deadline: deadline,
-                    amountIn: amountIn,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
-                })
-            );
+            ISlipstreamRouterHub(step.router)
+                .exactInputSingle(
+                    ISlipstreamRouterHub.ExactInputSingleParams({
+                        tokenIn: step.tokenIn,
+                        tokenOut: step.tokenOut,
+                        tickSpacing: _decodeTickSpacing(step.fee),
+                        recipient: address(this),
+                        deadline: deadline,
+                        amountIn: amountIn,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
         } else if (step.dex == StepKind.UniswapV3) {
-            IV3RouterHub(step.router).exactInputSingle(
-                IV3RouterHub.ExactInputSingleParams({
-                    tokenIn: step.tokenIn,
-                    tokenOut: step.tokenOut,
-                    fee: step.fee,
-                    recipient: address(this),
-                    amountIn: amountIn,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
-                })
-            );
+            IV3RouterHub(step.router)
+                .exactInputSingle(
+                    IV3RouterHub.ExactInputSingleParams({
+                        tokenIn: step.tokenIn,
+                        tokenOut: step.tokenOut,
+                        fee: step.fee,
+                        recipient: address(this),
+                        amountIn: amountIn,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
         } else if (step.dex == StepKind.PancakeV3) {
-            IPancakeV3RouterHub(step.router).exactInputSingle(
-                IPancakeV3RouterHub.ExactInputSingleParams({
-                    tokenIn: step.tokenIn,
-                    tokenOut: step.tokenOut,
-                    fee: step.fee,
-                    recipient: address(this),
-                    deadline: deadline,
-                    amountIn: amountIn,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
-                })
-            );
+            IPancakeV3RouterHub(step.router)
+                .exactInputSingle(
+                    IPancakeV3RouterHub.ExactInputSingleParams({
+                        tokenIn: step.tokenIn,
+                        tokenOut: step.tokenOut,
+                        fee: step.fee,
+                        recipient: address(this),
+                        deadline: deadline,
+                        amountIn: amountIn,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                );
         } else {
             revert UnsupportedDex();
         }
     }
 
     function _swapDirectV3(SwapStep calldata step, uint256 amountIn) internal {
+        _validatePoolStrict(step);
         IV3PoolHub pool = IV3PoolHub(step.pool);
         address token0 = pool.token0();
         address token1 = pool.token1();
@@ -364,6 +371,7 @@ contract ExecutorHub {
     }
 
     function _swapDirectV2(SwapStep calldata step, uint256 amountIn) internal {
+        _validatePoolStrict(step);
         if (step.stable) revert UnsupportedDex();
         if (step.fee == 0 || step.fee >= 10_000) revert InvalidFee();
 
@@ -395,17 +403,18 @@ contract ExecutorHub {
     function _swapAdapter(SwapStep calldata step, uint256 amountIn) internal {
         if (!adapters[step.router]) revert AdapterNotWhitelisted();
         _safeTransfer(step.tokenIn, step.router, amountIn);
-        IExecutorAdapterHub(step.router).swap(
-            step.pool,
-            step.tokenIn,
-            step.tokenOut,
-            step.fee,
-            step.stable,
-            step.factory,
-            amountIn,
-            address(this),
-            step.data
-        );
+        IExecutorAdapterHub(step.router)
+            .swap(
+                step.pool,
+                step.tokenIn,
+                step.tokenOut,
+                step.fee,
+                step.stable,
+                step.factory,
+                amountIn,
+                address(this),
+                step.data
+            );
     }
 
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
@@ -449,14 +458,22 @@ contract ExecutorHub {
 
     function _validatePool(SwapStep calldata step) internal view {
         if (step.factory == address(0) || step.pool == address(0)) return;
+        _validateExpectedPool(step);
+    }
 
+    function _validatePoolStrict(SwapStep calldata step) internal view {
+        if (step.factory == address(0) || step.pool == address(0)) revert MissingFactory();
+        _validateExpectedPool(step);
+    }
+
+    function _validateExpectedPool(SwapStep calldata step) internal view {
         address expectedPool;
-        if (step.dex == StepKind.AerodromeClassic) {
+        if (step.dex == StepKind.AerodromeClassic || step.dex == StepKind.DirectV2) {
             expectedPool = IAerodromeClassicFactoryHub(step.factory).getPool(step.tokenIn, step.tokenOut, step.stable);
         } else if (step.dex == StepKind.AerodromeSlipstream) {
             expectedPool =
                 ISlipstreamFactoryHub(step.factory).getPool(step.tokenIn, step.tokenOut, _decodeTickSpacing(step.fee));
-        } else if (step.dex == StepKind.UniswapV3 || step.dex == StepKind.PancakeV3) {
+        } else if (step.dex == StepKind.UniswapV3 || step.dex == StepKind.PancakeV3 || step.dex == StepKind.DirectV3) {
             expectedPool = IV3FactoryHub(step.factory).getPool(step.tokenIn, step.tokenOut, step.fee);
         } else {
             return;

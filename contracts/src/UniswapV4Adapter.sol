@@ -38,8 +38,7 @@ interface IPoolManagerV4Adapter {
 /// @dev Adapter data is abi.encode(currency0, currency1, fee, tickSpacing, hooks, sqrtPriceLimitX96, hookData).
 contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
     uint160 internal constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
-    uint160 internal constant MAX_SQRT_RATIO_MINUS_ONE =
-        1461446703485210103287273052203988822378723970341;
+    uint160 internal constant MAX_SQRT_RATIO_MINUS_ONE = 1461446703485210103287273052203988822378723970341;
 
     error UnauthorizedCaller();
     error UnauthorizedCallback();
@@ -51,6 +50,7 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
     error NoOutput();
 
     address public immutable hub;
+    address public immutable manager;
 
     struct UnlockData {
         address manager;
@@ -63,13 +63,15 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         bytes hookData;
     }
 
-    constructor(address hub_) {
+    constructor(address hub_, address manager_) {
         if (hub_ == address(0)) revert UnauthorizedCaller();
+        if (manager_ == address(0)) revert InvalidManager();
         hub = hub_;
+        manager = manager_;
     }
 
     function swap(
-        address pool,
+        address,
         address tokenIn,
         address tokenOut,
         uint24 fee,
@@ -83,11 +85,9 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         if (tokenIn == address(0) || tokenOut == address(0)) revert InvalidToken();
         if (amountIn == 0) revert InvalidAmount();
 
-        address manager = factory == address(0) ? pool : factory;
-        if (manager == address(0)) revert InvalidManager();
+        if (factory != address(0) && factory != manager) revert InvalidManager();
 
-        UnlockData memory unlockData =
-            _decodeUnlockData(manager, tokenIn, tokenOut, fee, amountIn, recipient, data);
+        UnlockData memory unlockData = _decodeUnlockData(manager, tokenIn, tokenOut, fee, amountIn, recipient, data);
         bytes memory result = IPoolManagerV4Adapter(manager).unlock(abi.encode(unlockData));
         amountOut = abi.decode(result, (uint256));
         if (amountOut == 0) revert NoOutput();
@@ -98,15 +98,16 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         if (msg.sender != decoded.manager) revert UnauthorizedCallback();
 
         bool zeroForOne = _validateAndDirection(decoded.key, decoded.tokenIn, decoded.tokenOut);
-        int256 delta = IPoolManagerV4Adapter(decoded.manager).swap(
-            decoded.key,
-            IPoolManagerV4Adapter.SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: -int256(decoded.amountIn),
-                sqrtPriceLimitX96: decoded.sqrtPriceLimitX96
-            }),
-            decoded.hookData
-        );
+        int256 delta = IPoolManagerV4Adapter(decoded.manager)
+            .swap(
+                decoded.key,
+                IPoolManagerV4Adapter.SwapParams({
+                    zeroForOne: zeroForOne,
+                    amountSpecified: -int256(decoded.amountIn),
+                    sqrtPriceLimitX96: decoded.sqrtPriceLimitX96
+                }),
+                decoded.hookData
+            );
 
         int128 delta0 = _amount0(delta);
         int128 delta1 = _amount1(delta);
@@ -123,7 +124,7 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
     }
 
     function _decodeUnlockData(
-        address manager,
+        address manager_,
         address tokenIn,
         address tokenOut,
         uint24 fallbackFee,
@@ -142,13 +143,9 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         ) = _decodeData(data);
         if (fee == 0) fee = fallbackFee;
         unlockData = UnlockData({
-            manager: manager,
+            manager: manager_,
             key: IPoolManagerV4Adapter.PoolKey({
-                currency0: currency0,
-                currency1: currency1,
-                fee: fee,
-                tickSpacing: tickSpacing,
-                hooks: hooks
+                currency0: currency0, currency1: currency1, fee: fee, tickSpacing: tickSpacing, hooks: hooks
             }),
             tokenIn: tokenIn,
             tokenOut: tokenOut,
@@ -159,8 +156,7 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         });
         bool zeroForOne = _validateAndDirection(unlockData.key, tokenIn, tokenOut);
         if (unlockData.sqrtPriceLimitX96 == 0) {
-            unlockData.sqrtPriceLimitX96 =
-                zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
+            unlockData.sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE;
         }
     }
 
@@ -191,10 +187,10 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         revert InvalidToken();
     }
 
-    function _settle(address manager, address token, uint256 amount) internal {
-        IPoolManagerV4Adapter(manager).sync(token);
-        if (!IERC20V4Adapter(token).transfer(manager, amount)) revert TransferFailed();
-        IPoolManagerV4Adapter(manager).settle();
+    function _settle(address manager_, address token, uint256 amount) internal {
+        IPoolManagerV4Adapter(manager_).sync(token);
+        if (!IERC20V4Adapter(token).transfer(manager_, amount)) revert TransferFailed();
+        IPoolManagerV4Adapter(manager_).settle();
     }
 
     function _amount0(int256 delta) internal pure returns (int128) {
