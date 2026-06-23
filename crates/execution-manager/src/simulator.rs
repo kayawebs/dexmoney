@@ -1,4 +1,4 @@
-use alloy_primitives::{aliases::U512, keccak256, Address, U256};
+use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -6,12 +6,10 @@ use base_arb_common::constants::{
     AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, AERODROME_SLIPSTREAM_ROUTER,
     PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER, UNISWAP_V3_FACTORY,
 };
-use base_arb_common::types::{Candidate, DexKind, PoolState, PoolVariant, SimulationResult};
+use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
 
 const EXECUTOR_DEADLINE_SECS: i64 = 30;
-const WETH_UNIT: u128 = 1_000_000_000_000_000_000u128;
-const USDC_UNIT: u64 = 1_000_000u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApprovalRequirement {
@@ -23,7 +21,6 @@ pub struct ApprovalRequirement {
 pub struct SimulationContext {
     pub observed_block: Option<u64>,
     fees: Option<SimulationFeeSuggestion>,
-    usdc_per_weth_units: Option<U256>,
 }
 
 impl SimulationContext {
@@ -31,7 +28,6 @@ impl SimulationContext {
         Self {
             observed_block: Some(observed_block),
             fees: simulation_fee_suggestion(provider, settings).await.ok(),
-            usdc_per_weth_units: load_usdc_per_weth_units(provider, settings).await,
         }
     }
 }
@@ -96,6 +92,7 @@ async fn simulate_inner(
         anyhow::bail!("candidate expired");
     }
 
+    let _ = min_simulated_profit_usdc;
     let min_profit_units = candidate.min_profit;
     if candidate.expected_profit < min_profit_units {
         anyhow::bail!("profit below simulated threshold");
@@ -124,22 +121,12 @@ async fn simulate_inner(
     };
     let gas_cost_cap = gas_estimate.saturating_mul(fees.max_fee_per_gas);
     let gas_cost_expected = gas_estimate.saturating_mul(fees.expected_fee_per_gas);
-    let gas_cost_in_token =
-        gas_cost_in_candidate_token(settings, candidate.token_in, gas_cost_expected, context);
-    let min_net_profit_in_token = min_net_profit_in_candidate_token(
-        settings,
-        candidate.token_in,
-        min_simulated_profit_usdc,
-        context,
-    );
-    let net_simulated_profit =
-        gas_cost_in_token.map(|gas_cost| simulated_profit.saturating_sub(gas_cost));
-    let gas_buffered_cost = gas_cost_in_token
-        .map(|gas_cost| apply_bps(gas_cost, settings.execution_gas_profit_buffer_bps))
-        .unwrap_or(U256::ZERO);
-    let required_profit = min_profit_units
-        .max(gas_buffered_cost.saturating_add(min_net_profit_in_token.unwrap_or(U256::ZERO)));
-    let profit_meets_threshold = simulated_profit >= required_profit;
+    let net_simulated_profit = if candidate.token_in == settings.weth_address {
+        Some(simulated_profit.saturating_sub(gas_cost_expected))
+    } else {
+        None
+    };
+    let profit_meets_threshold = simulated_profit >= min_profit_units;
     let block_number = context.observed_block;
 
     Ok(SimulationResult {
@@ -161,116 +148,12 @@ async fn simulate_inner(
         gas_cost_expected: Some(gas_cost_expected),
         net_simulated_profit,
         revert_reason: if !profit_meets_threshold {
-            Some(format!(
-                "simulated net profit below threshold required_profit={required_profit} gas_cost_in_token={} min_net_profit_in_token={}",
-                gas_cost_in_token
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                min_net_profit_in_token
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            ))
+            Some("simulated profit below threshold".into())
         } else {
             None
         },
         calldata,
     })
-}
-
-async fn load_usdc_per_weth_units(provider: &ChainProvider, settings: &Settings) -> Option<U256> {
-    let states = provider.bootstrap_configured_pools(settings).await.ok()?;
-    states
-        .iter()
-        .find_map(|state| usdc_per_weth_units_from_state(state, settings))
-}
-
-fn gas_cost_in_candidate_token(
-    settings: &Settings,
-    token: Address,
-    gas_cost_wei: U256,
-    context: &SimulationContext,
-) -> Option<U256> {
-    if token == settings.weth_address {
-        Some(gas_cost_wei)
-    } else if token == settings.usdc_address {
-        let usdc_per_weth = context.usdc_per_weth_units?;
-        mul_div(gas_cost_wei, usdc_per_weth, U256::from(WETH_UNIT)).ok()
-    } else {
-        None
-    }
-}
-
-fn min_net_profit_in_candidate_token(
-    settings: &Settings,
-    token: Address,
-    min_profit_usdc: f64,
-    context: &SimulationContext,
-) -> Option<U256> {
-    let usdc_units = usdc_float_to_units(min_profit_usdc);
-    if token == settings.usdc_address {
-        Some(usdc_units)
-    } else if token == settings.weth_address {
-        let usdc_per_weth = context.usdc_per_weth_units?;
-        mul_div(usdc_units, U256::from(WETH_UNIT), usdc_per_weth).ok()
-    } else {
-        None
-    }
-}
-
-fn usdc_per_weth_units_from_state(state: &PoolState, settings: &Settings) -> Option<U256> {
-    let weth = settings.weth_address;
-    let usdc = settings.usdc_address;
-    if !((state.token0 == weth && state.token1 == usdc)
-        || (state.token0 == usdc && state.token1 == weth))
-    {
-        return None;
-    }
-    match state.variant {
-        PoolVariant::AerodromeVolatile => {
-            let reserve0 = state.reserve0?;
-            let reserve1 = state.reserve1?;
-            if reserve0.is_zero() || reserve1.is_zero() {
-                return None;
-            }
-            if state.token0 == weth {
-                mul_div(U256::from(WETH_UNIT), reserve1, reserve0).ok()
-            } else {
-                mul_div(U256::from(WETH_UNIT), reserve0, reserve1).ok()
-            }
-        }
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
-            let sqrt_price = state.sqrt_price_x96?;
-            if sqrt_price.is_zero() {
-                return None;
-            }
-            let price_x192 = U512::from(sqrt_price) * U512::from(sqrt_price);
-            let q192 = U512::from(U256::from(1u64) << 192);
-            if state.token0 == weth {
-                u512_to_u256((U512::from(U256::from(WETH_UNIT)) * price_x192) / q192).ok()
-            } else {
-                u512_to_u256((U512::from(U256::from(WETH_UNIT)) * q192) / price_x192).ok()
-            }
-        }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => None,
-    }
-}
-
-fn usdc_float_to_units(value: f64) -> U256 {
-    if !value.is_finite() || value <= 0.0 {
-        return U256::ZERO;
-    }
-    U256::from((value * USDC_UNIT as f64).ceil() as u64)
-}
-
-fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256> {
-    if denominator.is_zero() {
-        anyhow::bail!("division by zero");
-    }
-    u512_to_u256((U512::from(a) * U512::from(b)) / U512::from(denominator))
-}
-
-fn u512_to_u256(value: U512) -> Result<U256> {
-    U256::checked_from_limbs_slice(value.as_limbs()).context("U512 to U256 overflow")
 }
 
 fn build_simulation_calldata(
@@ -521,12 +404,7 @@ fn step_execution_kind(
             let default_factory = settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
-            reject_untrusted_factory(
-                step.factory_address,
-                default_factory,
-                &[],
-                "Aerodrome Classic",
-            )?;
+            reject_untrusted_factory(step.factory_address, default_factory, &[], "Aerodrome Classic")?;
             Ok(ExecutorStepKind::AerodromeClassic)
         }
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
@@ -586,11 +464,9 @@ fn reject_untrusted_factory(
         return Ok(());
     };
     if configured_factory == Some(factory)
-        || fallback_factories.iter().any(|expected| {
-            expected
-                .parse::<Address>()
-                .is_ok_and(|expected| expected == factory)
-        })
+        || fallback_factories
+            .iter()
+            .any(|expected| expected.parse::<Address>().is_ok_and(|expected| expected == factory))
     {
         return Ok(());
     }
