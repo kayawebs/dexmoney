@@ -1162,6 +1162,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON dex_events (pool_address, block_number DESC, event_type)"#,
         r#"ALTER TABLE pool_states
             ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown'"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_states_pool_block_idx
+            ON pool_states (pool_address, block_number DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_state_warnings (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             pool_address TEXT NOT NULL,
@@ -1399,6 +1401,9 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON protocol_pool_observations (chain_id, latest_block DESC, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_pool_address_idx
             ON protocol_pool_observations (chain_id, lower(pool_address))
+            WHERE pool_address IS NOT NULL"#,
+        r#"CREATE INDEX IF NOT EXISTS protocol_pool_observations_pool_updated_idx
+            ON protocol_pool_observations (chain_id, pool_address, updated_at DESC)
             WHERE pool_address IS NOT NULL"#,
         r#"ALTER TABLE protocol_pool_observations
             ADD COLUMN IF NOT EXISTS pool_key_fee_pips BIGINT"#,

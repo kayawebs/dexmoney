@@ -600,7 +600,7 @@ async fn load_pool_coverage(
             ) AS dex_event_logs_same_block,
             {opportunities_expr} AS opportunities_near_block
         FROM target t
-        LEFT JOIN pools p ON p.pool_address = t.pool
+        LEFT JOIN pools p ON p.chain_id = $3 AND p.pool_address = t.pool
         LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
         LEFT JOIN LATERAL (
             SELECT block_number, source
@@ -618,7 +618,7 @@ async fn load_pool_coverage(
                 logs_30d, discovery_source, import_status
             FROM protocol_pool_observations po
             WHERE po.chain_id = $3
-              AND lower(po.pool_address) = t.pool
+              AND po.pool_address = t.pool
             ORDER BY po.updated_at DESC
             LIMIT 1
         ) po ON true
