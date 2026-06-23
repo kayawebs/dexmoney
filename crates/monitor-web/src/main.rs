@@ -353,6 +353,9 @@ struct ObservedPoolCandidate {
 #[derive(Debug, Deserialize)]
 struct AuthQuery {
     password: Option<String>,
+    q: Option<String>,
+    limit: Option<i64>,
+    include_pair_tokens: Option<bool>,
 }
 
 #[tokio::main]
@@ -492,16 +495,26 @@ async fn registry_tokens_page(
     if !password_matches_query(state.admin_password.as_deref(), auth.password.as_deref()) {
         return Ok(Html(render_login()));
     }
-    let rows = fetch_token_search_defaults(&state.pool)
+    let limit = auth.limit.unwrap_or(300).clamp(50, 1000);
+    let query = auth.q.as_deref().unwrap_or_default().trim();
+    let include_pair_tokens = auth.include_pair_tokens.unwrap_or(false);
+    let rows = fetch_token_search_defaults(&state.pool, query, limit, include_pair_tokens)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let content = format!(
         r#"{nav}
         <section class="card">
           <h2>Tokens</h2>
-          <div class="card-body">{table}</div>
+          <div class="card-body">{controls}{table}</div>
         </section>"#,
         nav = render_registry_nav(auth.password.as_deref(), "tokens"),
+        controls = render_token_search_controls(
+            auth.password.as_deref(),
+            query,
+            limit,
+            include_pair_tokens,
+            rows.len(),
+        ),
         table = render_token_search_defaults(&rows),
     );
     Ok(Html(render_page(
@@ -1361,19 +1374,20 @@ async fn update_token_search_defaults(
         .await;
     }
 
-    let rows = fetch_token_search_defaults(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let token_addresses = form
         .get("token_addresses")
         .map(String::as_str)
         .unwrap_or_default()
         .split(',')
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     if token_addresses.is_empty() {
         return render_registry_response(&state.pool, None, Some("no tokens submitted")).await;
     }
+    let rows = fetch_token_search_defaults_for_tokens(&state.pool, &token_addresses)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let store = PostgresStore {
         pool: (*state.pool).clone(),
@@ -1382,7 +1396,6 @@ async fn update_token_search_defaults(
     let mut background_discovery_symbols = Vec::new();
 
     for token_address in token_addresses {
-        let token_address = token_address.trim().to_lowercase();
         let Some(row) = rows
             .iter()
             .find(|row| row.token_address.eq_ignore_ascii_case(&token_address))
@@ -1801,43 +1814,81 @@ async fn fetch_enabled_token_pairs(pool: &PgPool) -> Result<Vec<TokenPairRow>> {
     .await?)
 }
 
-async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDefaultRow>> {
+async fn fetch_token_search_defaults(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+    include_pair_tokens: bool,
+) -> Result<Vec<TokenSearchDefaultRow>> {
     Ok(sqlx::query_as::<_, TokenSearchDefaultRow>(
         r#"
         WITH token_set AS (
-            SELECT chain_id, token_address, symbol, enabled
+            SELECT
+                d.chain_id,
+                lower(d.token_address) AS token_address,
+                COALESCE(t.symbol, d.token_address) AS symbol,
+                COALESCE(t.enabled, TRUE) AS enabled,
+                TRUE AS configured
+            FROM token_search_defaults d
+            LEFT JOIN tokens t
+              ON t.chain_id = d.chain_id
+             AND lower(t.token_address) = lower(d.token_address)
+            UNION
+            SELECT
+                chain_id,
+                lower(token_address) AS token_address,
+                symbol,
+                enabled,
+                FALSE AS configured
             FROM tokens
+            WHERE $1 <> ''
+              AND (
+                  symbol ILIKE '%' || $1 || '%'
+                  OR token_address ILIKE '%' || $1 || '%'
+              )
             UNION
             SELECT
                 tp.chain_id,
-                tp.token0 AS token_address,
+                lower(tp.token0) AS token_address,
                 COALESCE(t.symbol, tp.token0) AS symbol,
-                TRUE AS enabled
-            FROM token_pairs
+                TRUE AS enabled,
+                FALSE AS configured
+            FROM token_pairs tp
             LEFT JOIN tokens t
               ON t.chain_id = tp.chain_id
              AND lower(t.token_address) = lower(tp.token0)
-            WHERE tp.enabled = TRUE
+            WHERE $2 = TRUE
+              AND tp.enabled = TRUE
+              AND $1 <> ''
+              AND (
+                  COALESCE(t.symbol, tp.token0) ILIKE '%' || $1 || '%'
+                  OR tp.token0 ILIKE '%' || $1 || '%'
+              )
             UNION
             SELECT
                 tp.chain_id,
-                tp.token1 AS token_address,
+                lower(tp.token1) AS token_address,
                 COALESCE(t.symbol, tp.token1) AS symbol,
-                TRUE AS enabled
-            FROM token_pairs
+                TRUE AS enabled,
+                FALSE AS configured
+            FROM token_pairs tp
             LEFT JOIN tokens t
               ON t.chain_id = tp.chain_id
              AND lower(t.token_address) = lower(tp.token1)
-            WHERE tp.enabled = TRUE
-            UNION
-            SELECT chain_id, token_address, token_address AS symbol, TRUE AS enabled
-            FROM token_search_defaults
+            WHERE $2 = TRUE
+              AND tp.enabled = TRUE
+              AND $1 <> ''
+              AND (
+                  COALESCE(t.symbol, tp.token1) ILIKE '%' || $1 || '%'
+                  OR tp.token1 ILIKE '%' || $1 || '%'
+              )
         )
         SELECT
             token_set.chain_id,
             MIN(token_set.symbol) AS symbol,
             token_set.token_address,
             BOOL_OR(token_set.enabled) AS enabled,
+            BOOL_OR(token_set.configured) AS configured,
             cfg_all.search_amounts,
             cfg_all.min_profit,
             cfg_two_hop.search_amounts AS two_hop_search_amounts,
@@ -1847,15 +1898,15 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
         FROM token_set
         LEFT JOIN token_search_defaults cfg_all
           ON cfg_all.chain_id = token_set.chain_id
-         AND cfg_all.token_address = token_set.token_address
+         AND lower(cfg_all.token_address) = token_set.token_address
          AND cfg_all.executor_scope = 'all'
         LEFT JOIN token_search_defaults cfg_two_hop
           ON cfg_two_hop.chain_id = token_set.chain_id
-         AND cfg_two_hop.token_address = token_set.token_address
+         AND lower(cfg_two_hop.token_address) = token_set.token_address
          AND cfg_two_hop.executor_scope = 'two_hop'
         LEFT JOIN token_search_defaults cfg_multihop
           ON cfg_multihop.chain_id = token_set.chain_id
-         AND cfg_multihop.token_address = token_set.token_address
+         AND lower(cfg_multihop.token_address) = token_set.token_address
          AND cfg_multihop.executor_scope = 'multihop'
         GROUP BY
             token_set.chain_id,
@@ -1867,15 +1918,87 @@ async fn fetch_token_search_defaults(pool: &PgPool) -> Result<Vec<TokenSearchDef
             cfg_multihop.search_amounts,
             cfg_multihop.min_profit
         ORDER BY
-            (
-                (cfg_all.search_amounts IS NOT NULL AND cfg_all.min_profit IS NOT NULL)
-                OR (cfg_two_hop.search_amounts IS NOT NULL AND cfg_two_hop.min_profit IS NOT NULL)
-                OR (cfg_multihop.search_amounts IS NOT NULL AND cfg_multihop.min_profit IS NOT NULL)
-            ) DESC,
+            BOOL_OR(token_set.configured) DESC,
             MIN(token_set.symbol),
             token_set.token_address
+        LIMIT $3
         "#,
     )
+    .bind(query)
+    .bind(include_pair_tokens)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn fetch_token_search_defaults_for_tokens(
+    pool: &PgPool,
+    token_addresses: &[String],
+) -> Result<Vec<TokenSearchDefaultRow>> {
+    Ok(sqlx::query_as::<_, TokenSearchDefaultRow>(
+        r#"
+        WITH requested AS (
+            SELECT lower(unnest($1::text[])) AS token_address
+        ),
+        token_set AS (
+            SELECT
+                d.chain_id,
+                lower(d.token_address) AS token_address,
+                COALESCE(t.symbol, d.token_address) AS symbol,
+                COALESCE(t.enabled, TRUE) AS enabled,
+                TRUE AS configured
+            FROM token_search_defaults d
+            JOIN requested r ON r.token_address = lower(d.token_address)
+            LEFT JOIN tokens t
+              ON t.chain_id = d.chain_id
+             AND lower(t.token_address) = lower(d.token_address)
+            UNION
+            SELECT
+                t.chain_id,
+                lower(t.token_address) AS token_address,
+                t.symbol,
+                t.enabled,
+                FALSE AS configured
+            FROM tokens t
+            JOIN requested r ON r.token_address = lower(t.token_address)
+        )
+        SELECT
+            token_set.chain_id,
+            MIN(token_set.symbol) AS symbol,
+            token_set.token_address,
+            BOOL_OR(token_set.enabled) AS enabled,
+            BOOL_OR(token_set.configured) AS configured,
+            cfg_all.search_amounts,
+            cfg_all.min_profit,
+            cfg_two_hop.search_amounts AS two_hop_search_amounts,
+            cfg_two_hop.min_profit AS two_hop_min_profit,
+            cfg_multihop.search_amounts AS multihop_search_amounts,
+            cfg_multihop.min_profit AS multihop_min_profit
+        FROM token_set
+        LEFT JOIN token_search_defaults cfg_all
+          ON cfg_all.chain_id = token_set.chain_id
+         AND lower(cfg_all.token_address) = token_set.token_address
+         AND cfg_all.executor_scope = 'all'
+        LEFT JOIN token_search_defaults cfg_two_hop
+          ON cfg_two_hop.chain_id = token_set.chain_id
+         AND lower(cfg_two_hop.token_address) = token_set.token_address
+         AND cfg_two_hop.executor_scope = 'two_hop'
+        LEFT JOIN token_search_defaults cfg_multihop
+          ON cfg_multihop.chain_id = token_set.chain_id
+         AND lower(cfg_multihop.token_address) = token_set.token_address
+         AND cfg_multihop.executor_scope = 'multihop'
+        GROUP BY
+            token_set.chain_id,
+            token_set.token_address,
+            cfg_all.search_amounts,
+            cfg_all.min_profit,
+            cfg_two_hop.search_amounts,
+            cfg_two_hop.min_profit,
+            cfg_multihop.search_amounts,
+            cfg_multihop.min_profit
+        "#,
+    )
+    .bind(token_addresses)
     .fetch_all(pool)
     .await?)
 }
@@ -3096,6 +3219,42 @@ fn render_pair_actions(row: &TokenPairRow) -> String {
         render_rediscover_form(row),
         render_delete_pair_form(row),
         render_remove_pair_form(row)
+    )
+}
+
+fn render_token_search_controls(
+    auth_password: Option<&str>,
+    query: &str,
+    limit: i64,
+    include_pair_tokens: bool,
+    shown: usize,
+) -> String {
+    let checked = if include_pair_tokens { " checked" } else { "" };
+    format!(
+        r#"<form method="get" action="/registry/tokens" class="filter-form">
+  {password_input}
+  <label>Search
+    <input class="compact-input" name="q" value="{query}" placeholder="symbol or address">
+  </label>
+  <label>Limit
+    <input class="compact-input tiny-input" name="limit" value="{limit}" placeholder="300">
+  </label>
+  <label class="inline-check">
+    <input type="checkbox" name="include_pair_tokens" value="true"{checked}> include pair-token candidates
+  </label>
+  <button type="submit">Filter</button>
+  <span class="muted">Showing {shown} rows. Default view only loads configured token defaults; search to edit unconfigured tokens.</span>
+</form>"#,
+        password_input = auth_password
+            .map(|password| format!(
+                r#"<input type="hidden" name="password" value="{}">"#,
+                escape(password)
+            ))
+            .unwrap_or_default(),
+        query = escape(query),
+        limit = limit,
+        checked = checked,
+        shown = shown,
     )
 }
 
