@@ -3306,13 +3306,10 @@ where
         block_number: u64,
     ) -> Result<()> {
         let mut ticks = self.pool_store.get_pool_ticks(pool_id.address).await?;
-        let mut updates = Vec::with_capacity(deltas.len());
 
         for delta in deltas {
-            let existing = ticks
-                .iter_mut()
-                .find(|tick| tick.tick == delta.tick)
-                .cloned();
+            let existing_index = ticks.iter().position(|tick| tick.tick == delta.tick);
+            let existing = existing_index.and_then(|index| ticks.get(index).cloned());
             let mut tick_state = existing.unwrap_or_else(|| TickState {
                 pool_id: pool_id.clone(),
                 tick: delta.tick,
@@ -3330,31 +3327,41 @@ where
                 apply_signed_u256_delta(tick_state.liquidity_gross, delta.liquidity_gross_delta)?;
             tick_state.block_number = block_number;
             tick_state.updated_at = chrono::Utc::now();
-            updates.push(tick_state);
+            if tick_state.liquidity_gross.is_zero() {
+                if let Some(index) = existing_index {
+                    ticks.swap_remove(index);
+                }
+            } else if let Some(index) = existing_index {
+                ticks[index] = tick_state;
+            } else {
+                ticks.push(tick_state);
+            }
         }
 
-        if !updates.is_empty() {
-            self.pool_store.set_tick_states(updates).await?;
+        if !deltas.is_empty() {
+            ticks.sort_by_key(|tick| tick.tick);
+            self.pool_store
+                .replace_pool_ticks(pool_id.address, ticks.clone())
+                .await?;
             self.pool_store
                 .mark_tick_changed_pools(vec![pool_id.address])
                 .await?;
-            let state = ticks
-                .first()
-                .map(|tick| (tick.pool_id.chain_id, tick.pool_id.address));
-            if let Some((chain_id, pool_address)) = state {
-                self.tick_recorder.record(PoolTickRecord {
-                    chain_id,
-                    pool_address,
-                    dex,
-                    variant,
-                    protocol,
-                    ticks,
-                    status: "ready",
-                    block_number,
-                    source: "market_data_tick_delta",
-                    word_radius: None,
-                });
-            }
+            self.tick_recorder.record(PoolTickRecord {
+                chain_id: pool_id.chain_id,
+                pool_address: pool_id.address,
+                dex,
+                variant,
+                protocol,
+                status: if ticks.is_empty() {
+                    "zero_ticks"
+                } else {
+                    "ready"
+                },
+                ticks,
+                block_number,
+                source: "market_data_tick_delta",
+                word_radius: None,
+            });
         }
         Ok(())
     }
