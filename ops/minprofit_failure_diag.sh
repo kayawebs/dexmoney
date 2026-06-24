@@ -19,6 +19,7 @@ if [[ -f ".env.docker" ]]; then
 fi
 
 INTERVAL="${INTERVAL:-2 hours}"
+INCLUDE_STATE_FRESHNESS="${INCLUDE_STATE_FRESHNESS:-0}"
 OUT_DIR="${1:-${OUT_DIR:-reports}}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_FILE="$OUT_DIR/minprofit-failure-diag-$STAMP.txt"
@@ -51,6 +52,7 @@ fi
   echo "minprofit failure diagnostic report"
   echo "generated_at_utc: $(date -u '+%Y-%m-%d %H:%M:%S')"
   echo "interval: $INTERVAL"
+  echo "include_state_freshness: $INCLUDE_STATE_FRESHNESS"
   echo "database: $DB_URL"
   echo
   cat <<'EOF'
@@ -68,6 +70,7 @@ psql "$DB_URL" \
   -X \
   --set=ON_ERROR_STOP=1 \
   --set=interval="$INTERVAL" \
+  --set=include_state="$INCLUDE_STATE_FRESHNESS" \
   --pset=pager=off \
   --pset=border=2 \
   >>"$OUT_FILE" <<'SQL'
@@ -553,6 +556,7 @@ LIMIT 40;
 \echo '================================================================================'
 \echo '12. pool state freshness at opportunity block'
 \echo '================================================================================'
+\if :include_state
 WITH state_at_opp AS (
   SELECT DISTINCT ON (s.simulation_id, s.step_no)
     s.simulation_id,
@@ -586,6 +590,10 @@ SELECT
 FROM state_at_opp
 GROUP BY 1
 ORDER BY step_count DESC, max_expected_profit DESC;
+\else
+SELECT
+  'skipped; rerun with INCLUDE_STATE_FRESHNESS=1 for heavy historical pool_states lookup' AS note;
+\endif
 
 \echo
 \echo '================================================================================'
