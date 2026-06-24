@@ -23,7 +23,6 @@ const MAX_EXPIRED_CANDIDATE_DRAIN_PER_CYCLE: usize = 2_048;
 const MAX_CANDIDATE_DRAIN_PER_CYCLE: usize = 128;
 const MAX_SIMULATIONS_PER_CYCLE: usize = MAX_CANDIDATE_DRAIN_PER_CYCLE;
 const CANDIDATE_POP_CHUNK_SIZE: usize = 128;
-const IDLE_EOA_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const SIMULATION_RECORD_QUEUE_CAPACITY: usize = 1_024;
 const SIMULATION_RECORD_FLUSH_MS: u64 = 100;
 const SIMULATION_RECORD_MAX_BATCH: usize = 512;
@@ -35,7 +34,6 @@ struct ExecutionRuntime {
     worker_wallets: Vec<tx_manager::ExecutionWallet>,
     simulation_operator: Option<Address>,
     worker_min_balance: U256,
-    worker_target_balance: U256,
     executor_contracts: Vec<Address>,
 }
 
@@ -51,17 +49,11 @@ impl ExecutionRuntime {
             settings.execution_worker_min_balance_wei.as_deref(),
             "execution_worker_min_balance_wei",
         )?;
-        let worker_target_balance = parse_config_u256(
-            settings.execution_worker_target_balance_wei.as_deref(),
-            "execution_worker_target_balance_wei",
-        )?
-        .max(worker_min_balance);
         Ok(Self {
             fund_wallet,
             worker_wallets,
             simulation_operator,
             worker_min_balance,
-            worker_target_balance,
             executor_contracts: configured_executor_contracts(settings),
         })
     }
@@ -172,6 +164,7 @@ async fn main() -> Result<()> {
             worker_count = runtime.worker_wallets.len(),
             "execution EOA pool configured"
         );
+        assert_submit_runtime_ready(&redis, &postgres, &provider, &settings, &runtime).await?;
     }
 
     info!("execution-manager initialized");
@@ -221,38 +214,33 @@ where
         return Ok(());
     };
     let selected_wallet = if settings.execution_submit_enabled {
-        let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
-            anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
-        };
         if circuit_breaker.is_halted(settings) {
-            debug!("execution circuit breaker halted; leaving candidates queued");
-            return Ok(());
+            anyhow::bail!("execution circuit breaker halted; no candidates were popped");
         }
-        let cached = select_cached_ready_worker(eoa_store, runtime).await?;
-        match cached {
+        match select_cached_ready_worker(eoa_store, runtime).await? {
             Some(wallet) => Some(wallet),
             None => {
-                if !maintenance.should_run_idle_eoa_pool_maintenance() {
-                    debug!("execution worker unavailable; leaving candidates queued");
-                    return Ok(());
-                }
-                let prepared = prepare_eoa_pool(
+                reconcile_worker_lanes(
                     eoa_store,
                     recorder,
                     provider,
                     settings,
                     runtime,
-                    fund_wallet,
                     circuit_breaker,
                 )
                 .await?;
-                if prepared.is_none() || circuit_breaker.is_halted(settings) {
-                    debug!(
-                        "execution worker unavailable after maintenance; leaving candidates queued"
+                if circuit_breaker.is_halted(settings) {
+                    anyhow::bail!(
+                        "execution circuit breaker halted after lane reconciliation; no candidates were popped"
                     );
-                    return Ok(());
                 }
-                prepared
+                Some(
+                    select_cached_ready_worker(eoa_store, runtime)
+                        .await?
+                        .with_context(|| {
+                            "no ready execution worker EOA after lane reconciliation; no candidates were popped"
+                        })?,
+                )
             }
         }
     } else {
@@ -289,21 +277,6 @@ where
         );
     }
     if candidates.is_empty() {
-        if settings.execution_submit_enabled && maintenance.should_run_idle_eoa_pool_maintenance() {
-            let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
-                anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
-            };
-            prepare_eoa_pool(
-                eoa_store,
-                recorder,
-                provider,
-                settings,
-                runtime,
-                fund_wallet,
-                circuit_breaker,
-            )
-            .await?;
-        }
         debug!("no candidate available");
         return Ok(());
     };
@@ -364,25 +337,12 @@ where
 
 #[derive(Default)]
 struct ExecutionMaintenance {
-    last_idle_eoa_pool_maintenance: Option<Instant>,
     approved_allowances: HashSet<(Address, Address, Address)>,
     simulation_context: Option<(u64, simulator::SimulationContext)>,
     submitted_candidate_keys: SubmittedCandidateKeys,
 }
 
 impl ExecutionMaintenance {
-    fn should_run_idle_eoa_pool_maintenance(&mut self) -> bool {
-        let now = Instant::now();
-        if self
-            .last_idle_eoa_pool_maintenance
-            .is_some_and(|last| now.duration_since(last) < IDLE_EOA_POOL_MAINTENANCE_INTERVAL)
-        {
-            return false;
-        }
-        self.last_idle_eoa_pool_maintenance = Some(now);
-        true
-    }
-
     async fn simulation_context(
         &mut self,
         provider: &ChainProvider,
@@ -1090,6 +1050,125 @@ fn submitted_candidate_lock_key(candidate: &Candidate) -> String {
     hex::encode(keccak256(payload.as_bytes()).as_slice())
 }
 
+async fn assert_submit_runtime_ready<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    runtime: &ExecutionRuntime,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    if runtime.fund_wallet.is_none() {
+        anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+    }
+    if runtime.worker_wallets.is_empty() {
+        anyhow::bail!("execution worker EOA pool is empty");
+    }
+    if runtime.executor_contracts.is_empty() {
+        anyhow::bail!("no executor contract configured for live submission");
+    }
+
+    let mut circuit_breaker = ExecutionCircuitBreaker::new(settings.execution_failure_rate_min_txs);
+    reconcile_worker_lanes(
+        eoa_store,
+        recorder,
+        provider,
+        settings,
+        runtime,
+        &mut circuit_breaker,
+    )
+    .await?;
+    if circuit_breaker.is_halted(settings) {
+        anyhow::bail!("execution circuit breaker halted during startup lane reconciliation");
+    }
+
+    let mut ready_workers = 0usize;
+    let mut not_ready = Vec::new();
+    for worker in &runtime.worker_wallets {
+        let address = worker.address();
+        let Some(state) = eoa_store.get_lane_state(address).await? else {
+            not_ready.push(format!("{address:#x}: missing lane state"));
+            continue;
+        };
+        if state.status != EoaLaneStatus::Idle {
+            not_ready.push(format!("{address:#x}: status={:?}", state.status));
+            continue;
+        }
+        if state.eth_balance < runtime.worker_min_balance {
+            not_ready.push(format!(
+                "{address:#x}: low eth balance {} < {}",
+                state.eth_balance, runtime.worker_min_balance
+            ));
+            continue;
+        }
+        let mut missing_operator = None;
+        for executor in &runtime.executor_contracts {
+            if !tx_manager::operator_enabled(provider, *executor, address).await? {
+                missing_operator = Some(*executor);
+                break;
+            }
+        }
+        if let Some(executor) = missing_operator {
+            not_ready.push(format!(
+                "{address:#x}: not operator for executor {executor:#x}"
+            ));
+            continue;
+        }
+        ready_workers += 1;
+    }
+
+    if ready_workers == 0 {
+        anyhow::bail!(
+            "no ready execution worker EOA at startup: {}",
+            not_ready.join("; ")
+        );
+    }
+    info!(
+        ready_workers,
+        worker_count = runtime.worker_wallets.len(),
+        "execution worker readiness verified"
+    );
+    Ok(())
+}
+
+async fn reconcile_worker_lanes<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    runtime: &ExecutionRuntime,
+    circuit_breaker: &mut ExecutionCircuitBreaker,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    for worker in &runtime.worker_wallets {
+        let mut lane = eoa_store
+            .get_lane_state(worker.address())
+            .await?
+            .map(|state| eoa_lane::EoaLane { state })
+            .unwrap_or_else(|| eoa_lane::EoaLane::new(worker.address()));
+
+        if lane.state.status == EoaLaneStatus::Pending {
+            if let Some(success) =
+                handle_pending_lane(&mut lane, eoa_store, recorder, provider, worker, settings)
+                    .await?
+            {
+                circuit_breaker.observe_arb_receipt(success, settings);
+            }
+            continue;
+        }
+
+        sync_idle_lane(&mut lane, provider).await?;
+        eoa_store.set_lane_state(lane.state.clone()).await?;
+    }
+    Ok(())
+}
+
 async fn select_cached_ready_worker<E>(
     eoa_store: &E,
     runtime: &ExecutionRuntime,
@@ -1332,141 +1411,6 @@ where
     }
     candidates.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
     Ok(candidates)
-}
-
-async fn prepare_eoa_pool<E, R>(
-    eoa_store: &E,
-    recorder: &R,
-    provider: &ChainProvider,
-    settings: &Settings,
-    runtime: &ExecutionRuntime,
-    fund_wallet: &tx_manager::ExecutionWallet,
-    circuit_breaker: &mut ExecutionCircuitBreaker,
-) -> Result<Option<tx_manager::ExecutionWallet>>
-where
-    E: EoaStateStore,
-    R: RecorderStore + PendingTransactionStore,
-{
-    reconcile_db_pending_transactions(recorder, provider, fund_wallet.address()).await?;
-
-    for worker in &runtime.worker_wallets {
-        reconcile_db_pending_transactions(recorder, provider, worker.address()).await?;
-        let mut lane = eoa_store
-            .get_lane_state(worker.address())
-            .await?
-            .map(|state| eoa_lane::EoaLane { state })
-            .unwrap_or_else(|| eoa_lane::EoaLane::new(worker.address()));
-
-        if lane.state.status == EoaLaneStatus::Pending {
-            if let Some(success) =
-                handle_pending_lane(&mut lane, eoa_store, recorder, provider, worker, settings)
-                    .await?
-            {
-                circuit_breaker.observe_arb_receipt(success, settings);
-            }
-            continue;
-        }
-
-        sync_idle_lane(&mut lane, provider).await?;
-        eoa_store.set_lane_state(lane.state.clone()).await?;
-    }
-
-    if circuit_breaker.is_halted(settings) {
-        return Ok(None);
-    }
-
-    let admin_pending = admin_has_pending_nonce(provider, fund_wallet.address()).await?;
-    let mut ready_worker = None;
-    let mut incomplete_workers = 0u64;
-    for worker in &runtime.worker_wallets {
-        let lane = eoa_store
-            .get_lane_state(worker.address())
-            .await?
-            .map(|state| eoa_lane::EoaLane { state })
-            .unwrap_or_else(|| eoa_lane::EoaLane::new(worker.address()));
-        if lane.state.status != EoaLaneStatus::Idle {
-            continue;
-        }
-
-        if lane.state.eth_balance < runtime.worker_min_balance {
-            incomplete_workers = incomplete_workers.saturating_add(1);
-            if admin_pending {
-                continue;
-            }
-            let top_up = runtime
-                .worker_target_balance
-                .saturating_sub(lane.state.eth_balance);
-            if top_up.is_zero() {
-                continue;
-            }
-            let fund_balance = provider.get_balance(fund_wallet.address()).await?;
-            if fund_balance <= top_up {
-                warn!(
-                    fund = %fund_wallet.address(),
-                    worker = %worker.address(),
-                    fund_balance = %fund_balance,
-                    top_up = %top_up,
-                    "fund EOA balance is too low to top up worker"
-                );
-                return Ok(None);
-            }
-            let nonce = provider
-                .get_transaction_count(fund_wallet.address(), true)
-                .await?;
-            tx_manager::submit_value_transfer(
-                provider,
-                fund_wallet,
-                settings,
-                worker.address(),
-                top_up,
-                nonce,
-            )
-            .await?;
-            return Ok(None);
-        }
-
-        let mut missing_operator = None;
-        for executor in &runtime.executor_contracts {
-            if !tx_manager::operator_enabled(provider, *executor, worker.address()).await? {
-                missing_operator = Some(*executor);
-                break;
-            }
-        }
-        if let Some(executor) = missing_operator {
-            incomplete_workers = incomplete_workers.saturating_add(1);
-            if admin_pending {
-                continue;
-            }
-            let nonce = provider
-                .get_transaction_count(fund_wallet.address(), true)
-                .await?;
-            tx_manager::submit_set_operator(
-                provider,
-                fund_wallet,
-                settings,
-                executor,
-                worker.address(),
-                nonce,
-            )
-            .await?;
-            return Ok(None);
-        }
-
-        if ready_worker.is_none() {
-            ready_worker = Some(worker.clone());
-        }
-    }
-
-    if let Some(worker) = ready_worker {
-        debug!(
-            worker = %worker.address(),
-            incomplete_workers,
-            "selected execution worker EOA"
-        );
-        return Ok(Some(worker.clone()));
-    }
-
-    Ok(None)
 }
 
 async fn admin_has_pending_nonce(provider: &ChainProvider, address: Address) -> Result<bool> {
@@ -1762,56 +1706,6 @@ where
         }
     }
 
-    Ok(())
-}
-
-async fn reconcile_db_pending_transactions<R>(
-    recorder: &R,
-    provider: &ChainProvider,
-    eoa: alloy_primitives::Address,
-) -> Result<()>
-where
-    R: RecorderStore + PendingTransactionStore,
-{
-    let confirmed_nonce = provider.get_transaction_count(eoa, false).await?;
-    for pending in recorder.pending_transactions_for_eoa(eoa, 20).await? {
-        let Some(receipt) = provider.get_transaction_receipt(pending.tx_hash).await? else {
-            if confirmed_nonce > pending.nonce {
-                recorder
-                    .record_transaction(tx_manager::dropped_consumed_nonce_tx_result(
-                        pending.opportunity_id,
-                        pending.simulation_id,
-                        pending.eoa,
-                        pending.tx_hash,
-                        pending.nonce,
-                        confirmed_nonce,
-                    ))
-                    .await?;
-                warn!(
-                    tx_hash = %pending.tx_hash,
-                    nonce = pending.nonce,
-                    confirmed_nonce,
-                    "reconciled pending transaction as dropped because its nonce is already consumed"
-                );
-            }
-            continue;
-        };
-        recorder
-            .record_transaction(tx_manager::receipt_tx_result(
-                pending.opportunity_id,
-                pending.simulation_id,
-                pending.eoa,
-                pending.nonce,
-                &receipt,
-            ))
-            .await?;
-        debug!(
-            tx_hash = %pending.tx_hash,
-            block_number = ?receipt.block_number,
-            success = receipt.success,
-            "reconciled pending transaction from receipt"
-        );
-    }
     Ok(())
 }
 

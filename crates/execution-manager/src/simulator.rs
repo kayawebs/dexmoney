@@ -1155,7 +1155,7 @@ mod tests {
             "51".repeat(300)
         );
         let formatted = super::format_revert_reason(&raw);
-        assert!(formatted.starts_with("..."));
+        assert!(formatted.starts_with("rpc eth_call failed"));
         assert!(formatted.contains("execution reverted"));
         assert!(!formatted.contains("executeWithOwnFunds to="));
     }

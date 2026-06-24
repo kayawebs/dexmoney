@@ -109,11 +109,15 @@ Collected:
     selecting/refreshing worker EOA and checking circuit breaker. If worker
     readiness or circuit breaker returned early, fresh candidates were already
     removed from Redis and never simulated.
-  - Code fix: execution-manager now verifies worker/circuit-breaker readiness
-    before popping candidates in submit mode. If not ready, candidates remain
-    queued. Worker maintenance is rate-limited to the existing 5s idle
-    maintenance interval to avoid repeated RPC/admin actions while preserving
-    candidate queue contents.
+  - Code fix: execution-manager now treats worker readiness as a hard invariant.
+    Startup verifies that at least one worker EOA is funded, idle, and already an
+    operator for every configured executor. Runtime checks worker readiness
+    before popping Redis candidates; if no worker is ready, the cycle fails
+    before consuming candidates.
+  - No worker funding or `setOperator` maintenance runs in the hot path.
+    Funding/operator setup is an explicit deployment/ops step. The only runtime
+    reconciliation left is pending-lane receipt/nonce synchronization, which is
+    required to know whether a previously submitted worker lane can be reused.
 
 Interpretation:
 

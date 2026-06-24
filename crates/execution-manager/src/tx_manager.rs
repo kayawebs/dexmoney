@@ -18,7 +18,6 @@ const UNCHECKED_ARB_FALLBACK_GAS_LIMIT: u64 = 900_000;
 const APPROVE_TOKEN_SELECTOR: [u8; 4] = [0xda, 0x3e, 0x33, 0x97];
 const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
 const EXECUTOR_OPERATORS_SELECTOR: [u8; 4] = [0x13, 0xe7, 0xc9, 0xd8];
-const SET_OPERATOR_SELECTOR: [u8; 4] = [0x55, 0x8a, 0x72, 0x97];
 const EXECUTED_EVENT_TOPIC: &str =
     "0xe953ae62f4f69be1c6d943cb68d93d288f23ffae7332b84196d46e9e778b23b2";
 const MAX_UINT: U256 = U256::MAX;
@@ -139,18 +138,6 @@ pub async fn operator_enabled(
     Ok(decode_u256_result(&raw)? != U256::ZERO)
 }
 
-pub async fn submit_set_operator(
-    provider: &ChainProvider,
-    wallet: &ExecutionWallet,
-    settings: &Settings,
-    executor: Address,
-    operator: Address,
-    nonce: u64,
-) -> Result<Submission> {
-    let calldata = encode_address_bool_call(SET_OPERATOR_SELECTOR, operator, true);
-    submit_contract_call(provider, wallet, settings, executor, calldata, nonce).await
-}
-
 pub async fn submit_executor_approval(
     provider: &ChainProvider,
     wallet: &ExecutionWallet,
@@ -161,55 +148,6 @@ pub async fn submit_executor_approval(
 ) -> Result<Submission> {
     let calldata = encode_approve_token_call(approval.token, approval.spender, MAX_UINT);
     submit_contract_call(provider, wallet, settings, executor, calldata, nonce).await
-}
-
-pub async fn submit_value_transfer(
-    provider: &ChainProvider,
-    wallet: &ExecutionWallet,
-    settings: &Settings,
-    to: Address,
-    value: U256,
-    nonce: u64,
-) -> Result<Submission> {
-    let fees = aggressive_fee_suggestion(provider, settings).await?;
-    let gas_limit = U256::from(21_000u64);
-    let submitted_block = provider.get_block_number().await?;
-    let tx_hash = sign_and_send_value(
-        provider,
-        wallet,
-        settings,
-        to,
-        &[],
-        value,
-        nonce,
-        gas_limit,
-        fees.max_fee_per_gas,
-        fees.max_priority_fee_per_gas,
-    )
-    .await?;
-
-    tracing::info!(
-        tx_hash = %tx_hash,
-        nonce,
-        to = %to,
-        value = %value,
-        gas_limit = %gas_limit,
-        max_fee_per_gas = %fees.max_fee_per_gas,
-        max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
-        submitted_block,
-        "worker funding tx submitted"
-    );
-
-    Ok(Submission {
-        tx_hash,
-        nonce,
-        simulation_id: None,
-        executor_contract: Address::ZERO,
-        submitted_block,
-        gas_limit,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
-    })
 }
 
 async fn submit_contract_call(
@@ -383,35 +321,6 @@ async fn sign_and_send(
         .max_fee_per_gas(alloy_u256_to_ethers(max_fee_per_gas)?)
         .max_priority_fee_per_gas(alloy_u256_to_ethers(max_priority_fee_per_gas)?)
         .value(EthersU256::zero())
-        .data(Bytes::from(calldata.to_vec()));
-    let typed = TypedTransaction::Eip1559(tx);
-    let signature = wallet.wallet.sign_transaction(&typed).await?;
-    let raw = typed.rlp_signed(&signature);
-    let raw_hex = format!("0x{}", hex::encode(raw.as_ref()));
-    provider.send_raw_transaction(&raw_hex).await
-}
-
-async fn sign_and_send_value(
-    provider: &ChainProvider,
-    wallet: &ExecutionWallet,
-    settings: &Settings,
-    to: Address,
-    calldata: &[u8],
-    value: U256,
-    nonce: u64,
-    gas_limit: U256,
-    max_fee_per_gas: U256,
-    max_priority_fee_per_gas: U256,
-) -> Result<B256> {
-    let tx = Eip1559TransactionRequest::new()
-        .from(alloy_address_to_ethers(wallet.address))
-        .to(NameOrAddress::Address(alloy_address_to_ethers(to)))
-        .nonce(EthersU256::from(nonce))
-        .chain_id(U64::from(settings.chain_id))
-        .gas(alloy_u256_to_ethers(gas_limit)?)
-        .max_fee_per_gas(alloy_u256_to_ethers(max_fee_per_gas)?)
-        .max_priority_fee_per_gas(alloy_u256_to_ethers(max_priority_fee_per_gas)?)
-        .value(alloy_u256_to_ethers(value)?)
         .data(Bytes::from(calldata.to_vec()));
     let typed = TypedTransaction::Eip1559(tx);
     let signature = wallet.wallet.sign_transaction(&typed).await?;
@@ -649,14 +558,6 @@ fn encode_address_call(selector: [u8; 4], address: Address) -> Vec<u8> {
     let mut out = Vec::with_capacity(36);
     out.extend(selector);
     out.extend(encode_address(address));
-    out
-}
-
-fn encode_address_bool_call(selector: [u8; 4], address: Address, value: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(68);
-    out.extend(selector);
-    out.extend(encode_address(address));
-    out.extend(encode_u256(U256::from(value as u8)));
     out
 }
 
