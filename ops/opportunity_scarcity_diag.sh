@@ -246,7 +246,7 @@ section "3b. market-data performance aggregate"
 } >>"$OUT_FILE" 2>&1
 
 run_sql "4. effective funded-token configuration" <<'SQL'
-CREATE TEMP TABLE opportunity_scarcity_defaults ON COMMIT DROP AS
+CREATE TEMP TABLE opportunity_scarcity_defaults AS
 SELECT
   chain_id,
   lower(token_address) AS token,
@@ -256,7 +256,7 @@ SELECT
   updated_at
 FROM token_search_defaults;
 
-CREATE TEMP TABLE opportunity_scarcity_configs ON COMMIT DROP AS
+CREATE TEMP TABLE opportunity_scarcity_configs AS
 WITH defaults AS (
   SELECT * FROM opportunity_scarcity_defaults
 )
@@ -395,7 +395,7 @@ LIMIT 80;
 SQL
 
 run_sql "6. enabled path and pool readiness around funded pairs" <<'SQL'
-CREATE TEMP TABLE opportunity_scarcity_latest_states ON COMMIT DROP AS
+CREATE TEMP TABLE opportunity_scarcity_latest_states AS
 SELECT DISTINCT ON (lower(pool_address))
   lower(pool_address) AS pool_address,
   block_number,
