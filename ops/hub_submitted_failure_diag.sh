@@ -34,8 +34,9 @@ if [[ -z "$HUB_ADDRESS" ]]; then
 usage:
   INTERVAL="12 hours" HUB_ADDRESS=0x... $0 [hub_address] [out_dir]
 
-This report only diagnoses submitted chain transactions for the Hub. It does
-not count simulations that never produced a transaction hash.
+This report diagnoses submitted transactions for the Hub from the local
+transactions table. observed_transactions is used only as an optional chain
+index supplement because the chain indexer may lag or omit our own txs.
 EOF
   exit 2
 fi
@@ -94,6 +95,7 @@ run_sql() {
   echo "database: $DB_URL"
   echo
   echo "scope: submitted transactions only; simulations without tx_hash are excluded from failure ratios"
+  echo "primary_source: transactions.tx_hash; observed_transactions is supplementary"
 } >"$OUT_FILE"
 
 run_sql "0. database freshness" <<'SQL'
@@ -165,16 +167,23 @@ WHERE ot.tx_hash IS NULL
 ORDER BY name;
 SQL
 
-run_sql "2. submitted hub tx status, simulation reason, and gas" <<'SQL'
+run_sql "2. submitted tx status, simulation reason, and gas" <<'SQL'
 WITH submitted AS (
   SELECT
-    ot.tx_hash,
-    ot.block_number,
+    t.tx_hash,
+    COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
     ot.transaction_index,
-    ot.updated_at AS observed_at,
-    CASE ot.status WHEN true THEN 'success' WHEN false THEN 'reverted' ELSE 'unknown' END AS chain_status,
-    NULLIF(ot.gas_used, '')::numeric AS gas_used,
-    NULLIF(ot.effective_gas_price, '')::numeric AS effective_gas_price,
+    COALESCE(ot.updated_at, t.created_at) AS observed_at,
+    CASE
+      WHEN ot.status IS TRUE OR t.status = 'Confirmed' THEN 'success'
+      WHEN ot.status IS FALSE OR t.status = 'Reverted' THEN 'reverted'
+      ELSE 'unknown'
+    END AS chain_status,
+    COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric) AS gas_used,
+    COALESCE(
+      NULLIF(ot.effective_gas_price, '')::numeric,
+      NULLIF(t.effective_gas_price, '')::numeric
+    ) AS effective_gas_price,
     t.status AS db_status,
     t.created_at AS db_recorded_at,
     s.success AS sim_success,
@@ -189,11 +198,12 @@ WITH submitted AS (
       WHEN s.revert_reason IS NULL OR s.revert_reason = '' THEN '-'
       ELSE s.revert_reason
     END AS sim_reason
-  FROM observed_transactions ot
-  LEFT JOIN transactions t ON lower(t.tx_hash) = lower(ot.tx_hash)
+  FROM transactions t
+  LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
   LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
-  WHERE lower(ot.to_address) = lower(:'hub')
-    AND ot.updated_at >= now() - :'interval'::interval
+  LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
+  WHERE t.created_at >= now() - :'interval'::interval
+    AND t.tx_hash IS NOT NULL
 )
 SELECT
   chain_status,
@@ -213,10 +223,18 @@ ORDER BY chain_status DESC, txs DESC, max_fee_wei DESC NULLS LAST
 LIMIT 80;
 SQL
 
-run_sql "3. reverted hub tx details" <<'SQL'
+run_sql "3. reverted submitted tx details" <<'SQL'
 WITH submitted AS (
   SELECT
-    ot.*,
+    t.tx_hash,
+    COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
+    ot.transaction_index,
+    COALESCE(ot.from_address, t.eoa) AS from_address,
+    COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric) AS gas_used_num,
+    COALESCE(
+      NULLIF(ot.effective_gas_price, '')::numeric,
+      NULLIF(t.effective_gas_price, '')::numeric
+    ) AS effective_gas_price_num,
     t.id AS tx_record_id,
     t.created_at AS tx_recorded_at,
     t.opportunity_id,
@@ -232,13 +250,16 @@ WITH submitted AS (
     o.amount_in,
     o.expected_profit,
     o.min_profit
-  FROM observed_transactions ot
-  LEFT JOIN transactions t ON lower(t.tx_hash) = lower(ot.tx_hash)
+  FROM transactions t
+  LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
   LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
   LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
-  WHERE lower(ot.to_address) = lower(:'hub')
-    AND ot.updated_at >= now() - :'interval'::interval
-    AND ot.status IS FALSE
+  WHERE t.created_at >= now() - :'interval'::interval
+    AND t.tx_hash IS NOT NULL
+    AND (
+      ot.status IS FALSE
+      OR (ot.tx_hash IS NULL AND t.status = 'Reverted')
+    )
 )
 SELECT
   block_number,
@@ -246,9 +267,9 @@ SELECT
   tx_hash,
   from_address,
   COALESCE(db_status, '-') AS db_status,
-  NULLIF(gas_used, '')::numeric AS gas_used,
-  NULLIF(effective_gas_price, '')::numeric AS effective_gas_price,
-  NULLIF(gas_used, '')::numeric * NULLIF(effective_gas_price, '')::numeric AS fee_wei,
+  gas_used_num AS gas_used,
+  effective_gas_price_num AS effective_gas_price,
+  gas_used_num * effective_gas_price_num AS fee_wei,
   COALESCE(sim_path_name, path_json->>'name', '-') AS path_name,
   token_in,
   amount_in,
@@ -279,13 +300,16 @@ ORDER BY block_number DESC, transaction_index DESC
 LIMIT 200;
 SQL
 
-run_sql "4. reverted hub txs by path and reason" <<'SQL'
+run_sql "4. reverted submitted txs by path and reason" <<'SQL'
 WITH submitted AS (
   SELECT
-    ot.tx_hash,
-    ot.block_number,
-    NULLIF(ot.gas_used, '')::numeric AS gas_used,
-    NULLIF(ot.effective_gas_price, '')::numeric AS effective_gas_price,
+    t.tx_hash,
+    COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
+    COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric) AS gas_used,
+    COALESCE(
+      NULLIF(ot.effective_gas_price, '')::numeric,
+      NULLIF(t.effective_gas_price, '')::numeric
+    ) AS effective_gas_price,
     s.success AS sim_success,
     s.revert_reason AS sim_revert_reason,
     COALESCE(s.path_name, o.path_json->>'name', '-') AS path_name,
@@ -294,13 +318,16 @@ WITH submitted AS (
     o.expected_profit,
     o.min_profit,
     o.path_json
-  FROM observed_transactions ot
-  LEFT JOIN transactions t ON lower(t.tx_hash) = lower(ot.tx_hash)
+  FROM transactions t
+  LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
   LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
   LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
-  WHERE lower(ot.to_address) = lower(:'hub')
-    AND ot.updated_at >= now() - :'interval'::interval
-    AND ot.status IS FALSE
+  WHERE t.created_at >= now() - :'interval'::interval
+    AND t.tx_hash IS NOT NULL
+    AND (
+      ot.status IS FALSE
+      OR (ot.tx_hash IS NULL AND t.status = 'Reverted')
+    )
 )
 SELECT
   CASE
@@ -336,20 +363,36 @@ LIMIT 100;
 SQL
 
 run_sql "5. success vs revert gas comparison" <<'SQL'
+WITH submitted AS (
+  SELECT
+    CASE
+      WHEN ot.status IS TRUE OR t.status = 'Confirmed' THEN 'success'
+      WHEN ot.status IS FALSE OR t.status = 'Reverted' THEN 'reverted'
+      ELSE 'unknown'
+    END AS chain_status,
+    COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
+    COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric) AS gas_used,
+    COALESCE(
+      NULLIF(ot.effective_gas_price, '')::numeric,
+      NULLIF(t.effective_gas_price, '')::numeric
+    ) AS effective_gas_price
+  FROM transactions t
+  LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
+  LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
+  LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
+  WHERE t.created_at >= now() - :'interval'::interval
+    AND t.tx_hash IS NOT NULL
+)
 SELECT
-  CASE status WHEN true THEN 'success' WHEN false THEN 'reverted' ELSE 'unknown' END AS chain_status,
+  chain_status,
   count(*) AS txs,
   max(block_number) AS latest_block,
-  percentile_cont(0.5) WITHIN GROUP (ORDER BY NULLIF(gas_used, '')::numeric) AS p50_gas_used,
-  percentile_cont(0.9) WITHIN GROUP (ORDER BY NULLIF(gas_used, '')::numeric) AS p90_gas_used,
-  max(NULLIF(gas_used, '')::numeric) AS max_gas_used,
-  percentile_cont(0.5) WITHIN GROUP (
-    ORDER BY NULLIF(gas_used, '')::numeric * NULLIF(effective_gas_price, '')::numeric
-  ) AS p50_fee_wei,
-  max(NULLIF(gas_used, '')::numeric * NULLIF(effective_gas_price, '')::numeric) AS max_fee_wei
-FROM observed_transactions
-WHERE lower(to_address) = lower(:'hub')
-  AND updated_at >= now() - :'interval'::interval
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY gas_used) AS p50_gas_used,
+  percentile_cont(0.9) WITHIN GROUP (ORDER BY gas_used) AS p90_gas_used,
+  max(gas_used) AS max_gas_used,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY gas_used * effective_gas_price) AS p50_fee_wei,
+  max(gas_used * effective_gas_price) AS max_fee_wei
+FROM submitted
 GROUP BY 1
 ORDER BY txs DESC;
 SQL
@@ -357,14 +400,20 @@ SQL
 run_sql "6. approvals near reverted hub txs" <<'SQL'
 WITH reverted AS (
   SELECT
-    ot.tx_hash,
-    ot.block_number,
+    t.tx_hash,
+    COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
     ot.transaction_index,
-    ot.from_address
-  FROM observed_transactions ot
-  WHERE lower(ot.to_address) = lower(:'hub')
-    AND ot.updated_at >= now() - :'interval'::interval
-    AND ot.status IS FALSE
+    COALESCE(ot.from_address, t.eoa) AS from_address
+  FROM transactions t
+  LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
+  LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
+  LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
+  WHERE t.created_at >= now() - :'interval'::interval
+    AND t.tx_hash IS NOT NULL
+    AND (
+      ot.status IS FALSE
+      OR (ot.tx_hash IS NULL AND t.status = 'Reverted')
+    )
 )
 SELECT
   r.block_number,
@@ -388,15 +437,19 @@ ORDER BY r.block_number DESC, r.transaction_index DESC
 LIMIT 100;
 SQL
 
-run_sql "7. recent successful hub txs for comparison" <<'SQL'
+run_sql "7. recent successful submitted txs for comparison" <<'SQL'
 SELECT
-  ot.block_number,
+  COALESCE(ot.block_number, s.block_number, o.block_number) AS block_number,
   ot.transaction_index,
-  ot.tx_hash,
-  ot.from_address,
-  NULLIF(ot.gas_used, '')::numeric AS gas_used,
-  NULLIF(ot.effective_gas_price, '')::numeric AS effective_gas_price,
-  NULLIF(ot.gas_used, '')::numeric * NULLIF(ot.effective_gas_price, '')::numeric AS fee_wei,
+  t.tx_hash,
+  COALESCE(ot.from_address, t.eoa) AS from_address,
+  COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric) AS gas_used,
+  COALESCE(
+    NULLIF(ot.effective_gas_price, '')::numeric,
+    NULLIF(t.effective_gas_price, '')::numeric
+  ) AS effective_gas_price,
+  COALESCE(NULLIF(ot.gas_used, '')::numeric, NULLIF(t.gas_used, '')::numeric)
+    * COALESCE(NULLIF(ot.effective_gas_price, '')::numeric, NULLIF(t.effective_gas_price, '')::numeric) AS fee_wei,
   COALESCE(s.path_name, o.path_json->>'name', '-') AS path_name,
   o.token_in,
   o.amount_in,
@@ -404,13 +457,16 @@ SELECT
   o.min_profit,
   t.realized_profit,
   t.status AS db_status
-FROM observed_transactions ot
-LEFT JOIN transactions t ON lower(t.tx_hash) = lower(ot.tx_hash)
+FROM transactions t
+LEFT JOIN observed_transactions ot ON lower(ot.tx_hash) = lower(t.tx_hash)
 LEFT JOIN simulations s ON s.id = t.simulation_id OR s.opportunity_id = t.opportunity_id
 LEFT JOIN opportunities o ON o.id = COALESCE(t.opportunity_id, s.opportunity_id)
-WHERE lower(ot.to_address) = lower(:'hub')
-  AND ot.updated_at >= now() - :'interval'::interval
-  AND ot.status IS TRUE
+WHERE t.created_at >= now() - :'interval'::interval
+  AND t.tx_hash IS NOT NULL
+  AND (
+    ot.status IS TRUE
+    OR (ot.tx_hash IS NULL AND t.status = 'Confirmed')
+  )
 ORDER BY ot.block_number DESC, ot.transaction_index DESC
 LIMIT 100;
 SQL
