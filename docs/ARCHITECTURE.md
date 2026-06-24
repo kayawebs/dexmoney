@@ -40,7 +40,11 @@ This document defines the runtime boundaries for the Base arbitrage system. The 
 ### Balancer V3
 
 - Variant: `BalancerV3`.
-- Current state: observed and partially quoteable through router query.
+- Current state: observed, promoted when metadata is complete, quoteable through
+  router query, and executable through `BalancerV3Adapter`.
+- Durable readiness: `pool_quote_coverage` records offline router-query
+  validation status per pool/token direction. This keeps validation RPC out of
+  the hot search path.
 - Target state: classify pool type and use local math for supported pool families.
 - Hot-path rule: searcher should not depend on per-path RPC queries long term.
 
@@ -191,5 +195,6 @@ For next-block execution:
 - Searcher tick loading: per-pool Redis fetches are too expensive at current path scale.
 - Price-impact model: V3-style exact quote can succeed while spot-only impact estimation fails; this must not block simulation.
 - Balancer V3: runtime quote/execution is available through router-query +
-  adapter, but pool math is not fully local; router query is a temporary bridge.
+  adapter, and offline quote validation writes `pool_quote_coverage`; pool math
+  is not fully local yet, so router query is still a temporary bridge.
 - V4: metadata/tick hydration is still required for complete coverage.

@@ -449,6 +449,56 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_pool_quote_coverage(
+        &self,
+        chain_id: u64,
+        pool_address: Address,
+        token_in: Address,
+        token_out: Address,
+        dex: Option<DexKind>,
+        variant: Option<PoolVariant>,
+        status: &str,
+        amount_in: Option<U256>,
+        amount_out: Option<U256>,
+        source: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pool_quote_coverage (
+                chain_id, pool_address, token_in, token_out, dex, variant, status,
+                amount_in, amount_out, source, error, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+            ON CONFLICT (chain_id, pool_address, token_in, token_out)
+            DO UPDATE SET
+                dex = COALESCE(EXCLUDED.dex, pool_quote_coverage.dex),
+                variant = COALESCE(EXCLUDED.variant, pool_quote_coverage.variant),
+                status = EXCLUDED.status,
+                amount_in = EXCLUDED.amount_in,
+                amount_out = EXCLUDED.amount_out,
+                source = EXCLUDED.source,
+                error = EXCLUDED.error,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(pool_address))
+        .bind(address_to_string(token_in))
+        .bind(address_to_string(token_out))
+        .bind(dex.map(|dex| dex_to_string(dex).to_string()))
+        .bind(variant.map(|variant| variant_to_string(variant).to_string()))
+        .bind(status)
+        .bind(amount_in.map(|value| value.to_string()))
+        .bind(amount_out.map(|value| value.to_string()))
+        .bind(source)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn start_pool_tick_hydration_run(
         &self,
         chain_id: u64,
@@ -1496,6 +1546,25 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pool_tick_coverage (chain_id, status, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pool_tick_coverage_variant_idx
             ON pool_tick_coverage (chain_id, variant, tick_count, updated_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_quote_coverage (
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            token_in TEXT NOT NULL,
+            token_out TEXT NOT NULL,
+            dex TEXT,
+            variant TEXT,
+            status TEXT NOT NULL,
+            amount_in TEXT,
+            amount_out TEXT,
+            source TEXT NOT NULL,
+            error TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chain_id, pool_address, token_in, token_out)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_quote_coverage_status_idx
+            ON pool_quote_coverage (chain_id, variant, status, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_quote_coverage_pool_idx
+            ON pool_quote_coverage (chain_id, lower(pool_address), updated_at DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_tick_hydration_runs (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,

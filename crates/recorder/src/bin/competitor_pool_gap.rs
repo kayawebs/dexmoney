@@ -80,6 +80,11 @@ struct PoolCoverage {
     logs_30d: Option<i64>,
     opportunities_near_block: i64,
     balancer_runtime_ready: bool,
+    quote_ready_count: i64,
+    latest_quote_status: Option<String>,
+    latest_quote_source: Option<String>,
+    latest_quote_error: Option<String>,
+    latest_quote_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -395,6 +400,11 @@ async fn load_pool_coverage(
             COALESCE(op.first_block, po.first_block) AS first_seen_block,
             COALESCE(op.latest_block, po.latest_block) AS latest_seen_block,
             COALESCE(op.logs_30d, po.logs_30d) AS logs_30d,
+            COALESCE(qc.ready_count, 0)::bigint AS quote_ready_count,
+            qcl.status AS latest_quote_status,
+            qcl.source AS latest_quote_source,
+            qcl.error AS latest_quote_error,
+            qcl.updated_at AS latest_quote_updated_at,
             {opportunities_expr} AS opportunities_near_block
         FROM target t
         LEFT JOIN pools p ON p.chain_id = $3 AND p.pool_address = t.pool
@@ -427,6 +437,20 @@ async fn load_pool_coverage(
         LEFT JOIN pool_tick_coverage tc
           ON tc.chain_id = $3
          AND lower(tc.pool_address) = t.pool
+        LEFT JOIN LATERAL (
+            SELECT count(*) FILTER (WHERE status = 'ready') AS ready_count
+            FROM pool_quote_coverage qc
+            WHERE qc.chain_id = $3
+              AND lower(qc.pool_address) = t.pool
+        ) qc ON true
+        LEFT JOIN LATERAL (
+            SELECT status, source, error, updated_at
+            FROM pool_quote_coverage qc
+            WHERE qc.chain_id = $3
+              AND lower(qc.pool_address) = t.pool
+            ORDER BY updated_at DESC
+            LIMIT 1
+        ) qcl ON true
         "#,
     );
     let row = sqlx::query(&sql)
@@ -462,6 +486,11 @@ async fn load_pool_coverage(
         logs_30d: row.try_get("logs_30d")?,
         opportunities_near_block: row.try_get("opportunities_near_block")?,
         balancer_runtime_ready,
+        quote_ready_count: row.try_get("quote_ready_count")?,
+        latest_quote_status: row.try_get("latest_quote_status")?,
+        latest_quote_source: row.try_get("latest_quote_source")?,
+        latest_quote_error: row.try_get("latest_quote_error")?,
+        latest_quote_updated_at: row.try_get("latest_quote_updated_at")?,
     })
 }
 
@@ -499,8 +528,18 @@ fn classify_pool_gap(row: &PoolCoverage, include_opportunity_lookup: bool) -> St
     {
         return "v4_hook_pool_currently_unsupported".into();
     }
-    if row.variant.as_deref() == Some("BalancerV3") && !row.balancer_runtime_ready {
-        return "balancer_v3_needs_runtime_quote_validation".into();
+    if row.variant.as_deref() == Some("BalancerV3") {
+        if !row.balancer_runtime_ready {
+            return "balancer_v3_runtime_not_configured".into();
+        }
+        if row.quote_ready_count == 0 {
+            return match row.latest_quote_status.as_deref() {
+                Some("query_failed") => "balancer_v3_quote_failed".into(),
+                Some("zero_output") => "balancer_v3_quote_zero_output".into(),
+                Some(status) => format!("balancer_v3_quote_{status}"),
+                None => "balancer_v3_quote_unvalidated".into(),
+            };
+        }
     }
     if include_opportunity_lookup && row.opportunities_near_block == 0 {
         return "covered_no_opportunity_near_block".into();
@@ -550,7 +589,7 @@ fn write_pool_table(
     writeln!(writer, "== Unique Competitor Pools ==")?;
     writeln!(
         writer,
-        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\ttick_coverage_status\ttick_coverage_source\ttick_coverage_updated_at\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
+        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\ttick_coverage_status\ttick_coverage_source\ttick_coverage_updated_at\tquote_ready_count\tlatest_quote_status\tlatest_quote_source\tlatest_quote_updated_at\tlatest_quote_error\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
     )?;
     let mut rows = pools.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -567,7 +606,7 @@ fn write_pool_table(
             .unwrap_or_else(|| "missing_coverage".into());
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.pool,
             row.txs,
             row.latest_block,
@@ -601,6 +640,16 @@ fn write_pool_table(
                 .and_then(|c| c.tick_coverage_updated_at)
                 .map(|value| value.to_rfc3339())
                 .unwrap_or_else(|| "-".into()),
+            coverage
+                .map(|c| c.quote_ready_count.to_string())
+                .unwrap_or_else(|| "-".into()),
+            opt(coverage.and_then(|c| c.latest_quote_status.as_deref())),
+            opt(coverage.and_then(|c| c.latest_quote_source.as_deref())),
+            coverage
+                .and_then(|c| c.latest_quote_updated_at)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+            opt(coverage.and_then(|c| c.latest_quote_error.as_deref())),
             opt(coverage.and_then(|c| c.protocol.as_deref())),
             opt(coverage.and_then(|c| c.protocol_status.as_deref())),
             opt(coverage.and_then(|c| c.discovery_source.as_deref())),

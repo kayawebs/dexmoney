@@ -307,6 +307,17 @@ FROM protocol_pool_observations
 WHERE updated_at >= now() - :'interval'::interval
 GROUP BY 1, 2, 3
 ORDER BY observations DESC;
+
+SELECT
+  variant,
+  status,
+  count(*) AS rows,
+  count(DISTINCT lower(pool_address)) AS pools,
+  max(updated_at) AS latest_updated_at
+FROM pool_quote_coverage
+WHERE updated_at >= now() - :'interval'::interval
+GROUP BY 1, 2
+ORDER BY rows DESC;
 SQL
 
 run_cmd "10. latest execution-manager summaries" docker_compose_logs execution-manager

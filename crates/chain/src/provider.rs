@@ -1406,7 +1406,7 @@ impl ChainProvider {
         u32::try_from(fee).map_err(|_| anyhow::anyhow!("classic pool fee too large: {fee}"))
     }
 
-    async fn fetch_token_decimals(&self, token: Address) -> Result<u8> {
+    pub async fn fetch_token_decimals(&self, token: Address) -> Result<u8> {
         let raw = self.eth_call(token, "0x313ce567", "decimals()").await?;
         let words = decode_32byte_words(&raw)?;
         let decimals = parse_word_u256(&words[0])?;
