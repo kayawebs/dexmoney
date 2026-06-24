@@ -598,6 +598,9 @@ Added recorder-side observability fixes:
   quoter used by searcher diagnostics.
 - `ops/minprofit_proof_batch.sh` now sanitizes TSV fields and buckets V4/Balancer
   diagnostic gaps separately from real onchain state failures.
+- `doctor/arb_doctor.sh` is the opportunity-level entrypoint for future
+  evidence collection. It combines DB context, replay, route validation, and a
+  conservative verdict bucket into one artifact.
 
 ### Verification
 
@@ -617,5 +620,6 @@ Expected next report:
 ### Regression Guard
 
 Keep `ops/minprofit_proof_batch.sh` as the repeatable split tool for
-`MinProfitNotMet`. Do not classify old pool `source_block` as stale without a
-drift or event-loss proof.
+`MinProfitNotMet`. Use `doctor/arb_doctor.sh --opportunity-id <uuid>` as the
+first per-opportunity diagnostic artifact. Do not classify old pool
+`source_block` as stale without a drift or event-loss proof.

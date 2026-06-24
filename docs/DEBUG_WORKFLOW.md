@@ -160,6 +160,22 @@ evidence. If a task becomes too large for one working session, split it inside
 the same incident with local subtasks instead of creating external issue
 tracking.
 
+For opportunity-level failures, start with the root-level doctor entrypoint:
+
+```bash
+doctor/arb_doctor.sh --opportunity-id <uuid>
+```
+
+or, for submitted transactions:
+
+```bash
+doctor/arb_doctor.sh --tx-hash <0x...>
+```
+
+The doctor report is the default first artifact before writing new one-off SQL.
+Add a narrower `ops/*_diag.sh` or recorder bin only when the doctor report shows
+which layer needs deeper proof.
+
 ## Do Not Do
 
 - Do not tune balances, gas, min-profit, or search amount before diagnostics
