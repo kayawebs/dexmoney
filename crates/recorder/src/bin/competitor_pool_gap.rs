@@ -85,6 +85,11 @@ struct PoolCoverage {
     latest_quote_source: Option<String>,
     latest_quote_error: Option<String>,
     latest_quote_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    model_family: Option<String>,
+    model_status: Option<String>,
+    model_source: Option<String>,
+    model_error: Option<String>,
+    model_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -406,6 +411,11 @@ async fn load_pool_coverage(
             qcl.source AS latest_quote_source,
             qcl.error AS latest_quote_error,
             qcl.updated_at AS latest_quote_updated_at,
+            mc.model_family AS model_family,
+            mc.status AS model_status,
+            mc.source AS model_source,
+            mc.error AS model_error,
+            mc.updated_at AS model_updated_at,
             {opportunities_expr} AS opportunities_near_block
         FROM target t
         LEFT JOIN pools p ON p.chain_id = $3 AND p.pool_address = t.pool
@@ -452,6 +462,9 @@ async fn load_pool_coverage(
             ORDER BY updated_at DESC
             LIMIT 1
         ) qcl ON true
+        LEFT JOIN pool_model_coverage mc
+          ON mc.chain_id = $3
+         AND lower(mc.pool_address) = t.pool
         "#,
     );
     let row = sqlx::query(&sql)
@@ -492,6 +505,11 @@ async fn load_pool_coverage(
         latest_quote_source: row.try_get("latest_quote_source")?,
         latest_quote_error: row.try_get("latest_quote_error")?,
         latest_quote_updated_at: row.try_get("latest_quote_updated_at")?,
+        model_family: row.try_get("model_family")?,
+        model_status: row.try_get("model_status")?,
+        model_source: row.try_get("model_source")?,
+        model_error: row.try_get("model_error")?,
+        model_updated_at: row.try_get("model_updated_at")?,
     })
 }
 
@@ -530,15 +548,22 @@ fn classify_pool_gap(row: &PoolCoverage, include_opportunity_lookup: bool) -> St
         return "v4_hook_pool_currently_unsupported".into();
     }
     if row.variant.as_deref() == Some("BalancerV3") {
-        if !row.balancer_runtime_ready {
-            return "balancer_v3_runtime_not_configured".into();
-        }
         if row.quote_ready_count == 0 {
             return match row.latest_quote_status.as_deref() {
                 Some("query_failed") => "balancer_v3_quote_failed".into(),
                 Some("zero_output") => "balancer_v3_quote_zero_output".into(),
                 Some(status) => format!("balancer_v3_quote_{status}"),
                 None => "balancer_v3_quote_unvalidated".into(),
+            };
+        }
+        if !row.balancer_runtime_ready {
+            return match row.model_status.as_deref() {
+                Some("weighted_inputs_ready") | Some("stable_inputs_ready") => {
+                    "balancer_v3_local_math_missing".into()
+                }
+                Some("unsupported_pool_type") => "balancer_v3_unsupported_pool_type".into(),
+                Some(status) => format!("balancer_v3_model_{status}"),
+                None => "balancer_v3_model_unclassified".into(),
             };
         }
     }
@@ -590,7 +615,7 @@ fn write_pool_table(
     writeln!(writer, "== Unique Competitor Pools ==")?;
     writeln!(
         writer,
-        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\ttick_coverage_status\ttick_coverage_source\ttick_coverage_updated_at\tquote_ready_count\tlatest_quote_status\tlatest_quote_source\tlatest_quote_updated_at\tlatest_quote_error\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
+        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\ttick_coverage_status\ttick_coverage_source\ttick_coverage_updated_at\tquote_ready_count\tlatest_quote_status\tlatest_quote_source\tlatest_quote_updated_at\tlatest_quote_error\tmodel_family\tmodel_status\tmodel_source\tmodel_updated_at\tmodel_error\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
     )?;
     let mut rows = pools.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -607,7 +632,7 @@ fn write_pool_table(
             .unwrap_or_else(|| "missing_coverage".into());
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.pool,
             row.txs,
             row.latest_block,
@@ -651,6 +676,14 @@ fn write_pool_table(
                 .map(|value| value.to_rfc3339())
                 .unwrap_or_else(|| "-".into()),
             opt(coverage.and_then(|c| c.latest_quote_error.as_deref())),
+            opt(coverage.and_then(|c| c.model_family.as_deref())),
+            opt(coverage.and_then(|c| c.model_status.as_deref())),
+            opt(coverage.and_then(|c| c.model_source.as_deref())),
+            coverage
+                .and_then(|c| c.model_updated_at)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+            opt(coverage.and_then(|c| c.model_error.as_deref())),
             opt(coverage.and_then(|c| c.protocol.as_deref())),
             opt(coverage.and_then(|c| c.protocol_status.as_deref())),
             opt(coverage.and_then(|c| c.discovery_source.as_deref())),

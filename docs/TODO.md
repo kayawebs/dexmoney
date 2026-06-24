@@ -65,7 +65,12 @@
 - [x] Add offline Balancer V3 quote validation:
   - `validate_balancer_v3_quotes` checks router-query success by pool/token direction.
   - Results are persisted in `pool_quote_coverage` for reports and readiness checks.
-- [ ] Add Balancer V3 pool-type classification for local quote:
+- [x] Add offline Balancer V3 pool-type/input classification:
+  - `classify_balancer_v3_models` probes Vault live balances/static fee and
+    weighted/stable pool getters.
+  - Results are persisted in `pool_model_coverage` for reports and local-math
+    readiness.
+- [ ] Add Balancer V3 local quote:
   - Identify pool type and math family from Vault/pool metadata.
   - Store pool-specific balances, scaling factors, fees, and rate-provider data.
   - Quote only pool types with fully implemented local math.

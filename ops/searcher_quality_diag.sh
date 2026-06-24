@@ -350,6 +350,17 @@ FROM pool_quote_coverage
 WHERE updated_at >= now() - :'interval'::interval
 GROUP BY 1, 2
 ORDER BY rows DESC;
+
+SELECT
+  variant,
+  model_family,
+  status,
+  count(*) AS pools,
+  max(updated_at) AS latest_updated_at
+FROM pool_model_coverage
+WHERE updated_at >= now() - :'interval'::interval
+GROUP BY 1, 2, 3
+ORDER BY pools DESC;
 SQL
 
 run_cmd "10. latest execution-manager summaries" docker_compose_logs execution-manager

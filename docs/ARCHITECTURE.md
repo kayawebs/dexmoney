@@ -45,6 +45,8 @@ This document defines the runtime boundaries for the Base arbitrage system. The 
 - Durable readiness: `pool_quote_coverage` records offline router-query
   validation status per pool/token direction. This keeps validation RPC out of
   the hot search path.
+- Model readiness: `pool_model_coverage` records offline weighted/stable pool
+  type probes and the local-model input data needed for future local quoting.
 - Runtime bridge: searcher-side Balancer router queries are disabled by default
   and require `SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED=true`. This is only a
   controlled bridge for validation or narrow dry-runs, not the target production
@@ -136,6 +138,8 @@ Postgres stores durable state and analysis data:
 - `pool_ticks_current` for durable current initialized tick snapshots.
 - `pool_tick_coverage` for durable tick readiness status, including `ready`,
   `zero_ticks`, and `refresh_failed`.
+- `pool_model_coverage` for durable local quote model readiness, including
+  Balancer V3 weighted/stable input probes.
 - `opportunities`, `simulations`, `transactions`.
 - Hydration run progress tables and drift diagnostics.
 
@@ -199,7 +203,8 @@ For next-block execution:
 - Searcher tick loading: per-pool Redis fetches are too expensive at current path scale.
 - Price-impact model: V3-style exact quote can succeed while spot-only impact estimation fails; this must not block simulation.
 - Balancer V3: execution is available through `BalancerV3Adapter`, and offline
-  quote validation writes `pool_quote_coverage`; searcher runtime router quote is
-  explicitly opt-in because per-path RPC violates the production hot-path rule.
-  Pool math is not fully local yet.
+  quote validation writes `pool_quote_coverage`; offline model classification
+  writes `pool_model_coverage`. Searcher runtime router quote is explicitly
+  opt-in because per-path RPC violates the production hot-path rule. Pool math
+  is not fully local yet.
 - V4: metadata/tick hydration is still required for complete coverage.

@@ -499,6 +499,55 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_pool_model_coverage(
+        &self,
+        chain_id: u64,
+        pool_address: Address,
+        dex: Option<DexKind>,
+        variant: Option<PoolVariant>,
+        model_family: Option<&str>,
+        status: &str,
+        source: &str,
+        block_number: Option<u64>,
+        raw_json: serde_json::Value,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pool_model_coverage (
+                chain_id, pool_address, dex, variant, model_family, status,
+                source, block_number, raw_json, error, updated_at
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            ON CONFLICT (chain_id, pool_address)
+            DO UPDATE SET
+                dex = COALESCE(EXCLUDED.dex, pool_model_coverage.dex),
+                variant = COALESCE(EXCLUDED.variant, pool_model_coverage.variant),
+                model_family = EXCLUDED.model_family,
+                status = EXCLUDED.status,
+                source = EXCLUDED.source,
+                block_number = COALESCE(EXCLUDED.block_number, pool_model_coverage.block_number),
+                raw_json = EXCLUDED.raw_json,
+                error = EXCLUDED.error,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(pool_address))
+        .bind(dex.map(dex_to_string))
+        .bind(variant.map(variant_to_string))
+        .bind(model_family)
+        .bind(status)
+        .bind(source)
+        .bind(block_number.map(i64::try_from).transpose()?)
+        .bind(raw_json)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn start_pool_tick_hydration_run(
         &self,
         chain_id: u64,
@@ -1565,6 +1614,24 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pool_quote_coverage (chain_id, variant, status, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pool_quote_coverage_pool_idx
             ON pool_quote_coverage (chain_id, lower(pool_address), updated_at DESC)"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_model_coverage (
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            dex TEXT,
+            variant TEXT,
+            model_family TEXT,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL,
+            block_number BIGINT,
+            raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            error TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chain_id, pool_address)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_model_coverage_status_idx
+            ON pool_model_coverage (chain_id, variant, status, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_model_coverage_family_idx
+            ON pool_model_coverage (chain_id, model_family, status, updated_at DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_tick_hydration_runs (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,
