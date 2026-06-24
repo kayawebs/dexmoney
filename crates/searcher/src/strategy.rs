@@ -66,7 +66,6 @@ pub struct SearchStats {
     pub quote_skipped_missing_state: u64,
     pub quote_skipped_missing_ticks: u64,
     pub quote_skipped_tick_range_exhausted: u64,
-    pub quote_skipped_state_block_gap: u64,
     pub quote_skipped_error: u64,
     pub price_impact_rejected: u64,
     pub quote_model_edge_rejected: u64,
@@ -157,7 +156,6 @@ impl SearchStats {
         self.quote_skipped_missing_state += other.quote_skipped_missing_state;
         self.quote_skipped_missing_ticks += other.quote_skipped_missing_ticks;
         self.quote_skipped_tick_range_exhausted += other.quote_skipped_tick_range_exhausted;
-        self.quote_skipped_state_block_gap += other.quote_skipped_state_block_gap;
         self.quote_skipped_error += other.quote_skipped_error;
         self.price_impact_rejected += other.price_impact_rejected;
         self.quote_model_edge_rejected += other.quote_model_edge_rejected;
@@ -224,7 +222,6 @@ impl SearchStats {
             QuoteSkipReason::TickRangeExhausted => {
                 self.quote_skipped_tick_range_exhausted += 1;
             }
-            QuoteSkipReason::StateBlockGap => self.quote_skipped_state_block_gap += 1,
             QuoteSkipReason::QuoteError => self.quote_skipped_error += 1,
         }
     }
@@ -428,7 +425,6 @@ pub enum QuoteSkipReason {
     MissingState,
     MissingTicks,
     TickRangeExhausted,
-    StateBlockGap,
     QuoteError,
 }
 
@@ -2101,7 +2097,7 @@ async fn quote_path(
     path: &ArbPath,
     amount_in: U256,
     v3_quote_safety_bps: u64,
-    quote_max_state_block_lag: u64,
+    _quote_max_state_block_lag: u64,
     balancer_v3_runtime_quote_enabled: bool,
     balancer_v3_router: Option<Address>,
     balancer_query_sender: Address,
@@ -2127,32 +2123,6 @@ async fn quote_path(
                 format!("pool state missing for {:#x}", step.pool),
             )
         })?;
-    }
-
-    let mut max_source_block = 0u64;
-    let mut min_valid_through_block = u64::MAX;
-    for step in &path.steps {
-        let Some(pool_state) = context.pool_state(step.pool) else {
-            continue;
-        };
-        max_source_block = max_source_block.max(pool_state.block_number);
-        min_valid_through_block =
-            min_valid_through_block.min(pool_state.effective_valid_through_block());
-    }
-    if max_source_block > 0 && min_valid_through_block != u64::MAX {
-        let state_block_gap = max_source_block.saturating_sub(min_valid_through_block);
-        if state_block_gap > quote_max_state_block_lag {
-            return Err(QuoteSkip::new(
-                QuoteSkipReason::StateBlockGap,
-                format!(
-                    "path state block gap {} exceeds max {} (max_source_block={} min_valid_through_block={})",
-                    state_block_gap,
-                    quote_max_state_block_lag,
-                    max_source_block,
-                    min_valid_through_block
-                ),
-            ));
-        }
     }
 
     for (step_index, step) in path.steps.iter().enumerate() {
@@ -2830,8 +2800,7 @@ mod tests {
 
     use super::{
         anchor_search_configs, demo_pool_states, expand_max_amounts, is_supported_config_pool,
-        pair_config_index, quote_balancer_weighted_exact_in, QuoteSkipReason, SearchEngine,
-        SearchPath,
+        pair_config_index, quote_balancer_weighted_exact_in, SearchEngine, SearchPath,
     };
 
     #[test]
@@ -2934,64 +2903,6 @@ mod tests {
 
         assert!(!candidates.is_empty());
         assert!(candidates.iter().all(|c| !c.path.steps.is_empty()));
-    }
-
-    #[tokio::test]
-    async fn search_engine_rejects_paths_with_stale_step_snapshot() {
-        let engine = SearchEngine::new(500, 10_000, U256::ZERO);
-        let mut pool_states =
-            demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
-        let uni_pool = pool_states
-            .iter()
-            .find(|state| state.dex == base_arb_common::types::DexKind::UniswapV3)
-            .unwrap()
-            .pool_id
-            .address;
-        for state in &mut pool_states {
-            if state.dex == base_arb_common::types::DexKind::UniswapV3 {
-                state.block_number = 10;
-                state.valid_through_block = 10;
-            } else {
-                state.block_number = 1;
-                state.valid_through_block = 1;
-            }
-        }
-        let tick_states = vec![
-            TickState {
-                pool_id: PoolId {
-                    chain_id: 8453,
-                    address: uni_pool,
-                },
-                tick: -1000,
-                liquidity_net: 0,
-                liquidity_gross: U256::from(1u64),
-                block_number: 10,
-                updated_at: Utc::now(),
-            },
-            TickState {
-                pool_id: PoolId {
-                    chain_id: 8453,
-                    address: uni_pool,
-                },
-                tick: 1000,
-                liquidity_net: 0,
-                liquidity_gross: U256::from(1u64),
-                block_number: 10,
-                updated_at: Utc::now(),
-            },
-        ];
-
-        let (candidates, stats) = engine
-            .search_with_stats(&pool_states, &tick_states)
-            .await
-            .unwrap();
-
-        assert!(candidates.is_empty());
-        assert_eq!(stats.quote_skipped_state_block_gap, stats.quote_attempts);
-        assert!(stats
-            .top_quote_skipped
-            .iter()
-            .any(|sample| sample.reason == QuoteSkipReason::StateBlockGap));
     }
 
     #[test]

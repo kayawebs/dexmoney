@@ -124,24 +124,27 @@ Collected:
   - Zero-min-profit replay also failed as `Executor revert: MinProfitNotMet`
     for all 40 samples. This rules out a thin configured min-profit threshold
     for this sample set.
-  - Every sample carried stale mixed-block state evidence:
+  - Every sample carried old-source-block state evidence:
     `step_source_lag=>30` or equivalent source span greater than 30 blocks.
   - Examples:
     `replay-cd7ffef0.txt` had an AerodromeVolatile -> UniswapV4 path where
     one step used block `47752446` and the V4 step used block `47734900`.
     `replay-c6654a19.txt` and `replay-2ac8198d.txt` showed the same class on
     non-V4 UniswapV3 -> AerodromeSlipstream paths.
-  - Code inspection found the direct bug: `quote_max_state_block_lag` was
-    passed into `quote_path` but the parameter was named
-    `_quote_max_state_block_lag` and never enforced.
+  - Correction on 2026-06-24: old `PoolState.block_number` is not by itself a
+    correctness bug. It can simply mean the pool had no state-changing events
+    since that block. The replay feature is a correlation signal, not a proven
+    root cause.
 
 Interpretation:
 
-- The 40-sample batch shows at least one proven root cause:
-  stale mixed-block quote paths can pass searcher and fail even with zero
-  min profit.
-- This root cause is not V4-only; V4 appears frequently because many V4 states
-  are old, but V3-style paths also hit the same stale-state bug.
+- The 40-sample batch proves the failures are not caused by thin min-profit
+  thresholds: zero-min replay still fails.
+- Old source blocks are not sufficient evidence of stale state. A local pool
+  snapshot can be correct for many blocks if no relevant event occurred.
+- The remaining root cause must be proven through event coverage, drift, local
+  vs onchain per-step quote comparison, tick/metadata coverage, or
+  calldata/adapter semantic checks.
 - For this class, the issue is not gas policy, candidate queue age, or
   configured min-profit margin.
 
@@ -175,41 +178,30 @@ Replay targets from the report:
 
 ### Decision
 
-Focus T0 on V4 route correctness before changing profit thresholds or gas
-policy. Fresh same-block failures with large expected/min-profit ratios are a
-model/execution consistency problem.
+Focus T0 on local quote vs execution consistency before changing profit
+thresholds or gas policy. Fresh same-block failures with large
+expected/min-profit ratios are a model/execution consistency problem, not a
+profit-threshold tuning problem.
 
 ### Fix
 
-Partial fix in code:
+No searcher freshness gate is accepted for this class.
 
-- Searcher now rejects paths when
-  `max(step.source_block) - min(step.effective_valid_through_block)` exceeds
-  `quote_max_state_block_lag`.
-- The check uses only already-loaded local pool state; it adds no RPC call and
-  no simulation work.
-- `searcher cycle summary` now includes `quote_skipped_state_block_gap`.
-- Regression test:
-  `search_engine_rejects_paths_with_stale_step_snapshot`.
+- Searcher should consume the latest local pool snapshot and quote it quickly.
+- `PoolState.block_number` is metadata for diagnostics, not a reason to reject
+  a path.
+- If market-data has processed sealed blocks without missing logs, no-event
+  pools remain valid even when their `block_number` is old.
 
 Still open:
 
-- After deployment, if fresh same-block `MinProfitNotMet` remains high for
-  paths with `quote_skipped_state_block_gap=0`, the next split is per-step
-  local quote vs onchain execution diff for those fresh samples.
+- Next split is per-step local quote vs onchain execution diff for recent
+  failed samples, plus event-coverage/drift checks for the involved pools.
 
 ### Verification
 
-The stale-state fix is not verified until a post-change report shows the
-dominant `MinProfitNotMet` bucket reduced or reclassified into a smaller proven
-cause.
-
-Expected after searcher restart:
-
-- `quote_skipped_state_block_gap` becomes nonzero in `searcher cycle summary`.
-- Some previously emitted stale candidates disappear.
-- `MinProfitNotMet` simulation count should drop materially if this was the
-  dominant live cause.
+This incident is not verified until `MinProfitNotMet` is reduced or split into
+a smaller proven cause using per-step replay evidence.
 
 ### Regression Guard
 
