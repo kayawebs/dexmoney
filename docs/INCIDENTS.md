@@ -167,6 +167,11 @@ Added local evidence entrypoint:
   success controls, and representative replay targets.
 - `ops/replay_minprofit_targets.sh <report>` batch-runs section 11 replay
   targets and writes per-opportunity replay files plus `summary.tsv`.
+- `ops/minprofit_proof_batch.sh [report]` batch-runs replay plus
+  `validate_route` for representative `MinProfitNotMet` opportunities. Use it
+  to split failures into historical executor replay classes and route quote
+  buckets such as missing V4/Balancer local quote, onchain state fetch failure,
+  factory mismatch, or completed Redis/latest quote.
 
 Replay targets from the report:
 
@@ -197,6 +202,10 @@ Still open:
 
 - Next split is per-step local quote vs onchain execution diff for recent
   failed samples, plus event-coverage/drift checks for the involved pools.
+- Run `ops/minprofit_proof_batch.sh` first. If the dominant bucket is
+  `local_quote_missing_uniswap_v4` or `local_quote_missing_balancer_v3`, the
+  immediate fix is diagnostic/model coverage for that protocol before any
+  further production tuning.
 
 ### Verification
 
