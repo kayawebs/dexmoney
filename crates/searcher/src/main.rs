@@ -98,6 +98,7 @@ async fn main() -> Result<()> {
                 quote_skipped_missing_ticks = aggregate.search.quote_skipped_missing_ticks,
                 quote_skipped_tick_range_exhausted =
                     aggregate.search.quote_skipped_tick_range_exhausted,
+                quote_skipped_state_block_gap = aggregate.search.quote_skipped_state_block_gap,
                 quote_skipped_error = aggregate.search.quote_skipped_error,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
                 quote_model_edge_rejected = aggregate.search.quote_model_edge_rejected,

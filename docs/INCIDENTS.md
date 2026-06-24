@@ -118,13 +118,32 @@ Collected:
     Funding/operator setup is an explicit deployment/ops step. The only runtime
     reconciliation left is pending-lane receipt/nonce synchronization, which is
     required to know whether a previously submitted worker lane can be reused.
+- Batch replay set from the 2026-06-24 part 11 target list:
+  - `ops/replay_minprofit_targets.sh` replayed 40 representative opportunities.
+  - `summary.tsv` classified all 40 as `historical_min_profit_not_met`.
+  - Zero-min-profit replay also failed as `Executor revert: MinProfitNotMet`
+    for all 40 samples. This rules out a thin configured min-profit threshold
+    for this sample set.
+  - Every sample carried stale mixed-block state evidence:
+    `step_source_lag=>30` or equivalent source span greater than 30 blocks.
+  - Examples:
+    `replay-cd7ffef0.txt` had an AerodromeVolatile -> UniswapV4 path where
+    one step used block `47752446` and the V4 step used block `47734900`.
+    `replay-c6654a19.txt` and `replay-2ac8198d.txt` showed the same class on
+    non-V4 UniswapV3 -> AerodromeSlipstream paths.
+  - Code inspection found the direct bug: `quote_max_state_block_lag` was
+    passed into `quote_path` but the parameter was named
+    `_quote_max_state_block_lag` and never enforced.
 
 Interpretation:
 
-- This is not primarily a latency, stale-candidate, or configured-margin issue.
-- Current strongest hypothesis is V4-related quote/execution mismatch:
-  local path quote, V4 state/metadata, V4 calldata/adapter behavior, or mixed
-  V4 route semantics differ from execution simulation.
+- The 40-sample batch shows at least one proven root cause:
+  stale mixed-block quote paths can pass searcher and fail even with zero
+  min profit.
+- This root cause is not V4-only; V4 appears frequently because many V4 states
+  are old, but V3-style paths also hit the same stale-state bug.
+- For this class, the issue is not gas policy, candidate queue age, or
+  configured min-profit margin.
 
 Still needed:
 
@@ -162,16 +181,35 @@ model/execution consistency problem.
 
 ### Fix
 
-Pending deploy and new sample. Next action is to deploy the no-loss candidate
-drain fix, verify execution-manager resumes simulation batch summaries, then
-select recent post-adapter-whitelist `MinProfitNotMet` opportunities and replay
-them. Older V4 samples can produce false `AdapterNotWhitelisted` due to runtime
-config changes.
+Partial fix in code:
+
+- Searcher now rejects paths when
+  `max(step.source_block) - min(step.effective_valid_through_block)` exceeds
+  `quote_max_state_block_lag`.
+- The check uses only already-loaded local pool state; it adds no RPC call and
+  no simulation work.
+- `searcher cycle summary` now includes `quote_skipped_state_block_gap`.
+- Regression test:
+  `search_engine_rejects_paths_with_stale_step_snapshot`.
+
+Still open:
+
+- After deployment, if fresh same-block `MinProfitNotMet` remains high for
+  paths with `quote_skipped_state_block_gap=0`, the next split is per-step
+  local quote vs onchain execution diff for those fresh samples.
 
 ### Verification
 
-The fix is not verified until a post-change report shows the dominant
-`MinProfitNotMet` bucket reduced or reclassified into a smaller proven cause.
+The stale-state fix is not verified until a post-change report shows the
+dominant `MinProfitNotMet` bucket reduced or reclassified into a smaller proven
+cause.
+
+Expected after searcher restart:
+
+- `quote_skipped_state_block_gap` becomes nonzero in `searcher cycle summary`.
+- Some previously emitted stale candidates disappear.
+- `MinProfitNotMet` simulation count should drop materially if this was the
+  dominant live cause.
 
 ### Regression Guard
 
