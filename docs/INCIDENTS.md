@@ -100,6 +100,20 @@ Collected:
     T0 root-cause split.
   - Before selecting fresh replay targets, verify execution-manager is running,
     consuming Redis candidates, and not dropping candidates as stale/expired.
+- `execution-manager` log excerpt at 2026-06-24 09:16-09:18 UTC:
+  - Redis candidates were popped as fresh with `stale_by_block=0` and
+    `expired=0`; Redis queue ended empty.
+  - No matching `execution candidate batch summary` or simulations were
+    produced.
+  - Code inspection found a loss path: live submit mode popped candidates before
+    selecting/refreshing worker EOA and checking circuit breaker. If worker
+    readiness or circuit breaker returned early, fresh candidates were already
+    removed from Redis and never simulated.
+  - Code fix: execution-manager now verifies worker/circuit-breaker readiness
+    before popping candidates in submit mode. If not ready, candidates remain
+    queued. Worker maintenance is rate-limited to the existing 5s idle
+    maintenance interval to avoid repeated RPC/admin actions while preserving
+    candidate queue contents.
 
 Interpretation:
 
@@ -142,10 +156,11 @@ model/execution consistency problem.
 
 ### Fix
 
-Pending new sample. Next action is to restore/verify execution-manager
-simulation consumption, then select recent post-adapter-whitelist
-`MinProfitNotMet` opportunities and replay them. Older V4 samples can produce
-false `AdapterNotWhitelisted` due to runtime config changes.
+Pending deploy and new sample. Next action is to deploy the no-loss candidate
+drain fix, verify execution-manager resumes simulation batch summaries, then
+select recent post-adapter-whitelist `MinProfitNotMet` opportunities and replay
+them. Older V4 samples can produce false `AdapterNotWhitelisted` due to runtime
+config changes.
 
 ### Verification
 

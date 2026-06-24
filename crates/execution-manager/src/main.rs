@@ -220,6 +220,44 @@ where
         debug!("current block not available from market-data");
         return Ok(());
     };
+    let selected_wallet = if settings.execution_submit_enabled {
+        let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
+            anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
+        };
+        if circuit_breaker.is_halted(settings) {
+            debug!("execution circuit breaker halted; leaving candidates queued");
+            return Ok(());
+        }
+        let cached = select_cached_ready_worker(eoa_store, runtime).await?;
+        match cached {
+            Some(wallet) => Some(wallet),
+            None => {
+                if !maintenance.should_run_idle_eoa_pool_maintenance() {
+                    debug!("execution worker unavailable; leaving candidates queued");
+                    return Ok(());
+                }
+                let prepared = prepare_eoa_pool(
+                    eoa_store,
+                    recorder,
+                    provider,
+                    settings,
+                    runtime,
+                    fund_wallet,
+                    circuit_breaker,
+                )
+                .await?;
+                if prepared.is_none() || circuit_breaker.is_halted(settings) {
+                    debug!(
+                        "execution worker unavailable after maintenance; leaving candidates queued"
+                    );
+                    return Ok(());
+                }
+                prepared
+            }
+        }
+    } else {
+        None
+    };
     let candidates =
         pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
     let drained_candidate_count = candidates.len();
@@ -270,36 +308,6 @@ where
         return Ok(());
     };
 
-    let selected_wallet = if settings.execution_submit_enabled {
-        let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
-            anyhow::bail!("EOA_PRIVATE_KEY_1 is required when EXECUTION_SUBMIT_ENABLED=true");
-        };
-        if circuit_breaker.is_halted(settings) {
-            return Ok(());
-        }
-        let cached = select_cached_ready_worker(eoa_store, runtime).await?;
-        match cached {
-            Some(wallet) => Some(wallet),
-            None => {
-                let prepared = prepare_eoa_pool(
-                    eoa_store,
-                    recorder,
-                    provider,
-                    settings,
-                    runtime,
-                    fund_wallet,
-                    circuit_breaker,
-                )
-                .await?;
-                if prepared.is_none() || circuit_breaker.is_halted(settings) {
-                    return Ok(());
-                }
-                prepared
-            }
-        }
-    } else {
-        None
-    };
     let operator = selected_wallet
         .as_ref()
         .map(tx_manager::ExecutionWallet::address)
