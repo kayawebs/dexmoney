@@ -59,6 +59,22 @@ pub struct PoolState {
     pub stable: Option<bool>,
     pub reserve0: Option<U256>,
     pub reserve1: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_weight0: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_weight1: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_scaling_factor0: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_scaling_factor1: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_token_rate0: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_token_rate1: Option<U256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balancer_swap_fee_percentage: Option<U256>,
     pub sqrt_price_x96: Option<U256>,
     pub liquidity: Option<U256>,
     pub tick: Option<i32>,
