@@ -130,7 +130,8 @@ async fn main() -> Result<()> {
     let mut tx_rows = Vec::new();
     let balancer_runtime_ready = settings.balancer_v3_vault.is_some()
         && settings.balancer_v3_router.is_some()
-        && settings.balancer_v3_adapter.is_some();
+        && settings.balancer_v3_adapter.is_some()
+        && settings.searcher_balancer_v3_runtime_quote_enabled;
 
     for tx in &txs {
         let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {

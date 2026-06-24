@@ -294,6 +294,38 @@ WHERE ps.updated_at >= now() - :'interval'::interval
 GROUP BY p.variant
 ORDER BY state_pools DESC;
 
+WITH enabled_v3_style AS (
+  SELECT chain_id, lower(pool_address) AS pool, variant, updated_at
+  FROM pools
+  WHERE enabled
+    AND variant IN ('UniswapV3', 'PancakeV3', 'AerodromeSlipstream', 'UniswapV4')
+),
+tick_rows AS (
+  SELECT chain_id, lower(pool_address) AS pool, count(*) AS tick_rows, max(block_number) AS latest_tick_block
+  FROM pool_ticks_current
+  GROUP BY 1, 2
+)
+SELECT
+  e.variant,
+  count(*) AS enabled_pools,
+  count(*) FILTER (WHERE tc.status = 'ready') AS coverage_ready,
+  count(*) FILTER (WHERE tc.status = 'zero_ticks') AS coverage_zero_ticks,
+  count(*) FILTER (WHERE tc.status = 'refresh_failed') AS coverage_refresh_failed,
+  count(*) FILTER (WHERE tc.status IS NULL) AS coverage_unscanned,
+  count(*) FILTER (WHERE COALESCE(tr.tick_rows, 0) > 0) AS pools_with_tick_rows,
+  sum(COALESCE(tr.tick_rows, 0)) AS tick_rows,
+  max(tr.latest_tick_block) AS latest_tick_block,
+  max(tc.updated_at) AS latest_coverage_at
+FROM enabled_v3_style e
+LEFT JOIN pool_tick_coverage tc
+  ON tc.chain_id = e.chain_id
+ AND lower(tc.pool_address) = e.pool
+LEFT JOIN tick_rows tr
+  ON tr.chain_id = e.chain_id
+ AND tr.pool = e.pool
+GROUP BY e.variant
+ORDER BY enabled_pools DESC;
+
 SELECT
   protocol,
   event_type,

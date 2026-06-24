@@ -874,6 +874,7 @@ mod tests {
             v3_tick_bitmap_word_radius: 8,
             v3_quote_safety_bps: 2,
             quote_max_state_block_lag: 0,
+            searcher_balancer_v3_runtime_quote_enabled: false,
             min_profit_failure_ttl_secs: 21_600,
             execution_min_priority_fee_wei: None,
             execution_priority_fee_multiplier_bps: 20_000,

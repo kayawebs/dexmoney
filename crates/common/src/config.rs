@@ -60,6 +60,7 @@ pub struct Settings {
     pub v3_tick_bitmap_word_radius: i32,
     pub v3_quote_safety_bps: u64,
     pub quote_max_state_block_lag: u64,
+    pub searcher_balancer_v3_runtime_quote_enabled: bool,
     pub min_profit_failure_ttl_secs: u64,
     pub execution_min_priority_fee_wei: Option<String>,
     pub execution_priority_fee_multiplier_bps: u64,
@@ -107,6 +108,7 @@ impl Settings {
             .set_default("v3_tick_bitmap_word_radius", 8i32)?
             .set_default("v3_quote_safety_bps", 10u64)?
             .set_default("quote_max_state_block_lag", 0u64)?
+            .set_default("searcher_balancer_v3_runtime_quote_enabled", false)?
             .set_default("min_profit_failure_ttl_secs", 21_600u64)?
             .set_default("execution_min_priority_fee_wei", "4300000")?
             .set_default("execution_priority_fee_multiplier_bps", 10_000u64)?

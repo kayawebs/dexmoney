@@ -50,6 +50,7 @@ pub struct SearchEngine {
     pub v3_quote_safety_bps: u64,
     pub quote_max_state_block_lag: u64,
     pub multihop_enabled: bool,
+    pub balancer_v3_runtime_quote_enabled: bool,
     pub balancer_v3_router: Option<Address>,
     pub balancer_query_sender: Address,
     pub chain_provider: Option<ChainProvider>,
@@ -549,6 +550,7 @@ impl SearchEngine {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 1,
             multihop_enabled: false,
+            balancer_v3_runtime_quote_enabled: false,
             balancer_v3_router: None,
             balancer_query_sender: Address::ZERO,
             chain_provider: None,
@@ -614,6 +616,7 @@ impl SearchEngine {
                     *amount_in,
                     self.v3_quote_safety_bps,
                     self.quote_max_state_block_lag,
+                    self.balancer_v3_runtime_quote_enabled,
                     self.balancer_v3_router,
                     self.balancer_query_sender,
                     self.chain_provider.as_ref(),
@@ -785,6 +788,7 @@ impl SearchEngine {
                 *amount_in,
                 self.v3_quote_safety_bps,
                 self.quote_max_state_block_lag,
+                self.balancer_v3_runtime_quote_enabled,
                 self.balancer_v3_router,
                 self.balancer_query_sender,
                 self.chain_provider.as_ref(),
@@ -1174,15 +1178,19 @@ pub fn engine_from_settings(
         v3_quote_safety_bps: settings.v3_quote_safety_bps,
         quote_max_state_block_lag: settings.quote_max_state_block_lag,
         multihop_enabled: settings.searcher_multihop_enabled,
-        balancer_v3_router: settings.balancer_v3_router,
+        balancer_v3_runtime_quote_enabled: settings.searcher_balancer_v3_runtime_quote_enabled,
+        balancer_v3_router: settings
+            .searcher_balancer_v3_runtime_quote_enabled
+            .then_some(settings.balancer_v3_router)
+            .flatten(),
         balancer_query_sender: settings
             .executor_contract_multihop
             .or(settings.executor_contract_2hop)
             .or(settings.executor_contract)
             .unwrap_or(Address::ZERO),
-        chain_provider: settings
-            .balancer_v3_router
-            .map(|_| ChainProvider::from_settings(settings)),
+        chain_provider: (settings.searcher_balancer_v3_runtime_quote_enabled
+            && settings.balancer_v3_router.is_some())
+        .then(|| ChainProvider::from_settings(settings)),
     })
 }
 
@@ -2074,6 +2082,7 @@ async fn quote_path(
     amount_in: U256,
     v3_quote_safety_bps: u64,
     _quote_max_state_block_lag: u64,
+    balancer_v3_runtime_quote_enabled: bool,
     balancer_v3_router: Option<Address>,
     balancer_query_sender: Address,
     chain_provider: Option<&ChainProvider>,
@@ -2178,6 +2187,11 @@ async fn quote_path(
                 }
             }
             PoolVariant::BalancerV3 => {
+                if !balancer_v3_runtime_quote_enabled {
+                    return Err(QuoteSkip::quote_error(
+                        "Balancer V3 runtime router quote disabled; run validate_balancer_v3_quotes or enable SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED explicitly",
+                    ));
+                }
                 let router = balancer_v3_router.ok_or_else(|| {
                     QuoteSkip::quote_error("BALANCER_V3_ROUTER is required for Balancer V3 quote")
                 })?;
@@ -2877,6 +2891,7 @@ mod tests {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
             multihop_enabled: true,
+            balancer_v3_runtime_quote_enabled: false,
             balancer_v3_router: None,
             balancer_query_sender: Address::ZERO,
             chain_provider: None,
@@ -2939,6 +2954,7 @@ mod tests {
             v3_quote_safety_bps: 0,
             quote_max_state_block_lag: 0,
             multihop_enabled: true,
+            balancer_v3_runtime_quote_enabled: false,
             balancer_v3_router: None,
             balancer_query_sender: Address::ZERO,
             chain_provider: None,

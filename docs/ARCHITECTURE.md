@@ -45,6 +45,10 @@ This document defines the runtime boundaries for the Base arbitrage system. The 
 - Durable readiness: `pool_quote_coverage` records offline router-query
   validation status per pool/token direction. This keeps validation RPC out of
   the hot search path.
+- Runtime bridge: searcher-side Balancer router queries are disabled by default
+  and require `SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED=true`. This is only a
+  controlled bridge for validation or narrow dry-runs, not the target production
+  hot path.
 - Target state: classify pool type and use local math for supported pool families.
 - Hot-path rule: searcher should not depend on per-path RPC queries long term.
 
@@ -194,7 +198,8 @@ For next-block execution:
   keeps using Redis hot ticks.
 - Searcher tick loading: per-pool Redis fetches are too expensive at current path scale.
 - Price-impact model: V3-style exact quote can succeed while spot-only impact estimation fails; this must not block simulation.
-- Balancer V3: runtime quote/execution is available through router-query +
-  adapter, and offline quote validation writes `pool_quote_coverage`; pool math
-  is not fully local yet, so router query is still a temporary bridge.
+- Balancer V3: execution is available through `BalancerV3Adapter`, and offline
+  quote validation writes `pool_quote_coverage`; searcher runtime router quote is
+  explicitly opt-in because per-path RPC violates the production hot-path rule.
+  Pool math is not fully local yet.
 - V4: metadata/tick hydration is still required for complete coverage.

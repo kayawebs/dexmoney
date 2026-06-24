@@ -58,7 +58,10 @@
   - Continue applying live `ModifyLiquidity` deltas from PoolManager logs after backfill.
 - [x] Add Balancer V3 router-query quote and adapter execution path:
   - Promote Vault-observed swap edges when token/fee metadata is present.
-  - Use router query for runtime quote and adapter execution until local math is added.
+  - Keep searcher runtime router quote behind
+    `SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED=true`; default production search
+    must not call RPC per path.
+  - Use adapter execution after a path is selected and simulated.
 - [x] Add offline Balancer V3 quote validation:
   - `validate_balancer_v3_quotes` checks router-query success by pool/token direction.
   - Results are persisted in `pool_quote_coverage` for reports and readiness checks.
