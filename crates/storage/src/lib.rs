@@ -96,6 +96,13 @@ pub trait CandidateStore: Send + Sync {
     }
     async fn pop_candidate(&self) -> anyhow::Result<Option<Candidate>>;
     async fn pop_candidates(&self, limit: usize) -> anyhow::Result<Vec<Candidate>>;
+    async fn try_acquire_submission_lock(
+        &self,
+        _key: &str,
+        _ttl_secs: u64,
+    ) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 #[async_trait]

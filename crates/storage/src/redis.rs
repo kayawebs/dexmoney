@@ -69,6 +69,10 @@ pub fn candidates_key() -> &'static str {
     "candidates:priority"
 }
 
+pub fn submission_lock_key(key: &str) -> String {
+    format!("submitted-candidate-lock:{key}")
+}
+
 pub fn changed_pools_key() -> &'static str {
     "pools:changed"
 }
@@ -563,6 +567,20 @@ impl CandidateStore for RedisStore {
             .into_iter()
             .map(|(payload, _)| serde_json::from_str(&payload).map_err(Into::into))
             .collect()
+    }
+
+    async fn try_acquire_submission_lock(&self, key: &str, ttl_secs: u64) -> Result<bool> {
+        let mut manager = self.manager.clone();
+        let redis_key = submission_lock_key(key);
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(redis_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut manager)
+            .await?;
+        Ok(acquired.is_some())
     }
 }
 

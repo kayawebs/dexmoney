@@ -27,6 +27,7 @@ const IDLE_EOA_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const SIMULATION_RECORD_QUEUE_CAPACITY: usize = 1_024;
 const SIMULATION_RECORD_FLUSH_MS: u64 = 100;
 const SIMULATION_RECORD_MAX_BATCH: usize = 512;
+const SUBMITTED_CANDIDATE_LOCK_TTL_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 struct ExecutionRuntime {
@@ -331,6 +332,7 @@ where
         .await;
     }
     run_live_submission_batch(
+        candidate_store,
         eoa_store,
         recorder,
         simulation_recorder,
@@ -571,6 +573,7 @@ struct LiveSimulationOutcome {
 }
 
 async fn run_live_submission_batch<E, R>(
+    submission_lock_store: &impl CandidateStore,
     eoa_store: &E,
     recorder: &R,
     simulation_recorder: &SimulationRecordQueue,
@@ -752,6 +755,7 @@ where
             circuit_breaker,
             &outcome.candidate,
             &outcome.simulation,
+            submission_lock_store,
         )
         .await?
         {
@@ -957,6 +961,7 @@ async fn submit_simulated_candidate<E, R>(
     circuit_breaker: &ExecutionCircuitBreaker,
     candidate: &Candidate,
     simulation: &SimulationResult,
+    submission_lock_store: &impl CandidateStore,
 ) -> Result<CandidateAction>
 where
     E: EoaStateStore,
@@ -998,6 +1003,22 @@ where
         .map(|state| eoa_lane::EoaLane { state })
         .unwrap_or_else(|| eoa_lane::EoaLane::new(wallet.address()));
     let nonce = lane.state.local_nonce;
+    let submission_lock_key = submitted_candidate_lock_key(candidate);
+    if !submission_lock_store
+        .try_acquire_submission_lock(&submission_lock_key, SUBMITTED_CANDIDATE_LOCK_TTL_SECS)
+        .await?
+    {
+        info!(
+            candidate_id = %candidate.id,
+            path = %candidate.path.name,
+            candidate_block = candidate.block_number,
+            token_in = %candidate.token_in,
+            amount_in = %candidate.amount_in,
+            submission_lock_key,
+            "candidate skipped because submission lock is already held"
+        );
+        return Ok(CandidateAction::Skipped("submission_lock"));
+    }
     match tx_manager::submit_candidate(provider, wallet, settings, candidate, simulation, nonce)
         .await
     {
@@ -1050,6 +1071,15 @@ where
             Ok(CandidateAction::Simulated)
         }
     }
+}
+
+fn submitted_candidate_lock_key(candidate: &Candidate) -> String {
+    let key = CandidateDedupKey::from_candidate(candidate);
+    let payload = format!(
+        "{}:{}:{:#x}:{}",
+        key.block_number, key.path_name, key.token_in, key.amount_in
+    );
+    hex::encode(keccak256(payload.as_bytes()).as_slice())
 }
 
 async fn select_cached_ready_worker<E>(
@@ -1784,7 +1814,9 @@ mod tests {
     use chrono::{Duration, Utc};
     use uuid::Uuid;
 
-    use super::{coalesce_candidates_by_execution_key, SubmittedCandidateKeys};
+    use super::{
+        coalesce_candidates_by_execution_key, submitted_candidate_lock_key, SubmittedCandidateKeys,
+    };
 
     fn candidate(
         block_number: u64,
@@ -1842,5 +1874,26 @@ mod tests {
         keys.prune_before(101);
         assert_eq!(keys.len(), 0);
         assert!(!keys.contains_candidate(&same_key_higher_profit));
+    }
+
+    #[test]
+    fn submitted_candidate_lock_key_matches_execution_key() {
+        let first = candidate(100, "same-path", 1_000_000, 10_000);
+        let same_key_higher_profit = candidate(100, "same-path", 1_000_000, 20_000);
+        let different_amount = candidate(100, "same-path", 2_000_000, 20_000);
+        let next_block = candidate(101, "same-path", 1_000_000, 20_000);
+
+        assert_eq!(
+            submitted_candidate_lock_key(&first),
+            submitted_candidate_lock_key(&same_key_higher_profit)
+        );
+        assert_ne!(
+            submitted_candidate_lock_key(&first),
+            submitted_candidate_lock_key(&different_amount)
+        );
+        assert_ne!(
+            submitted_candidate_lock_key(&first),
+            submitted_candidate_lock_key(&next_block)
+        );
     }
 }
