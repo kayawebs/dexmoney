@@ -62,6 +62,17 @@ Collected:
     for the sampled failing paths.
   - Same-path controls show several high-volume failing paths with zero
     successes, plus a few V4-including families with occasional successes.
+- `replay-85959011.txt`:
+  - Original failure was `Executor revert: MinProfitNotMet`.
+  - Replay failed before meaningful execution with
+    `replay_error: dex and pool variant mismatch`.
+  - The failing path includes a V4 second step:
+    `AerodromeVolatile -> UniswapV4`.
+  - Root cause for this replay result is the replay tool lagging current
+    `ExecutorHub` adapter semantics: V4/Balancer steps must encode as
+    `Adapter=6`.
+  - Code fix: `replay_simulations` now encodes V4/Balancer adapter steps and
+    uses configured V4 PoolManager/Balancer Vault as factory fallback.
 
 Interpretation:
 
@@ -104,9 +115,9 @@ model/execution consistency problem.
 
 ### Fix
 
-Pending replay. Next action is to replay representative opportunities from
-section 11 and classify whether the mismatch is deterministic at the
-opportunity block or caused by later block movement.
+Pending rerun after replay tool fix. Next action is to rerun representative
+opportunities from section 11 and classify whether the mismatch is deterministic
+at the opportunity block or caused by later block movement.
 
 ### Verification
 

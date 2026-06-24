@@ -1128,6 +1128,18 @@ fn factory_for_step(step: &SwapStep, settings: &Settings) -> Result<Option<Addre
                     .context("PANCAKE_V3_FACTORY is not configured")?,
             ))
         }
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => {
+            Ok(Some(
+                settings
+                    .uniswap_v4_pool_manager
+                    .context("UNISWAP_V4_POOL_MANAGER is not configured")?,
+            ))
+        }
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => Ok(Some(
+            settings
+                .balancer_v3_vault
+                .context("BALANCER_V3_VAULT is not configured")?,
+        )),
         _ => Ok(None),
     }
 }
@@ -1135,9 +1147,9 @@ fn factory_for_step(step: &SwapStep, settings: &Settings) -> Result<Option<Addre
 fn router_fee_for_step(step: &SwapStep) -> Result<u32> {
     let fee_bps = step.fee_bps.unwrap_or_default();
     Ok(match (step.dex, step.variant) {
-        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) => {
-            fee_bps.checked_mul(100).context("V3 fee bps overflow")?
-        }
+        (DexKind::UniswapV3, _) | (DexKind::PancakeSwap, _) | (DexKind::UniswapV4, _) => fee_bps
+            .checked_mul(100)
+            .context("V3-style fee bps overflow")?,
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
             let spacing = step
                 .tick_spacing
@@ -1161,6 +1173,8 @@ fn executor_dex_kind(step: &SwapStep) -> Result<u8> {
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
             Ok(3)
         }
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => Ok(6),
+        (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => Ok(6),
         _ => bail!("dex and pool variant mismatch"),
     }
 }
