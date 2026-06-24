@@ -18,6 +18,7 @@ struct Args {
     limit: i64,
     max_age_hours: i64,
     word_radius: i32,
+    gaps_only: bool,
     pools: HashSet<Address>,
 }
 
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
     );
 
     let mut checked = 0usize;
-    let mut skipped_existing = 0usize;
+    let mut persisted_existing = 0usize;
     let mut repaired = 0usize;
     let mut zero_ticks = 0usize;
     let mut failed = 0usize;
@@ -59,9 +60,37 @@ async fn main() -> Result<()> {
         let address = pool.state.pool_id.address;
         let existing_ticks = redis.get_pool_ticks(address).await?;
         if !args.force && !existing_ticks.is_empty() {
-            skipped_existing += 1;
+            persisted_existing += 1;
+            ticks_written += existing_ticks.len();
+            if args.apply {
+                postgres
+                    .replace_pool_ticks_current(
+                        pool.state.pool_id.chain_id,
+                        address,
+                        &existing_ticks,
+                        "v3_tick_repair_redis_cache",
+                    )
+                    .await?;
+                postgres
+                    .upsert_pool_tick_coverage(
+                        pool.state.pool_id.chain_id,
+                        address,
+                        Some(pool.state.dex),
+                        Some(pool.state.variant),
+                        protocol_for_pool(&pool.state),
+                        "ready",
+                        existing_ticks.len(),
+                        Some(pool.state.block_number),
+                        "v3_tick_repair_redis_cache",
+                        Some(args.word_radius),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
             println!(
-                "skip existing pool={address:#x} ticks={}",
+                "persist existing redis ticks pool={address:#x} variant={:?} ticks={}",
+                pool.state.variant,
                 existing_ticks.len()
             );
             continue;
@@ -173,7 +202,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "checked={checked} repaired={repaired} skipped_existing={skipped_existing} zero_ticks={zero_ticks} ticks_written={ticks_written} failed={failed}"
+        "checked={checked} repaired={repaired} persisted_existing={persisted_existing} zero_ticks={zero_ticks} ticks_written={ticks_written} failed={failed}"
     );
     Ok(())
 }
@@ -194,6 +223,7 @@ fn parse_args() -> Result<Args> {
         limit: 100,
         max_age_hours: 24,
         word_radius: 8,
+        gaps_only: false,
         pools: HashSet::new(),
     };
     let mut iter = env::args().skip(1);
@@ -201,6 +231,7 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--apply" => args.apply = true,
             "--force" => args.force = true,
+            "--gaps-only" => args.gaps_only = true,
             "--limit" => {
                 args.limit = iter
                     .next()
@@ -251,7 +282,7 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: repair_v3_ticks [--apply] [--force] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
+        "Usage: repair_v3_ticks [--apply] [--force] [--gaps-only] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
     );
 }
 
@@ -276,6 +307,11 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
           FROM pool_states
           WHERE updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
           ORDER BY lower(pool_address), updated_at DESC
+        ),
+        tick_rows AS (
+          SELECT chain_id, lower(pool_address) AS pool, count(*) AS tick_rows
+          FROM pool_ticks_current
+          GROUP BY 1, 2
         )
         SELECT
           p.chain_id,
@@ -297,6 +333,12 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
           ls.updated_at
         FROM pools p
         JOIN latest_state ls ON lower(ls.pool_address) = lower(p.pool_address)
+        LEFT JOIN pool_tick_coverage tc
+          ON tc.chain_id = p.chain_id
+         AND lower(tc.pool_address) = lower(p.pool_address)
+        LEFT JOIN tick_rows tr
+          ON tr.chain_id = p.chain_id
+         AND tr.pool = lower(p.pool_address)
         WHERE p.enabled
           AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
           AND ls.sqrt_price_x96 IS NOT NULL
@@ -310,13 +352,27 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
               WHERE lower(filter.pool_address) = lower(p.pool_address)
             )
           )
-        ORDER BY ls.updated_at DESC
+          AND (
+            NOT $4::BOOLEAN
+            OR tc.status IS NULL
+            OR tc.status = 'refresh_failed'
+            OR (tc.status = 'ready' AND COALESCE(tr.tick_rows, 0) = 0)
+          )
+        ORDER BY
+          CASE
+            WHEN tc.status IS NULL THEN 0
+            WHEN tc.status = 'refresh_failed' THEN 1
+            WHEN tc.status = 'ready' AND COALESCE(tr.tick_rows, 0) = 0 THEN 2
+            ELSE 3
+          END,
+          ls.updated_at DESC
         LIMIT $1
         "#,
     )
     .bind(args.limit)
     .bind(args.max_age_hours)
     .bind(&pool_filter)
+    .bind(args.gaps_only)
     .fetch_all(&postgres.pool)
     .await?;
 
