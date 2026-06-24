@@ -144,9 +144,9 @@ Category: safety | correctness | performance | coverage | observability | config
 ### Follow-up
 ```
 
-## GitHub Issue Policy
+## Local Tracking Policy
 
-Use a GitHub issue when:
+Use `docs/INCIDENTS.md` when:
 
 - the problem spans more than one turn or one process;
 - a fix requires deployment plus later verification;
@@ -154,8 +154,11 @@ Use a GitHub issue when:
 - it affects funds, submitted txs, or protocol coverage;
 - it is likely to recur.
 
-Use `docs/INCIDENTS.md` for long-term project memory even when a GitHub issue is
-also opened.
+Use `reports/*.txt` for command output and evidence snapshots. Use
+`ops/*_diag.sh` or recorder binaries when an investigation needs repeatable
+evidence. If a task becomes too large for one working session, split it inside
+the same incident with local subtasks instead of creating external issue
+tracking.
 
 ## Do Not Do
 
@@ -163,5 +166,5 @@ also opened.
   show those are the bottleneck.
 - Do not add fallback logic that hides a bad model or stale data.
 - Do not use competitor usage alone as executable trust.
-- Do not call an issue fixed until there is post-change verification.
+- Do not call an incident fixed until there is post-change verification.
 - Do not rely only on chat history for project memory.

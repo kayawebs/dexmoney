@@ -5,9 +5,9 @@ diagnostics. When priorities conflict, follow the order below.
 
 For non-trivial production issues, follow
 [`DEBUG_WORKFLOW.md`](DEBUG_WORKFLOW.md) before changing code. Important issues
-must leave durable memory in [`INCIDENTS.md`](INCIDENTS.md) and/or a GitHub
-diagnostic issue. The required loop is: symptom, hypotheses, evidence, decision,
-fix, verification, regression guard.
+must leave durable memory in [`INCIDENTS.md`](INCIDENTS.md) and local diagnostic
+reports under `reports/`. The required loop is: symptom, hypotheses, evidence,
+decision, fix, verification, regression guard.
 
 ## 0. Performance First
 

@@ -53,14 +53,22 @@ Needed:
 - Replay at opportunity block, simulation block, and receipt/latest block for
   representative samples.
 
+Added local evidence entrypoint:
+
+- `ops/minprofit_failure_diag.sh` writes
+  `reports/minprofit-failure-diag-*.txt`.
+- The report groups failures by window, protocol combo, path, pool, margin
+  bucket, candidate age, block lag, token/amount, path diagnostics, same-path
+  success controls, and representative replay targets.
+
 ### Decision
 
 Unknown.
 
 ### Fix
 
-Pending evidence. First action is to add `ops/minprofit_failure_diag.sh` and/or
-extend replay tooling to accept explicit `opportunity_id` and `simulation_id`.
+Pending evidence. First action is to run `ops/minprofit_failure_diag.sh` on the
+server and replay representative opportunities from section 11.
 
 ### Verification
 
@@ -363,23 +371,23 @@ Complex production issues must now follow the documented workflow:
 - make the smallest classified fix;
 - verify with a metric;
 - add a regression guard;
-- leave durable notes in this file and/or a GitHub issue.
+- leave durable notes in this file and local diagnostic reports.
 
 ### Fix
 
-Added `docs/DEBUG_WORKFLOW.md`, this incident log, and a GitHub diagnostic issue
-template.
+Added `docs/DEBUG_WORKFLOW.md`, this incident log, and local diagnostic report
+rules.
 
 ### Verification
 
-Future issues should reference a report, GitHub issue, or incident entry before
-non-trivial code changes.
+Future issues should reference a report or incident entry before non-trivial
+code changes.
 
 ### Regression Guard
 
 `docs/OPERATING_PRIORITIES.md` points to the workflow, and
-`.github/ISSUE_TEMPLATE/diagnostic.md` provides the same structure for GitHub
-tracking.
+Local diagnostic scripts and reports provide repeatable evidence for each active
+incident.
 
 ## Pending Incident Backfill
 
