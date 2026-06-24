@@ -94,6 +94,12 @@ Collected:
   - Next sample set must be selected after the current adapter was deployed and
     whitelisted, or the replay tool must be extended to reconstruct historical
     runtime config.
+- `minprofit-failure-diag-20260624T090600Z.txt`:
+  - 30m window has `opportunities=5676` but `simulations=0`.
+  - No 30m `MinProfitNotMet` samples exist, so this report cannot advance the
+    T0 root-cause split.
+  - Before selecting fresh replay targets, verify execution-manager is running,
+    consuming Redis candidates, and not dropping candidates as stale/expired.
 
 Interpretation:
 
@@ -136,7 +142,8 @@ model/execution consistency problem.
 
 ### Fix
 
-Pending new sample. Next action is to select recent post-adapter-whitelist
+Pending new sample. Next action is to restore/verify execution-manager
+simulation consumption, then select recent post-adapter-whitelist
 `MinProfitNotMet` opportunities and replay them. Older V4 samples can produce
 false `AdapterNotWhitelisted` due to runtime config changes.
 
