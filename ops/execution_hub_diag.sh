@@ -128,7 +128,7 @@ SELECT
     WHEN revert_reason ILIKE '%PoolMismatch%' THEN 'PoolMismatch'
     WHEN revert_reason ILIKE '%trusted factory%' OR revert_reason ILIKE '%factory is not configured%' THEN 'untrusted_factory'
     WHEN revert_reason ILIKE '%router/no-revert-data%' THEN 'router/no-revert-data'
-    WHEN revert_reason ILIKE '%0x5a7cfa65%' THEN 'router_selector_0x5a7cfa65'
+    WHEN revert_reason ILIKE '%0x5a7cfa65%' THEN 'UniswapV4Adapter.NoOutput'
     ELSE COALESCE(NULLIF(revert_reason, ''), 'unknown_failure')
   END AS reason,
   count(*) AS n,

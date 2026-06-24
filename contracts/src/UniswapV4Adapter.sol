@@ -113,10 +113,10 @@ contract UniswapV4Adapter is IUnlockCallbackV4Adapter {
         int128 delta1 = _amount1(delta);
         int128 inputDelta = zeroForOne ? delta0 : delta1;
         int128 outputDelta = zeroForOne ? delta1 : delta0;
-        if (inputDelta >= 0 || outputDelta <= 0) revert NoOutput();
+        if (inputDelta <= 0 || outputDelta >= 0) revert NoOutput();
 
-        uint256 amountToSettle = uint256(uint128(-inputDelta));
-        uint256 amountToTake = uint256(uint128(outputDelta));
+        uint256 amountToSettle = uint256(uint128(inputDelta));
+        uint256 amountToTake = uint256(uint128(-outputDelta));
         _settle(decoded.manager, decoded.tokenIn, amountToSettle);
         IPoolManagerV4Adapter(decoded.manager).take(decoded.tokenOut, decoded.recipient, amountToTake);
 
