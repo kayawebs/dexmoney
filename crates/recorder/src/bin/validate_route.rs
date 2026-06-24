@@ -10,6 +10,7 @@ use base_arb_common::{
 };
 use base_arb_dex::{
     aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter},
+    balancer_v3::quote_weighted_exact_in as quote_balancer_weighted_exact_in,
     quoter::DexQuoter,
     uniswap_v3::{quote_exact_in_with_ticks_diagnostics, UniswapV3CurrentTickQuoter},
 };
@@ -327,8 +328,18 @@ async fn quote_local_step(
                 Ok(quote.amount_out)
             }
         }
-        PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {
+        PoolVariant::UniswapV4 => {
             bail!("local quote not implemented for {:?}", state.variant)
+        }
+        PoolVariant::BalancerV3 => {
+            if state.balancer_model.as_deref() != Some("weighted") {
+                bail!(
+                    "local quote not implemented for BalancerV3 model {:?}",
+                    state.balancer_model
+                );
+            }
+            quote_balancer_weighted_exact_in(state, step.token_in, step.token_out, amount_in)
+                .map_err(anyhow::Error::msg)
         }
     }
 }
