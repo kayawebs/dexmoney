@@ -23,6 +23,12 @@ struct MonitorConfig {
     pool_state_stale_critical_secs: i64,
     no_opportunity_warn_secs: i64,
     no_opportunity_critical_secs: i64,
+    opportunity_flow_window_secs: i64,
+    opportunity_flow_min_pool_states: i64,
+    opportunity_flow_warn_opportunities: i64,
+    opportunity_flow_critical_opportunities: i64,
+    funded_path_min_pairs: i64,
+    funded_path_min_ready_pairs: i64,
     candidate_sample: usize,
     missing_tick_sample: i64,
     telegram_token: Option<String>,
@@ -89,6 +95,21 @@ impl MonitorConfig {
             pool_state_stale_critical_secs: env_i64("HEALTH_POOL_STATE_STALE_CRITICAL_SECS", 60),
             no_opportunity_warn_secs: env_i64("HEALTH_NO_OPPORTUNITY_WARN_SECS", 600),
             no_opportunity_critical_secs: env_i64("HEALTH_NO_OPPORTUNITY_CRITICAL_SECS", 1800),
+            opportunity_flow_window_secs: env_i64("HEALTH_OPPORTUNITY_FLOW_WINDOW_SECS", 600),
+            opportunity_flow_min_pool_states: env_i64(
+                "HEALTH_OPPORTUNITY_FLOW_MIN_POOL_STATES",
+                500,
+            ),
+            opportunity_flow_warn_opportunities: env_i64(
+                "HEALTH_OPPORTUNITY_FLOW_WARN_OPPORTUNITIES",
+                10,
+            ),
+            opportunity_flow_critical_opportunities: env_i64(
+                "HEALTH_OPPORTUNITY_FLOW_CRITICAL_OPPORTUNITIES",
+                1,
+            ),
+            funded_path_min_pairs: env_i64("HEALTH_FUNDED_PATH_MIN_PAIRS", 1),
+            funded_path_min_ready_pairs: env_i64("HEALTH_FUNDED_PATH_MIN_READY_PAIRS", 1),
             candidate_sample: env_usize("HEALTH_CANDIDATE_SAMPLE", 50),
             missing_tick_sample: env_i64("HEALTH_MISSING_TICK_SAMPLE", 100),
             telegram_token: env::var("HEALTH_TELEGRAM_BOT_TOKEN")
@@ -132,6 +153,8 @@ async fn collect_checks(
         .await,
     );
     checks.push(check_table_freshness(pg, "simulations", "created_at", 900, 3600).await);
+    checks.push(check_opportunity_flow(config, pg).await);
+    checks.push(check_funded_path_readiness(config, pg).await);
     checks.push(check_candidate_queue(config, provider, redis).await);
     checks.push(check_missing_ticks(config, pg).await);
     checks
@@ -305,6 +328,148 @@ async fn check_candidate_queue(
         severity,
         message: format!(
             "depth={depth} sample_fresh={fresh} sample_stale={stale} max_lag_blocks={max_lag}"
+        ),
+    }
+}
+
+async fn check_opportunity_flow(config: &MonitorConfig, pg: &PgPool) -> HealthCheck {
+    let row = match sqlx::query(
+        r#"
+        SELECT
+          (SELECT count(*) FROM pool_states WHERE updated_at >= NOW() - ($1::double precision * INTERVAL '1 second')) AS pool_states,
+          (SELECT count(*) FROM opportunities WHERE created_at >= NOW() - ($1::double precision * INTERVAL '1 second')) AS opportunities,
+          (SELECT count(*) FROM simulations WHERE created_at >= NOW() - ($1::double precision * INTERVAL '1 second')) AS simulations,
+          (SELECT count(*) FROM transactions WHERE created_at >= NOW() - ($1::double precision * INTERVAL '1 second')) AS transactions
+        "#,
+    )
+    .bind(config.opportunity_flow_window_secs)
+    .fetch_one(pg)
+    .await
+    {
+        Ok(row) => row,
+        Err(err) => {
+            return HealthCheck {
+                name: "opportunity_flow",
+                severity: Severity::Warn,
+                message: format!("flow query failed: {err:#}"),
+            };
+        }
+    };
+
+    let pool_states: i64 = row.try_get("pool_states").unwrap_or_default();
+    let opportunities: i64 = row.try_get("opportunities").unwrap_or_default();
+    let simulations: i64 = row.try_get("simulations").unwrap_or_default();
+    let transactions: i64 = row.try_get("transactions").unwrap_or_default();
+
+    let severity = if pool_states < config.opportunity_flow_min_pool_states {
+        Severity::Ok
+    } else if opportunities < config.opportunity_flow_critical_opportunities {
+        Severity::Critical
+    } else if opportunities < config.opportunity_flow_warn_opportunities {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    };
+    HealthCheck {
+        name: "opportunity_flow",
+        severity,
+        message: format!(
+            "window_secs={} pool_states={} opportunities={} simulations={} transactions={} min_pool_states={} warn_opportunities={} critical_opportunities={}",
+            config.opportunity_flow_window_secs,
+            pool_states,
+            opportunities,
+            simulations,
+            transactions,
+            config.opportunity_flow_min_pool_states,
+            config.opportunity_flow_warn_opportunities,
+            config.opportunity_flow_critical_opportunities
+        ),
+    }
+}
+
+async fn check_funded_path_readiness(config: &MonitorConfig, pg: &PgPool) -> HealthCheck {
+    let row = match sqlx::query(
+        r#"
+        WITH defaults AS (
+          SELECT chain_id, lower(token_address) AS token, executor_scope, NULLIF(BTRIM(search_amounts), '') AS search_amounts
+          FROM token_search_defaults
+        ),
+        funded_pairs AS (
+          SELECT
+            tp.id,
+            tp.symbol,
+            COALESCE(NULLIF(BTRIM(tp.token0_search_amounts), ''), d0_two.search_amounts, d0_multi.search_amounts, d0_all.search_amounts) AS token0_amounts,
+            COALESCE(NULLIF(BTRIM(tp.token1_search_amounts), ''), d1_two.search_amounts, d1_multi.search_amounts, d1_all.search_amounts) AS token1_amounts
+          FROM token_pairs tp
+          LEFT JOIN defaults d0_all ON d0_all.chain_id = tp.chain_id AND d0_all.token = lower(tp.token0) AND d0_all.executor_scope = 'all'
+          LEFT JOIN defaults d0_two ON d0_two.chain_id = tp.chain_id AND d0_two.token = lower(tp.token0) AND d0_two.executor_scope = 'two_hop'
+          LEFT JOIN defaults d0_multi ON d0_multi.chain_id = tp.chain_id AND d0_multi.token = lower(tp.token0) AND d0_multi.executor_scope = 'multihop'
+          LEFT JOIN defaults d1_all ON d1_all.chain_id = tp.chain_id AND d1_all.token = lower(tp.token1) AND d1_all.executor_scope = 'all'
+          LEFT JOIN defaults d1_two ON d1_two.chain_id = tp.chain_id AND d1_two.token = lower(tp.token1) AND d1_two.executor_scope = 'two_hop'
+          LEFT JOIN defaults d1_multi ON d1_multi.chain_id = tp.chain_id AND d1_multi.token = lower(tp.token1) AND d1_multi.executor_scope = 'multihop'
+          WHERE tp.enabled
+        ),
+        pair_pools AS (
+          SELECT
+            fp.id,
+            fp.symbol,
+            count(p.id) FILTER (WHERE p.enabled) AS enabled_pools
+          FROM funded_pairs fp
+          LEFT JOIN pools p ON p.token_pair_id = fp.id
+          WHERE fp.token0_amounts IS NOT NULL OR fp.token1_amounts IS NOT NULL
+          GROUP BY fp.id, fp.symbol
+        )
+        SELECT
+          count(*) AS funded_pairs,
+          count(*) FILTER (WHERE enabled_pools >= 2) AS ready_pairs,
+          COALESCE(sum(enabled_pools), 0) AS enabled_pools,
+          COALESCE(sum(GREATEST(enabled_pools * (enabled_pools - 1), 0)), 0) AS ordered_two_pool_paths,
+          string_agg(symbol || ':' || enabled_pools::text, ', ' ORDER BY enabled_pools DESC, symbol) FILTER (WHERE enabled_pools < 2) AS weak_examples
+        FROM pair_pools
+        "#,
+    )
+    .fetch_one(pg)
+    .await
+    {
+        Ok(row) => row,
+        Err(err) => {
+            return HealthCheck {
+                name: "funded_path_readiness",
+                severity: Severity::Warn,
+                message: format!("funded path query failed: {err:#}"),
+            };
+        }
+    };
+
+    let funded_pairs: i64 = row.try_get("funded_pairs").unwrap_or_default();
+    let ready_pairs: i64 = row.try_get("ready_pairs").unwrap_or_default();
+    let enabled_pools: i64 = row.try_get("enabled_pools").unwrap_or_default();
+    let ordered_two_pool_paths: i64 = row.try_get("ordered_two_pool_paths").unwrap_or_default();
+    let weak_examples: Option<String> = row.try_get("weak_examples").ok().flatten();
+    let weak_examples = weak_examples
+        .as_deref()
+        .map(|examples| examples.chars().take(240).collect::<String>())
+        .unwrap_or_else(|| "-".to_string());
+
+    let severity = if funded_pairs < config.funded_path_min_pairs {
+        Severity::Critical
+    } else if ready_pairs < config.funded_path_min_ready_pairs {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    };
+    HealthCheck {
+        name: "funded_path_readiness",
+        severity,
+        message: format!(
+            "funded_pairs={} ready_pairs={} enabled_pools={} ordered_two_pool_paths={} min_pairs={} min_ready_pairs={} weak_examples={}",
+            funded_pairs,
+            ready_pairs,
+            enabled_pools,
+            ordered_two_pool_paths,
+            config.funded_path_min_pairs,
+            config.funded_path_min_ready_pairs,
+            weak_examples
         ),
     }
 }

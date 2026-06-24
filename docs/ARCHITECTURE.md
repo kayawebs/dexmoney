@@ -128,6 +128,7 @@ Owns runtime health checks and alerting.
 
 - Reads DB, Redis, and lightweight RPC freshness.
 - Reports market-data lag, searcher latency, stale candidates, missing ticks, no-opportunity windows, simulation failures, and executor failures.
+- Runs lightweight opportunity-scarcity checks for active market data with low opportunity output, plus funded-pair path readiness; heavy root-cause reports stay in `ops/*_diag.sh`.
 - Emits logs first; Telegram alerts are an optional delivery layer.
 
 ## Storage Model
