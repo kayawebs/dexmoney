@@ -12,7 +12,7 @@ use base_arb_storage::{
     PendingTransactionStore, RecorderStore,
 };
 use chrono::Utc;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
@@ -221,6 +221,34 @@ where
     };
     let candidates =
         pop_fresh_candidates(candidate_store, current_block, max_candidate_lag_blocks).await?;
+    let drained_candidate_count = candidates.len();
+    let (mut candidates, coalesced_duplicate_candidates) =
+        coalesce_candidates_by_execution_key(candidates);
+    let skipped_submitted_duplicates = if settings.execution_submit_enabled {
+        maintenance
+            .submitted_candidate_keys
+            .prune_before(current_block.saturating_sub(max_candidate_lag_blocks));
+        let before = candidates.len();
+        candidates.retain(|candidate| {
+            !maintenance
+                .submitted_candidate_keys
+                .contains_candidate(candidate)
+        });
+        before.saturating_sub(candidates.len())
+    } else {
+        0
+    };
+    if coalesced_duplicate_candidates > 0 || skipped_submitted_duplicates > 0 {
+        info!(
+            drained_candidate_count,
+            candidate_count = candidates.len(),
+            coalesced_duplicate_candidates,
+            skipped_submitted_duplicates,
+            submitted_dedup_cache_size = maintenance.submitted_candidate_keys.len(),
+            current_block,
+            "execution candidate dedup summary"
+        );
+    }
     if candidates.is_empty() {
         if settings.execution_submit_enabled && maintenance.should_run_idle_eoa_pool_maintenance() {
             let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
@@ -319,6 +347,7 @@ where
         batch_started,
         circuit_breaker,
         &mut maintenance.approved_allowances,
+        &mut maintenance.submitted_candidate_keys,
     )
     .await
 }
@@ -328,6 +357,7 @@ struct ExecutionMaintenance {
     last_idle_eoa_pool_maintenance: Option<Instant>,
     approved_allowances: HashSet<(Address, Address, Address)>,
     simulation_context: Option<(u64, simulator::SimulationContext)>,
+    submitted_candidate_keys: SubmittedCandidateKeys,
 }
 
 impl ExecutionMaintenance {
@@ -358,6 +388,73 @@ impl ExecutionMaintenance {
         self.simulation_context = Some((current_block, context.clone()));
         context
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CandidateDedupKey {
+    block_number: u64,
+    path_name: String,
+    token_in: Address,
+    amount_in: U256,
+}
+
+impl CandidateDedupKey {
+    fn from_candidate(candidate: &Candidate) -> Self {
+        Self {
+            block_number: candidate.block_number,
+            path_name: candidate.path.name.clone(),
+            token_in: candidate.token_in,
+            amount_in: candidate.amount_in,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SubmittedCandidateKeys {
+    keys: HashSet<CandidateDedupKey>,
+}
+
+impl SubmittedCandidateKeys {
+    fn contains_candidate(&self, candidate: &Candidate) -> bool {
+        self.keys
+            .contains(&CandidateDedupKey::from_candidate(candidate))
+    }
+
+    fn insert_candidate(&mut self, candidate: &Candidate) -> bool {
+        self.keys
+            .insert(CandidateDedupKey::from_candidate(candidate))
+    }
+
+    fn prune_before(&mut self, min_block_number: u64) {
+        self.keys.retain(|key| key.block_number >= min_block_number);
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+fn coalesce_candidates_by_execution_key(candidates: Vec<Candidate>) -> (Vec<Candidate>, usize) {
+    let mut best_by_key = HashMap::<CandidateDedupKey, Candidate>::new();
+    let mut coalesced = 0usize;
+    for candidate in candidates {
+        let key = CandidateDedupKey::from_candidate(&candidate);
+        match best_by_key.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            Entry::Occupied(mut entry) => {
+                coalesced += 1;
+                if candidate.expected_profit > entry.get().expected_profit {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+
+    let mut candidates = best_by_key.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+    (candidates, coalesced)
 }
 
 async fn run_dry_run_simulation_batch(
@@ -490,6 +587,7 @@ async fn run_live_submission_batch<E, R>(
     batch_started: Instant,
     circuit_breaker: &ExecutionCircuitBreaker,
     approved_allowances: &mut HashSet<(Address, Address, Address)>,
+    submitted_candidate_keys: &mut SubmittedCandidateKeys,
 ) -> Result<()>
 where
     E: EoaStateStore,
@@ -658,6 +756,7 @@ where
         .await?
         {
             CandidateAction::Submitted => {
+                submitted_candidate_keys.insert_candidate(&outcome.candidate);
                 submitted = true;
                 break;
             }
@@ -681,6 +780,7 @@ where
         submitted,
         skipped = skipped_by_reason.values().sum::<usize>(),
         approved_allowance_cache_size = approved_allowances.len(),
+        submitted_dedup_cache_size = submitted_candidate_keys.len(),
         elapsed_ms = batch_started.elapsed().as_millis() as u64,
         skipped_by_reason = ?skipped_by_reason,
         "execution candidate batch summary"
@@ -1675,4 +1775,72 @@ where
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{address, U256};
+    use base_arb_common::types::{ArbPath, Candidate, OpportunityStatus};
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    use super::{coalesce_candidates_by_execution_key, SubmittedCandidateKeys};
+
+    fn candidate(
+        block_number: u64,
+        path_name: &str,
+        amount_in: u64,
+        expected_profit: u64,
+    ) -> Candidate {
+        Candidate {
+            id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(1),
+            block_number,
+            strategy: "test".to_string(),
+            token_in: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            amount_in: U256::from(amount_in),
+            expected_amount_out: U256::from(amount_in + expected_profit),
+            expected_profit: U256::from(expected_profit),
+            min_profit: U256::from(5_000u64),
+            price_impact_bps: 1,
+            path: ArbPath {
+                name: path_name.to_string(),
+                steps: Vec::new(),
+                diagnostics: None,
+            },
+            status: OpportunityStatus::Created,
+        }
+    }
+
+    #[test]
+    fn coalesce_candidates_keeps_highest_profit_for_same_execution_key() {
+        let low = candidate(100, "same-path", 1_000_000, 10_000);
+        let high = candidate(100, "same-path", 1_000_000, 20_000);
+        let different_amount = candidate(100, "same-path", 2_000_000, 15_000);
+
+        let (coalesced, duplicates) =
+            coalesce_candidates_by_execution_key(vec![low, different_amount, high.clone()]);
+
+        assert_eq!(duplicates, 1);
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].id, high.id);
+        assert_eq!(coalesced[0].expected_profit, U256::from(20_000u64));
+    }
+
+    #[test]
+    fn submitted_candidate_keys_match_same_block_path_token_and_amount() {
+        let first = candidate(100, "same-path", 1_000_000, 10_000);
+        let same_key_higher_profit = candidate(100, "same-path", 1_000_000, 20_000);
+        let next_block = candidate(101, "same-path", 1_000_000, 20_000);
+
+        let mut keys = SubmittedCandidateKeys::default();
+        assert!(keys.insert_candidate(&first));
+        assert!(keys.contains_candidate(&same_key_higher_profit));
+        assert!(!keys.contains_candidate(&next_block));
+
+        keys.prune_before(101);
+        assert_eq!(keys.len(), 0);
+        assert!(!keys.contains_candidate(&same_key_higher_profit));
+    }
 }
