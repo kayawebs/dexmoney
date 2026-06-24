@@ -73,6 +73,16 @@ Collected:
     `Adapter=6`.
   - Code fix: `replay_simulations` now encodes V4/Balancer adapter steps and
     uses configured V4 PoolManager/Balancer Vault as factory fallback.
+- `replay-85959011-v2.txt`:
+  - Replay reached historical `eth_call` against `ExecutorHub`, but the report
+    still classified the result as `historical_other` because revert formatting
+    truncated the important RPC error details.
+  - Structural check still attempted factory-style `getPool` against the V4
+    PoolManager, which is not a valid V4 check.
+  - Code fix: replay now skips V4/Balancer `getPool` structural checks, parses
+    `data=0x...` selectors, trims calldata-heavy eth_call context, and knows
+    current Hub custom errors including `BalanceDidNotIncrease`,
+    `AdapterNotWhitelisted`, `MissingFactory`, and `InvalidFee`.
 
 Interpretation:
 

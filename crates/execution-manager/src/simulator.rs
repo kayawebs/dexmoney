@@ -718,20 +718,22 @@ fn executor_error_name(selector: &str) -> Option<&'static str> {
         "0x27e1f1e5" => Some("Executor revert: OnlyOperator"),
         "0xeced32bc" => Some("Executor revert: PausedError"),
         "0x1ab7da6b" => Some("Executor revert: DeadlineExpired"),
-        "0xf84835a0" => Some("Executor revert: TokenNotWhitelisted"),
-        "0xb76b08ae" => Some("Executor revert: RouterNotWhitelisted"),
-        "0x1b4c7fdf" => Some("Executor revert: PoolNotWhitelisted"),
-        "0x8de0e0da" => Some("Executor revert: FactoryNotWhitelisted"),
         "0x20db8267" => Some("Executor revert: InvalidPath"),
         "0x1ae9030e" => Some("Executor revert: InvalidStepCount"),
         "0xf4d678b8" => Some("Executor revert: InsufficientBalance"),
         "0x13be252b" => Some("Executor revert: InsufficientAllowance"),
         "0xa5d3ca34" => Some("Executor revert: UnsupportedDex"),
         "0x270815a0" => Some("Executor revert: InvalidTickSpacing"),
+        "0x58d620b3" => Some("Executor revert: InvalidFee"),
         "0xeab28cb4" => Some("Executor revert: PoolMismatch"),
         "0xd433008b" => Some("Executor revert: MinProfitNotMet"),
         "0x90b8ec18" => Some("Executor revert: TransferFailed"),
         "0x8164f842" => Some("Executor revert: ApprovalFailed"),
+        "0xf5c6c81a" => Some("Executor revert: UnauthorizedCallback"),
+        "0xf7a632f5" => Some("Executor revert: InvalidCallback"),
+        "0x27f83cbc" => Some("Executor revert: BalanceDidNotIncrease"),
+        "0xd71b9a00" => Some("Executor revert: AdapterNotWhitelisted"),
+        "0x2eb8055a" => Some("Executor revert: MissingFactory"),
         _ => None,
     }
 }
@@ -739,7 +741,7 @@ fn executor_error_name(selector: &str) -> Option<&'static str> {
 fn hex_selectors(raw: &str) -> Vec<String> {
     let mut selectors = Vec::new();
     for part in raw.split(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ':' | '{' | '}' | '[' | ']')
+        c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ':' | '=' | '{' | '}' | '[' | ']')
     }) {
         let clean = part.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != 'x');
         if clean.len() >= 10
@@ -761,6 +763,9 @@ fn compact_revert_reason(raw: &str) -> String {
         || raw.contains("execution reverted data=\"0x\"")
     {
         return "router/no-revert-data".to_string();
+    }
+    if let Some(idx) = raw.find("rpc eth_call failed") {
+        return tail_chars(&raw[idx..], 240);
     }
     let mut lines = raw
         .lines()
