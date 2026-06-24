@@ -497,4 +497,129 @@ ORDER BY t.created_at DESC
 LIMIT 100;
 SQL
 
+run_sql "9. all simulation outcomes, including non-submitted" <<'SQL'
+WITH sim_scope AS (
+  SELECT
+    s.id AS simulation_id,
+    s.created_at,
+    s.block_number,
+    s.success,
+    s.revert_reason,
+    COALESCE(s.path_name, o.path_json->>'name', '-') AS path_name,
+    o.path_json,
+    o.token_in,
+    o.amount_in,
+    o.expected_profit,
+    o.min_profit,
+    t.tx_hash,
+    t.status AS tx_status
+  FROM simulations s
+  LEFT JOIN opportunities o ON o.id = s.opportunity_id
+  LEFT JOIN transactions t ON t.simulation_id = s.id
+  WHERE s.created_at >= now() - :'interval'::interval
+),
+classified AS (
+  SELECT
+    *,
+    CASE
+      WHEN path_json::text ILIKE '%UniswapV4%' OR path_name ILIKE '%uni-v4%' THEN 'has_uniswap_v4'
+      WHEN path_json::text ILIKE '%BalancerV3%' OR path_name ILIKE '%balancer%' THEN 'has_balancer_v3'
+      WHEN path_json::text ILIKE '%AerodromeSlipstream%' OR path_name ILIKE '%aero-slipstream%' THEN 'has_aero_slipstream'
+      WHEN path_json::text ILIKE '%UniswapV3%' OR path_name ILIKE '%uni-v3%' THEN 'has_v3'
+      ELSE 'other'
+    END AS path_bucket,
+    CASE
+      WHEN success THEN 'success'
+      WHEN revert_reason ILIKE '%MinProfitNotMet%' THEN 'MinProfitNotMet'
+      WHEN revert_reason ILIKE '%InsufficientAllowance%' THEN 'InsufficientAllowance'
+      WHEN revert_reason ILIKE '%InsufficientBalance%' THEN 'InsufficientBalance'
+      WHEN revert_reason ILIKE '%PoolMismatch%' THEN 'PoolMismatch'
+      WHEN revert_reason ILIKE '%router/no-revert-data%' THEN 'router/no-revert-data'
+      WHEN revert_reason ILIKE '%0x5a7cfa65%' THEN 'UniswapV4Adapter.NoOutput'
+      WHEN revert_reason IS NULL OR revert_reason = '' THEN '-'
+      ELSE revert_reason
+    END AS reason
+  FROM sim_scope
+)
+SELECT
+  path_bucket,
+  reason,
+  count(DISTINCT simulation_id) AS simulations,
+  count(DISTINCT tx_hash) FILTER (WHERE tx_hash IS NOT NULL) AS submitted_txs,
+  count(DISTINCT simulation_id) FILTER (WHERE tx_hash IS NULL) AS non_submitted_simulations,
+  max(block_number) AS latest_block,
+  max(created_at) AS latest,
+  min(NULLIF(expected_profit, '')::numeric) AS min_expected_profit,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY NULLIF(expected_profit, '')::numeric) AS p50_expected_profit,
+  max(NULLIF(expected_profit, '')::numeric) AS max_expected_profit
+FROM classified
+GROUP BY 1, 2
+ORDER BY simulations DESC, max_expected_profit DESC NULLS LAST
+LIMIT 100;
+SQL
+
+run_sql "10. top non-submitted simulation failures by path" <<'SQL'
+WITH sim_scope AS (
+  SELECT
+    s.id AS simulation_id,
+    s.created_at,
+    s.block_number,
+    s.success,
+    s.revert_reason,
+    COALESCE(s.path_name, o.path_json->>'name', '-') AS path_name,
+    o.path_json,
+    o.token_in,
+    o.amount_in,
+    o.expected_profit,
+    o.min_profit,
+    t.tx_hash
+  FROM simulations s
+  LEFT JOIN opportunities o ON o.id = s.opportunity_id
+  LEFT JOIN transactions t ON t.simulation_id = s.id
+  WHERE s.created_at >= now() - :'interval'::interval
+),
+classified AS (
+  SELECT
+    *,
+    CASE
+      WHEN path_json::text ILIKE '%UniswapV4%' OR path_name ILIKE '%uni-v4%' THEN 'has_uniswap_v4'
+      WHEN path_json::text ILIKE '%BalancerV3%' OR path_name ILIKE '%balancer%' THEN 'has_balancer_v3'
+      WHEN path_json::text ILIKE '%AerodromeSlipstream%' OR path_name ILIKE '%aero-slipstream%' THEN 'has_aero_slipstream'
+      WHEN path_json::text ILIKE '%UniswapV3%' OR path_name ILIKE '%uni-v3%' THEN 'has_v3'
+      ELSE 'other'
+    END AS path_bucket,
+    CASE
+      WHEN success THEN 'success'
+      WHEN revert_reason ILIKE '%MinProfitNotMet%' THEN 'MinProfitNotMet'
+      WHEN revert_reason ILIKE '%InsufficientAllowance%' THEN 'InsufficientAllowance'
+      WHEN revert_reason ILIKE '%InsufficientBalance%' THEN 'InsufficientBalance'
+      WHEN revert_reason ILIKE '%PoolMismatch%' THEN 'PoolMismatch'
+      WHEN revert_reason ILIKE '%router/no-revert-data%' THEN 'router/no-revert-data'
+      WHEN revert_reason ILIKE '%0x5a7cfa65%' THEN 'UniswapV4Adapter.NoOutput'
+      WHEN revert_reason IS NULL OR revert_reason = '' THEN '-'
+      ELSE revert_reason
+    END AS reason
+  FROM sim_scope
+)
+SELECT
+  path_bucket,
+  reason,
+  path_name,
+  token_in,
+  amount_in,
+  count(DISTINCT simulation_id) AS simulations,
+  max(block_number) AS latest_block,
+  max(created_at) AS latest,
+  min(NULLIF(expected_profit, '')::numeric) AS min_expected_profit,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY NULLIF(expected_profit, '')::numeric) AS p50_expected_profit,
+  max(NULLIF(expected_profit, '')::numeric) AS max_expected_profit,
+  max(NULLIF(min_profit, '')::numeric) AS max_min_profit
+FROM classified
+WHERE success IS NOT TRUE
+  AND tx_hash IS NULL
+GROUP BY 1, 2, 3, 4, 5
+ORDER BY simulations DESC, max_expected_profit DESC NULLS LAST
+LIMIT 100;
+SQL
+
 echo "$OUT_FILE"
