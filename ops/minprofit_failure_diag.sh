@@ -405,40 +405,57 @@ LIMIT 50;
 \echo '================================================================================'
 \echo '8. top pools in MinProfitNotMet paths'
 \echo '================================================================================'
+WITH pool_counts AS (
+  SELECT
+    s.pool,
+    max(s.dex) AS step_dex,
+    max(s.variant) AS step_variant,
+    count(*) AS step_failures,
+    count(DISTINCT s.opportunity_id) AS opportunities,
+    count(DISTINCT b.path_name) AS paths,
+    max(b.simulation_at) AS latest,
+    max(b.expected_profit) AS max_expected_profit,
+    max(b.expected_to_min_ratio) AS max_expected_to_min_ratio
+  FROM mp_steps s
+  JOIN mp_features b ON b.simulation_id = s.simulation_id
+  GROUP BY s.pool
+  ORDER BY count(*) DESC, max(b.expected_profit) DESC
+  LIMIT 80
+),
+latest_states AS (
+  SELECT
+    lower(ps.pool_address) AS pool,
+    max(ps.block_number) AS latest_state_block,
+    max(ps.updated_at) AS latest_state_at
+  FROM pool_states ps
+  JOIN pool_counts pc ON lower(ps.pool_address) = pc.pool
+  GROUP BY 1
+)
 SELECT
-  s.pool,
-  COALESCE(p.dex, po.dex, s.dex) AS dex,
-  COALESCE(p.variant, po.variant, s.variant) AS variant,
+  pc.pool,
+  COALESCE(p.dex, po.dex, pc.step_dex) AS dex,
+  COALESCE(p.variant, po.variant, pc.step_variant) AS variant,
   COALESCE(tp.symbol, po.symbol, '-') AS symbol,
-  count(*) AS step_failures,
-  count(DISTINCT s.opportunity_id) AS opportunities,
-  count(DISTINCT b.path_name) AS paths,
-  max(b.simulation_at) AS latest,
-  max(b.expected_profit) AS max_expected_profit,
-  max(b.expected_to_min_ratio) AS max_expected_to_min_ratio,
-  max(ps.block_number) AS latest_state_block,
-  max(ps.updated_at) AS latest_state_at
-FROM mp_steps s
-JOIN mp_features b ON b.simulation_id = s.simulation_id
-LEFT JOIN pools p ON lower(p.pool_address) = s.pool
+  pc.step_failures,
+  pc.opportunities,
+  pc.paths,
+  pc.latest,
+  pc.max_expected_profit,
+  pc.max_expected_to_min_ratio,
+  ls.latest_state_block,
+  ls.latest_state_at
+FROM pool_counts pc
+LEFT JOIN pools p ON lower(p.pool_address) = pc.pool
 LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
 LEFT JOIN LATERAL (
   SELECT po.dex, po.variant, po.symbol
   FROM protocol_pool_observations po
-  WHERE lower(po.pool_address) = s.pool
+  WHERE lower(po.pool_address) = pc.pool
   ORDER BY po.updated_at DESC NULLS LAST
   LIMIT 1
 ) po ON true
-LEFT JOIN LATERAL (
-  SELECT ps.block_number, ps.updated_at
-  FROM pool_states ps
-  WHERE lower(ps.pool_address) = s.pool
-  ORDER BY ps.block_number DESC NULLS LAST, ps.updated_at DESC NULLS LAST
-  LIMIT 1
-) ps ON true
-GROUP BY 1, 2, 3, 4
-ORDER BY step_failures DESC, max_expected_profit DESC
-LIMIT 80;
+LEFT JOIN latest_states ls ON ls.pool = pc.pool
+ORDER BY pc.step_failures DESC, pc.max_expected_profit DESC;
 
 \echo
 \echo '================================================================================'
