@@ -181,14 +181,32 @@ SELECT
   p.updated_at AS pool_updated_at,
   ls.block_number AS latest_state_block,
   ls.updated_at AS latest_state_at,
-  ls.source AS latest_state_source,
-  ls.has_sqrt_price,
-  ls.has_liquidity,
-  ls.has_tick
+    ls.source AS latest_state_source,
+    ls.has_sqrt_price,
+    ls.has_liquidity,
+  ls.has_tick,
+  tc.status AS coverage_status,
+  tc.tick_count AS coverage_tick_count,
+  tc.source AS coverage_source,
+  tc.from_block AS coverage_from_block,
+  tc.to_block AS coverage_to_block,
+  tc.updated_at AS coverage_updated_at,
+  tr.tick_rows,
+  tr.latest_tick_block
 FROM missing m
 LEFT JOIN pools p ON lower(p.pool_address) = m.pool
 LEFT JOIN token_pairs tp ON tp.id = p.token_pair_id
 LEFT JOIN latest_state ls ON ls.pool = m.pool
+LEFT JOIN pool_tick_coverage tc
+  ON tc.chain_id = p.chain_id
+ AND lower(tc.pool_address) = m.pool
+LEFT JOIN (
+  SELECT chain_id, lower(pool_address) AS pool, count(*) AS tick_rows, max(block_number) AS latest_tick_block
+  FROM pool_ticks_current
+  GROUP BY 1, 2
+) tr
+  ON tr.chain_id = p.chain_id
+ AND tr.pool = m.pool
 ORDER BY m.samples DESC, m.pool;
 SQL
 fi

@@ -139,6 +139,10 @@ async fn classify_pool(
     let balances = call_uint_array(provider, vault, "getCurrentLiveBalances(address)", pool)
         .await
         .with_context(|| format!("Vault getCurrentLiveBalances failed for {pool:#x}"))?;
+    let (decimal_scaling_factors, token_rates) =
+        call_two_uint_arrays(provider, vault, "getPoolTokenRates(address)", pool)
+            .await
+            .with_context(|| format!("Vault getPoolTokenRates failed for {pool:#x}"))?;
     let static_swap_fee = call_uint(
         provider,
         vault,
@@ -158,17 +162,32 @@ async fn classify_pool(
             balances.len()
         );
     }
+    if decimal_scaling_factors.len() != tokens.len() || token_rates.len() != tokens.len() {
+        bail!(
+            "Balancer token/rate length mismatch tokens={} scaling={} rates={}",
+            tokens.len(),
+            decimal_scaling_factors.len(),
+            token_rates.len()
+        );
+    }
 
     match call_uint_array(provider, pool, "getNormalizedWeights()", Address::ZERO).await {
         Ok(weights) if weights.len() == tokens.len() => {
+            let status = if tokens.len() == 2 {
+                "weighted_inputs_ready"
+            } else {
+                "weighted_multi_token_unsupported"
+            };
             return Ok(BalancerModel {
                 family: "weighted".to_string(),
-                status: "weighted_inputs_ready".to_string(),
+                status: status.to_string(),
                 raw_json: json!({
                     "tokens": address_strings(&tokens),
                     "balances_live_scaled18": u256_strings(&balances),
                     "static_swap_fee_percentage": static_swap_fee.to_string(),
                     "normalized_weights": u256_strings(&weights),
+                    "decimal_scaling_factors": u256_strings(&decimal_scaling_factors),
+                    "token_rates": u256_strings(&token_rates),
                 }),
             });
         }
@@ -181,6 +200,8 @@ async fn classify_pool(
                     "balances_live_scaled18": u256_strings(&balances),
                     "static_swap_fee_percentage": static_swap_fee.to_string(),
                     "normalized_weights": u256_strings(&weights),
+                    "decimal_scaling_factors": u256_strings(&decimal_scaling_factors),
+                    "token_rates": u256_strings(&token_rates),
                     "error": format!("weights length {} != token length {}", weights.len(), tokens.len()),
                 }),
             });
@@ -197,6 +218,8 @@ async fn classify_pool(
                         "amplification_parameter": amp.to_string(),
                         "amplification_is_updating": is_updating,
                         "amplification_precision": precision.to_string(),
+                        "decimal_scaling_factors": u256_strings(&decimal_scaling_factors),
+                        "token_rates": u256_strings(&token_rates),
                     }),
                 });
             }
@@ -208,6 +231,8 @@ async fn classify_pool(
                         "tokens": address_strings(&tokens),
                         "balances_live_scaled18": u256_strings(&balances),
                         "static_swap_fee_percentage": static_swap_fee.to_string(),
+                        "decimal_scaling_factors": u256_strings(&decimal_scaling_factors),
+                        "token_rates": u256_strings(&token_rates),
                         "weighted_probe_error": weight_err.to_string(),
                         "stable_probe_error": stable_err.to_string(),
                     }),
@@ -284,6 +309,23 @@ async fn load_balancer_pools(
             })
         })
         .collect()
+}
+
+async fn call_two_uint_arrays(
+    provider: &ChainProvider,
+    to: Address,
+    signature: &str,
+    address_arg: Address,
+) -> Result<(Vec<U256>, Vec<U256>)> {
+    let raw = provider
+        .eth_call_from(
+            None,
+            to,
+            &encode_address_call(signature, address_arg),
+            signature,
+        )
+        .await?;
+    decode_two_uint_arrays(&raw)
 }
 
 async fn call_uint_array(
@@ -400,6 +442,34 @@ fn decode_address_array(raw: &str) -> Result<Vec<Address>> {
             Address::from_slice(&bytes[12..])
         })
         .collect::<Vec<_>>())
+}
+
+fn decode_two_uint_arrays(raw: &str) -> Result<(Vec<U256>, Vec<U256>)> {
+    let words = decode_words(raw)?;
+    if words.len() < 2 {
+        bail!("tuple response missing dynamic array offsets");
+    }
+    let first = decode_uint_array_at_offset(&words, words[0])?;
+    let second = decode_uint_array_at_offset(&words, words[1])?;
+    Ok((first, second))
+}
+
+fn decode_uint_array_at_offset(words: &[U256], offset_bytes: U256) -> Result<Vec<U256>> {
+    if offset_bytes % U256::from(32u64) != U256::ZERO {
+        bail!("dynamic offset is not word-aligned");
+    }
+    let offset =
+        usize::try_from(offset_bytes / U256::from(32u64)).context("dynamic offset too large")?;
+    let len = words
+        .get(offset)
+        .copied()
+        .context("dynamic array missing length")?;
+    let len = usize::try_from(len).context("array length does not fit usize")?;
+    let start = offset + 1;
+    if words.len() < start + len {
+        bail!("dynamic uint array shorter than declared length");
+    }
+    Ok(words[start..start + len].to_vec())
 }
 
 fn dynamic_offset_words(words: &[U256]) -> Result<usize> {

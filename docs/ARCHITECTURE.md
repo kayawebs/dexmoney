@@ -186,6 +186,13 @@ Cold/unsupported pools remain in Postgres until promoted.
 
 If multiple processes need the same expensive data, one process must own the fetch and publish it through Postgres/Redis.
 
+## Tick Coverage Strategy
+
+- V3-style pools (`UniswapV3`, `PancakeV3`, `AerodromeSlipstream`) are repaired by targeted hot-pool backfill, not by chain-wide full tick scans. Candidate pools come from recent activity, opportunities, competitor usage, and `MissingTicks` logs.
+- Uniswap V4 uses PoolManager log hydration into Postgres because PoolId state is manager-scoped. `pool_ticks_current` and `pool_tick_coverage` are the durable source; Redis only receives ticks for promoted hot pools.
+- Health and diagnostics must treat `pool_tick_coverage` as the readiness source. A missing `ticks:index:<pool>` means "not in Redis hot cache", not necessarily "tick data missing".
+- `zero_ticks` is a valid coverage state for pools whose scan found no initialized ticks in the selected range; it should not be alerted like `refresh_failed` or unscanned hot pools.
+
 ## Latency Targets
 
 For next-block execution:
@@ -202,9 +209,12 @@ For next-block execution:
   keeps using Redis hot ticks.
 - Searcher tick loading: per-pool Redis fetches are too expensive at current path scale.
 - Price-impact model: V3-style exact quote can succeed while spot-only impact estimation fails; this must not block simulation.
-- Balancer V3: execution is available through `BalancerV3Adapter`, and offline
-  quote validation writes `pool_quote_coverage`; offline model classification
-  writes `pool_model_coverage`. Searcher runtime router quote is explicitly
-  opt-in because per-path RPC violates the production hot-path rule. Pool math
-  is not fully local yet.
+- Balancer V3: execution is available through `BalancerV3Adapter`. Offline quote
+  validation writes `pool_quote_coverage`; offline model classification writes
+  `pool_model_coverage`. Searcher runtime router quote is explicitly opt-in
+  because per-path RPC violates the production hot-path rule. Two-token weighted
+  pools are quoted locally from Vault live scaled balances, token rates, decimal
+  scaling factors, normalized weights, and swap fee. Stable, boosted, composable,
+  and multi-token weighted pools remain unsupported for local production search
+  until their exact math and state update rules are implemented.
 - V4: metadata/tick hydration is still required for complete coverage.

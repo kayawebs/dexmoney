@@ -70,10 +70,17 @@
     weighted/stable pool getters.
   - Results are persisted in `pool_model_coverage` for reports and local-math
     readiness.
-- [ ] Add Balancer V3 local quote:
-  - Identify pool type and math family from Vault/pool metadata.
-  - Store pool-specific balances, scaling factors, fees, and rate-provider data.
-  - Quote only pool types with fully implemented local math.
+- [x] Add first Balancer V3 local quote path:
+  - Classify 2-token weighted pools with Vault live scaled balances, token rates,
+    decimal scaling factors, static fee, and normalized weights.
+  - Promote only `weighted_inputs_ready` pools into market-data hot state.
+  - Quote 2-token weighted pools locally in searcher; keep runtime router quote
+    as explicit opt-in fallback only.
+- [ ] Extend Balancer V3 local quote coverage:
+  - Implement exact fixed-point weighted math to replace the conservative f64
+    first pass.
+  - Add stable pool math.
+  - Add boosted/rate-provider edge cases and multi-token weighted routing.
 - [x] Extend competitor reports to separate tick coverage state from missing ticks.
 - [x] Audit V3-style tick availability:
   - Explain every persistent `MissingTicks` skip by variant and discovery source.

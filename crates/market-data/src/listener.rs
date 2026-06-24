@@ -75,6 +75,19 @@ const BALANCER_V3_POOL_REGISTERED_TOPIC: &str =
 const BALANCER_V3_SWAP_TOPIC: &str =
     "0x0874b2d545cb271cdbda4e093020c452328b24af12382ed62c4d00f5c26709db";
 
+#[derive(Debug, Clone)]
+struct BalancerWeightedModel {
+    balance0: U256,
+    balance1: U256,
+    weight0: U256,
+    weight1: U256,
+    scaling_factor0: U256,
+    scaling_factor1: U256,
+    token_rate0: U256,
+    token_rate1: U256,
+    swap_fee_percentage: U256,
+}
+
 pub struct MarketDataService<P> {
     pub settings: Settings,
     pub provider: ChainProvider,
@@ -1518,33 +1531,38 @@ where
         let Some(vault) = self.settings.balancer_v3_vault else {
             return Ok(V4PromoteStats::default());
         };
-        if self.settings.balancer_v3_router.is_none() {
-            return Ok(V4PromoteStats::default());
-        }
 
         let rows = sqlx::query(
             r#"
             SELECT
-                pool_address, manager_address, token0, token1, symbol,
-                factory_address, fee_bps, latest_block
-            FROM protocol_pool_observations
-            WHERE chain_id = $1
-              AND protocol = 'balancer-v3'
-              AND lower(manager_address) = lower($2)
-              AND pool_address IS NOT NULL
-              AND token0 IS NOT NULL
-              AND token1 IS NOT NULL
-              AND fee_bps IS NOT NULL
+                po.pool_address, po.manager_address, po.token0, po.token1, po.symbol,
+                po.factory_address, po.fee_bps, po.latest_block,
+                mc.status AS model_status,
+                mc.raw_json AS model_json
+            FROM protocol_pool_observations po
+            JOIN pool_model_coverage mc
+              ON mc.chain_id = po.chain_id
+             AND lower(mc.pool_address) = lower(po.pool_address)
+             AND mc.variant = 'BalancerV3'
+             AND mc.model_family = 'weighted'
+             AND mc.status = 'weighted_inputs_ready'
+            WHERE po.chain_id = $1
+              AND po.protocol = 'balancer-v3'
+              AND lower(po.manager_address) = lower($2)
+              AND po.pool_address IS NOT NULL
+              AND po.token0 IS NOT NULL
+              AND po.token1 IS NOT NULL
+              AND po.fee_bps IS NOT NULL
               AND (
-                  updated_at >= NOW() - INTERVAL '2 minutes'
+                  po.updated_at >= NOW() - INTERVAL '2 minutes'
                   OR NOT EXISTS (
                       SELECT 1
                       FROM pools p
-                      WHERE p.chain_id = protocol_pool_observations.chain_id
-                        AND lower(p.pool_address) = lower(protocol_pool_observations.pool_address)
+                      WHERE p.chain_id = po.chain_id
+                        AND lower(p.pool_address) = lower(po.pool_address)
                   )
               )
-            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
+            ORDER BY po.logs_30d DESC, po.latest_block DESC, po.updated_at DESC
             LIMIT $3
             "#,
         )
@@ -1617,7 +1635,7 @@ where
                 r#"
                 UPDATE protocol_pool_observations
                 SET import_status = 'imported',
-                    import_reason = 'Balancer V3 swap edge promoted for router-query quote/search',
+                    import_reason = 'Balancer V3 2-token weighted edge promoted for local quote/search',
                     updated_at = NOW()
                 WHERE chain_id = $1
                   AND protocol = 'balancer-v3'
@@ -1799,6 +1817,9 @@ where
             .map(|value| value.parse::<Address>())
             .transpose()?
             .or(Some(manager_address));
+        let model_json = row.try_get::<Value, _>("model_json")?;
+        let model = Self::parse_balancer_weighted_model(&model_json, token0, token1)
+            .context("invalid Balancer V3 weighted model coverage")?;
 
         Ok(PoolState {
             pool_id: PoolId {
@@ -1817,16 +1838,16 @@ where
             pool_key_fee_pips: None,
             hooks_address: None,
             stable: None,
-            reserve0: None,
-            reserve1: None,
-            balancer_model: None,
-            balancer_weight0: None,
-            balancer_weight1: None,
-            balancer_scaling_factor0: None,
-            balancer_scaling_factor1: None,
-            balancer_token_rate0: None,
-            balancer_token_rate1: None,
-            balancer_swap_fee_percentage: None,
+            reserve0: Some(model.balance0),
+            reserve1: Some(model.balance1),
+            balancer_model: Some("weighted".to_string()),
+            balancer_weight0: Some(model.weight0),
+            balancer_weight1: Some(model.weight1),
+            balancer_scaling_factor0: Some(model.scaling_factor0),
+            balancer_scaling_factor1: Some(model.scaling_factor1),
+            balancer_token_rate0: Some(model.token_rate0),
+            balancer_token_rate1: Some(model.token_rate1),
+            balancer_swap_fee_percentage: Some(model.swap_fee_percentage),
             sqrt_price_x96: None,
             liquidity: None,
             tick: None,
@@ -1834,6 +1855,48 @@ where
             block_number,
             valid_through_block: block_number,
             updated_at: chrono::Utc::now(),
+        })
+    }
+
+    fn parse_balancer_weighted_model(
+        model_json: &Value,
+        token0: Address,
+        token1: Address,
+    ) -> Result<BalancerWeightedModel> {
+        let tokens = json_address_array(model_json, "tokens")?;
+        let balances = json_u256_array(model_json, "balances_live_scaled18")?;
+        let weights = json_u256_array(model_json, "normalized_weights")?;
+        let scaling_factors = json_u256_array(model_json, "decimal_scaling_factors")?;
+        let token_rates = json_u256_array(model_json, "token_rates")?;
+        if tokens.len() != 2
+            || balances.len() != 2
+            || weights.len() != 2
+            || scaling_factors.len() != 2
+            || token_rates.len() != 2
+        {
+            anyhow::bail!("Balancer weighted local quote currently supports exactly 2-token pools");
+        }
+        let index0 = tokens
+            .iter()
+            .position(|token| *token == token0)
+            .context("model tokens missing token0")?;
+        let index1 = tokens
+            .iter()
+            .position(|token| *token == token1)
+            .context("model tokens missing token1")?;
+        if index0 == index1 {
+            anyhow::bail!("model token indexes overlap");
+        }
+        Ok(BalancerWeightedModel {
+            balance0: balances[index0],
+            balance1: balances[index1],
+            weight0: weights[index0],
+            weight1: weights[index1],
+            scaling_factor0: scaling_factors[index0],
+            scaling_factor1: scaling_factors[index1],
+            token_rate0: token_rates[index0],
+            token_rate1: token_rates[index1],
+            swap_fee_percentage: json_u256_field(model_json, "static_swap_fee_percentage")?,
         })
     }
 
@@ -4315,6 +4378,49 @@ fn parse_word_i256_i128_local(word: &str) -> Result<i128> {
 fn parse_decimal_u256(value: &str, field: &str) -> Result<U256> {
     U256::from_str_radix(value.trim(), 10)
         .with_context(|| format!("invalid decimal U256 in {field}: {value}"))
+}
+
+fn json_u256_field(value: &Value, field: &str) -> Result<U256> {
+    let raw = value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("missing {field}"))?;
+    parse_decimal_u256(raw, field)
+}
+
+fn json_u256_array(value: &Value, field: &str) -> Result<Vec<U256>> {
+    let values = value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing {field} array"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let raw = value
+                .as_str()
+                .with_context(|| format!("{field}[{index}] is not a string"))?;
+            parse_decimal_u256(raw, field)
+        })
+        .collect()
+}
+
+fn json_address_array(value: &Value, field: &str) -> Result<Vec<Address>> {
+    let values = value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing {field} array"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .with_context(|| format!("{field}[{index}] is not a string"))?
+                .parse::<Address>()
+                .with_context(|| format!("invalid address in {field}[{index}]"))
+        })
+        .collect()
 }
 
 fn parse_word_i24_local(word: &str) -> Option<i32> {

@@ -133,7 +133,7 @@ async fn collect_checks(
     );
     checks.push(check_table_freshness(pg, "simulations", "created_at", 900, 3600).await);
     checks.push(check_candidate_queue(config, provider, redis).await);
-    checks.push(check_missing_ticks(config, pg, redis).await);
+    checks.push(check_missing_ticks(config, pg).await);
     checks
 }
 
@@ -309,11 +309,7 @@ async fn check_candidate_queue(
     }
 }
 
-async fn check_missing_ticks(
-    config: &MonitorConfig,
-    pg: &PgPool,
-    redis: &mut ConnectionManager,
-) -> HealthCheck {
+async fn check_missing_ticks(config: &MonitorConfig, pg: &PgPool) -> HealthCheck {
     let rows = match sqlx::query(
         r#"
         WITH latest_state AS (
@@ -324,9 +320,18 @@ async fn check_missing_ticks(
           WHERE updated_at >= NOW() - INTERVAL '1 hour'
           ORDER BY lower(pool_address), updated_at DESC
         )
-        SELECT p.pool_address, p.variant, ls.updated_at
+        SELECT
+          p.pool_address,
+          p.variant,
+          tc.status,
+          tc.tick_count,
+          tc.updated_at AS coverage_updated_at,
+          ls.updated_at AS state_updated_at
         FROM latest_state ls
         JOIN pools p ON lower(p.pool_address) = ls.pool
+        LEFT JOIN pool_tick_coverage tc
+          ON tc.chain_id = p.chain_id
+         AND lower(tc.pool_address) = lower(p.pool_address)
         WHERE p.enabled
           AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3', 'UniswapV4')
         ORDER BY ls.updated_at DESC
@@ -355,45 +360,50 @@ async fn check_missing_ticks(
         };
     }
 
-    let mut pipe = redis::pipe();
-    let mut pools = Vec::with_capacity(rows.len());
+    let mut missing = 0usize;
+    let mut failed = 0usize;
+    let mut examples = Vec::new();
     for row in &rows {
         let pool: String = row.try_get("pool_address").unwrap_or_default();
-        pools.push(pool.clone());
-        pipe.scard(format!("ticks:index:{pool}"));
-    }
-    let counts: Vec<u64> = match pipe.query_async(redis).await {
-        Ok(counts) => counts,
-        Err(err) => {
-            return HealthCheck {
-                name: "missing_ticks",
-                severity: Severity::Warn,
-                message: format!("redis tick sample failed: {err}"),
-            };
+        let status: Option<String> = row.try_get("status").ok().flatten();
+        let tick_count: Option<i64> = row.try_get("tick_count").ok().flatten();
+        let is_missing = match status.as_deref() {
+            Some("ready") => tick_count.unwrap_or_default() <= 0,
+            Some("zero_ticks") => false,
+            Some("refresh_failed") => {
+                failed += 1;
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if is_missing {
+            missing += 1;
+            if examples.len() < 5 {
+                examples.push(format!(
+                    "{}:{}",
+                    pool,
+                    status.as_deref().unwrap_or("unscanned")
+                ));
+            }
         }
-    };
-    let missing = counts.iter().filter(|count| **count == 0).count();
-    let severity = if missing * 2 >= counts.len() {
+    }
+    let severity = if missing * 2 >= rows.len() {
         Severity::Critical
     } else if missing > 0 {
         Severity::Warn
     } else {
         Severity::Ok
     };
-    let examples = pools
-        .into_iter()
-        .zip(counts.iter())
-        .filter_map(|(pool, count)| (*count == 0).then_some(pool))
-        .take(5)
-        .collect::<Vec<_>>()
-        .join(",");
+    let examples = examples.join(",");
     HealthCheck {
         name: "missing_ticks",
         severity,
         message: format!(
-            "sample={} missing={} examples={}",
-            counts.len(),
+            "sample={} missing={} failed={} examples={}",
+            rows.len(),
             missing,
+            failed,
             if examples.is_empty() { "-" } else { &examples }
         ),
     }

@@ -1,4 +1,4 @@
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::events::DexEvent;
 use base_arb_common::types::{DexKind, PoolState, PoolVariant};
@@ -14,6 +14,9 @@ const PANCAKE_V3_SWAP_TOPIC: &str =
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83";
 const V3_MINT_TOPIC: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde";
 const V3_BURN_TOPIC: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
+const BALANCER_V3_SWAP_TOPIC: &str =
+    "0x0874b2d545cb271cdbda4e093020c452328b24af12382ed62c4d00f5c26709db";
+const ONE_18: u128 = 1_000_000_000_000_000_000u128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickDelta {
@@ -63,6 +66,23 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
         state.sqrt_price_x96 = Some(sqrt_price_x96);
         state.liquidity = Some(liquidity);
         state.tick = Some(tick);
+    } else if state.dex == DexKind::Balancer
+        && state.variant == PoolVariant::BalancerV3
+        && topic0 == BALANCER_V3_SWAP_TOPIC
+    {
+        let topics = event
+            .raw_data_json
+            .get("topics")
+            .and_then(|topics| topics.as_array())
+            .context("Balancer V3 swap missing topics")?;
+        if topics.len() < 4 {
+            anyhow::bail!("Balancer V3 Swap missing indexed token topics");
+        }
+        let token_in = decode_address_topic(&topics[2])?;
+        let token_out = decode_address_topic(&topics[3])?;
+        let (amount_in, amount_out, swap_fee_percentage) = decode_balancer_swap(data)?;
+        apply_balancer_swap_balances(state, token_in, token_out, amount_in, amount_out)?;
+        state.balancer_swap_fee_percentage = Some(swap_fee_percentage);
     } else {
         return Ok(false);
     }
@@ -71,6 +91,97 @@ pub fn apply_event_to_pool_state(state: &mut PoolState, event: &DexEvent) -> Res
     state.valid_through_block = state.valid_through_block.max(event.block_number);
     state.updated_at = Utc::now();
     Ok(true)
+}
+
+fn apply_balancer_swap_balances(
+    state: &mut PoolState,
+    token_in: Address,
+    token_out: Address,
+    amount_in_raw: U256,
+    amount_out_raw: U256,
+) -> Result<()> {
+    let (in_is_token0, out_is_token0) = match (token_in, token_out) {
+        (token_in, token_out) if token_in == state.token0 && token_out == state.token1 => {
+            (true, false)
+        }
+        (token_in, token_out) if token_in == state.token1 && token_out == state.token0 => {
+            (false, true)
+        }
+        _ => anyhow::bail!("Balancer V3 swap token pair does not match pool state"),
+    };
+    let amount_in_scaled = scale_balancer_raw_amount(state, in_is_token0, amount_in_raw)?;
+    let amount_out_scaled = scale_balancer_raw_amount(state, out_is_token0, amount_out_raw)?;
+    let reserve0 = state
+        .reserve0
+        .context("Balancer V3 missing token0 balance")?;
+    let reserve1 = state
+        .reserve1
+        .context("Balancer V3 missing token1 balance")?;
+    if in_is_token0 {
+        state.reserve0 = Some(reserve0.saturating_add(amount_in_scaled));
+        state.reserve1 = Some(
+            reserve1
+                .checked_sub(amount_out_scaled)
+                .context("Balancer V3 token1 balance underflow")?,
+        );
+    } else {
+        state.reserve1 = Some(reserve1.saturating_add(amount_in_scaled));
+        state.reserve0 = Some(
+            reserve0
+                .checked_sub(amount_out_scaled)
+                .context("Balancer V3 token0 balance underflow")?,
+        );
+    }
+    Ok(())
+}
+
+fn scale_balancer_raw_amount(
+    state: &PoolState,
+    token0_side: bool,
+    amount_raw: U256,
+) -> Result<U256> {
+    let scaling_factor = if token0_side {
+        state.balancer_scaling_factor0
+    } else {
+        state.balancer_scaling_factor1
+    }
+    .context("Balancer V3 missing decimal scaling factor")?;
+    let token_rate = if token0_side {
+        state.balancer_token_rate0
+    } else {
+        state.balancer_token_rate1
+    }
+    .context("Balancer V3 missing token rate")?;
+    amount_raw
+        .checked_mul(scaling_factor)
+        .and_then(|value| value.checked_mul(token_rate))
+        .and_then(|value| value.checked_div(U256::from(ONE_18)))
+        .context("Balancer V3 raw-to-scaled amount overflow")
+}
+
+fn decode_balancer_swap(data: &str) -> Result<(U256, U256, U256)> {
+    let clean = data.trim_start_matches("0x");
+    if clean.len() < 192 {
+        anyhow::bail!("Balancer V3 Swap data too short");
+    }
+    let amount_in = U256::from_str_radix(&clean[0..64], 16)?;
+    let amount_out = U256::from_str_radix(&clean[64..128], 16)?;
+    let swap_fee_percentage = U256::from_str_radix(&clean[128..192], 16)?;
+    Ok((amount_in, amount_out, swap_fee_percentage))
+}
+
+fn decode_address_topic(topic: &serde_json::Value) -> Result<Address> {
+    let raw = topic
+        .as_str()
+        .context("indexed address topic is not a string")?;
+    let clean = raw.trim_start_matches("0x");
+    if clean.len() < 40 {
+        anyhow::bail!("indexed address topic too short");
+    }
+    let tail = &clean[clean.len() - 40..];
+    format!("0x{tail}")
+        .parse::<Address>()
+        .context("invalid indexed address topic")
 }
 
 pub fn is_v3_liquidity_event(state: &PoolState, event: &DexEvent) -> Result<bool> {
@@ -223,6 +334,11 @@ mod tests {
 
     use super::apply_event_to_pool_state;
 
+    fn address_topic(address: alloy_primitives::Address) -> String {
+        let address = format!("{address:#x}");
+        format!("0x{:0>64}", address.trim_start_matches("0x"))
+    }
+
     #[test]
     fn applies_aerodrome_sync_reserves() {
         let pool = address!("1111111111111111111111111111111111111111");
@@ -347,6 +463,86 @@ mod tests {
         assert_eq!(state.liquidity, Some(U256::from(456u64)));
         assert_eq!(state.tick, Some(-200_230));
         assert_eq!(state.block_number, 10);
+    }
+
+    #[test]
+    fn applies_balancer_v3_swap_scaled_balances() {
+        let pool = address!("9999999999999999999999999999999999999999");
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let weth = address!("4200000000000000000000000000000000000006");
+        let one_18 = U256::from(super::ONE_18);
+        let mut state = PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: pool,
+            },
+            dex: DexKind::Balancer,
+            variant: PoolVariant::BalancerV3,
+            factory_address: None,
+            token0: usdc,
+            token1: weth,
+            token0_decimals: Some(6),
+            token1_decimals: Some(18),
+            fee_bps: 1,
+            fee_pips: None,
+            pool_key_fee_pips: None,
+            hooks_address: None,
+            stable: None,
+            reserve0: Some(U256::from(100u64) * one_18),
+            reserve1: Some(one_18),
+            balancer_model: Some("weighted".to_string()),
+            balancer_weight0: Some(one_18 / U256::from(2u64)),
+            balancer_weight1: Some(one_18 / U256::from(2u64)),
+            balancer_scaling_factor0: Some(U256::from(1_000_000_000_000u64)),
+            balancer_scaling_factor1: Some(U256::from(1u64)),
+            balancer_token_rate0: Some(one_18),
+            balancer_token_rate1: Some(one_18),
+            balancer_swap_fee_percentage: Some(U256::from(1_000_000_000_000_000u64)),
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            tick_spacing: None,
+            block_number: 1,
+            valid_through_block: 1,
+            updated_at: Utc::now(),
+        };
+        let event = DexEvent {
+            block_number: 20,
+            tx_hash: "0xbalancer".into(),
+            log_index: 0,
+            pool_address: pool,
+            dex: DexKind::Balancer,
+            event_type: "Swap".into(),
+            raw_data_json: json!({
+                "topics": [
+                    super::BALANCER_V3_SWAP_TOPIC,
+                    address_topic(pool),
+                    address_topic(usdc),
+                    address_topic(weth)
+                ],
+                "data": concat!(
+                    "0x",
+                    "00000000000000000000000000000000000000000000000000000000004c4b40",
+                    "000000000000000000000000000000000000000000000000002386f26fc10000",
+                    "00000000000000000000000000000000000000000000000000038d7ea4c68000",
+                    "0000000000000000000000000000000000000000000000000000000000001388"
+                )
+            }),
+        };
+
+        let changed = apply_event_to_pool_state(&mut state, &event).unwrap();
+
+        assert!(changed);
+        assert_eq!(state.reserve0, Some(U256::from(105u64) * one_18));
+        assert_eq!(
+            state.reserve1,
+            Some(one_18 - U256::from(10_000_000_000_000_000u64))
+        );
+        assert_eq!(
+            state.balancer_swap_fee_percentage,
+            Some(U256::from(1_000_000_000_000_000u64))
+        );
+        assert_eq!(state.block_number, 20);
     }
 
     #[test]
