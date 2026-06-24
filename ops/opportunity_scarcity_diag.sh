@@ -246,17 +246,20 @@ section "3b. market-data performance aggregate"
 } >>"$OUT_FILE" 2>&1
 
 run_sql "4. effective funded-token configuration" <<'SQL'
+CREATE TEMP TABLE opportunity_scarcity_defaults ON COMMIT DROP AS
+SELECT
+  chain_id,
+  lower(token_address) AS token,
+  executor_scope,
+  NULLIF(BTRIM(search_amounts), '') AS search_amounts,
+  NULLIF(BTRIM(min_profit), '') AS min_profit,
+  updated_at
+FROM token_search_defaults;
+
+CREATE TEMP TABLE opportunity_scarcity_configs ON COMMIT DROP AS
 WITH defaults AS (
-  SELECT
-    chain_id,
-    lower(token_address) AS token,
-    executor_scope,
-    NULLIF(BTRIM(search_amounts), '') AS search_amounts,
-    NULLIF(BTRIM(min_profit), '') AS min_profit,
-    updated_at
-  FROM token_search_defaults
-),
-configs AS (
+  SELECT * FROM opportunity_scarcity_defaults
+)
   SELECT
     tp.id,
     tp.symbol,
@@ -284,14 +287,15 @@ configs AS (
   LEFT JOIN defaults d1_two ON d1_two.chain_id = tp.chain_id AND d1_two.token = lower(tp.token1) AND d1_two.executor_scope = 'two_hop'
   LEFT JOIN defaults d1_multi ON d1_multi.chain_id = tp.chain_id AND d1_multi.token = lower(tp.token1) AND d1_multi.executor_scope = 'multihop'
   WHERE tp.enabled
-)
+;
+
 SELECT
   executor_scope,
   token,
   search_amounts,
   min_profit,
   updated_at
-FROM defaults
+FROM opportunity_scarcity_defaults
 WHERE search_amounts IS NOT NULL OR min_profit IS NOT NULL
 ORDER BY token, executor_scope;
 
@@ -303,7 +307,7 @@ SELECT
     WHERE token0_two_hop_amounts IS NULL AND token1_two_hop_amounts IS NULL
       AND token0_multihop_amounts IS NULL AND token1_multihop_amounts IS NULL
   ) AS enabled_without_effective_amounts
-FROM configs;
+FROM opportunity_scarcity_configs;
 
 SELECT
   symbol,
@@ -320,7 +324,7 @@ SELECT
   token1_two_hop_min_profit,
   token1_multihop_min_profit,
   updated_at
-FROM configs
+FROM opportunity_scarcity_configs
 WHERE token0_two_hop_amounts IS NOT NULL
    OR token1_two_hop_amounts IS NOT NULL
    OR token0_multihop_amounts IS NOT NULL
@@ -391,20 +395,20 @@ LIMIT 80;
 SQL
 
 run_sql "6. enabled path and pool readiness around funded pairs" <<'SQL'
-WITH latest_states AS (
-  SELECT DISTINCT ON (lower(pool_address))
-    lower(pool_address) AS pool_address,
-    block_number,
-    updated_at,
-    reserve0,
-    reserve1,
-    sqrt_price_x96,
-    liquidity,
-    tick
-  FROM pool_states
-  ORDER BY lower(pool_address), block_number DESC, updated_at DESC
-),
-defaults AS (
+CREATE TEMP TABLE opportunity_scarcity_latest_states ON COMMIT DROP AS
+SELECT DISTINCT ON (lower(pool_address))
+  lower(pool_address) AS pool_address,
+  block_number,
+  updated_at,
+  reserve0,
+  reserve1,
+  sqrt_price_x96,
+  liquidity,
+  tick
+FROM pool_states
+ORDER BY lower(pool_address), block_number DESC, updated_at DESC;
+
+WITH defaults AS (
   SELECT chain_id, lower(token_address) AS token, executor_scope, NULLIF(BTRIM(search_amounts), '') AS search_amounts
   FROM token_search_defaults
 ),
@@ -441,7 +445,7 @@ pool_readiness AS (
     count(*) FILTER (WHERE p.enabled AND p.variant = 'BalancerV3') AS balancer_v3_pools,
     max(ls.updated_at) AS latest_state
   FROM pools p
-  LEFT JOIN latest_states ls ON ls.pool_address = lower(p.pool_address)
+  LEFT JOIN opportunity_scarcity_latest_states ls ON ls.pool_address = lower(p.pool_address)
   GROUP BY p.token_pair_id
 )
 SELECT
@@ -469,7 +473,7 @@ SELECT
   max(p.updated_at) AS latest_pool_update,
   max(ls.updated_at) AS latest_state
 FROM pools p
-LEFT JOIN latest_states ls ON ls.pool_address = lower(p.pool_address)
+LEFT JOIN opportunity_scarcity_latest_states ls ON ls.pool_address = lower(p.pool_address)
 WHERE p.enabled
 GROUP BY 1, 2, 3
 ORDER BY enabled_pools DESC
@@ -523,22 +527,22 @@ SQL
 run_sql "8. simulation and submission outcome check" <<'SQL'
 SELECT
   CASE
-    WHEN success THEN 'success'
-    WHEN revert_reason ILIKE '%MinProfitNotMet%' THEN 'MinProfitNotMet'
-    WHEN revert_reason ILIKE '%InsufficientAllowance%' THEN 'InsufficientAllowance'
-    WHEN revert_reason ILIKE '%InsufficientBalance%' THEN 'InsufficientBalance'
-    WHEN revert_reason ILIKE '%PoolMismatch%' THEN 'PoolMismatch'
-    WHEN revert_reason ILIKE '%trusted factory%' OR revert_reason ILIKE '%factory is not configured%' THEN 'untrusted_factory'
-    WHEN revert_reason ILIKE '%router/no-revert-data%' THEN 'router/no-revert-data'
-    WHEN revert_reason ILIKE '%0x5a7cfa65%' THEN 'UniswapV4Adapter.NoOutput'
-    ELSE COALESCE(NULLIF(revert_reason, ''), 'unknown_failure')
+    WHEN s.success THEN 'success'
+    WHEN s.revert_reason ILIKE '%MinProfitNotMet%' THEN 'MinProfitNotMet'
+    WHEN s.revert_reason ILIKE '%InsufficientAllowance%' THEN 'InsufficientAllowance'
+    WHEN s.revert_reason ILIKE '%InsufficientBalance%' THEN 'InsufficientBalance'
+    WHEN s.revert_reason ILIKE '%PoolMismatch%' THEN 'PoolMismatch'
+    WHEN s.revert_reason ILIKE '%trusted factory%' OR s.revert_reason ILIKE '%factory is not configured%' THEN 'untrusted_factory'
+    WHEN s.revert_reason ILIKE '%router/no-revert-data%' THEN 'router/no-revert-data'
+    WHEN s.revert_reason ILIKE '%0x5a7cfa65%' THEN 'UniswapV4Adapter.NoOutput'
+    ELSE COALESCE(NULLIF(s.revert_reason, ''), 'unknown_failure')
   END AS reason,
   count(*) AS simulations,
-  max(created_at) AS latest,
+  max(s.created_at) AS latest,
   count(t.id) FILTER (WHERE t.tx_hash IS NOT NULL AND t.tx_hash <> '') AS submitted_txs,
-  min(expected_profit::numeric) AS min_expected_profit,
-  percentile_cont(0.5) WITHIN GROUP (ORDER BY expected_profit::numeric) AS p50_expected_profit,
-  max(expected_profit::numeric) AS max_expected_profit
+  min(s.expected_profit::numeric) AS min_expected_profit,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY s.expected_profit::numeric) AS p50_expected_profit,
+  max(s.expected_profit::numeric) AS max_expected_profit
 FROM simulations s
 LEFT JOIN transactions t ON t.simulation_id = s.id
 WHERE s.created_at >= now() - :'interval'::interval
