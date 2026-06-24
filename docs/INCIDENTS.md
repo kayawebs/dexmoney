@@ -143,6 +143,8 @@ Added local evidence entrypoint:
 - The report groups failures by window, protocol combo, path, pool, margin
   bucket, candidate age, block lag, token/amount, path diagnostics, same-path
   success controls, and representative replay targets.
+- `ops/replay_minprofit_targets.sh <report>` batch-runs section 11 replay
+  targets and writes per-opportunity replay files plus `summary.tsv`.
 
 Replay targets from the report:
 
