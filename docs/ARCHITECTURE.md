@@ -126,6 +126,8 @@ Postgres stores durable state and analysis data:
 - `observed_pools`, `protocol_pool_observations`.
 - `pool_states`, `dex_events`.
 - `pool_ticks_current` for durable current initialized tick snapshots.
+- `pool_tick_coverage` for durable tick readiness status, including `ready`,
+  `zero_ticks`, and `refresh_failed`.
 - `opportunities`, `simulations`, `transactions`.
 - Hydration run progress tables and drift diagnostics.
 
@@ -183,8 +185,11 @@ For next-block execution:
 
 ## Current Known Gaps
 
-- V3-style MissingTicks: hot pool state can exist while Redis initialized ticks are empty.
+- V3-style tick persistence: market-data writes refreshed ticks through a
+  background Postgres queue so reports use durable coverage while searcher
+  keeps using Redis hot ticks.
 - Searcher tick loading: per-pool Redis fetches are too expensive at current path scale.
 - Price-impact model: V3-style exact quote can succeed while spot-only impact estimation fails; this must not block simulation.
-- Balancer V3: pool math is not fully local; router query is a temporary bridge.
+- Balancer V3: runtime quote/execution is available through router-query +
+  adapter, but pool math is not fully local; router query is a temporary bridge.
 - V4: metadata/tick hydration is still required for complete coverage.

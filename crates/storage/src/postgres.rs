@@ -394,6 +394,61 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_pool_tick_coverage(
+        &self,
+        chain_id: u64,
+        pool_address: Address,
+        dex: Option<DexKind>,
+        variant: Option<PoolVariant>,
+        protocol: Option<&str>,
+        status: &str,
+        tick_count: usize,
+        block_number: Option<u64>,
+        source: &str,
+        word_radius: Option<i32>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pool_tick_coverage (
+                chain_id, pool_address, dex, variant, protocol, status, tick_count,
+                block_number, source, word_radius, from_block, to_block, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+            ON CONFLICT (chain_id, pool_address)
+            DO UPDATE SET
+                dex = COALESCE(EXCLUDED.dex, pool_tick_coverage.dex),
+                variant = COALESCE(EXCLUDED.variant, pool_tick_coverage.variant),
+                protocol = COALESCE(EXCLUDED.protocol, pool_tick_coverage.protocol),
+                status = EXCLUDED.status,
+                tick_count = EXCLUDED.tick_count,
+                block_number = COALESCE(EXCLUDED.block_number, pool_tick_coverage.block_number),
+                source = EXCLUDED.source,
+                word_radius = COALESCE(EXCLUDED.word_radius, pool_tick_coverage.word_radius),
+                from_block = COALESCE(EXCLUDED.from_block, pool_tick_coverage.from_block),
+                to_block = COALESCE(EXCLUDED.to_block, pool_tick_coverage.to_block),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(i64::try_from(chain_id)?)
+        .bind(address_to_string(pool_address))
+        .bind(dex.map(|dex| dex_to_string(dex).to_string()))
+        .bind(variant.map(|variant| variant_to_string(variant).to_string()))
+        .bind(protocol)
+        .bind(status)
+        .bind(i64::try_from(tick_count)?)
+        .bind(block_number.map(i64::try_from).transpose()?)
+        .bind(source)
+        .bind(word_radius.map(i64::from))
+        .bind(from_block.map(i64::try_from).transpose()?)
+        .bind(to_block.map(i64::try_from).transpose()?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn start_pool_tick_hydration_run(
         &self,
         chain_id: u64,
@@ -1421,6 +1476,26 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS pool_ticks_current_pool_idx
             ON pool_ticks_current (chain_id, lower(pool_address))"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_tick_coverage (
+            chain_id BIGINT NOT NULL,
+            pool_address TEXT NOT NULL,
+            dex TEXT,
+            variant TEXT,
+            protocol TEXT,
+            status TEXT NOT NULL,
+            tick_count BIGINT NOT NULL DEFAULT 0,
+            block_number BIGINT,
+            source TEXT NOT NULL,
+            word_radius BIGINT,
+            from_block BIGINT,
+            to_block BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chain_id, pool_address)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_tick_coverage_status_idx
+            ON pool_tick_coverage (chain_id, status, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_tick_coverage_variant_idx
+            ON pool_tick_coverage (chain_id, variant, tick_count, updated_at DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_tick_hydration_runs (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             chain_id BIGINT NOT NULL,
@@ -1917,12 +1992,11 @@ impl RecorderStore for PostgresStore {
     async fn record_transaction(&self, tx: TxResult) -> Result<()> {
         let simulation_id = match tx.simulation_id {
             Some(simulation_id) => {
-                let exists: bool = sqlx::query_scalar(
-                    r#"SELECT EXISTS(SELECT 1 FROM simulations WHERE id = $1)"#,
-                )
-                .bind(simulation_id)
-                .fetch_one(&self.pool)
-                .await?;
+                let exists: bool =
+                    sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM simulations WHERE id = $1)"#)
+                        .bind(simulation_id)
+                        .fetch_one(&self.pool)
+                        .await?;
                 if exists {
                     Some(simulation_id)
                 } else {

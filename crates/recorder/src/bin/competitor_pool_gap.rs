@@ -72,10 +72,14 @@ struct PoolCoverage {
     latest_state_source: Option<String>,
     tick_count: i64,
     latest_tick_block: Option<i64>,
+    tick_coverage_status: Option<String>,
+    tick_coverage_source: Option<String>,
+    tick_coverage_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     first_seen_block: Option<i64>,
     latest_seen_block: Option<i64>,
     logs_30d: Option<i64>,
     opportunities_near_block: i64,
+    balancer_runtime_ready: bool,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +123,9 @@ async fn main() -> Result<()> {
     let mut topic_counts = BTreeMap::<String, usize>::new();
     let mut pools = BTreeMap::<String, PoolAggregate>::new();
     let mut tx_rows = Vec::new();
+    let balancer_runtime_ready = settings.balancer_v3_vault.is_some()
+        && settings.balancer_v3_router.is_some()
+        && settings.balancer_v3_adapter.is_some();
 
     for tx in &txs {
         let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {
@@ -151,6 +158,7 @@ async fn main() -> Result<()> {
                 tx.block_number,
                 &hit.pool,
                 cli.include_opportunity_lookup,
+                balancer_runtime_ready,
             )
             .await?;
             let gap = classify_pool_gap(&coverage, cli.include_opportunity_lookup);
@@ -347,6 +355,7 @@ async fn load_pool_coverage(
     block_number: u64,
     pool_address: &str,
     include_opportunity_lookup: bool,
+    balancer_runtime_ready: bool,
 ) -> Result<PoolCoverage> {
     let opportunities_expr = if include_opportunity_lookup {
         r#"
@@ -380,6 +389,9 @@ async fn load_pool_coverage(
             ps.source AS latest_state_source,
             COALESCE(pt.tick_count, 0)::bigint AS tick_count,
             pt.latest_tick_block AS latest_tick_block,
+            tc.status AS tick_coverage_status,
+            tc.source AS tick_coverage_source,
+            tc.updated_at AS tick_coverage_updated_at,
             COALESCE(op.first_block, po.first_block) AS first_seen_block,
             COALESCE(op.latest_block, po.latest_block) AS latest_seen_block,
             COALESCE(op.logs_30d, po.logs_30d) AS logs_30d,
@@ -412,6 +424,9 @@ async fn load_pool_coverage(
             WHERE pt.chain_id = $3
               AND pt.pool_address = t.pool
         ) pt ON true
+        LEFT JOIN pool_tick_coverage tc
+          ON tc.chain_id = $3
+         AND lower(tc.pool_address) = t.pool
         "#,
     );
     let row = sqlx::query(&sql)
@@ -439,10 +454,14 @@ async fn load_pool_coverage(
         latest_state_source: row.try_get("latest_state_source")?,
         tick_count: row.try_get("tick_count")?,
         latest_tick_block: row.try_get("latest_tick_block")?,
+        tick_coverage_status: row.try_get("tick_coverage_status")?,
+        tick_coverage_source: row.try_get("tick_coverage_source")?,
+        tick_coverage_updated_at: row.try_get("tick_coverage_updated_at")?,
         first_seen_block: row.try_get("first_seen_block")?,
         latest_seen_block: row.try_get("latest_seen_block")?,
         logs_30d: row.try_get("logs_30d")?,
         opportunities_near_block: row.try_get("opportunities_near_block")?,
+        balancer_runtime_ready,
     })
 }
 
@@ -465,7 +484,12 @@ fn classify_pool_gap(row: &PoolCoverage, include_opportunity_lookup: bool) -> St
         return "missing_pool_state".into();
     }
     if is_v3_style(row) && row.tick_count == 0 {
-        return "missing_ticks".into();
+        return match row.tick_coverage_status.as_deref() {
+            Some("zero_ticks") => "tick_scan_zero".into(),
+            Some("refresh_failed") => "tick_scan_failed".into(),
+            Some(status) => format!("tick_coverage_{status}"),
+            None => "missing_ticks_unscanned".into(),
+        };
     }
     if row.variant.as_deref() == Some("UniswapV4")
         && row
@@ -475,7 +499,7 @@ fn classify_pool_gap(row: &PoolCoverage, include_opportunity_lookup: bool) -> St
     {
         return "v4_hook_pool_currently_unsupported".into();
     }
-    if row.variant.as_deref() == Some("BalancerV3") {
+    if row.variant.as_deref() == Some("BalancerV3") && !row.balancer_runtime_ready {
         return "balancer_v3_needs_runtime_quote_validation".into();
     }
     if include_opportunity_lookup && row.opportunities_near_block == 0 {
@@ -526,7 +550,7 @@ fn write_pool_table(
     writeln!(writer, "== Unique Competitor Pools ==")?;
     writeln!(
         writer,
-        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
+        "pool\ttxs\tlatest_block\ttopic\tgap\tsymbol\tdex\tvariant\ttoken0\ttoken1\tenabled\tpool_source\tstate_block\tstate_source\tticks\tlatest_tick_block\ttick_coverage_status\ttick_coverage_source\ttick_coverage_updated_at\tprotocol\tprotocol_status\tdiscovery\tfirst_seen\tlatest_seen\tlogs_30d\thooks\tfactory"
     )?;
     let mut rows = pools.into_values().collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -543,7 +567,7 @@ fn write_pool_table(
             .unwrap_or_else(|| "missing_coverage".into());
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.pool,
             row.txs,
             row.latest_block,
@@ -570,6 +594,12 @@ fn write_pool_table(
             coverage
                 .and_then(|c| c.latest_tick_block)
                 .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            opt(coverage.and_then(|c| c.tick_coverage_status.as_deref())),
+            opt(coverage.and_then(|c| c.tick_coverage_source.as_deref())),
+            coverage
+                .and_then(|c| c.tick_coverage_updated_at)
+                .map(|value| value.to_rfc3339())
                 .unwrap_or_else(|| "-".into()),
             opt(coverage.and_then(|c| c.protocol.as_deref())),
             opt(coverage.and_then(|c| c.protocol_status.as_deref())),

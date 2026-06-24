@@ -41,6 +41,7 @@ const FLASHBLOCK_FALLBACK_BLOCK_CACHE_TTL: Duration = Duration::from_millis(250)
 const MAX_PENDING_VALIDATIONS: usize = 20_000;
 const POOL_STATE_RECORD_QUEUE_CAPACITY: usize = 128;
 const DEX_EVENT_RECORD_QUEUE_CAPACITY: usize = 128;
+const TICK_RECORD_QUEUE_CAPACITY: usize = 512;
 const BACKGROUND_RECORD_FLUSH_MS: u64 = 100;
 const BACKGROUND_RECORD_MAX_BATCH: usize = 512;
 const UNISWAP_V3_FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
@@ -81,6 +82,7 @@ pub struct MarketDataService<P> {
     pub recorder: PostgresStore,
     pool_state_recorder: PoolStateRecordQueue,
     dex_event_recorder: DexEventRecordQueue,
+    tick_recorder: TickRecordQueue,
 }
 
 #[derive(Clone)]
@@ -111,8 +113,126 @@ impl<P> MarketDataService<P> {
             pool_store,
             pool_state_recorder: PoolStateRecordQueue::spawn(recorder.clone()),
             dex_event_recorder: DexEventRecordQueue::spawn(recorder.clone()),
+            tick_recorder: TickRecordQueue::spawn(recorder.clone()),
             recorder,
         }
+    }
+}
+
+#[derive(Clone)]
+struct TickRecordQueue {
+    sender: mpsc::Sender<PoolTickRecord>,
+}
+
+#[derive(Clone)]
+struct PoolTickRecord {
+    chain_id: u64,
+    pool_address: Address,
+    dex: DexKind,
+    variant: PoolVariant,
+    protocol: Option<&'static str>,
+    ticks: Vec<TickState>,
+    status: &'static str,
+    block_number: u64,
+    source: &'static str,
+    word_radius: Option<i32>,
+}
+
+impl TickRecordQueue {
+    fn spawn(store: PostgresStore) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<PoolTickRecord>(TICK_RECORD_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            let mut pending: HashMap<(u64, Address), PoolTickRecord> = HashMap::new();
+            let mut flush_interval = interval(Duration::from_millis(BACKGROUND_RECORD_FLUSH_MS));
+            loop {
+                tokio::select! {
+                    Some(record) = receiver.recv() => {
+                        pending.insert((record.chain_id, record.pool_address), record);
+                        if pending.len() >= BACKGROUND_RECORD_MAX_BATCH {
+                            flush_tick_records(&store, &mut pending).await;
+                        }
+                    }
+                    _ = flush_interval.tick() => {
+                        if !pending.is_empty() {
+                            flush_tick_records(&store, &mut pending).await;
+                        }
+                    }
+                    else => {
+                        if !pending.is_empty() {
+                            flush_tick_records(&store, &mut pending).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    fn record(&self, record: PoolTickRecord) {
+        if let Err(err) = self.sender.try_send(record) {
+            warn!(
+                error = %err,
+                "dropping tick persistence record because background queue is full"
+            );
+        }
+    }
+}
+
+async fn flush_tick_records(
+    store: &PostgresStore,
+    pending: &mut HashMap<(u64, Address), PoolTickRecord>,
+) {
+    let records = pending
+        .drain()
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
+    let count = records.len();
+    let mut failed = 0usize;
+    for record in records {
+        let result = async {
+            store
+                .replace_pool_ticks_current(
+                    record.chain_id,
+                    record.pool_address,
+                    &record.ticks,
+                    record.source,
+                )
+                .await?;
+            store
+                .upsert_pool_tick_coverage(
+                    record.chain_id,
+                    record.pool_address,
+                    Some(record.dex),
+                    Some(record.variant),
+                    record.protocol,
+                    record.status,
+                    record.ticks.len(),
+                    Some(record.block_number),
+                    record.source,
+                    record.word_radius,
+                    None,
+                    None,
+                )
+                .await
+        }
+        .await;
+        if let Err(err) = result {
+            failed += 1;
+            warn!(
+                pool = %record.pool_address,
+                status = record.status,
+                source = record.source,
+                error = %err,
+                "failed to persist pool ticks"
+            );
+        }
+    }
+    if failed > 0 {
+        warn!(
+            count,
+            failed, "tick persistence batch completed with failures"
+        );
     }
 }
 
@@ -380,8 +500,15 @@ where
                     let tick_deltas =
                         super::state_updater::v3_tick_deltas_from_event(state, event)?;
                     if !tick_deltas.is_empty() {
-                        self.apply_tick_deltas(&state.pool_id, &tick_deltas, event.block_number)
-                            .await?;
+                        self.apply_tick_deltas(
+                            &state.pool_id,
+                            state.dex,
+                            state.variant,
+                            protocol_for_tick_state(state),
+                            &tick_deltas,
+                            event.block_number,
+                        )
+                        .await?;
                     }
                 }
                 if super::state_updater::is_v3_liquidity_event(state, event)? {
@@ -1222,8 +1349,15 @@ where
                 .upsert_protocol_pool_observation(observation)
                 .await?;
             if let Some(pool_id) = v4_pool_id.filter(|_| !v4_tick_deltas.is_empty()) {
-                self.apply_tick_deltas(&pool_id, &v4_tick_deltas, v4_block_number)
-                    .await?;
+                self.apply_tick_deltas(
+                    &pool_id,
+                    DexKind::UniswapV4,
+                    PoolVariant::UniswapV4,
+                    Some("uniswap-v4"),
+                    &v4_tick_deltas,
+                    v4_block_number,
+                )
+                .await?;
             }
             observed += 1;
         }
@@ -2964,6 +3098,18 @@ where
                         error = %err,
                         "initialized tick refresh failed for pool"
                     );
+                    self.tick_recorder.record(PoolTickRecord {
+                        chain_id: state.pool_id.chain_id,
+                        pool_address: state.pool_id.address,
+                        dex: state.dex,
+                        variant: state.variant,
+                        protocol: protocol_for_tick_state(state),
+                        ticks: Vec::new(),
+                        status: "refresh_failed",
+                        block_number: state.block_number,
+                        source: "market_data_tick_refresh",
+                        word_radius: Some(word_radius),
+                    });
                     continue;
                 }
             };
@@ -2973,6 +3119,18 @@ where
                     word_radius,
                     "initialized tick refresh found no ticks"
                 );
+                self.tick_recorder.record(PoolTickRecord {
+                    chain_id: state.pool_id.chain_id,
+                    pool_address: state.pool_id.address,
+                    dex: state.dex,
+                    variant: state.variant,
+                    protocol: protocol_for_tick_state(state),
+                    ticks,
+                    status: "zero_ticks",
+                    block_number: state.block_number,
+                    source: "market_data_tick_refresh",
+                    word_radius: Some(word_radius),
+                });
                 continue;
             }
             let count = ticks.len();
@@ -2983,12 +3141,24 @@ where
             let ticks_changed = tick_states_changed(&existing_ticks, &ticks);
             if ticks_changed {
                 self.pool_store
-                    .replace_pool_ticks(state.pool_id.address, ticks)
+                    .replace_pool_ticks(state.pool_id.address, ticks.clone())
                     .await?;
                 self.pool_store
                     .mark_tick_changed_pools(vec![state.pool_id.address])
                     .await?;
             }
+            self.tick_recorder.record(PoolTickRecord {
+                chain_id: state.pool_id.chain_id,
+                pool_address: state.pool_id.address,
+                dex: state.dex,
+                variant: state.variant,
+                protocol: protocol_for_tick_state(state),
+                ticks,
+                status: "ready",
+                block_number: state.block_number,
+                source: "market_data_tick_refresh",
+                word_radius: Some(word_radius),
+            });
             debug!(
                 pool = %state.pool_id.address,
                 count,
@@ -3050,6 +3220,9 @@ where
     async fn apply_tick_deltas(
         &self,
         pool_id: &PoolId,
+        dex: DexKind,
+        variant: PoolVariant,
+        protocol: Option<&'static str>,
         deltas: &[super::state_updater::TickDelta],
         block_number: u64,
     ) -> Result<()> {
@@ -3086,6 +3259,23 @@ where
             self.pool_store
                 .mark_tick_changed_pools(vec![pool_id.address])
                 .await?;
+            let state = ticks
+                .first()
+                .map(|tick| (tick.pool_id.chain_id, tick.pool_id.address));
+            if let Some((chain_id, pool_address)) = state {
+                self.tick_recorder.record(PoolTickRecord {
+                    chain_id,
+                    pool_address,
+                    dex,
+                    variant,
+                    protocol,
+                    ticks,
+                    status: "ready",
+                    block_number,
+                    source: "market_data_tick_delta",
+                    word_radius: None,
+                });
+            }
         }
         Ok(())
     }
@@ -3409,6 +3599,16 @@ fn is_v3_style_state(state: &PoolState) -> bool {
             | (DexKind::UniswapV3, PoolVariant::UniswapV3)
             | (DexKind::PancakeSwap, PoolVariant::PancakeV3)
     )
+}
+
+fn protocol_for_tick_state(state: &PoolState) -> Option<&'static str> {
+    match (state.dex, state.variant) {
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream) => Some("aerodrome-slipstream"),
+        (DexKind::UniswapV3, PoolVariant::UniswapV3) => Some("uniswap-v3"),
+        (DexKind::PancakeSwap, PoolVariant::PancakeV3) => Some("pancake-v3"),
+        (DexKind::UniswapV4, PoolVariant::UniswapV4) => Some("uniswap-v4"),
+        _ => None,
+    }
 }
 
 #[allow(dead_code)]

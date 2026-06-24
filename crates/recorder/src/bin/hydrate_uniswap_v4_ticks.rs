@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::{
     config::Settings,
-    types::{PoolId, TickState},
+    types::{DexKind, PoolId, PoolVariant, TickState},
 };
 use base_arb_storage::{
     postgres::{ensure_registry_schema, PostgresStore},
@@ -402,6 +402,26 @@ async fn hydrate_ticks(
                     .replace_pool_ticks(pool.pool_address, tick_states.clone())
                     .await?;
             }
+            store
+                .upsert_pool_tick_coverage(
+                    settings.chain_id,
+                    pool.pool_address,
+                    Some(DexKind::UniswapV4),
+                    Some(PoolVariant::UniswapV4),
+                    Some("uniswap-v4"),
+                    if tick_states.is_empty() {
+                        "zero_ticks"
+                    } else {
+                        "ready"
+                    },
+                    tick_states.len(),
+                    Some(to_block),
+                    "uniswap_v4_tick_hydrator",
+                    None,
+                    Some(from_block),
+                    Some(to_block),
+                )
+                .await?;
             if sync_redis && !tick_states.is_empty() {
                 redis
                     .mark_tick_changed_pools(vec![pool.pool_address])
@@ -692,6 +712,26 @@ async fn flush_manager_scan_batch(
                     .replace_pool_ticks(pool.pool_address, tick_states.clone())
                     .await?;
             }
+            store
+                .upsert_pool_tick_coverage(
+                    settings.chain_id,
+                    pool.pool_address,
+                    Some(DexKind::UniswapV4),
+                    Some(PoolVariant::UniswapV4),
+                    Some("uniswap-v4"),
+                    if tick_states.is_empty() {
+                        "zero_ticks"
+                    } else {
+                        "ready"
+                    },
+                    tick_states.len(),
+                    Some(to_block),
+                    "uniswap_v4_tick_hydrator",
+                    None,
+                    Some(from_block),
+                    Some(to_block),
+                )
+                .await?;
             if sync_redis && !tick_states.is_empty() {
                 changed_pools.push(pool.pool_address);
             }

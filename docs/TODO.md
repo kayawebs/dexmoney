@@ -49,19 +49,22 @@
 
 - [x] Observe Uniswap V4 PoolManager and Balancer V3 Vault logs into `protocol_pool_observations`.
 - [x] Hydrate Uniswap V4 observations with matching `Initialize` metadata so PoolId rows can be classified.
-- [ ] Promote quoteable Uniswap V4 pools into the hot path:
+- [x] Promote quoteable Uniswap V4 pools into the hot path:
   - Static fee only; dynamic-fee flag pools stay observation-only until dynamic fee reads are modeled.
   - Zero-hook only; nonzero hook pools stay observation-only until hook semantics are proven safe.
   - Require token0/token1/fee/tickSpacing/sqrtPrice/liquidity/tick before publishing state.
-- [ ] Add Uniswap V4 PoolId-keyed tick liquidity storage and exact cross-tick quote support.
+- [x] Add Uniswap V4 PoolId-keyed tick liquidity storage and exact cross-tick quote support.
   - Backfill initialized ticks from historical `ModifyLiquidity` before trusting exact V4 quotes.
   - Continue applying live `ModifyLiquidity` deltas from PoolManager logs after backfill.
-- [ ] Add Balancer V3 pool-type classification:
+- [x] Add Balancer V3 router-query quote and adapter execution path:
+  - Promote Vault-observed swap edges when token/fee metadata is present.
+  - Use router query for runtime quote and adapter execution until local math is added.
+- [ ] Add Balancer V3 pool-type classification for local quote:
   - Identify pool type and math family from Vault/pool metadata.
   - Store pool-specific balances, scaling factors, fees, and rate-provider data.
   - Quote only pool types with fully implemented local math.
-- [ ] Extend competitor reports to separate `unsupported_protocol`, `missing_state`, `hooked_v4`, and `dynamic_fee_v4` gaps.
-- [ ] Audit V3-style tick availability:
+- [x] Extend competitor reports to separate tick coverage state from missing ticks.
+- [x] Audit V3-style tick availability:
   - Explain every persistent `MissingTicks` skip by variant and discovery source.
   - Distinguish async warmup lag, RPC failures, tick bitmap radius misses, and genuinely empty/out-of-range liquidity.
   - Add a repair path that backfills missing initialized ticks without blocking live market-data.

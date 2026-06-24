@@ -74,6 +74,32 @@ async fn main() -> Result<()> {
             Ok(ticks) => {
                 if ticks.is_empty() {
                     zero_ticks += 1;
+                    if args.apply {
+                        postgres
+                            .replace_pool_ticks_current(
+                                pool.state.pool_id.chain_id,
+                                address,
+                                &[],
+                                "v3_tick_repair",
+                            )
+                            .await?;
+                        postgres
+                            .upsert_pool_tick_coverage(
+                                pool.state.pool_id.chain_id,
+                                address,
+                                Some(pool.state.dex),
+                                Some(pool.state.variant),
+                                protocol_for_pool(&pool.state),
+                                "zero_ticks",
+                                0,
+                                Some(pool.state.block_number),
+                                "v3_tick_repair",
+                                Some(args.word_radius),
+                                None,
+                                None,
+                            )
+                            .await?;
+                    }
                     println!(
                         "zero ticks pool={address:#x} variant={:?} block={} tick={:?}",
                         pool.state.variant, pool.state.block_number, pool.state.tick
@@ -90,6 +116,22 @@ async fn main() -> Result<()> {
                             "v3_tick_repair",
                         )
                         .await?;
+                    postgres
+                        .upsert_pool_tick_coverage(
+                            pool.state.pool_id.chain_id,
+                            address,
+                            Some(pool.state.dex),
+                            Some(pool.state.variant),
+                            protocol_for_pool(&pool.state),
+                            "ready",
+                            ticks.len(),
+                            Some(pool.state.block_number),
+                            "v3_tick_repair",
+                            Some(args.word_radius),
+                            None,
+                            None,
+                        )
+                        .await?;
                     redis.replace_pool_ticks(address, ticks.clone()).await?;
                     redis.mark_tick_changed_pools(vec![address]).await?;
                 }
@@ -104,6 +146,24 @@ async fn main() -> Result<()> {
             }
             Err(err) => {
                 failed += 1;
+                if args.apply {
+                    postgres
+                        .upsert_pool_tick_coverage(
+                            pool.state.pool_id.chain_id,
+                            address,
+                            Some(pool.state.dex),
+                            Some(pool.state.variant),
+                            protocol_for_pool(&pool.state),
+                            "refresh_failed",
+                            0,
+                            Some(pool.state.block_number),
+                            "v3_tick_repair",
+                            Some(args.word_radius),
+                            None,
+                            None,
+                        )
+                        .await?;
+                }
                 println!(
                     "failed pool={address:#x} variant={:?} block={} error={err:#}",
                     pool.state.variant, pool.state.block_number
@@ -116,6 +176,15 @@ async fn main() -> Result<()> {
         "checked={checked} repaired={repaired} skipped_existing={skipped_existing} zero_ticks={zero_ticks} ticks_written={ticks_written} failed={failed}"
     );
     Ok(())
+}
+
+fn protocol_for_pool(state: &PoolState) -> Option<&'static str> {
+    match (state.dex, state.variant) {
+        (DexKind::Aerodrome, PoolVariant::AerodromeSlipstream) => Some("aerodrome-slipstream"),
+        (DexKind::UniswapV3, PoolVariant::UniswapV3) => Some("uniswap-v3"),
+        (DexKind::PancakeSwap, PoolVariant::PancakeV3) => Some("pancake-v3"),
+        _ => None,
+    }
 }
 
 fn parse_args() -> Result<Args> {
