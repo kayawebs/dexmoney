@@ -186,8 +186,34 @@ SQL
 run_sql "4. Recent hydration run progress" <<'SQL'
 SELECT *
 FROM pool_tick_hydration_runs
-ORDER BY updated_at DESC
+ORDER BY COALESCE(finished_at, started_at) DESC
 LIMIT 10;
+SQL
+
+run_sql "5. Tick rows without coverage marker" <<'SQL'
+WITH tick_rows AS (
+  SELECT chain_id, lower(pool_address) AS pool, count(*) AS tick_rows, max(block_number) AS latest_tick_block
+  FROM pool_ticks_current
+  GROUP BY 1, 2
+)
+SELECT
+  p.dex,
+  p.variant,
+  count(*) AS pools_with_ticks_without_ready_coverage,
+  sum(tr.tick_rows) AS tick_rows,
+  max(tr.latest_tick_block) AS latest_tick_block
+FROM tick_rows tr
+JOIN pools p
+  ON p.chain_id = tr.chain_id
+ AND lower(p.pool_address) = tr.pool
+LEFT JOIN pool_tick_coverage tc
+  ON tc.chain_id = tr.chain_id
+ AND lower(tc.pool_address) = tr.pool
+WHERE p.enabled
+  AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3', 'UniswapV4')
+  AND COALESCE(tc.status, '') <> 'ready'
+GROUP BY 1, 2
+ORDER BY pools_with_ticks_without_ready_coverage DESC;
 SQL
 
 echo "$OUT_FILE"
