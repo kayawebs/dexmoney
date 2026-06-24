@@ -3,6 +3,12 @@
 This document is the long-term decision memory for Dexmoney optimization and
 diagnostics. When priorities conflict, follow the order below.
 
+For non-trivial production issues, follow
+[`DEBUG_WORKFLOW.md`](DEBUG_WORKFLOW.md) before changing code. Important issues
+must leave durable memory in [`INCIDENTS.md`](INCIDENTS.md) and/or a GitHub
+diagnostic issue. The required loop is: symptom, hypotheses, evidence, decision,
+fix, verification, regression guard.
+
 ## 0. Performance First
 
 The primary product is fast, accurate arbitrage attempts. Every runtime decision
