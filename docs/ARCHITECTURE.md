@@ -2,6 +2,10 @@
 
 This document defines the runtime boundaries for the Base arbitrage system. The primary goal is low-latency, data-correct arbitrage. Engineering completeness is secondary to keeping the hot path fast, observable, and easy to debug.
 
+Operational tradeoffs and diagnostic priority order are defined in
+[`OPERATING_PRIORITIES.md`](OPERATING_PRIORITIES.md). When implementation
+choices conflict, follow that priority order first.
+
 ## Supported Protocol Families
 
 ### Aerodrome Classic
