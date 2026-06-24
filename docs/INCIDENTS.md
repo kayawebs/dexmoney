@@ -43,7 +43,34 @@ is actually competitive.
 
 ### Evidence
 
-Needed:
+Collected:
+
+- `minprofit-failure-diag-20260624T063050Z.txt`:
+  - 2h window: `opportunities=21592`, `simulations=21219`,
+    `simulation_success=6`, `min_profit_not_met=15619`, `submitted_txs=4`.
+  - `MinProfitNotMet` candidates are fresh: `p50_sim_age_secs=0.0637`,
+    `p90_sim_age_secs=0.1071`, `p50_sim_block_lag=0`, `p90_sim_block_lag=0`.
+  - Failure margin is usually not thin:
+    `p50_expected_to_min_ratio=55.643`, `p90_expected_to_min_ratio=1369.886`.
+  - The dominant protocol combos include `UniswapV4`; top buckets are
+    `AerodromeSlipstream -> AerodromeVolatile -> UniswapV4`,
+    `PancakeV3 -> UniswapV3 -> AerodromeVolatile -> UniswapV4`, and
+    `UniswapV4 -> UniswapV4`.
+  - The largest margin bucket is `>=20x` with 11514 failures, so simply raising
+    min profit will hide the symptom but not explain the mismatch.
+  - Diagnostics show no `tick_range_exhausted` and no `v3_pools_without_ticks`
+    for the sampled failing paths.
+  - Same-path controls show several high-volume failing paths with zero
+    successes, plus a few V4-including families with occasional successes.
+
+Interpretation:
+
+- This is not primarily a latency, stale-candidate, or configured-margin issue.
+- Current strongest hypothesis is V4-related quote/execution mismatch:
+  local path quote, V4 state/metadata, V4 calldata/adapter behavior, or mixed
+  V4 route semantics differ from execution simulation.
+
+Still needed:
 
 - `MinProfitNotMet` counts by 30m, 2h, and 12h windows.
 - Failure split by simulation-only vs submitted-onchain revert.
@@ -61,14 +88,25 @@ Added local evidence entrypoint:
   bucket, candidate age, block lag, token/amount, path diagnostics, same-path
   success controls, and representative replay targets.
 
+Replay targets from the report:
+
+- `291e8615-563c-4fa4-a203-48385e700427`: pure V4 path with very large
+  expected profit.
+- `c71f8660-28a9-4219-ab5c-c33dbde33e04`: high-volume
+  AeroSlipstream/AeroVolatile/V4 mixed path.
+- `85959011-e3a1-4abe-8d6f-96e19e967415`: Aerodrome classic into V4 path.
+
 ### Decision
 
-Unknown.
+Focus T0 on V4 route correctness before changing profit thresholds or gas
+policy. Fresh same-block failures with large expected/min-profit ratios are a
+model/execution consistency problem.
 
 ### Fix
 
-Pending evidence. First action is to run `ops/minprofit_failure_diag.sh` on the
-server and replay representative opportunities from section 11.
+Pending replay. Next action is to replay representative opportunities from
+section 11 and classify whether the mismatch is deterministic at the
+opportunity block or caused by later block movement.
 
 ### Verification
 
