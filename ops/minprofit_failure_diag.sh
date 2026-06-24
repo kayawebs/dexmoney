@@ -317,24 +317,32 @@ LIMIT 50;
 \echo '================================================================================'
 \echo '5. expected/min-profit margin buckets'
 \echo '================================================================================'
+WITH bucketed AS (
+  SELECT
+    CASE
+      WHEN expected_to_min_ratio IS NULL THEN 'unknown'
+      WHEN expected_to_min_ratio < 1.05 THEN '<1.05x'
+      WHEN expected_to_min_ratio < 1.2 THEN '1.05-1.2x'
+      WHEN expected_to_min_ratio < 2 THEN '1.2-2x'
+      WHEN expected_to_min_ratio < 5 THEN '2-5x'
+      WHEN expected_to_min_ratio < 20 THEN '5-20x'
+      ELSE '>=20x'
+    END AS margin_bucket,
+    simulation_at,
+    expected_profit,
+    sim_age_secs
+  FROM mp_features
+)
 SELECT
-  CASE
-    WHEN expected_to_min_ratio IS NULL THEN 'unknown'
-    WHEN expected_to_min_ratio < 1.05 THEN '<1.05x'
-    WHEN expected_to_min_ratio < 1.2 THEN '1.05-1.2x'
-    WHEN expected_to_min_ratio < 2 THEN '1.2-2x'
-    WHEN expected_to_min_ratio < 5 THEN '2-5x'
-    WHEN expected_to_min_ratio < 20 THEN '5-20x'
-    ELSE '>=20x'
-  END AS margin_bucket,
+  margin_bucket,
   count(*) AS failures,
   max(simulation_at) AS latest,
   percentile_cont(0.5) WITHIN GROUP (ORDER BY expected_profit) AS p50_expected_profit,
   max(expected_profit) AS max_expected_profit,
   percentile_cont(0.5) WITHIN GROUP (ORDER BY sim_age_secs) AS p50_sim_age_secs,
   percentile_cont(0.9) WITHIN GROUP (ORDER BY sim_age_secs) AS p90_sim_age_secs
-FROM mp_features
-GROUP BY 1
+FROM bucketed
+GROUP BY margin_bucket
 ORDER BY
   CASE
     WHEN margin_bucket = '<1.05x' THEN 1
