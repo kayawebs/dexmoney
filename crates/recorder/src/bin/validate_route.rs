@@ -6,7 +6,9 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::{
     config::Settings,
     constants::{AERODROME_SLIPSTREAM_ROUTER, PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER},
-    types::{ArbPath, DexKind, PoolRegistryEntry, PoolState, PoolVariant, SwapStep},
+    types::{
+        ArbPath, DexKind, PoolRegistryEntry, PoolState, PoolVariant, QuoteStepDiagnostics, SwapStep,
+    },
 };
 use base_arb_dex::{
     aerodrome::{AerodromeStableQuoter, AerodromeVolatileQuoter},
@@ -190,10 +192,44 @@ async fn validate_step_quotes(
             stable: Some(classic_stable_flag(step)),
             enabled: true,
         };
-        let state = provider
+        let state = match provider
             .fetch_pool_state_from_registry_at_block_hash(&entry, block_hash, block_number)
             .await
-            .with_context(|| format!("failed to fetch state for step {step_no} quote check"))?;
+        {
+            Ok(state) => state,
+            Err(err) if is_singleton_vault_step(step) => {
+                println!(
+                    "step {step_no}: onchain quote state fetch skipped_singleton_vault: {err:#}"
+                );
+                if let Some(state) = tick_store.get_pool_state(step.pool).await? {
+                    println!(
+                        "step {step_no}: using redis_current_state for singleton/vault quote check source_block={} valid_through_block={} updated_at={}",
+                        state.block_number,
+                        state.effective_valid_through_block(),
+                        state.updated_at
+                    );
+                    state
+                } else if let Some(recorded) = recorded_step_diagnostics(path, step_no, step) {
+                    println!(
+                        "step {step_no}: redis_current_state missing; recorded_snapshot_passthrough amount_in={} amount_out={} mode={} source_block={}",
+                        recorded.amount_in, recorded.amount_out, recorded.mode, recorded.source_block
+                    );
+                    local_amount = recorded.amount_out;
+                    direct_amount = None;
+                    continue;
+                } else {
+                    println!(
+                        "step {step_no}: singleton/vault quote check unavailable; no redis state or recorded snapshot"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                return Err(err.context(format!(
+                    "failed to fetch state for step {step_no} quote check"
+                )));
+            }
+        };
         let local = quote_local_step(step, &state, local_amount, tick_store)
             .await
             .with_context(|| format!("failed local quote for step {step_no}"))?;
@@ -300,7 +336,10 @@ async fn quote_local_step(
             };
             Ok(quote.amount_out)
         }
-        PoolVariant::AerodromeSlipstream | PoolVariant::UniswapV3 | PoolVariant::PancakeV3 => {
+        PoolVariant::AerodromeSlipstream
+        | PoolVariant::UniswapV3
+        | PoolVariant::PancakeV3
+        | PoolVariant::UniswapV4 => {
             let ticks = tick_store.get_pool_ticks(state.pool_id.address).await?;
             if ticks.is_empty() {
                 let quote = UniswapV3CurrentTickQuoter
@@ -327,9 +366,6 @@ async fn quote_local_step(
                 );
                 Ok(quote.amount_out)
             }
-        }
-        PoolVariant::UniswapV4 => {
-            bail!("local quote not implemented for {:?}", state.variant)
         }
         PoolVariant::BalancerV3 => {
             if state.balancer_model.as_deref() != Some("weighted") {
@@ -487,9 +523,20 @@ async fn validate_step(
                 state.reserve0, state.reserve1, state.sqrt_price_x96, state.liquidity, state.tick
             );
         }
+        Err(err) if is_singleton_vault_step(step) => {
+            println!("onchain_state: skipped_singleton_vault: {err:#}");
+        }
         Err(err) => {
             println!("onchain_state: FAILED: {err:#}");
         }
+    }
+
+    if is_singleton_vault_step(step) {
+        println!(
+            "factory_check: skipped_singleton_vault manager_or_vault={:?}",
+            step.factory_address
+        );
+        return Ok(());
     }
 
     match factory_for_step(step, settings) {
@@ -865,6 +912,30 @@ fn classic_stable_flag(step: &SwapStep) -> bool {
         (step.dex, step.variant),
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
     ) && step.stable.unwrap_or(false)
+}
+
+fn is_singleton_vault_step(step: &SwapStep) -> bool {
+    matches!(
+        (step.dex, step.variant),
+        (DexKind::UniswapV4, Some(PoolVariant::UniswapV4))
+            | (DexKind::UniswapV4, None)
+            | (DexKind::Balancer, Some(PoolVariant::BalancerV3))
+            | (DexKind::Balancer, None)
+    )
+}
+
+fn recorded_step_diagnostics<'a>(
+    path: &'a ArbPath,
+    step_no: usize,
+    step: &SwapStep,
+) -> Option<&'a QuoteStepDiagnostics> {
+    let diagnostics = path.diagnostics.as_ref()?;
+    diagnostics.steps.iter().find(|recorded| {
+        recorded.step_no as usize == step_no
+            && recorded.pool == step.pool
+            && recorded.token_in == step.token_in
+            && recorded.token_out == step.token_out
+    })
 }
 
 fn encode_factory_get_pool_bool(token_in: Address, token_out: Address, stable: bool) -> Vec<u8> {

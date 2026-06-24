@@ -171,8 +171,15 @@ echo
 
 classify_validate_output() {
   local file="$1"
+  local log_file="${2:-}"
   if [[ ! -s "$file" ]]; then
     echo "missing-output"
+  elif grep -q "skipped_singleton_vault" "$file" 2>/dev/null; then
+    echo "singleton_vault_diagnostic_fallback"
+  elif grep -q "registry pool state fetch by block hash is not implemented for singleton/vault dex UniswapV4" "$file" "$log_file" 2>/dev/null; then
+    echo "diagnostic_missing_uniswap_v4_state_fetch"
+  elif grep -q "registry pool state fetch by block hash is not implemented for singleton/vault dex BalancerV3" "$file" "$log_file" 2>/dev/null; then
+    echo "diagnostic_missing_balancer_v3_state_fetch"
   elif grep -q "local quote not implemented for UniswapV4" "$file"; then
     echo "local_quote_missing_uniswap_v4"
   elif grep -q "local quote not implemented for BalancerV3" "$file"; then
@@ -206,10 +213,20 @@ extract_replay_classification() {
 
 extract_zero_min_result() {
   local file="$1"
-  grep -m1 '^historical_zero_min_result:' "$file" 2>/dev/null \
-    | sed 's/^historical_zero_min_result:[[:space:]]*//' \
-    | sed 's/[[:space:]]\+/ /g' \
-    || true
+  awk '
+    /^historical_zero_min_result:/ {
+      sub(/^historical_zero_min_result:[[:space:]]*/, "", $0)
+      gsub(/[[:space:]]+/, " ", $0)
+      print
+      exit
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+tsv_field() {
+  printf '%s' "${1:-}" \
+    | tr '\t\r\n' '   ' \
+    | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
 }
 
 idx=0
@@ -256,10 +273,19 @@ for opportunity_id in "${IDS[@]}"; do
       "${validate_args[@]}" >"$validate_file" 2>"$OUT_DIR/validate-$short.log"; then
       validate_status="failed"
     fi
-    validate_bucket="$(classify_validate_output "$validate_file")"
+    validate_bucket="$(classify_validate_output "$validate_file" "$OUT_DIR/validate-$short.log")"
   fi
 
-  echo -e "$idx\t$opportunity_id\t$replay_status\t$replay_classification\t$zero_min_result\t$validate_status\t$validate_bucket\t$replay_file\t$validate_file" >>"$SUMMARY"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(tsv_field "$idx")" \
+    "$(tsv_field "$opportunity_id")" \
+    "$(tsv_field "$replay_status")" \
+    "$(tsv_field "$replay_classification")" \
+    "$(tsv_field "$zero_min_result")" \
+    "$(tsv_field "$validate_status")" \
+    "$(tsv_field "$validate_bucket")" \
+    "$(tsv_field "$replay_file")" \
+    "$(tsv_field "$validate_file")" >>"$SUMMARY"
 done
 
 echo

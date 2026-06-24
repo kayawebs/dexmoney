@@ -536,3 +536,86 @@ These recent issues should be backfilled when they are next touched:
 - V4 tick coverage and hot-pool promotion.
 - `MinProfitNotMet` root-cause split.
 - Submitted transaction revert rate.
+
+## 2026-06-24 MinProfitNotMet Root-Cause Split
+
+Status: Open
+Category: observability
+
+### Symptom
+
+Recent execution simulations are dominated by `Executor revert:
+MinProfitNotMet`. A proof batch over representative failures showed every
+sample still failed with `MinProfitNotMet` even when replayed with zero
+min-profit.
+
+### Impact
+
+Searcher is emitting locally profitable candidates, but execution simulation
+often proves no output surplus. Until this is split by protocol/model/callpath,
+raising min-profit only hides opportunities and does not explain why local quote
+is optimistic.
+
+### Hypotheses
+
+- V4 local quote/model or V4 adapter execution semantics differ.
+- Some pool snapshots or tick sets used by the searcher are materially different
+  from execution-time state.
+- Non-V4 legs are producing optimistic local quotes.
+
+### Evidence
+
+- Proof batch directory: `reports/minprofit-proof-20260624T104122Z` on the
+  server; copied samples in `/Users/peter/Documents/dexmoney/minprofit`.
+- 12/12 replay samples: `historical_min_profit_not_met`.
+- 12/12 replay samples: `historical_zero_min_result: Executor revert:
+  MinProfitNotMet`.
+- 12/12 sampled paths include `UniswapV4`.
+- Reachable non-V4 validation legs were not the first failure signal; for
+  example Aerodrome volatile local quote matched pool `getAmountOut` at 0 bps
+  in a representative sample.
+- `validate_route` previously stopped at V4 with `registry pool state fetch by
+  block hash is not implemented for singleton/vault dex UniswapV4`, which is a
+  diagnostic-tool limitation, not proof of stale pool state.
+- A pool `source_block` older than the current block is not by itself evidence
+  of stale state. It means last observed state-changing block for that pool.
+
+### Decision
+
+Root cause is still unknown. Current strongest split is V4-specific, but the
+tooling must first distinguish V4 diagnostic coverage gaps from actual model or
+adapter failures.
+
+### Fix
+
+Added recorder-side observability fixes:
+
+- `validate_route` now treats Uniswap V4 and Balancer V3 as singleton/vault
+  protocols for diagnostics, skips unsupported block-hash state fetch/factory
+  checks explicitly, and falls back to Redis current state or recorded quote
+  snapshots instead of aborting the route trace.
+- `validate_route` now local-quotes Uniswap V4 with the same V3-style tick
+  quoter used by searcher diagnostics.
+- `ops/minprofit_proof_batch.sh` now sanitizes TSV fields and buckets V4/Balancer
+  diagnostic gaps separately from real onchain state failures.
+
+### Verification
+
+Rerun:
+
+```bash
+ops/minprofit_proof_batch.sh /path/to/minprofit-failure-diag.txt
+```
+
+Expected next report:
+
+- `summary.tsv` remains nine columns.
+- V4 samples no longer collapse into generic `onchain_state_failed`.
+- `validate_route` prints per-step Redis/recorded quote traces through V4
+  instead of stopping before final profit comparison.
+
+### Regression Guard
+
+Keep `ops/minprofit_proof_batch.sh` as the repeatable split tool for
+`MinProfitNotMet`. Do not classify old pool `source_block` as stale without a
+drift or event-loss proof.
