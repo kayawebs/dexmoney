@@ -75,7 +75,7 @@ contract UniswapV4AdapterTest is Test {
         tokenIn.mint(address(adapter), amountIn);
         tokenOut.mint(address(manager), amountOut);
 
-        manager.setDelta(int128(int256(amountIn)), -int128(int256(amountOut)));
+        manager.setDelta(-int128(int256(amountIn)), int128(int256(amountOut)));
 
         bytes memory data = abi.encode(currency0, currency1, uint24(500), int24(10), address(0), uint160(0), bytes(""));
 
