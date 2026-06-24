@@ -83,6 +83,17 @@ Collected:
     `data=0x...` selectors, trims calldata-heavy eth_call context, and knows
     current Hub custom errors including `BalanceDidNotIncrease`,
     `AdapterNotWhitelisted`, `MissingFactory`, and `InvalidFee`.
+- `replay-85959011-v3.txt`:
+  - Historical eth_call now decodes cleanly as
+    `Executor revert: AdapterNotWhitelisted`.
+  - This does not prove the original `MinProfitNotMet` root cause. The replay
+    used the current configured V4 adapter against an older opportunity block;
+    that adapter was not whitelisted in Hub at that historical block.
+  - This sample is invalid for T0 root-cause replay unless the replay uses the
+    adapter address that was configured at the original simulation time.
+  - Next sample set must be selected after the current adapter was deployed and
+    whitelisted, or the replay tool must be extended to reconstruct historical
+    runtime config.
 
 Interpretation:
 
@@ -125,9 +136,9 @@ model/execution consistency problem.
 
 ### Fix
 
-Pending rerun after replay tool fix. Next action is to rerun representative
-opportunities from section 11 and classify whether the mismatch is deterministic
-at the opportunity block or caused by later block movement.
+Pending new sample. Next action is to select recent post-adapter-whitelist
+`MinProfitNotMet` opportunities and replay them. Older V4 samples can produce
+false `AdapterNotWhitelisted` due to runtime config changes.
 
 ### Verification
 

@@ -473,6 +473,18 @@ fn classify(
     if historical.contains("PoolMismatch") {
         return "structural_pool_mismatch".into();
     }
+    if historical.contains("AdapterNotWhitelisted") {
+        return "historical_adapter_not_whitelisted".into();
+    }
+    if historical.contains("BalanceDidNotIncrease") {
+        return "historical_balance_did_not_increase".into();
+    }
+    if historical.contains("MissingFactory") {
+        return "historical_missing_factory".into();
+    }
+    if historical.contains("InvalidFee") {
+        return "historical_invalid_fee".into();
+    }
     format!("historical_other: {}", short_reason(historical))
 }
 
