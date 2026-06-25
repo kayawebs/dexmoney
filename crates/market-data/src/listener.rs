@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
+use tokio::time::{interval, sleep, timeout, Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
@@ -30,9 +30,13 @@ const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
-const V4_PROMOTE_INTERVAL: Duration = Duration::from_secs(30);
+const V4_PROMOTE_INTERVAL: Duration = Duration::from_secs(1);
 const V4_PROMOTE_LIMIT: i64 = 1_000;
 const BALANCER_PROMOTE_LIMIT: i64 = 1_000;
+const BLOCK_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const SEALED_EVENT_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const MARKET_DATA_BLOCK_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const POOL_DISCOVERY_BLOCK_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TICK_WARMUP_BATCH_SIZE: usize = 16;
 const TICK_WARMUP_BATCH_PAUSE: Duration = Duration::from_millis(50);
@@ -418,6 +422,13 @@ where
         self.dex_event_recorder.enqueue(events);
     }
 
+    async fn get_block_number_or_fail(&self, context: &'static str) -> Result<u64> {
+        timeout(BLOCK_POLL_TIMEOUT, self.provider.get_block_number())
+            .await
+            .with_context(|| format!("{context} timed out after {BLOCK_POLL_TIMEOUT:?}"))?
+            .with_context(|| format!("{context} failed"))
+    }
+
     pub async fn run(&self) -> Result<()> {
         info!("event listener started");
         self.seed_default_factories().await?;
@@ -428,8 +439,11 @@ where
         self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
         self.spawn_flashblocks_listener();
 
-        let mut last_seen_block = self.provider.get_block_number().await?;
+        let mut last_seen_block = self
+            .get_block_number_or_fail("market-data startup block poll")
+            .await?;
         self.pool_store.set_current_block(last_seen_block).await?;
+        let mut last_block_advance_at = Instant::now();
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut recent_logs = RecentLogCache::new(20_000);
         let mut pending_validations = VecDeque::new();
@@ -440,9 +454,17 @@ where
 
         loop {
             ticker.tick().await;
-            let latest_block = self.provider.get_block_number().await?;
+            let latest_block = self
+                .get_block_number_or_fail("market-data block poll")
+                .await?;
             self.pool_store.set_current_block(latest_block).await?;
             if latest_block <= last_seen_block {
+                if last_block_advance_at.elapsed() >= MARKET_DATA_BLOCK_STALL_TIMEOUT {
+                    anyhow::bail!(
+                        "market-data block feed stalled: last_seen_block={last_seen_block} latest_block={latest_block} stalled_for_ms={}",
+                        last_block_advance_at.elapsed().as_millis()
+                    );
+                }
                 if Instant::now() >= next_registry_reload {
                     monitored_states = self.reload_if_changed(monitored_states).await?;
                     next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
@@ -455,6 +477,7 @@ where
                 .await?;
                 continue;
             }
+            last_block_advance_at = Instant::now();
 
             if Instant::now() >= next_registry_reload {
                 monitored_states = self.reload_if_changed(monitored_states).await?;
@@ -463,14 +486,22 @@ where
 
             let block_started = Instant::now();
             let fetch_started = Instant::now();
-            let events = self
-                .provider
-                .fetch_relevant_events_for_pools(
+            let events = timeout(
+                SEALED_EVENT_FETCH_TIMEOUT,
+                self.provider.fetch_relevant_events_for_pools(
                     &monitored_states,
                     last_seen_block + 1,
                     latest_block,
+                ),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "market-data sealed event fetch timed out after {SEALED_EVENT_FETCH_TIMEOUT:?} for blocks {}..{}",
+                    last_seen_block + 1,
+                    latest_block
                 )
-                .await?;
+            })??;
             let fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
             let apply_started = Instant::now();
@@ -756,7 +787,10 @@ where
         info!("pool discovery started");
         self.seed_default_factories().await?;
 
-        let mut last_scanned_block = self.provider.get_block_number().await?;
+        let mut last_scanned_block = self
+            .get_block_number_or_fail("pool-discovery startup block poll")
+            .await?;
+        let mut last_block_advance_at = Instant::now();
         let mut globally_observed_pools = HashSet::new();
         let mut next_v4_promotion = Instant::now();
         info!(last_scanned_block, "pool discovery synchronized at startup");
@@ -766,10 +800,19 @@ where
 
         loop {
             ticker.tick().await;
-            let latest_block = self.provider.get_block_number().await?;
+            let latest_block = self
+                .get_block_number_or_fail("pool-discovery block poll")
+                .await?;
             if latest_block <= last_scanned_block {
+                if last_block_advance_at.elapsed() >= POOL_DISCOVERY_BLOCK_STALL_TIMEOUT {
+                    anyhow::bail!(
+                        "pool-discovery block feed stalled: last_scanned_block={last_scanned_block} latest_block={latest_block} stalled_for_ms={}",
+                        last_block_advance_at.elapsed().as_millis()
+                    );
+                }
                 continue;
             }
+            last_block_advance_at = Instant::now();
 
             let from_block = last_scanned_block + 1;
             let to_block =
@@ -785,11 +828,13 @@ where
                 let promote_started = Instant::now();
                 let promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
                 let balancer_promote_stats = self.promote_quoteable_balancer_v3_pools().await?;
-                if promote_stats.promoted > 0
+                if promote_stats.selected > 0
+                    || promote_stats.promoted > 0
                     || promote_stats.published_states > 0
                     || promote_stats.skipped > 0
                 {
                     info!(
+                        selected = promote_stats.selected,
                         promoted = promote_stats.promoted,
                         published_states = promote_stats.published_states,
                         skipped = promote_stats.skipped,
@@ -797,11 +842,13 @@ where
                         "Uniswap V4 quoteable pool promotion processed observations"
                     );
                 }
-                if balancer_promote_stats.promoted > 0
+                if balancer_promote_stats.selected > 0
+                    || balancer_promote_stats.promoted > 0
                     || balancer_promote_stats.published_states > 0
                     || balancer_promote_stats.skipped > 0
                 {
                     info!(
+                        selected = balancer_promote_stats.selected,
                         promoted = balancer_promote_stats.promoted,
                         published_states = balancer_promote_stats.published_states,
                         skipped = balancer_promote_stats.skipped,
@@ -833,9 +880,12 @@ where
             return Ok(());
         };
 
-        let latest_block = self.provider.get_block_number().await?;
+        let latest_block = self
+            .get_block_number_or_fail("competitor pool discovery startup block poll")
+            .await?;
         let mut last_scanned_block =
             latest_block.saturating_sub(self.settings.competitor_pool_discovery_lookback_blocks);
+        let mut last_block_advance_at = Instant::now();
         let mut recent_txs = RecentTxCache::new(20_000);
         info!(
             collector = %collector,
@@ -850,10 +900,19 @@ where
 
         loop {
             ticker.tick().await;
-            let latest_block = self.provider.get_block_number().await?;
+            let latest_block = self
+                .get_block_number_or_fail("competitor pool discovery block poll")
+                .await?;
             if latest_block <= last_scanned_block {
+                if last_block_advance_at.elapsed() >= POOL_DISCOVERY_BLOCK_STALL_TIMEOUT {
+                    anyhow::bail!(
+                        "competitor pool discovery block feed stalled: last_scanned_block={last_scanned_block} latest_block={latest_block} stalled_for_ms={}",
+                        last_block_advance_at.elapsed().as_millis()
+                    );
+                }
                 continue;
             }
+            last_block_advance_at = Instant::now();
             let from_block = last_scanned_block + 1;
             let to_block = latest_block.min(
                 last_scanned_block.saturating_add(
@@ -1416,11 +1475,13 @@ where
               AND po.liquidity IS NOT NULL
               AND po.tick IS NOT NULL
               AND (
-                  po.updated_at >= NOW() - INTERVAL '2 minutes'
-                  OR latest_state.block_number IS NULL
-                  OR COALESCE(po.latest_block, 0) > latest_state.block_number
+                  latest_state.block_number IS NULL
+                  OR po.latest_block > latest_state.block_number
               )
-            ORDER BY po.logs_30d DESC, po.latest_block DESC, po.updated_at DESC
+            ORDER BY
+                po.latest_block DESC,
+                (po.latest_block - COALESCE(latest_state.block_number, 0)) DESC,
+                po.logs_30d DESC
             LIMIT $4
             "#,
         )
@@ -1432,6 +1493,7 @@ where
         .await?;
 
         let mut stats = V4PromoteStats::default();
+        stats.selected = rows.len();
         let mut changed = Vec::new();
         let mut published_states = Vec::new();
         let mut token_symbols = HashMap::new();
@@ -1564,11 +1626,13 @@ where
               AND po.token1 IS NOT NULL
               AND po.fee_bps IS NOT NULL
               AND (
-                  po.updated_at >= NOW() - INTERVAL '2 minutes'
-                  OR latest_state.block_number IS NULL
-                  OR COALESCE(po.latest_block, 0) > latest_state.block_number
+                  latest_state.block_number IS NULL
+                  OR po.latest_block > latest_state.block_number
               )
-            ORDER BY po.logs_30d DESC, po.latest_block DESC, po.updated_at DESC
+            ORDER BY
+                po.latest_block DESC,
+                (po.latest_block - COALESCE(latest_state.block_number, 0)) DESC,
+                po.logs_30d DESC
             LIMIT $3
             "#,
         )
@@ -1579,6 +1643,7 @@ where
         .await?;
 
         let mut stats = V4PromoteStats::default();
+        stats.selected = rows.len();
         let mut changed = Vec::new();
         let mut published_states = Vec::new();
         let mut token_symbols = HashMap::new();
@@ -2611,7 +2676,10 @@ where
                 return Ok(*block_number);
             }
         }
-        let block_number = self.provider.get_block_number().await?.saturating_add(1);
+        let block_number = self
+            .get_block_number_or_fail("flashblock fallback block poll")
+            .await?
+            .saturating_add(1);
         *fallback_block_cache = Some((now, block_number));
         Ok(block_number)
     }
@@ -3010,7 +3078,9 @@ where
             return Ok(states);
         }
 
-        let block_number = self.provider.get_block_number().await?;
+        let block_number = self
+            .get_block_number_or_fail("Aerodrome fee refresh block poll")
+            .await?;
         let block_hash = self.provider.get_block_hash(block_number).await?;
         let mut changed_pools = HashSet::new();
         let mut checked = 0usize;
@@ -4727,6 +4797,7 @@ struct PendingValidation {
 
 #[derive(Debug, Default)]
 struct V4PromoteStats {
+    selected: usize,
     promoted: usize,
     published_states: usize,
     skipped: usize,
