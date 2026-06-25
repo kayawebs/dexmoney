@@ -28,6 +28,7 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 UNISWAP_V4_SWAP_TOPIC="0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
 UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC="0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec"
+RPC_LOG_CHUNK_BLOCKS="${RPC_LOG_CHUNK_BLOCKS:-90000}"
 
 if [[ -z "$POOL" ]]; then
   cat >&2 <<'EOF'
@@ -49,6 +50,68 @@ OUT_FILE="$OUT_DIR/v4-state-diag-$STAMP.txt"
 
 hex_block() {
   printf '0x%x' "$1"
+}
+
+fetch_log_summary() {
+  local label="$1"
+  local topic0="$2"
+  local from_block="$3"
+  local to_block="$4"
+
+  local total=0
+  local first_block=""
+  local latest_block=""
+  local latest_tx=""
+  local chunk_from="$from_block"
+
+  while (( chunk_from <= to_block )); do
+    local chunk_to=$((chunk_from + RPC_LOG_CHUNK_BLOCKS - 1))
+    if (( chunk_to > to_block )); then
+      chunk_to="$to_block"
+    fi
+
+    local params
+    params="$(jq -cn \
+      --arg from "$(hex_block "$chunk_from")" \
+      --arg to "$(hex_block "$chunk_to")" \
+      --arg address "$MANAGER" \
+      --arg topic0 "$topic0" \
+      --arg topic1 "$POOL_UID" \
+      '{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}')"
+
+    echo "${label}_chunk blocks=${chunk_from}..${chunk_to}"
+    local logs
+    if ! logs="$(cast rpc --rpc-url "$RPC_URL" eth_getLogs "$params" 2>&1)"; then
+      echo "${label}_chunk_error blocks=${chunk_from}..${chunk_to} error=${logs}"
+      return 1
+    fi
+
+    local count
+    count="$(printf '%s\n' "$logs" | jq 'length' 2>/dev/null || echo 0)"
+    echo "${label}_chunk_count=${count}"
+    if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+      local chunk_first chunk_latest chunk_tx
+      chunk_first="$(printf '%s\n' "$logs" | jq -r '.[0].blockNumber')"
+      chunk_latest="$(printf '%s\n' "$logs" | jq -r '.[-1].blockNumber')"
+      chunk_tx="$(printf '%s\n' "$logs" | jq -r '.[-1].transactionHash')"
+      if [[ -z "$first_block" ]]; then
+        first_block="$chunk_first"
+      fi
+      latest_block="$chunk_latest"
+      latest_tx="$chunk_tx"
+      total=$((total + count))
+    fi
+
+    chunk_from=$((chunk_to + 1))
+  done
+
+  jq -cn \
+    --arg label "$label" \
+    --argjson count "$total" \
+    --arg first_block "${first_block:-null}" \
+    --arg latest_block "${latest_block:-null}" \
+    --arg latest_tx "${latest_tx:-null}" \
+    '{label:$label,count:$count,first_block:$first_block,latest_block:$latest_block,latest_tx:$latest_tx}'
 }
 
 section() {
@@ -277,40 +340,13 @@ if [[ -n "$RPC_URL" && -n "$MANAGER" && -n "$POOL_UID" && -n "$OBS_LATEST" ]]; t
     echo "swap_topic=$UNISWAP_V4_SWAP_TOPIC"
     echo "modify_liquidity_topic=$UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC"
 
-    SWAP_PARAMS="$(jq -cn \
-      --arg from "$FROM_HEX" \
-      --arg to "$TO_HEX" \
-      --arg address "$MANAGER" \
-      --arg topic0 "$UNISWAP_V4_SWAP_TOPIC" \
-      --arg topic1 "$POOL_UID" \
-      '{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}')"
-    MODIFY_PARAMS="$(jq -cn \
-      --arg from "$FROM_HEX" \
-      --arg to "$TO_HEX" \
-      --arg address "$MANAGER" \
-      --arg topic0 "$UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC" \
-      --arg topic1 "$POOL_UID" \
-      '{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}')"
-
     echo
     echo "swap_logs:"
-    if SWAP_LOGS="$(cast rpc --rpc-url "$RPC_URL" eth_getLogs "$SWAP_PARAMS" 2>&1)"; then
-      printf '%s\n' "$SWAP_LOGS" \
-        | jq '{count:length, first_block:(.[0].blockNumber // null), latest_block:(.[-1].blockNumber // null), latest_tx:(.[-1].transactionHash // null)}' 2>/dev/null \
-        || printf '%s\n' "$SWAP_LOGS"
-    else
-      printf '%s\n' "$SWAP_LOGS"
-    fi
+    fetch_log_summary "swap" "$UNISWAP_V4_SWAP_TOPIC" "$FROM_BLOCK" "$CURRENT_BLOCK" || true
 
     echo
     echo "modify_liquidity_logs:"
-    if MODIFY_LOGS="$(cast rpc --rpc-url "$RPC_URL" eth_getLogs "$MODIFY_PARAMS" 2>&1)"; then
-      printf '%s\n' "$MODIFY_LOGS" \
-        | jq '{count:length, first_block:(.[0].blockNumber // null), latest_block:(.[-1].blockNumber // null), latest_tx:(.[-1].transactionHash // null)}' 2>/dev/null \
-        || printf '%s\n' "$MODIFY_LOGS"
-    else
-      printf '%s\n' "$MODIFY_LOGS"
-    fi
+    fetch_log_summary "modify_liquidity" "$UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC" "$FROM_BLOCK" "$CURRENT_BLOCK" || true
   } >>"$OUT_FILE" 2>&1
 else
   echo "skipped RPC log check because RPC/manager/pool_uid/latest_block is missing" >>"$OUT_FILE"
