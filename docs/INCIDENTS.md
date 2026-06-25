@@ -135,6 +135,20 @@ Collected:
     correctness bug. It can simply mean the pool had no state-changing events
     since that block. The replay feature is a correlation signal, not a proven
     root cause.
+- `summary.tsv` from `/Users/peter/Documents/dexmoney/minprofit`:
+  - 20/20 representative failures are `historical_min_profit_not_met`.
+  - 20/20 zero-min-profit replay attempts still fail as
+    `Executor revert: MinProfitNotMet`, so configured min profit is not the
+    immediate cause for this batch.
+  - `validate_route` shows `latest_local_profit` and `redis_local_profit`
+    remain above the configured `min_profit=5000` for every sample.
+  - The samples repeatedly include V4 singleton/vault diagnostic fallback
+    steps. Current local/Redis quote says profitable, while replayed executor
+    semantics says not profitable.
+  - Next proof step is to rerun `ops/minprofit_proof_batch.sh` with
+    `EXECUTOR_CALL=1` so the report captures `executor_original` and
+    `executor_zero_min` decoded Hub/adapter revert results for the exact
+    current calldata.
 
 Interpretation:
 
@@ -147,6 +161,10 @@ Interpretation:
   calldata/adapter semantic checks.
 - For this class, the issue is not gas policy, candidate queue age, or
   configured min-profit margin.
+- The latest 20-sample batch further rules out "old block number" as a
+  sufficient explanation: current Redis/latest local quotes still show profit.
+  The next branch point is executor-call proof, especially V4 adapter calldata
+  and PoolKey semantics.
 
 Still needed:
 
@@ -178,6 +196,10 @@ Added local evidence entrypoint:
   `diagnosis_hint`. This is the default batch artifact for deciding whether the
   next fix belongs in market-data state, searcher quote math, adapter calldata,
   or execution semantics.
+- `ops/minprofit_proof_batch.sh` can be run with `EXECUTOR_CALL=1` to include
+  `executor_original` and `executor_zero_min` decoded eth_call results in
+  `summary.tsv`. Use this when replay/local quote evidence disagrees with Hub
+  execution.
 
 Replay targets from the report:
 

@@ -495,8 +495,16 @@ async fn validate_step(
     println!("token_in: {:#x}", step.token_in);
     println!("token_out: {:#x}", step.token_out);
     println!(
-        "fee_bps: {:?} stable: {:?} tick_spacing: {:?}",
-        step.fee_bps, step.stable, step.tick_spacing
+        "fee_bps: {:?} pool_key_fee_pips: {:?} stable: {:?} tick_spacing: {:?} hooks: {:?} adapter_data_bytes: {}",
+        step.fee_bps,
+        step.pool_key_fee_pips,
+        step.stable,
+        step.tick_spacing,
+        step.hooks_address,
+        step.adapter_data
+            .as_deref()
+            .map(|data| data.trim_start_matches("0x").len() / 2)
+            .unwrap_or_default()
     );
 
     let entry = PoolRegistryEntry {
@@ -653,13 +661,61 @@ async fn validate_executor_call(
 
     println!("\n== Executor Call ==");
     let deadline = U256::from((Utc::now().timestamp() + EXECUTOR_DEADLINE_SECS) as u64);
+    println!("executor: {executor:#x}");
+    println!("operator: {operator:#x}");
+
+    executor_call_once(
+        "executor_call_original",
+        path,
+        token_in,
+        amount_in,
+        min_profit,
+        deadline,
+        executor,
+        operator,
+        settings,
+        provider,
+    )
+    .await?;
+    if min_profit != U256::ZERO {
+        executor_call_once(
+            "executor_call_zero_min",
+            path,
+            token_in,
+            amount_in,
+            U256::ZERO,
+            deadline,
+            executor,
+            operator,
+            settings,
+            provider,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn executor_call_once(
+    label: &str,
+    path: &ArbPath,
+    token_in: Address,
+    amount_in: U256,
+    min_profit: U256,
+    deadline: U256,
+    executor: Address,
+    operator: Address,
+    settings: &Settings,
+    provider: &ChainProvider,
+) -> Result<()> {
     let calldata =
         build_execute_calldata(path, token_in, amount_in, min_profit, deadline, settings)?;
     let data_hex = format!("0x{}", hex::encode(&calldata));
-    println!("executor: {executor:#x}");
-    println!("operator: {operator:#x}");
-    println!("calldata_bytes: {}", calldata.len());
-
+    println!(
+        "{label}: min_profit={min_profit} calldata_bytes={}",
+        calldata.len()
+    );
     match provider
         .eth_call_from(
             Some(operator),
@@ -669,10 +725,13 @@ async fn validate_executor_call(
         )
         .await
     {
-        Ok(raw) => println!("executor_call: ok result={raw}"),
-        Err(err) => println!("executor_call: FAILED: {err:#}"),
+        Ok(raw) => println!("{label}: ok result={raw}"),
+        Err(err) => {
+            let raw = format!("{err:#}");
+            let decoded = decode_revert_selector(&raw).unwrap_or("unknown");
+            println!("{label}: FAILED decoded={decoded}: {raw}");
+        }
     }
-
     Ok(())
 }
 
@@ -922,6 +981,59 @@ fn is_singleton_vault_step(step: &SwapStep) -> bool {
             | (DexKind::Balancer, Some(PoolVariant::BalancerV3))
             | (DexKind::Balancer, None)
     )
+}
+
+fn decode_revert_selector(raw: &str) -> Option<&'static str> {
+    for selector in hex_selectors(raw) {
+        match selector.as_str() {
+            "0x5fc483c5" => return Some("ExecutorHub.OnlyOwner"),
+            "0x27e1f1e5" => return Some("ExecutorHub.OnlyOperator"),
+            "0xeced32bc" => return Some("ExecutorHub.PausedError"),
+            "0x1ab7da6b" => return Some("ExecutorHub.DeadlineExpired"),
+            "0x20db8267" => return Some("ExecutorHub.InvalidPath"),
+            "0x1ae9030e" => return Some("ExecutorHub.InvalidStepCount"),
+            "0xf4d678b8" => return Some("ExecutorHub.InsufficientBalance"),
+            "0x13be252b" => return Some("ExecutorHub.InsufficientAllowance"),
+            "0xa5d3ca34" => return Some("ExecutorHub.UnsupportedDex"),
+            "0x270815a0" => return Some("ExecutorHub.InvalidTickSpacing"),
+            "0x58d620b3" => return Some("ExecutorHub.InvalidFee"),
+            "0xeab28cb4" => return Some("ExecutorHub.PoolMismatch"),
+            "0xd433008b" => return Some("ExecutorHub.MinProfitNotMet"),
+            "0x90b8ec18" => return Some("ExecutorHub.TransferFailed"),
+            "0x8164f842" => return Some("ExecutorHub.ApprovalFailed"),
+            "0xf5c6c81a" => return Some("ExecutorHub.UnauthorizedCallback"),
+            "0xf7a632f5" => return Some("ExecutorHub.InvalidCallback"),
+            "0x27f83cbc" => return Some("ExecutorHub.BalanceDidNotIncrease"),
+            "0xd71b9a00" => return Some("ExecutorHub.AdapterNotWhitelisted"),
+            "0x2eb8055a" => return Some("ExecutorHub.MissingFactory"),
+            "0x5c427cd9" => return Some("Adapter.UnauthorizedCaller"),
+            "0x34e70f7a" => return Some("UniswapV4Adapter.InvalidManager"),
+            "0xc256622b" => return Some("UniswapV4Adapter.InvalidPoolKey"),
+            "0xc1ab6dc1" => return Some("Adapter.InvalidToken"),
+            "0x2c5211c6" => return Some("UniswapV4Adapter.InvalidAmount"),
+            "0x5a7cfa65" => return Some("UniswapV4Adapter.NoOutput"),
+            "0x466d7fef" => return Some("BalancerV3Adapter.InvalidRouter"),
+            "0x2083cd40" => return Some("BalancerV3Adapter.InvalidPool"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn hex_selectors(raw: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    for part in raw.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ':' | '=' | '{' | '}' | '[' | ']')
+    }) {
+        let clean = part.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != 'x');
+        if clean.len() >= 10
+            && clean.starts_with("0x")
+            && clean[2..10].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            selectors.push(clean[..10].to_ascii_lowercase());
+        }
+    }
+    selectors
 }
 
 fn recorded_step_diagnostics<'a>(

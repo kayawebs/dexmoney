@@ -67,6 +67,20 @@ extract_ids_from_report_table() {
   ' "$REPORT_FILE"
 }
 
+extract_ids_from_summary_tsv() {
+  awk -F'\t' '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "opportunity_id") id_col = i
+      }
+      next
+    }
+    id_col > 0 && $id_col ~ /^[0-9a-fA-F-]{36}$/ {
+      print tolower($id_col)
+    }
+  ' "$REPORT_FILE"
+}
+
 select_recent_ids_from_db() {
   local limit_sql="$LIMIT"
   if [[ "$limit_sql" == "0" ]]; then
@@ -120,6 +134,7 @@ if [[ -n "$REPORT_FILE" ]]; then
     IDS+=("$opportunity_id")
   done < <(
     {
+      extract_ids_from_summary_tsv
       extract_ids_from_report_commands
       extract_ids_from_report_table
     } | awk 'NF && !seen[$0]++'
@@ -136,6 +151,7 @@ no opportunity ids found.
 
 Usage:
   $0 <minprofit-failure-diag-report>
+  $0 <minprofit-proof-summary.tsv>
 
 Or select recent DB samples:
   INTERVAL="$INTERVAL" LIMIT="$LIMIT" $0
@@ -153,7 +169,7 @@ fi
 
 SUMMARY="$OUT_DIR/summary.tsv"
 {
-  echo -e "idx\topportunity_id\treplay_status\treplay_classification\tzero_min_result\tvalidate_status\tvalidate_bucket\texpected_profit\tmin_profit\tlatest_local_profit\tredis_local_profit\tredis_expected_diff_bps\tfirst_step_delta\tdiagnosis_hint\treplay_file\tvalidate_file"
+  echo -e "idx\topportunity_id\treplay_status\treplay_classification\tzero_min_result\tvalidate_status\tvalidate_bucket\texpected_profit\tmin_profit\tlatest_local_profit\tredis_local_profit\tredis_expected_diff_bps\tfirst_step_delta\texecutor_original\texecutor_zero_min\tdiagnosis_hint\treplay_file\tvalidate_file"
 } >"$SUMMARY"
 
 echo "minprofit proof batch"
@@ -194,7 +210,7 @@ classify_validate_output() {
     echo "factory_mismatch"
   elif grep -q "factory_check: FAILED" "$file"; then
     echo "factory_check_failed"
-  elif grep -q "executor_call: FAILED" "$file"; then
+  elif grep -Eq "executor_call(_[a-z_]+)?: FAILED" "$file"; then
     echo "executor_call_failed"
   elif grep -q "final: opportunity_expected_profit" "$file"; then
     echo "route_quote_completed"
@@ -326,6 +342,30 @@ extract_first_step_delta() {
   ' "$file" 2>/dev/null || true
 }
 
+extract_executor_call_result() {
+  local file="$1"
+  local label="$2"
+  awk -v label="$label" '
+    index($0, label ": ok") == 1 {
+      print "ok"
+      exit
+    }
+    index($0, label ": FAILED") == 1 {
+      n = split($0, parts, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        split(parts[i], kv, "=")
+        if (kv[1] == "decoded") {
+          gsub(":", "", kv[2])
+          print kv[2]
+          exit
+        }
+      }
+      print "failed_unknown"
+      exit
+    }
+  ' "$file" 2>/dev/null || true
+}
+
 diagnosis_hint() {
   local validate_bucket="$1"
   local zero_min_result="$2"
@@ -334,7 +374,25 @@ diagnosis_hint() {
   local latest_local_profit="$5"
   local redis_local_profit="$6"
   local first_step_delta="$7"
+  local executor_original="$8"
+  local executor_zero_min="$9"
 
+  if [[ "$executor_zero_min" == "ExecutorHub.MinProfitNotMet" ]]; then
+    echo "executor_zero_min_not_profitable"
+    return
+  fi
+  if [[ "$executor_zero_min" == "ok" && "$executor_original" == "ExecutorHub.MinProfitNotMet" ]]; then
+    echo "executor_profit_below_configured_min"
+    return
+  fi
+  if [[ "$executor_zero_min" == "UniswapV4Adapter.NoOutput" || "$executor_original" == "UniswapV4Adapter.NoOutput" ]]; then
+    echo "uniswap_v4_adapter_no_output"
+    return
+  fi
+  if [[ "$executor_zero_min" != "-" && "$executor_zero_min" != "ok" && "$executor_zero_min" != "" ]]; then
+    echo "executor_zero_min_failed:$executor_zero_min"
+    return
+  fi
   if [[ "$validate_bucket" == *"missing"* || "$validate_bucket" == *"failed"* || "$validate_bucket" == *"fallback"* ]]; then
     echo "diagnostic_or_data_gap:$validate_bucket"
     return
@@ -388,12 +446,14 @@ for opportunity_id in "${IDS[@]}"; do
   redis_local_profit="-"
   redis_expected_diff_bps="-"
   first_step_delta="-"
+  executor_original="-"
+  executor_zero_min="-"
   hint="-"
 
   echo "[$idx/${#IDS[@]}] $opportunity_id"
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo -e "$idx\t$opportunity_id\tdry_run\t-\t-\tdry_run\t-\t-\t-\t-\t-\t-\t-\tdry_run\t$replay_file\t$validate_file" >>"$SUMMARY"
+    echo -e "$idx\t$opportunity_id\tdry_run\t-\t-\tdry_run\t-\t-\t-\t-\t-\t-\t-\t-\t-\tdry_run\t$replay_file\t$validate_file" >>"$SUMMARY"
     continue
   fi
 
@@ -429,6 +489,10 @@ for opportunity_id in "${IDS[@]}"; do
     redis_local_profit="$(extract_final_field "$validate_file" "redis final:" "redis_local_profit")"
     redis_expected_diff_bps="$(numeric_diff_bps "$expected_profit" "$redis_local_profit")"
     first_step_delta="$(extract_first_step_delta "$validate_file")"
+    executor_original="$(extract_executor_call_result "$validate_file" "executor_call_original")"
+    [[ -n "$executor_original" ]] || executor_original="-"
+    executor_zero_min="$(extract_executor_call_result "$validate_file" "executor_call_zero_min")"
+    [[ -n "$executor_zero_min" ]] || executor_zero_min="-"
   fi
 
   hint="$(diagnosis_hint \
@@ -438,9 +502,11 @@ for opportunity_id in "${IDS[@]}"; do
     "$min_profit" \
     "$latest_local_profit" \
     "$redis_local_profit" \
-    "$first_step_delta")"
+    "$first_step_delta" \
+    "$executor_original" \
+    "$executor_zero_min")"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(tsv_field "$idx")" \
     "$(tsv_field "$opportunity_id")" \
     "$(tsv_field "$replay_status")" \
@@ -454,6 +520,8 @@ for opportunity_id in "${IDS[@]}"; do
     "$(tsv_field "$redis_local_profit")" \
     "$(tsv_field "$redis_expected_diff_bps")" \
     "$(tsv_field "$first_step_delta")" \
+    "$(tsv_field "$executor_original")" \
+    "$(tsv_field "$executor_zero_min")" \
     "$(tsv_field "$hint")" \
     "$(tsv_field "$replay_file")" \
     "$(tsv_field "$validate_file")" >>"$SUMMARY"
@@ -472,6 +540,6 @@ awk -F'\t' 'NR > 1 { replay[$4]++; validate[$7]++ } END {
 }' "$SUMMARY" | sort -rn || true
 echo
 echo "diagnosis hint counts:"
-awk -F'\t' 'NR > 1 { hint[$14]++ } END {
+awk -F'\t' 'NR > 1 { hint[$16]++ } END {
   for (k in hint) print hint[k] "\t" k
 }' "$SUMMARY" | sort -rn || true
