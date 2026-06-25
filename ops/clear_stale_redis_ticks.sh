@@ -24,6 +24,7 @@ CHAIN_ID="${CHAIN_ID:-8453}"
 APPLY=0
 POOL=""
 ALL=0
+VERBOSE=0
 
 usage() {
   cat <<'EOF'
@@ -39,6 +40,7 @@ Examples:
   ops/clear_stale_redis_ticks.sh 0xbe518be37a79a7b7122f02f9278bc348b15e9565
   ops/clear_stale_redis_ticks.sh 0xbe518be37a79a7b7122f02f9278bc348b15e9565 --apply
   ops/clear_stale_redis_ticks.sh --all --apply
+  ops/clear_stale_redis_ticks.sh --all --apply --verbose
 EOF
 }
 
@@ -50,6 +52,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all)
       ALL=1
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
       shift
       ;;
     -h|--help)
@@ -125,16 +131,25 @@ echo
 
 cleared=0
 matched=0
+processed=0
 while IFS= read -r pool; do
+  processed=$((processed + 1))
   [[ -z "$pool" ]] && continue
   pool_lc="$(printf '%s' "$pool" | tr 'A-F' 'a-f')"
   key="$(grep -i "ticks:index:${pool_lc}$" "$redis_keys_file" | head -n 1 || true)"
   if [[ -z "$key" ]]; then
+    if [[ "$ALL" -eq 1 && "$VERBOSE" -eq 0 && $((processed % 1000)) -eq 0 ]]; then
+      echo "progress processed=$processed matched=$matched cleared=$cleared"
+    fi
     continue
   fi
   matched=$((matched + 1))
   count="$(redis-cli -u "$REDIS" SCARD "$key" 2>/dev/null || echo 0)"
-  echo "pool=$pool_lc key=$key redis_ticks=$count"
+  if [[ "$ALL" -eq 0 || "$VERBOSE" -eq 1 ]]; then
+    echo "pool=$pool_lc key=$key redis_ticks=$count"
+  elif [[ $((matched % 250)) -eq 0 ]]; then
+    echo "progress processed=$processed matched=$matched cleared=$cleared"
+  fi
   if [[ "$APPLY" -eq 1 ]]; then
     if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
       redis-cli -u "$REDIS" --raw SMEMBERS "$key" \
