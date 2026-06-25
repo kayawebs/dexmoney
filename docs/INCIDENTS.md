@@ -172,6 +172,12 @@ Added local evidence entrypoint:
   to split failures into historical executor replay classes and route quote
   buckets such as missing V4/Balancer local quote, onchain state fetch failure,
   factory mismatch, or completed Redis/latest quote.
+- `ops/minprofit_proof_batch.sh` now also writes per-target
+  `expected_profit`, `min_profit`, `latest_local_profit`, `redis_local_profit`,
+  `redis_expected_diff_bps`, first recorded-vs-redis step delta, and a
+  `diagnosis_hint`. This is the default batch artifact for deciding whether the
+  next fix belongs in market-data state, searcher quote math, adapter calldata,
+  or execution semantics.
 
 Replay targets from the report:
 
@@ -205,7 +211,11 @@ Still open:
 - Run `ops/minprofit_proof_batch.sh` first. If the dominant bucket is
   `local_quote_missing_uniswap_v4` or `local_quote_missing_balancer_v3`, the
   immediate fix is diagnostic/model coverage for that protocol before any
-  further production tuning.
+  further production tuning. If `diagnosis_hint` is
+  `recorded_vs_redis_quote_diverged`, inspect the first divergent step/pool. If
+  it is `executor_adapter_semantics_or_historical_state`, run
+  `doctor/arb_doctor.sh --opportunity-id <uuid> --executor-call` on one fresh
+  sample from that bucket.
 
 ### Verification
 

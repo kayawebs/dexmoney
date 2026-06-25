@@ -153,7 +153,7 @@ fi
 
 SUMMARY="$OUT_DIR/summary.tsv"
 {
-  echo -e "idx\topportunity_id\treplay_status\treplay_classification\tzero_min_result\tvalidate_status\tvalidate_bucket\treplay_file\tvalidate_file"
+  echo -e "idx\topportunity_id\treplay_status\treplay_classification\tzero_min_result\tvalidate_status\tvalidate_bucket\texpected_profit\tmin_profit\tlatest_local_profit\tredis_local_profit\tredis_expected_diff_bps\tfirst_step_delta\tdiagnosis_hint\treplay_file\tvalidate_file"
 } >"$SUMMARY"
 
 echo "minprofit proof batch"
@@ -223,6 +223,148 @@ extract_zero_min_result() {
   ' "$file" 2>/dev/null || true
 }
 
+extract_route_field() {
+  local file="$1"
+  local key="$2"
+  awk -v key="$key" '
+    $0 ~ "^" key ":" {
+      sub("^[^:]+:[[:space:]]*", "", $0)
+      print
+      exit
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+extract_final_field() {
+  local file="$1"
+  local line_prefix="$2"
+  local key="$3"
+  awk -v prefix="$line_prefix" -v key="$key" '
+    index($0, prefix) == 1 {
+      n = split($0, parts, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        split(parts[i], kv, "=")
+        if (kv[1] == key) {
+          print kv[2]
+          exit
+        }
+      }
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+numeric_diff_bps() {
+  local a="${1:-}"
+  local b="${2:-}"
+  if [[ -z "$a" || -z "$b" || "$a" == "unavailable" || "$b" == "unavailable" ]]; then
+    echo "-"
+    return
+  fi
+  awk -v a="$a" -v b="$b" 'BEGIN {
+    if (a + 0 == 0 && b + 0 == 0) {
+      print 0
+      exit
+    }
+    max = (a + 0 > b + 0) ? a + 0 : b + 0
+    diff = (a + 0 > b + 0) ? a - b : b - a
+    printf "%.2f", 10000.0 * diff / max
+  }'
+}
+
+decimal_lt() {
+  local a="${1:-0}"
+  local b="${2:-0}"
+  a="$(printf '%s' "$a" | sed 's/^0*//')"
+  b="$(printf '%s' "$b" | sed 's/^0*//')"
+  [[ -n "$a" ]] || a="0"
+  [[ -n "$b" ]] || b="0"
+  if (( ${#a} < ${#b} )); then
+    return 0
+  fi
+  if (( ${#a} > ${#b} )); then
+    return 1
+  fi
+  [[ "$a" < "$b" ]]
+}
+
+extract_first_step_delta() {
+  local file="$1"
+  awk '
+    function field_value(line, key,    n, parts, i, kv) {
+      n = split(line, parts, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        split(parts[i], kv, "=")
+        if (kv[1] == key) return kv[2]
+      }
+      return ""
+    }
+    /^recorded step [0-9]+:/ {
+      step = $3
+      gsub(":", "", step)
+      rec[step] = field_value($0, "amount_out")
+      pool[step] = field_value($0, "pool")
+      variant[step] = field_value($0, "variant")
+    }
+    /^redis step [0-9]+: amount_in=/ {
+      step = $3
+      gsub(":", "", step)
+      red[step] = field_value($0, "amount_out")
+    }
+    END {
+      for (i = 1; i <= 32; i++) {
+        if (rec[i] == "" || red[i] == "") continue
+        max = (rec[i] + 0 > red[i] + 0) ? rec[i] + 0 : red[i] + 0
+        diff = (rec[i] + 0 > red[i] + 0) ? rec[i] - red[i] : red[i] - rec[i]
+        bps = (max == 0) ? 0 : 10000.0 * diff / max
+        if (bps > 1.0) {
+          printf "step=%s diff_bps=%.2f recorded=%s redis=%s pool=%s variant=%s", i, bps, rec[i], red[i], pool[i], variant[i]
+          exit
+        }
+      }
+      print "-"
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+diagnosis_hint() {
+  local validate_bucket="$1"
+  local zero_min_result="$2"
+  local expected_profit="$3"
+  local min_profit="$4"
+  local latest_local_profit="$5"
+  local redis_local_profit="$6"
+  local first_step_delta="$7"
+
+  if [[ "$validate_bucket" == *"missing"* || "$validate_bucket" == *"failed"* || "$validate_bucket" == *"fallback"* ]]; then
+    echo "diagnostic_or_data_gap:$validate_bucket"
+    return
+  fi
+  if [[ "$redis_local_profit" =~ ^[0-9]+$ && "$min_profit" =~ ^[0-9]+$ ]] \
+    && decimal_lt "$redis_local_profit" "$min_profit"; then
+    echo "current_state_not_profitable"
+    return
+  fi
+  if [[ "$latest_local_profit" =~ ^[0-9]+$ && "$min_profit" =~ ^[0-9]+$ ]] \
+    && decimal_lt "$latest_local_profit" "$min_profit"; then
+    echo "latest_onchain_state_not_profitable"
+    return
+  fi
+  if [[ "$first_step_delta" != "-" ]]; then
+    echo "recorded_vs_redis_quote_diverged"
+    return
+  fi
+  if [[ "$zero_min_result" == *"MinProfitNotMet"* ]]; then
+    echo "executor_adapter_semantics_or_historical_state"
+    return
+  fi
+  if [[ "$expected_profit" =~ ^[0-9]+$ && "$min_profit" =~ ^[0-9]+$ ]] \
+    && decimal_lt "$expected_profit" "$min_profit"; then
+    echo "bad_candidate_expected_below_min"
+    return
+  fi
+  echo "needs_single_case_doctor"
+}
+
 tsv_field() {
   printf '%s' "${1:-}" \
     | tr '\t\r\n' '   ' \
@@ -240,11 +382,18 @@ for opportunity_id in "${IDS[@]}"; do
   replay_classification="-"
   zero_min_result="-"
   validate_bucket="-"
+  expected_profit="-"
+  min_profit="-"
+  latest_local_profit="-"
+  redis_local_profit="-"
+  redis_expected_diff_bps="-"
+  first_step_delta="-"
+  hint="-"
 
   echo "[$idx/${#IDS[@]}] $opportunity_id"
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo -e "$idx\t$opportunity_id\tdry_run\t-\t-\tdry_run\t-\t$replay_file\t$validate_file" >>"$SUMMARY"
+    echo -e "$idx\t$opportunity_id\tdry_run\t-\t-\tdry_run\t-\t-\t-\t-\t-\t-\t-\tdry_run\t$replay_file\t$validate_file" >>"$SUMMARY"
     continue
   fi
 
@@ -274,9 +423,24 @@ for opportunity_id in "${IDS[@]}"; do
       validate_status="failed"
     fi
     validate_bucket="$(classify_validate_output "$validate_file" "$OUT_DIR/validate-$short.log")"
+    expected_profit="$(extract_route_field "$validate_file" "expected_profit")"
+    min_profit="$(extract_route_field "$validate_file" "min_profit")"
+    latest_local_profit="$(extract_final_field "$validate_file" "final:" "latest_local_profit")"
+    redis_local_profit="$(extract_final_field "$validate_file" "redis final:" "redis_local_profit")"
+    redis_expected_diff_bps="$(numeric_diff_bps "$expected_profit" "$redis_local_profit")"
+    first_step_delta="$(extract_first_step_delta "$validate_file")"
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  hint="$(diagnosis_hint \
+    "$validate_bucket" \
+    "$zero_min_result" \
+    "$expected_profit" \
+    "$min_profit" \
+    "$latest_local_profit" \
+    "$redis_local_profit" \
+    "$first_step_delta")"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(tsv_field "$idx")" \
     "$(tsv_field "$opportunity_id")" \
     "$(tsv_field "$replay_status")" \
@@ -284,6 +448,13 @@ for opportunity_id in "${IDS[@]}"; do
     "$(tsv_field "$zero_min_result")" \
     "$(tsv_field "$validate_status")" \
     "$(tsv_field "$validate_bucket")" \
+    "$(tsv_field "$expected_profit")" \
+    "$(tsv_field "$min_profit")" \
+    "$(tsv_field "$latest_local_profit")" \
+    "$(tsv_field "$redis_local_profit")" \
+    "$(tsv_field "$redis_expected_diff_bps")" \
+    "$(tsv_field "$first_step_delta")" \
+    "$(tsv_field "$hint")" \
     "$(tsv_field "$replay_file")" \
     "$(tsv_field "$validate_file")" >>"$SUMMARY"
 done
@@ -298,4 +469,9 @@ awk -F'\t' 'NR > 1 { replay[$4]++; validate[$7]++ } END {
   for (k in replay) print replay[k] "\t" k
   print "-- validate_bucket --"
   for (k in validate) print validate[k] "\t" k
+}' "$SUMMARY" | sort -rn || true
+echo
+echo "diagnosis hint counts:"
+awk -F'\t' 'NR > 1 { hint[$14]++ } END {
+  for (k in hint) print hint[k] "\t" k
 }' "$SUMMARY" | sort -rn || true
