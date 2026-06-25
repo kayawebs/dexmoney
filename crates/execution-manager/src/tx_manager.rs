@@ -22,6 +22,7 @@ const EXECUTED_EVENT_TOPIC: &str =
     "0xe953ae62f4f69be1c6d943cb68d93d288f23ffae7332b84196d46e9e778b23b2";
 const MAX_UINT: U256 = U256::MAX;
 const MIN_EXISTING_ALLOWANCE: u128 = 1_000_000_000_000_000_000u128;
+const NATIVE_TRANSFER_GAS_LIMIT: u64 = 21_000;
 
 #[derive(Debug, Clone)]
 pub struct ExecutionWallet {
@@ -148,6 +149,58 @@ pub async fn submit_executor_approval(
 ) -> Result<Submission> {
     let calldata = encode_approve_token_call(approval.token, approval.spender, MAX_UINT);
     submit_contract_call(provider, wallet, settings, executor, calldata, nonce).await
+}
+
+pub async fn submit_native_transfer(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    to: Address,
+    value: U256,
+    nonce: u64,
+) -> Result<Submission> {
+    if value.is_zero() {
+        anyhow::bail!("native transfer value is zero");
+    }
+    let gas_limit = U256::from(NATIVE_TRANSFER_GAS_LIMIT);
+    let fees = aggressive_fee_suggestion(provider, settings).await?;
+    let submitted_block = provider.get_block_number().await?;
+    let tx_hash = sign_and_send_value(
+        provider,
+        wallet,
+        settings,
+        to,
+        &[],
+        value,
+        nonce,
+        gas_limit,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    )
+    .await?;
+
+    tracing::info!(
+        tx_hash = %tx_hash,
+        nonce,
+        to = %to,
+        value = %value,
+        gas_limit = %gas_limit,
+        max_fee_per_gas = %fees.max_fee_per_gas,
+        max_priority_fee_per_gas = %fees.max_priority_fee_per_gas,
+        submitted_block,
+        "worker funding tx submitted"
+    );
+
+    Ok(Submission {
+        tx_hash,
+        nonce,
+        simulation_id: None,
+        executor_contract: Address::ZERO,
+        submitted_block,
+        gas_limit,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+    })
 }
 
 async fn submit_contract_call(
@@ -312,15 +365,42 @@ async fn sign_and_send(
     max_fee_per_gas: U256,
     max_priority_fee_per_gas: U256,
 ) -> Result<B256> {
+    sign_and_send_value(
+        provider,
+        wallet,
+        settings,
+        executor,
+        calldata,
+        U256::ZERO,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    )
+    .await
+}
+
+async fn sign_and_send_value(
+    provider: &ChainProvider,
+    wallet: &ExecutionWallet,
+    settings: &Settings,
+    to: Address,
+    calldata: &[u8],
+    value: U256,
+    nonce: u64,
+    gas_limit: U256,
+    max_fee_per_gas: U256,
+    max_priority_fee_per_gas: U256,
+) -> Result<B256> {
     let tx = Eip1559TransactionRequest::new()
         .from(alloy_address_to_ethers(wallet.address))
-        .to(NameOrAddress::Address(alloy_address_to_ethers(executor)))
+        .to(NameOrAddress::Address(alloy_address_to_ethers(to)))
         .nonce(EthersU256::from(nonce))
         .chain_id(U64::from(settings.chain_id))
         .gas(alloy_u256_to_ethers(gas_limit)?)
         .max_fee_per_gas(alloy_u256_to_ethers(max_fee_per_gas)?)
         .max_priority_fee_per_gas(alloy_u256_to_ethers(max_priority_fee_per_gas)?)
-        .value(EthersU256::zero())
+        .value(alloy_u256_to_ethers(value)?)
         .data(Bytes::from(calldata.to_vec()));
     let typed = TypedTransaction::Eip1559(tx);
     let signature = wallet.wallet.sign_transaction(&typed).await?;

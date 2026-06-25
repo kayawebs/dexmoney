@@ -2,7 +2,7 @@ mod eoa_lane;
 mod simulator;
 mod tx_manager;
 
-use alloy_primitives::{keccak256, Address, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use anyhow::{Context, Result};
 use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
@@ -15,7 +15,7 @@ use chrono::Utc;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -27,6 +27,8 @@ const SIMULATION_RECORD_QUEUE_CAPACITY: usize = 1_024;
 const SIMULATION_RECORD_FLUSH_MS: u64 = 100;
 const SIMULATION_RECORD_MAX_BATCH: usize = 512;
 const SUBMITTED_CANDIDATE_LOCK_TTL_SECS: u64 = 300;
+const WORKER_FUNDING_RECEIPT_POLL_MS: u64 = 250;
+const WORKER_FUNDING_RECEIPT_ATTEMPTS: usize = 80;
 
 #[derive(Debug, Clone)]
 struct ExecutionRuntime {
@@ -34,6 +36,7 @@ struct ExecutionRuntime {
     worker_wallets: Vec<tx_manager::ExecutionWallet>,
     simulation_operator: Option<Address>,
     worker_min_balance: U256,
+    worker_target_balance: U256,
     executor_contracts: Vec<Address>,
 }
 
@@ -49,11 +52,23 @@ impl ExecutionRuntime {
             settings.execution_worker_min_balance_wei.as_deref(),
             "execution_worker_min_balance_wei",
         )?;
+        let worker_target_balance = parse_config_u256(
+            settings.execution_worker_target_balance_wei.as_deref(),
+            "execution_worker_target_balance_wei",
+        )?;
+        if worker_target_balance < worker_min_balance {
+            anyhow::bail!(
+                "execution_worker_target_balance_wei {} is below execution_worker_min_balance_wei {}",
+                worker_target_balance,
+                worker_min_balance
+            );
+        }
         Ok(Self {
             fund_wallet,
             worker_wallets,
             simulation_operator,
             worker_min_balance,
+            worker_target_balance,
             executor_contracts: configured_executor_contracts(settings),
         })
     }
@@ -143,13 +158,6 @@ async fn main() -> Result<()> {
     let provider = ChainProvider::from_settings(&settings);
     let runtime = ExecutionRuntime::from_settings(&settings)?;
     let simulation_recorder = SimulationRecordQueue::spawn(postgres.clone());
-    let cleared_candidates = redis.clear_candidates().await?;
-    if cleared_candidates > 0 {
-        info!(
-            cleared_candidates,
-            "cleared stale candidate queue on execution-manager startup"
-        );
-    }
 
     if settings.execution_submit_enabled {
         let workers = runtime
@@ -165,6 +173,13 @@ async fn main() -> Result<()> {
             "execution EOA pool configured"
         );
         assert_submit_runtime_ready(&redis, &postgres, &provider, &settings, &runtime).await?;
+    }
+    let cleared_candidates = redis.clear_candidates().await?;
+    if cleared_candidates > 0 {
+        info!(
+            cleared_candidates,
+            "cleared stale candidate queue on execution-manager startup"
+        );
     }
 
     info!("execution-manager initialized");
@@ -1160,13 +1175,99 @@ where
             {
                 circuit_breaker.observe_arb_receipt(success, settings);
             }
-            continue;
+            if lane.state.status == EoaLaneStatus::Pending {
+                continue;
+            }
         }
 
         sync_idle_lane(&mut lane, provider).await?;
+        fund_worker_lane_if_needed(&mut lane, provider, settings, runtime).await?;
         eoa_store.set_lane_state(lane.state.clone()).await?;
     }
     Ok(())
+}
+
+async fn fund_worker_lane_if_needed(
+    lane: &mut eoa_lane::EoaLane,
+    provider: &ChainProvider,
+    settings: &Settings,
+    runtime: &ExecutionRuntime,
+) -> Result<()> {
+    if lane.state.status != EoaLaneStatus::Idle {
+        return Ok(());
+    }
+    if lane.state.eth_balance >= runtime.worker_min_balance {
+        return Ok(());
+    }
+    let Some(fund_wallet) = runtime.fund_wallet.as_ref() else {
+        anyhow::bail!(
+            "worker {:#x} has low balance {} < {}, but fund wallet is not configured",
+            lane.state.address,
+            lane.state.eth_balance,
+            runtime.worker_min_balance
+        );
+    };
+    if fund_wallet.address() == lane.state.address {
+        anyhow::bail!(
+            "worker {:#x} has low balance {} < {}, and is also the fund wallet",
+            lane.state.address,
+            lane.state.eth_balance,
+            runtime.worker_min_balance
+        );
+    }
+
+    let value = runtime
+        .worker_target_balance
+        .saturating_sub(lane.state.eth_balance);
+    if value.is_zero() {
+        return Ok(());
+    }
+    let fund_balance = provider.get_balance(fund_wallet.address()).await?;
+    if fund_balance <= value {
+        anyhow::bail!(
+            "fund wallet {:#x} balance {} is not enough to fund worker {:#x} value {}",
+            fund_wallet.address(),
+            fund_balance,
+            lane.state.address,
+            value
+        );
+    }
+    let nonce = provider
+        .get_transaction_count(fund_wallet.address(), true)
+        .await?;
+    let submission = tx_manager::submit_native_transfer(
+        provider,
+        fund_wallet,
+        settings,
+        lane.state.address,
+        value,
+        nonce,
+    )
+    .await?;
+    wait_for_worker_funding_receipt(provider, submission.tx_hash).await?;
+    sync_idle_lane(lane, provider).await?;
+    info!(
+        worker = %lane.state.address,
+        balance = %lane.state.eth_balance,
+        target_balance = %runtime.worker_target_balance,
+        min_balance = %runtime.worker_min_balance,
+        tx_hash = %submission.tx_hash,
+        "worker funding confirmed"
+    );
+    Ok(())
+}
+
+async fn wait_for_worker_funding_receipt(provider: &ChainProvider, tx_hash: B256) -> Result<()> {
+    for _ in 0..WORKER_FUNDING_RECEIPT_ATTEMPTS {
+        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            if receipt.success {
+                return Ok(());
+            }
+            anyhow::bail!("worker funding tx {tx_hash:#x} reverted");
+        }
+        sleep(Duration::from_millis(WORKER_FUNDING_RECEIPT_POLL_MS)).await;
+    }
+    anyhow::bail!("timed out waiting for worker funding tx {tx_hash:#x} receipt")
 }
 
 async fn select_cached_ready_worker<E>(
