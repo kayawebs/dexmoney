@@ -100,7 +100,10 @@ section "0. Redis chain and pool state"
   POOL_LC="$(printf '%s' "$POOL" | tr 'A-F' 'a-f')"
   POOL_KEY="$(redis-cli -u "$REDIS" --raw GET "pool_index:$POOL_LC" 2>/dev/null || true)"
   if [[ -z "$POOL_KEY" ]]; then
-    POOL_KEY="$(redis-cli -u "$REDIS" --raw --scan --pattern "pool_index:*${POOL_LC#0x}" 2>/dev/null | head -n 1 | xargs -r -I{} redis-cli -u "$REDIS" --raw GET "{}" 2>/dev/null || true)"
+    POOL_INDEX_KEY="$(redis-cli -u "$REDIS" --raw --scan --pattern "pool_index:*" 2>/dev/null | grep -i "$POOL_LC" | head -n 1 || true)"
+    if [[ -n "$POOL_INDEX_KEY" ]]; then
+      POOL_KEY="$(redis-cli -u "$REDIS" --raw GET "$POOL_INDEX_KEY" 2>/dev/null || true)"
+    fi
   fi
   echo "pool_key=${POOL_KEY:-missing}"
   if [[ -n "$POOL_KEY" ]]; then
@@ -110,7 +113,7 @@ section "0. Redis chain and pool state"
   fi
   echo
   echo "redis tick index:"
-  TICK_KEY="$(redis-cli -u "$REDIS" --raw --scan --pattern "ticks:index:*${POOL_LC#0x}" 2>/dev/null | head -n 1 || true)"
+  TICK_KEY="$(redis-cli -u "$REDIS" --raw --scan --pattern "ticks:index:*" 2>/dev/null | grep -i "$POOL_LC" | head -n 1 || true)"
   echo "tick_key=${TICK_KEY:-missing}"
   if [[ -n "$TICK_KEY" ]]; then
     redis-cli -u "$REDIS" SCARD "$TICK_KEY" || true
@@ -280,14 +283,14 @@ if [[ -n "$RPC_URL" && -n "$MANAGER" && -n "$POOL_UID" && -n "$OBS_LATEST" ]]; t
       --arg address "$MANAGER" \
       --arg topic0 "$UNISWAP_V4_SWAP_TOPIC" \
       --arg topic1 "$POOL_UID" \
-      '[{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}]')"
+      '{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}')"
     MODIFY_PARAMS="$(jq -cn \
       --arg from "$FROM_HEX" \
       --arg to "$TO_HEX" \
       --arg address "$MANAGER" \
       --arg topic0 "$UNISWAP_V4_MODIFY_LIQUIDITY_TOPIC" \
       --arg topic1 "$POOL_UID" \
-      '[{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}]')"
+      '{fromBlock:$from,toBlock:$to,address:$address,topics:[[$topic0],[$topic1]]}')"
 
     echo
     echo "swap_logs:"
