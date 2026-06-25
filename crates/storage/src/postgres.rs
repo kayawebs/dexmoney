@@ -1319,6 +1319,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown'"#,
         r#"CREATE INDEX IF NOT EXISTS pool_states_pool_block_idx
             ON pool_states (pool_address, block_number DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_states_lower_pool_block_idx
+            ON pool_states (lower(pool_address), block_number DESC)"#,
         r#"CREATE TABLE IF NOT EXISTS pool_state_warnings (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
             pool_address TEXT NOT NULL,

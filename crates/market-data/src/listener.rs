@@ -1392,32 +1392,35 @@ where
         let rows = sqlx::query(
             r#"
             SELECT
-                pool_uid, pool_address, manager_address, token0, token1, symbol,
-                fee_bps, fee_pips, pool_key_fee_pips, tick_spacing, hooks_address,
-                sqrt_price_x96, liquidity, tick, latest_block
-            FROM protocol_pool_observations
-            WHERE chain_id = $1
-              AND protocol = 'uniswap-v4'
-              AND lower(manager_address) = lower($2)
-              AND pool_address IS NOT NULL
-              AND token0 IS NOT NULL
-              AND token1 IS NOT NULL
-              AND fee_pips IS NOT NULL
-              AND tick_spacing IS NOT NULL
-              AND lower(COALESCE(hooks_address, $3)) = lower($3)
-              AND sqrt_price_x96 IS NOT NULL
-              AND liquidity IS NOT NULL
-              AND tick IS NOT NULL
+                po.pool_uid, po.pool_address, po.manager_address, po.token0, po.token1, po.symbol,
+                po.fee_bps, po.fee_pips, po.pool_key_fee_pips, po.tick_spacing, po.hooks_address,
+                po.sqrt_price_x96, po.liquidity, po.tick, po.latest_block
+            FROM protocol_pool_observations po
+            LEFT JOIN LATERAL (
+                SELECT ps.block_number
+                FROM pool_states ps
+                WHERE lower(ps.pool_address) = lower(po.pool_address)
+                ORDER BY ps.block_number DESC
+                LIMIT 1
+            ) latest_state ON true
+            WHERE po.chain_id = $1
+              AND po.protocol = 'uniswap-v4'
+              AND lower(po.manager_address) = lower($2)
+              AND po.pool_address IS NOT NULL
+              AND po.token0 IS NOT NULL
+              AND po.token1 IS NOT NULL
+              AND po.fee_pips IS NOT NULL
+              AND po.tick_spacing IS NOT NULL
+              AND lower(COALESCE(po.hooks_address, $3)) = lower($3)
+              AND po.sqrt_price_x96 IS NOT NULL
+              AND po.liquidity IS NOT NULL
+              AND po.tick IS NOT NULL
               AND (
-                  updated_at >= NOW() - INTERVAL '2 minutes'
-                  OR NOT EXISTS (
-                      SELECT 1
-                      FROM pools p
-                      WHERE p.chain_id = protocol_pool_observations.chain_id
-                        AND lower(p.pool_address) = lower(protocol_pool_observations.pool_address)
-                  )
+                  po.updated_at >= NOW() - INTERVAL '2 minutes'
+                  OR latest_state.block_number IS NULL
+                  OR COALESCE(po.latest_block, 0) > latest_state.block_number
               )
-            ORDER BY logs_30d DESC, latest_block DESC, updated_at DESC
+            ORDER BY po.logs_30d DESC, po.latest_block DESC, po.updated_at DESC
             LIMIT $4
             "#,
         )
@@ -1546,6 +1549,13 @@ where
              AND mc.variant = 'BalancerV3'
              AND mc.model_family = 'weighted'
              AND mc.status = 'weighted_inputs_ready'
+            LEFT JOIN LATERAL (
+                SELECT ps.block_number
+                FROM pool_states ps
+                WHERE lower(ps.pool_address) = lower(po.pool_address)
+                ORDER BY ps.block_number DESC
+                LIMIT 1
+            ) latest_state ON true
             WHERE po.chain_id = $1
               AND po.protocol = 'balancer-v3'
               AND lower(po.manager_address) = lower($2)
@@ -1555,12 +1565,8 @@ where
               AND po.fee_bps IS NOT NULL
               AND (
                   po.updated_at >= NOW() - INTERVAL '2 minutes'
-                  OR NOT EXISTS (
-                      SELECT 1
-                      FROM pools p
-                      WHERE p.chain_id = po.chain_id
-                        AND lower(p.pool_address) = lower(po.pool_address)
-                  )
+                  OR latest_state.block_number IS NULL
+                  OR COALESCE(po.latest_block, 0) > latest_state.block_number
               )
             ORDER BY po.logs_30d DESC, po.latest_block DESC, po.updated_at DESC
             LIMIT $3

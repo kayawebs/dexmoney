@@ -170,6 +170,11 @@ tick_counts AS (
   SELECT lower(pool_address) AS pool, count(*) AS pg_ticks, max(block_number) AS latest_tick_block
   FROM pool_ticks_current
   GROUP BY 1
+),
+latest_pool_states AS (
+  SELECT lower(pool_address) AS pool, max(block_number) AS latest_pool_state_block
+  FROM pool_states
+  GROUP BY 1
 )
 SELECT
   pc.pool,
@@ -181,6 +186,7 @@ SELECT
   pc.paths,
   pc.latest,
   pc.max_expected_profit,
+  lps.latest_pool_state_block,
   tc.status AS tick_status,
   COALESCE(t.pg_ticks, 0) AS pg_ticks,
   t.latest_tick_block,
@@ -197,6 +203,7 @@ LEFT JOIN LATERAL (
   LIMIT 1
 ) po ON true
 LEFT JOIN tick_counts t ON t.pool = pc.pool
+LEFT JOIN latest_pool_states lps ON lps.pool = pc.pool
 LEFT JOIN pool_tick_coverage tc ON tc.chain_id = 8453 AND lower(tc.pool_address) = pc.pool
 ORDER BY pc.step_failures DESC, pc.max_expected_profit DESC
 LIMIT 80;
@@ -221,6 +228,11 @@ tick_counts AS (
   SELECT lower(pool_address) AS pool, count(*) AS pg_ticks, max(block_number) AS latest_tick_block
   FROM pool_ticks_current
   GROUP BY 1
+),
+latest_pool_states AS (
+  SELECT lower(pool_address) AS pool, max(block_number) AS latest_pool_state_block
+  FROM pool_states
+  GROUP BY 1
 )
 SELECT
   v4.pool,
@@ -230,6 +242,7 @@ SELECT
   v4.max_expected_profit,
   po.latest_block AS observation_latest_block,
   po.updated_at AS observation_updated_at,
+  lps.latest_pool_state_block,
   tc.status AS tick_status,
   COALESCE(t.pg_ticks, 0) AS pg_ticks,
   t.latest_tick_block,
@@ -238,6 +251,7 @@ SELECT
 FROM v4
 LEFT JOIN protocol_pool_observations po ON po.protocol = 'uniswap-v4' AND lower(po.pool_address) = v4.pool
 LEFT JOIN tick_counts t ON t.pool = v4.pool
+LEFT JOIN latest_pool_states lps ON lps.pool = v4.pool
 LEFT JOIN pool_tick_coverage tc ON tc.chain_id = 8453 AND lower(tc.pool_address) = v4.pool
 ORDER BY v4.step_failures DESC, v4.max_expected_profit DESC
 LIMIT 80;
