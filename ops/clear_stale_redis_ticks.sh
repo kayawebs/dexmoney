@@ -93,6 +93,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 target_file="$tmpdir/targets.txt"
 redis_keys_file="$tmpdir/redis_tick_keys.txt"
+matched_file="$tmpdir/matched_ticks.tsv"
 
 if [[ "$ALL" -eq 1 ]]; then
   psql "$DB_URL" -X -q -At \
@@ -122,27 +123,35 @@ if [[ ! -s "$target_file" ]]; then
 fi
 
 redis-cli -u "$REDIS" --raw --scan --pattern 'ticks:index:*' >"$redis_keys_file"
+awk '
+  NR == FNR {
+    targets[tolower($1)] = 1
+    next
+  }
+  {
+    key = $0
+    pool = $0
+    sub(/^ticks:index:/, "", pool)
+    pool = tolower(pool)
+    if (pool in targets) {
+      print pool "\t" key
+    }
+  }
+' "$target_file" "$redis_keys_file" >"$matched_file"
 
 echo "stale Redis tick cleanup"
 echo "apply: $APPLY"
 echo "targets: $(wc -l < "$target_file" | tr -d ' ')"
 echo "redis_tick_indexes: $(wc -l < "$redis_keys_file" | tr -d ' ')"
+echo "matched_tick_indexes: $(wc -l < "$matched_file" | tr -d ' ')"
 echo
 
 cleared=0
 matched=0
 processed=0
-while IFS= read -r pool; do
+while IFS=$'\t' read -r pool_lc key; do
   processed=$((processed + 1))
-  [[ -z "$pool" ]] && continue
-  pool_lc="$(printf '%s' "$pool" | tr 'A-F' 'a-f')"
-  key="$(grep -i "ticks:index:${pool_lc}$" "$redis_keys_file" | head -n 1 || true)"
-  if [[ -z "$key" ]]; then
-    if [[ "$ALL" -eq 1 && "$VERBOSE" -eq 0 && $((processed % 1000)) -eq 0 ]]; then
-      echo "progress processed=$processed matched=$matched cleared=$cleared"
-    fi
-    continue
-  fi
+  [[ -z "$pool_lc" || -z "$key" ]] && continue
   matched=$((matched + 1))
   count="$(redis-cli -u "$REDIS" SCARD "$key" 2>/dev/null || echo 0)"
   if [[ "$ALL" -eq 0 || "$VERBOSE" -eq 1 ]]; then
@@ -159,7 +168,7 @@ while IFS= read -r pool; do
     redis-cli -u "$REDIS" SADD ticks:changed "$pool_lc" >/dev/null
     cleared=$((cleared + 1))
   fi
-done <"$target_file"
+done <"$matched_file"
 
 echo
 echo "matched_with_redis_ticks: $matched"
