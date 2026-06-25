@@ -3193,6 +3193,24 @@ where
                 }
             };
             if ticks.is_empty() {
+                let existing_ticks = self
+                    .pool_store
+                    .get_pool_ticks(state.pool_id.address)
+                    .await?;
+                if !existing_ticks.is_empty() {
+                    self.pool_store
+                        .replace_pool_ticks(state.pool_id.address, Vec::new())
+                        .await?;
+                    self.pool_store
+                        .mark_tick_changed_pools(vec![state.pool_id.address])
+                        .await?;
+                    info!(
+                        pool = %state.pool_id.address,
+                        old_tick_count = existing_ticks.len(),
+                        word_radius,
+                        "initialized tick refresh cleared stale Redis ticks"
+                    );
+                }
                 debug!(
                     pool = %state.pool_id.address,
                     word_radius,
