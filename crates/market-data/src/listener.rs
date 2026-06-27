@@ -2769,7 +2769,12 @@ where
 
         let mut seen = HashSet::new();
         let mut out = Vec::with_capacity(registry_pools.len());
+        let mut skipped_singleton = 0usize;
         for entry in &registry_pools {
+            if !registry_pool_requires_direct_monitoring(entry) {
+                skipped_singleton += 1;
+                continue;
+            }
             if !seen.insert(entry.pool_address) {
                 debug!(
                     pool = %entry.pool_address,
@@ -2790,6 +2795,13 @@ where
                 }
             }
         }
+        if skipped_singleton > 0 {
+            info!(
+                monitored = out.len(),
+                skipped_singleton,
+                "skipped singleton/vault registry pools for direct market-data monitoring"
+            );
+        }
         Ok(out)
     }
 
@@ -2802,7 +2814,12 @@ where
 
         let mut seen = HashSet::new();
         let mut registry_entries = Vec::with_capacity(registry_pools.len());
+        let mut skipped_singleton = 0usize;
         for entry in registry_pools {
+            if !registry_pool_requires_direct_monitoring(&entry) {
+                skipped_singleton += 1;
+                continue;
+            }
             if seen.insert(entry.pool_address) {
                 registry_entries.push(entry);
             }
@@ -2854,6 +2871,7 @@ where
                 added = added_states.len(),
                 removed,
                 failed,
+                skipped_singleton,
                 "pool registry changed; reloading monitored pools"
             );
         }
@@ -3803,6 +3821,10 @@ fn protocol_for_tick_state(state: &PoolState) -> Option<&'static str> {
         (DexKind::UniswapV4, PoolVariant::UniswapV4) => Some("uniswap-v4"),
         _ => None,
     }
+}
+
+fn registry_pool_requires_direct_monitoring(entry: &PoolRegistryEntry) -> bool {
+    !matches!(entry.dex, DexKind::UniswapV4 | DexKind::Balancer)
 }
 
 #[allow(dead_code)]
