@@ -417,6 +417,8 @@ impl TickStateStore for RedisStore {
         }
         pipe.del(&index_key).ignore();
         queue_tick_entries(&mut pipe, &key_values, keys_by_pool);
+        pipe.sadd(changed_tick_pools_key(), format!("{pool:#x}"))
+            .ignore();
         let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }

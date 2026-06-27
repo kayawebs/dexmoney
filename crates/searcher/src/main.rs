@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 const SEARCHER_PUBLISH_BATCH_PATHS: usize = 256;
 const ACTIVE_POOL_SWEEP_MIN_MS: u64 = 100;
 const ACTIVE_POOL_SWEEP_MAX_MS: u64 = 1_000;
+const TICK_CACHE_MAX_AGE_MS: u64 = 30_000;
 const OPPORTUNITY_RECORD_QUEUE_CAPACITY: usize = 1_024;
 const OPPORTUNITY_RECORD_FLUSH_MS: u64 = 100;
 const OPPORTUNITY_RECORD_MAX_BATCH: usize = 512;
@@ -340,6 +341,7 @@ async fn flush_opportunity_records(store: &PostgresStore, pending: &mut Vec<Cand
 struct SearchRuntime {
     pool_states: HashMap<Address, PoolState>,
     tick_states: HashMap<Address, Vec<TickState>>,
+    tick_states_loaded_at: HashMap<Address, Instant>,
     active_pool_addresses: HashSet<Address>,
     pool_topology: HashMap<Address, PoolTopology>,
     latest_pool_state_block: u64,
@@ -511,6 +513,7 @@ where
                     runtime.latest_pool_state_block = latest_pool_state_block(&runtime.pool_states);
                 }
                 runtime.tick_states.remove(&pool);
+                runtime.tick_states_loaded_at.remove(&pool);
                 if runtime.active_pool_addresses.remove(&pool) {
                     rebuild_path_index = true;
                 }
@@ -611,6 +614,7 @@ where
     let tick_load_stats = load_tick_states_for_pools(
         &runtime.pool_states,
         &mut runtime.tick_states,
+        &mut runtime.tick_states_loaded_at,
         pool_store,
         &tick_changed_pools,
         &mut refreshed_tick_pools,
@@ -855,6 +859,7 @@ struct TickLoadStats {
 async fn load_tick_states_for_pools<P>(
     pool_states: &HashMap<Address, PoolState>,
     tick_states: &mut HashMap<Address, Vec<TickState>>,
+    tick_states_loaded_at: &mut HashMap<Address, Instant>,
     pool_store: &P,
     tick_changed_pools: &HashSet<Address>,
     refreshed_tick_pools: &mut HashSet<Address>,
@@ -879,7 +884,11 @@ where
             continue;
         }
 
+        let cache_expired = tick_states_loaded_at.get(pool).is_none_or(|loaded_at| {
+            loaded_at.elapsed() >= Duration::from_millis(TICK_CACHE_MAX_AGE_MS)
+        });
         let should_refresh = !tick_states.contains_key(pool)
+            || cache_expired
             || (tick_changed_pools.contains(pool) && !refreshed_tick_pools.contains(pool));
         if should_refresh {
             stats.cache_misses += 1;
@@ -892,8 +901,10 @@ where
 
     if !pools_to_refresh.is_empty() {
         let loaded = pool_store.get_pool_ticks_many(&pools_to_refresh).await?;
+        let loaded_at = Instant::now();
         for pool in pools_to_refresh {
             tick_states.insert(pool, loaded.get(&pool).cloned().unwrap_or_default());
+            tick_states_loaded_at.insert(pool, loaded_at);
             refreshed_tick_pools.insert(pool);
         }
     }
