@@ -438,7 +438,6 @@ where
         self.publish_monitored_states(&monitored_states, "onchain_init")
             .await?;
         self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
-        self.spawn_flashblocks_listener();
 
         let startup_head_block = self
             .get_block_number_or_fail("market-data startup block poll")
@@ -461,6 +460,18 @@ where
             catchup_blocks = startup_head_block.saturating_sub(last_seen_block),
             "market-data synchronized at startup"
         );
+        let mut flashblocks_started = false;
+        if last_seen_block >= startup_head_block {
+            self.spawn_flashblocks_listener();
+            flashblocks_started = true;
+        } else {
+            info!(
+                last_seen_block,
+                startup_head_block,
+                catchup_blocks = startup_head_block.saturating_sub(last_seen_block),
+                "Flashblocks pendingLogs listener delayed until sealed catch-up completes"
+            );
+        }
 
         let mut ticker = interval(Duration::from_millis(100));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -470,6 +481,10 @@ where
             let chain_head_block = self
                 .get_block_number_or_fail("market-data block poll")
                 .await?;
+            if !flashblocks_started && chain_head_block <= last_seen_block {
+                self.spawn_flashblocks_listener();
+                flashblocks_started = true;
+            }
             if chain_head_block <= last_seen_block {
                 if last_block_advance_at.elapsed() >= MARKET_DATA_BLOCK_STALL_TIMEOUT {
                     anyhow::bail!(
@@ -817,6 +832,15 @@ where
 
             last_seen_block = latest_block;
             self.pool_store.set_current_block(last_seen_block).await?;
+            if !flashblocks_started && latest_block >= chain_head_block {
+                info!(
+                    last_seen_block,
+                    chain_head_block,
+                    "sealed catch-up complete; starting Flashblocks pendingLogs listener"
+                );
+                self.spawn_flashblocks_listener();
+                flashblocks_started = true;
+            }
         }
     }
 

@@ -722,6 +722,10 @@ watermark before polling the current RPC head. If the stored watermark is behind
 the head, market-data catches up from the stored block instead of jumping to the
 head. Sealed catch-up is chunked with `SEALED_EVENT_MAX_BLOCK_SPAN = 50`, and
 `chain:current_block` is advanced only after the chunk has been processed.
+Flashblocks startup is also delayed until sealed catch-up reaches the chain
+head. Otherwise pending-log handling can advance `chain:current_block` before
+sealed blocks are replayed, making searcher/executor consume an apparently
+fresh watermark backed by stale pool state.
 
 ### Verification
 
