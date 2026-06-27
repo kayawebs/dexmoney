@@ -691,3 +691,51 @@ Keep `ops/minprofit_proof_batch.sh` as the repeatable split tool for
 `MinProfitNotMet`. Use `doctor/arb_doctor.sh --opportunity-id <uuid>` as the
 first per-opportunity diagnostic artifact. Do not classify old pool
 `source_block` as stale without a drift or event-loss proof.
+
+## 2026-06-27: Market-Data Startup Skipped Sealed Blocks After Node Recovery
+
+### Symptom
+
+Fresh post-restart simulations still failed with `ExecutorHub.MinProfitNotMet`,
+including zero-min-profit executor calls. A representative opportunity
+`d4759ce7-b1e3-4269-b296-f494996e458c` showed local/Redis quote profit on a
+Uniswap V4 -> Uniswap V3 path, but historical `debug_traceCall` showed the V4
+leg produced about 16x less output than the local quote expected.
+
+### Root Cause
+
+`market-data` initialized `last_seen_block` from the current RPC head on startup
+and immediately advanced `chain:current_block`. If the node or bot was down
+while sealed blocks were produced, market-data skipped those blocks instead of
+catching up. For the sampled V4 pool, chain logs contained 109 `Swap` and 4
+`ModifyLiquidity` events in `47806541..47905337`, while local protocol state
+was still at `47806540`.
+
+This is not the normal case where a pool has no events and an old state block is
+still accurate. It is an event-loss gap: the pool did have state-changing logs,
+but the market-data sealed-block loop never consumed them.
+
+### Fix
+
+`market-data` startup now reads the previous Redis `chain:current_block`
+watermark before polling the current RPC head. If the stored watermark is behind
+the head, market-data catches up from the stored block instead of jumping to the
+head. Sealed catch-up is chunked with `SEALED_EVENT_MAX_BLOCK_SPAN = 50`, and
+`chain:current_block` is advanced only after the chunk has been processed.
+
+### Verification
+
+After deployment, market-data startup logs should include:
+
+- `startup_head_block`
+- `stored_current_block`
+- `catchup_blocks`
+
+Sealed summaries should include:
+
+- `chain_head_block`
+- `catchup_lag_blocks`
+
+During catch-up, `catchup_lag_blocks` should monotonically decrease. Searcher
+should see `chain:current_block` lag until market-data has actually processed
+the missing blocks.

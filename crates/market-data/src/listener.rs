@@ -30,6 +30,7 @@ const VALIDATION_DELAY_BLOCKS: u64 = 2;
 const VALIDATION_MAX_PER_IDLE_TICK: usize = 8;
 const POOL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 const POOL_DISCOVERY_MAX_BLOCK_SPAN: u64 = 50;
+const SEALED_EVENT_MAX_BLOCK_SPAN: u64 = 50;
 const V4_PROMOTE_INTERVAL: Duration = Duration::from_secs(1);
 const V4_PROMOTE_LIMIT: i64 = 1_000;
 const BALANCER_PROMOTE_LIMIT: i64 = 1_000;
@@ -439,29 +440,40 @@ where
         self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
         self.spawn_flashblocks_listener();
 
-        let mut last_seen_block = self
+        let startup_head_block = self
             .get_block_number_or_fail("market-data startup block poll")
             .await?;
-        self.pool_store.set_current_block(last_seen_block).await?;
+        let stored_current_block = self.pool_store.get_current_block().await?;
+        let mut last_seen_block = stored_current_block
+            .filter(|block| *block <= startup_head_block)
+            .unwrap_or(startup_head_block);
+        if stored_current_block.is_none() || stored_current_block > Some(startup_head_block) {
+            self.pool_store.set_current_block(last_seen_block).await?;
+        }
         let mut last_block_advance_at = Instant::now();
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut recent_logs = RecentLogCache::new(20_000);
         let mut pending_validations = VecDeque::new();
-        info!(last_seen_block, "market-data synchronized at startup");
+        info!(
+            last_seen_block,
+            startup_head_block,
+            stored_current_block,
+            catchup_blocks = startup_head_block.saturating_sub(last_seen_block),
+            "market-data synchronized at startup"
+        );
 
         let mut ticker = interval(Duration::from_millis(100));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             ticker.tick().await;
-            let latest_block = self
+            let chain_head_block = self
                 .get_block_number_or_fail("market-data block poll")
                 .await?;
-            self.pool_store.set_current_block(latest_block).await?;
-            if latest_block <= last_seen_block {
+            if chain_head_block <= last_seen_block {
                 if last_block_advance_at.elapsed() >= MARKET_DATA_BLOCK_STALL_TIMEOUT {
                     anyhow::bail!(
-                        "market-data block feed stalled: last_seen_block={last_seen_block} latest_block={latest_block} stalled_for_ms={}",
+                        "market-data block feed stalled: last_seen_block={last_seen_block} latest_block={chain_head_block} stalled_for_ms={}",
                         last_block_advance_at.elapsed().as_millis()
                     );
                 }
@@ -471,13 +483,15 @@ where
                 }
                 self.validate_due_snapshots(
                     &mut pending_validations,
-                    latest_block,
+                    chain_head_block,
                     VALIDATION_MAX_PER_IDLE_TICK,
                 )
                 .await?;
                 continue;
             }
             last_block_advance_at = Instant::now();
+            let latest_block =
+                chain_head_block.min(last_seen_block.saturating_add(SEALED_EVENT_MAX_BLOCK_SPAN));
 
             if Instant::now() >= next_registry_reload {
                 monitored_states = self.reload_if_changed(monitored_states).await?;
@@ -783,6 +797,8 @@ where
                 from_block = last_seen_block + 1,
                 to_block = latest_block,
                 block_span = latest_block.saturating_sub(last_seen_block),
+                chain_head_block,
+                catchup_lag_blocks = chain_head_block.saturating_sub(latest_block),
                 events = events.len(),
                 changed_pools = changed_pools.len(),
                 fee_refreshed_pools = fee_refreshed_pools.len(),
@@ -800,6 +816,7 @@ where
             );
 
             last_seen_block = latest_block;
+            self.pool_store.set_current_block(last_seen_block).await?;
         }
     }
 
@@ -845,8 +862,7 @@ where
             if Instant::now() >= next_v4_promotion {
                 let promote_started = Instant::now();
                 let promote_stats = self.promote_quoteable_uniswap_v4_pools(None).await?;
-                let balancer_promote_stats =
-                    self.promote_quoteable_balancer_v3_pools(None).await?;
+                let balancer_promote_stats = self.promote_quoteable_balancer_v3_pools(None).await?;
                 if promote_stats.selected > 0
                     || promote_stats.promoted > 0
                     || promote_stats.published_states > 0
