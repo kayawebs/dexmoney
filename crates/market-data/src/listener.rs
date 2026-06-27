@@ -435,10 +435,6 @@ where
         self.seed_default_factories().await?;
 
         let mut monitored_states = self.load_monitored_states().await?;
-        self.publish_monitored_states(&monitored_states, "onchain_init")
-            .await?;
-        self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
-
         let startup_head_block = self
             .get_block_number_or_fail("market-data startup block poll")
             .await?;
@@ -449,6 +445,9 @@ where
         if stored_current_block.is_none() || stored_current_block > Some(startup_head_block) {
             self.pool_store.set_current_block(last_seen_block).await?;
         }
+        self.publish_monitored_states_at_block(&monitored_states, "onchain_init", last_seen_block)
+            .await?;
+        self.spawn_initialized_tick_warmup(monitored_states.clone(), "onchain_init");
         let mut last_block_advance_at = Instant::now();
         let mut next_registry_reload = Instant::now() + REGISTRY_RELOAD_INTERVAL;
         let mut recent_logs = RecentLogCache::new(20_000);
@@ -2944,12 +2943,17 @@ where
         Ok(next)
     }
 
-    async fn publish_monitored_states(&self, states: &[PoolState], source: &str) -> Result<()> {
+    async fn publish_monitored_states_at_block(
+        &self,
+        states: &[PoolState],
+        source: &str,
+        current_block: u64,
+    ) -> Result<()> {
         let selected = states
             .iter()
             .map(|state| state.pool_id.address)
             .collect::<HashSet<_>>();
-        self.publish_selected_states(states, &selected, source)
+        self.publish_selected_states_with_block(states, &selected, source, Some(current_block))
             .await
     }
 
@@ -2958,6 +2962,17 @@ where
         states: &[PoolState],
         selected: &HashSet<Address>,
         source: &str,
+    ) -> Result<()> {
+        self.publish_selected_states_with_block(states, selected, source, None)
+            .await
+    }
+
+    async fn publish_selected_states_with_block(
+        &self,
+        states: &[PoolState],
+        selected: &HashSet<Address>,
+        source: &str,
+        current_block_override: Option<u64>,
     ) -> Result<()> {
         let mut seen = HashSet::new();
         let mut publish_states = Vec::new();
@@ -3016,7 +3031,11 @@ where
         }
         let record_states = publish_states.clone();
         self.pool_store
-            .publish_pool_states(latest_state_block, publish_states, changed_pools)
+            .publish_pool_states(
+                current_block_override.unwrap_or(latest_state_block),
+                publish_states,
+                changed_pools,
+            )
             .await?;
         self.spawn_record_pool_states(record_states, source);
         Ok(())
