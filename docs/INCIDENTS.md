@@ -149,6 +149,37 @@ Collected:
     `EXECUTOR_CALL=1` so the report captures `executor_original` and
     `executor_zero_min` decoded Hub/adapter revert results for the exact
     current calldata.
+- 2026-06-27 live proof after Base node restore:
+  - `ops/minprofit_recent_focus.sh` over the last 30m showed
+    `Executor revert: MinProfitNotMet` as the dominant bucket with 1594 recent
+    failures. The failures were concentrated in V4 paths, especially
+    `UniswapV4 -> AerodromeSlipstream`, `UniswapV4 -> PancakeV3`,
+    `UniswapV4 -> UniswapV4`, and `UniswapV4 -> UniswapV3`.
+  - `ops/minprofit_proof_batch.sh` with `EXECUTOR_CALL=1` on six fresh samples
+    showed local replay/Redis quote still profitable, but both
+    `executor_original` and `executor_zero_min` reverted as
+    `ExecutorHub.MinProfitNotMet`. This again rules out configured min profit
+    as the direct cause for those samples.
+  - A top live sample,
+    `24ef0282-69ba-4d18-a775-4b5efb2f5d9c`, used path
+    `USDC/cbBTC uni-v4-5686f5 -> aero-slipstream-b3e778`. Local Redis quote
+    used V4 state `tick=-63836`, `liquidity=26041638052`,
+    `sqrt_price_x96=3256664623231334420946017604` from block `47806424`.
+  - Direct V4 `StateView.getSlot0/getLiquidity` for the same PoolId showed
+    current onchain state `tick=-64009`, `liquidity=11259056919`,
+    `sqrt_price_x96=3228700276848664183336046038`, `lpFee=3000`.
+    Therefore the V4 Redis state used by searcher was stale even though the
+    route was emitted against a fresh Slipstream state.
+  - Code inspection found the architectural cause: ordinary V2/V3/Slipstream
+    events are handled in the `market-data` sealed-block path before publishing
+    changed pools, but V4/Balancer singleton logs were handled in the separate
+    `pool-discovery` loop and then promoted to Redis in capped batches. This
+    allowed searcher to see fresh non-V4 state paired with stale V4 state.
+  - Code fix: `market-data` now processes protocol singleton logs in the
+    sealed-block path and immediately promotes quoteable V4/Balancer states
+    before publishing the sealed block summary. The live `pool-discovery`
+    protocol-log scan was removed to avoid duplicate observation writes; its
+    periodic promotion remains useful for backlog/historical hydration.
 
 Interpretation:
 
@@ -156,15 +187,20 @@ Interpretation:
   thresholds: zero-min replay still fails.
 - Old source blocks are not sufficient evidence of stale state. A local pool
   snapshot can be correct for many blocks if no relevant event occurred.
-- The remaining root cause must be proven through event coverage, drift, local
-  vs onchain per-step quote comparison, tick/metadata coverage, or
+- A proven 2026-06-27 root cause is V4/Balancer singleton state promotion being
+  outside the `market-data` sealed-block path. This can pair fresh non-V4 state
+  with stale V4 state and produce deterministic `MinProfitNotMet`, including
+  zero-min replay failures.
+- Remaining `MinProfitNotMet` after deploying the sealed-block protocol-log fix
+  must be split through event coverage, drift, local vs onchain per-step quote
+  comparison, tick/metadata coverage, or
   calldata/adapter semantic checks.
 - For this class, the issue is not gas policy, candidate queue age, or
   configured min-profit margin.
 - The latest 20-sample batch further rules out "old block number" as a
   sufficient explanation: current Redis/latest local quotes still show profit.
-  The next branch point is executor-call proof, especially V4 adapter calldata
-  and PoolKey semantics.
+  2026-06-27 executor-call proof moved the main branch point to V4/Balancer
+  singleton state promotion timing.
 
 Still needed:
 

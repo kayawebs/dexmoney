@@ -734,6 +734,18 @@ where
 
             let fee_ms = fee_started.elapsed().as_millis() as u64;
 
+            let protocol_started = Instant::now();
+            let protocol_observed = self
+                .discover_protocol_pool_logs(last_seen_block + 1, latest_block)
+                .await?;
+            let mut v4_promote_stats = V4PromoteStats::default();
+            let mut balancer_promote_stats = V4PromoteStats::default();
+            if protocol_observed > 0 {
+                v4_promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
+                balancer_promote_stats = self.promote_quoteable_balancer_v3_pools().await?;
+            }
+            let protocol_ms = protocol_started.elapsed().as_millis() as u64;
+
             let publish_started = Instant::now();
             self.spawn_record_dex_events(event_records);
             tokio::try_join!(
@@ -770,10 +782,14 @@ where
                 events = events.len(),
                 changed_pools = changed_pools.len(),
                 fee_refreshed_pools = fee_refreshed_pools.len(),
+                protocol_observed,
+                v4_promoted = v4_promote_stats.promoted,
+                balancer_promoted = balancer_promote_stats.promoted,
                 watermarked_pools = 0usize,
                 fetch_ms,
                 apply_ms,
                 fee_ms,
+                protocol_ms,
                 publish_ms,
                 total_ms = block_started.elapsed().as_millis() as u64,
                 "market-data sealed block summary"
@@ -821,8 +837,6 @@ where
             self.discover_live_pool_creations(from_block, to_block)
                 .await?;
             self.discover_global_swap_pools(from_block, to_block, &mut globally_observed_pools)
-                .await?;
-            self.discover_protocol_pool_logs(from_block, to_block)
                 .await?;
             if Instant::now() >= next_v4_promotion {
                 let promote_started = Instant::now();
@@ -1344,9 +1358,9 @@ where
         Ok(())
     }
 
-    async fn discover_protocol_pool_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
+    async fn discover_protocol_pool_logs(&self, from_block: u64, to_block: u64) -> Result<usize> {
         if from_block > to_block {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut addresses = Vec::new();
@@ -1357,7 +1371,7 @@ where
             addresses.push(vault);
         }
         if addresses.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let topics = [
@@ -1382,11 +1396,11 @@ where
                     error = %err,
                     "protocol pool discovery getLogs failed"
                 );
-                return Ok(());
+                return Ok(0);
             }
         };
         if logs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut observed = 0usize;
@@ -1440,7 +1454,7 @@ where
                 skipped, from_block, to_block, "protocol pool discovery processed logs"
             );
         }
-        Ok(())
+        Ok(observed)
     }
 
     async fn promote_quoteable_uniswap_v4_pools(&self) -> Result<V4PromoteStats> {
