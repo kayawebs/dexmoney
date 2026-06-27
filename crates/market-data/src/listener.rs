@@ -741,8 +741,12 @@ where
             let mut v4_promote_stats = V4PromoteStats::default();
             let mut balancer_promote_stats = V4PromoteStats::default();
             if protocol_observed > 0 {
-                v4_promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
-                balancer_promote_stats = self.promote_quoteable_balancer_v3_pools().await?;
+                v4_promote_stats = self
+                    .promote_quoteable_uniswap_v4_pools(Some(last_seen_block + 1))
+                    .await?;
+                balancer_promote_stats = self
+                    .promote_quoteable_balancer_v3_pools(Some(last_seen_block + 1))
+                    .await?;
             }
             let protocol_ms = protocol_started.elapsed().as_millis() as u64;
 
@@ -840,8 +844,9 @@ where
                 .await?;
             if Instant::now() >= next_v4_promotion {
                 let promote_started = Instant::now();
-                let promote_stats = self.promote_quoteable_uniswap_v4_pools().await?;
-                let balancer_promote_stats = self.promote_quoteable_balancer_v3_pools().await?;
+                let promote_stats = self.promote_quoteable_uniswap_v4_pools(None).await?;
+                let balancer_promote_stats =
+                    self.promote_quoteable_balancer_v3_pools(None).await?;
                 if promote_stats.selected > 0
                     || promote_stats.promoted > 0
                     || promote_stats.published_states > 0
@@ -1457,7 +1462,10 @@ where
         Ok(observed)
     }
 
-    async fn promote_quoteable_uniswap_v4_pools(&self) -> Result<V4PromoteStats> {
+    async fn promote_quoteable_uniswap_v4_pools(
+        &self,
+        min_latest_block: Option<u64>,
+    ) -> Result<V4PromoteStats> {
         let Some(pool_manager) = self.settings.uniswap_v4_pool_manager else {
             return Ok(V4PromoteStats::default());
         };
@@ -1488,6 +1496,7 @@ where
               AND po.sqrt_price_x96 IS NOT NULL
               AND po.liquidity IS NOT NULL
               AND po.tick IS NOT NULL
+              AND ($5::BIGINT IS NULL OR po.latest_block >= $5)
               AND (
                   latest_state.block_number IS NULL
                   OR po.latest_block > latest_state.block_number
@@ -1503,6 +1512,7 @@ where
         .bind(format!("{pool_manager:#x}"))
         .bind(ZERO_ADDRESS)
         .bind(V4_PROMOTE_LIMIT)
+        .bind(min_latest_block.map(i64::try_from).transpose()?)
         .fetch_all(&self.recorder.pool)
         .await?;
 
@@ -1606,7 +1616,10 @@ where
         Ok(stats)
     }
 
-    async fn promote_quoteable_balancer_v3_pools(&self) -> Result<V4PromoteStats> {
+    async fn promote_quoteable_balancer_v3_pools(
+        &self,
+        min_latest_block: Option<u64>,
+    ) -> Result<V4PromoteStats> {
         let Some(vault) = self.settings.balancer_v3_vault else {
             return Ok(V4PromoteStats::default());
         };
@@ -1639,6 +1652,7 @@ where
               AND po.token0 IS NOT NULL
               AND po.token1 IS NOT NULL
               AND po.fee_bps IS NOT NULL
+              AND ($4::BIGINT IS NULL OR po.latest_block >= $4)
               AND (
                   latest_state.block_number IS NULL
                   OR po.latest_block > latest_state.block_number
@@ -1653,6 +1667,7 @@ where
         .bind(i64::try_from(self.settings.chain_id)?)
         .bind(format!("{vault:#x}"))
         .bind(BALANCER_PROMOTE_LIMIT)
+        .bind(min_latest_block.map(i64::try_from).transpose()?)
         .fetch_all(&self.recorder.pool)
         .await?;
 
