@@ -4,7 +4,7 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::constants::{
     AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, AERODROME_SLIPSTREAM_ROUTER,
-    PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER, UNISWAP_V3_FACTORY,
+    PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER, UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY,
 };
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
 use chrono::Utc;
@@ -360,6 +360,7 @@ enum ExecutorStepKind {
     AerodromeSlipstream,
     UniswapV3Router,
     PancakeV3Router,
+    DirectV2,
     Adapter,
 }
 
@@ -370,20 +371,21 @@ impl ExecutorStepKind {
             Self::AerodromeSlipstream => 1,
             Self::UniswapV3Router => 2,
             Self::PancakeV3Router => 3,
+            Self::DirectV2 => 4,
             Self::Adapter => 6,
         }
     }
 
     fn is_direct(self) -> bool {
-        false
+        matches!(self, Self::DirectV2)
     }
 
     fn needs_router_approval(self) -> bool {
-        !matches!(self, Self::Adapter)
+        !matches!(self, Self::Adapter | Self::DirectV2)
     }
 
     fn requires_hub(self) -> bool {
-        matches!(self, Self::Adapter)
+        matches!(self, Self::Adapter | Self::DirectV2)
     }
 }
 
@@ -401,6 +403,9 @@ fn step_execution_kind(
 ) -> Result<ExecutorStepKind> {
     match (step.dex, step.variant) {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
+            if is_uniswap_v2_factory(step.factory_address) {
+                return Ok(ExecutorStepKind::DirectV2);
+            }
             let default_factory = settings
                 .aerodrome_pool_factory
                 .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
@@ -533,6 +538,11 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None)
     ) {
+        if is_uniswap_v2_factory(step.factory_address) {
+            return step
+                .factory_address
+                .context("DirectV2 execution requires the pair factory");
+        }
         reject_untrusted_factory(
             step.factory_address,
             settings
@@ -628,6 +638,15 @@ fn factory_for_step(
     } else {
         Ok(Address::ZERO)
     }
+}
+
+fn is_uniswap_v2_factory(factory: Option<Address>) -> bool {
+    let Some(factory) = factory else {
+        return false;
+    };
+    UNISWAP_V2_FACTORY
+        .parse::<Address>()
+        .is_ok_and(|expected| expected == factory)
 }
 
 fn router_for_step(

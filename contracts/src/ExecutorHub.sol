@@ -29,6 +29,10 @@ interface IAerodromeClassicFactoryHub {
     function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
 }
 
+interface IV2FactoryHub {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
 interface IV3RouterHub {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -468,8 +472,10 @@ contract ExecutorHub {
 
     function _validateExpectedPool(SwapStep calldata step) internal view {
         address expectedPool;
-        if (step.dex == StepKind.AerodromeClassic || step.dex == StepKind.DirectV2) {
+        if (step.dex == StepKind.AerodromeClassic) {
             expectedPool = IAerodromeClassicFactoryHub(step.factory).getPool(step.tokenIn, step.tokenOut, step.stable);
+        } else if (step.dex == StepKind.DirectV2) {
+            expectedPool = IV2FactoryHub(step.factory).getPair(step.tokenIn, step.tokenOut);
         } else if (step.dex == StepKind.AerodromeSlipstream) {
             expectedPool =
                 ISlipstreamFactoryHub(step.factory).getPool(step.tokenIn, step.tokenOut, _decodeTickSpacing(step.fee));

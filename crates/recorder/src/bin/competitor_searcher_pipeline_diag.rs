@@ -14,7 +14,7 @@ use base_arb_common::{
     config::Settings,
     constants::{
         AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, PANCAKE_V3_FACTORY,
-        UNISWAP_V3_FACTORY,
+        UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY,
     },
     types::{
         ArbPath, DexKind, PoolState, PoolVariant, QuoteDiagnostics, QuoteResult,
@@ -1998,7 +1998,7 @@ fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
             is_supported_factory(
                 state,
                 settings.aerodrome_pool_factory,
-                &[AERODROME_CLASSIC_FACTORY],
+                &[AERODROME_CLASSIC_FACTORY, UNISWAP_V2_FACTORY],
             ) && is_nonzero_u256(state.reserve0)
                 && is_nonzero_u256(state.reserve1)
         }

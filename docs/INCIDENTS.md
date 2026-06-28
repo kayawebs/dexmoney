@@ -113,6 +113,14 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   `dynamic_multihop_priority_edges`; fresh competitor diagnostics should not
   stop at `path_generation` solely because a current changed pool is outside
   the base top-16 fanout or stale by wall-clock age.
+- Follow-up on the primary sample after the fanout/active fix showed a second
+  P0 blocker: pool `0xfa65a76655f3c0641b79e89de3f51459c3727823` comes from
+  factory `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`. The factory returns
+  the pool via `getPair(tokenA,tokenB)` and reverts on Aerodrome-style
+  `getPool(tokenA,tokenB,stable)`. Code support has been added for this known
+  `UNISWAP_V2_FACTORY` as `DirectV2`, including `ExecutorHub` strict
+  validation through `getPair`. This part is not live until a new Hub is
+  deployed and configured.
 
 ### Regression Guard
 

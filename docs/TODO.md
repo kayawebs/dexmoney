@@ -137,6 +137,13 @@ Priority order:
     `0x6a003d20...e018d` and fresh competitor reports should no longer classify
     changed-pool-ready cycles as `root_stage=path_generation` solely because of
     top-16 fanout or time-based active guard.
+  - Follow-up P0 evidence after the fanout fix: the same sample still used
+    pool `0xfa65a76655f3c0641b79e89de3f51459c3727823`, which is created by
+    `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`. Onchain this factory supports
+    `getPair(tokenA,tokenB)` and reverts on Aerodrome-style
+    `getPool(tokenA,tokenB,stable)`. Minimal code support has been added for
+    known `UNISWAP_V2_FACTORY` as DirectV2/getPair; this requires deploying a
+    new `ExecutorHub` before live execution can use these paths.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx

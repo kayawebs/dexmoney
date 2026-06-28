@@ -7,7 +7,7 @@ use anyhow::Result;
 use base_arb_common::config::Settings;
 use base_arb_common::constants::{
     AERODROME_CLASSIC_FACTORY, AERODROME_SLIPSTREAM_FACTORIES, PANCAKE_V3_FACTORY,
-    UNISWAP_V3_FACTORY,
+    UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY,
 };
 use base_arb_common::errors::ArbBotError;
 use base_arb_common::types::{
@@ -822,7 +822,7 @@ fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
             if !is_supported_factory(
                 state,
                 settings.aerodrome_pool_factory,
-                &[AERODROME_CLASSIC_FACTORY],
+                &[AERODROME_CLASSIC_FACTORY, UNISWAP_V2_FACTORY],
             ) {
                 return false;
             }
