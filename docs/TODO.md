@@ -96,15 +96,47 @@ Priority order:
   - Do not treat amount cap as the only cause: tx
     `0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d`
     used only `11,496,168` raw USDC and still had no local opportunity.
-  - Prove whether our no-opportunity result is caused by configured amount,
-    min profit, impact guard, path generation, or exact quote disagreement.
+  - Diagnostic landed:
+    `ops/competitor_searcher_pipeline_diag.sh --tx-hash <hash>` reconstructs
+    recognized anchor cycles and prints path generation, Redis/tick presence,
+    rough quote, exact quote, min-profit, impact, quote-model edge, and
+    candidate publish eligibility from the current local Redis snapshot.
   - A report enhancement has been added locally so `anchor_input_guess` includes
     pool-to-pool anchor token flow and configured max ratio, even when the
     competitor profit token is not an anchor token.
-  - Next durable tool needed: given a competitor tx, reconstruct each recognized
-    anchor cycle and print the exact local searcher stage result:
-    path-generated, quote-skipped reason, rough-quote result, min-profit result,
-    impact result, and candidate publish result.
+  - Primary post-`c4ae103` sample
+    `0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d`
+    now diagnoses as `root_stage=path_generation`: both reconstructed 4-hop
+    cycles have `path_generated=no`; current Redis has all pool states and the
+    tx implies a changed-pool trigger, but local graph generation excludes ready
+    edges via dynamic fanout and excludes pool
+    `0xfa65a76655f3c0641b79e89de3f51459c3727823` via active-state guard.
+    The tool recovers the observed input
+    `observed_anchor_input_shadow=11496168`.
+  - Regression sample
+    `0x117417c777e2f26d57c1cec10fc8fdd3f331e9a19fe4c3e1e88ad9e7a3eb44b5`
+    also diagnoses as `root_stage=path_generation` in the current Redis
+    snapshot because pool `0x9d14ff91ae2c6e3d1a760542248b6c7f206894b0` is
+    excluded by the active-state guard; the tool recovers
+    `observed_anchor_input_shadow=477683563`.
+  - Split rule: current diagnostic proves the first current-snapshot local miss
+    stage, but not historical Redis/tick state at the exact tx block. Before
+    changing live behavior, add path-generation shadow evidence for competitor
+    cycles: missing edge rank, depth score, active-state rejection reason, and
+    whether changed-pool-adjacent ready edges would pass if included.
+  - Minimal live fix implemented locally: changed pools now bypass the
+    time-based active guard when their state is quote-ready, and dynamic
+    multihop fanout keeps the normal top-16 edges while also forcing current
+    changed-pool edges into token adjacency lists. This is not a global fanout
+    increase; it only prevents the pool that triggered the cycle from being
+    pruned before path generation.
+  - Added `dynamic_multihop_priority_edges` to searcher cycle logs and mirrored
+    the priority-pool fanout behavior in
+    `ops/competitor_searcher_pipeline_diag.sh`.
+  - Verification needed after deploy: competitor pipeline diagnostic for
+    `0x6a003d20...e018d` and fresh competitor reports should no longer classify
+    changed-pool-ready cycles as `root_stage=path_generation` solely because of
+    top-16 fanout or time-based active guard.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx

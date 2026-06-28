@@ -8,12 +8,120 @@ This file is the durable memory for important production issues. Use
 Work these in priority order. Do not skip directly to fixes unless the Evidence
 section already proves the root cause.
 
-1. `2026-06-24 MinProfitNotMet Root Cause Split`
-2. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
-3. `2026-06-24 Submitted Transaction Revert Rate`
-4. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
-5. `2026-06-24 Balancer V3 Readiness`
-6. `2026-06-24 Health Monitor Coverage`
+1. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
+2. `2026-06-24 MinProfitNotMet Root Cause Split`
+3. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
+4. `2026-06-24 Submitted Transaction Revert Rate`
+5. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
+6. `2026-06-24 Balancer V3 Readiness`
+7. `2026-06-24 Health Monitor Coverage`
+
+## 2026-06-28 Competitor Ready Anchor Cycle No Opportunity
+
+Status: Fix implemented locally; awaiting deploy/runtime verification
+Category: opportunity gap / search pipeline
+
+### Symptom
+
+After `c4ae103` fixed same-block trusted pool state publication, the
+post-deploy competitor gap report `reports/competitor-gap-20260628T064024Z`
+still showed ready anchor cycles with no local opportunity near the competitor
+block. Primary sample:
+`0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d`.
+It is a ready 4-hop USDC anchor cycle with competitor input `11,496,168` raw
+USDC, below the configured USDC max `45,270,872`, and profit `17,803` raw USDC.
+
+### Hypotheses
+
+- Path generation rejects the cycle before quote.
+- Quote skips due missing Redis state, missing ticks, or tick range exhaustion.
+- Configured amount grid misses the profitable input.
+- Min-profit, price-impact, or quote-model edge rejects the quoted route.
+- Candidate publish is blocked by trust/execution filters or missing changed-pool
+  trigger.
+
+### Evidence
+
+- Added durable diagnostic:
+  `ops/competitor_searcher_pipeline_diag.sh --tx-hash <hash>`.
+- The diagnostic reconstructs recognized anchor cycles from the competitor tx,
+  loads current local Redis pool/tick state, mirrors local searcher graph fanout,
+  rough quote, exact quote, min-profit, impact, quote-model edge, and reports the
+  first observed stage. It also marks `state_snapshot:
+  current_redis_at_run_time`; historical Redis/tick replay is not implemented.
+- Primary sample `0x6a003d20...e018d` on the cloud node:
+  `recognized_swap_pools=4`, `recognized_anchor_cycles=2`,
+  `all_redis_states_present=true`, `changed_pool_trigger_inferred_from_tx=true`,
+  and `opportunities_near_block=0` for all four pools.
+- Primary sample Cycle 1:
+  `path_generated=no`. Reasons:
+  `edge excluded by dynamic graph fanout token=USDC pool=0x6b0f53...39a1be`;
+  `pool excluded by active-state guard pool=0xfa65a7...727823`;
+  `edge excluded by dynamic graph fanout token=VIRTUAL pool=0x7cb770...6f9830`.
+  The diagnostic recovered the observed anchor input
+  `observed_anchor_input_shadow=11496168`.
+- Primary sample Cycle 2:
+  `path_generated=no`. Reasons:
+  `edge excluded by dynamic graph fanout token=USDC pool=0x7cb770...6f9830`;
+  `pool excluded by active-state guard pool=0xfa65a7...727823`.
+- Regression sample
+  `0x117417c777e2f26d57c1cec10fc8fdd3f331e9a19fe4c3e1e88ad9e7a3eb44b5`
+  reconstructed the 2-hop USDC/cbBTC cycles and also stopped at
+  `path_generation`: pool `0x9d14ff...6894b0` was excluded by the active-state
+  guard in the current Redis snapshot. The diagnostic recovered
+  `observed_anchor_input_shadow=477683563` for the matching direction.
+
+### Root Cause / Split
+
+The proven first local pipeline miss for the primary P0b sample is path
+generation/hot-pool selection, not missing Redis state, missing ticks,
+configured amount cap, changed-pool trigger, min-profit, or impact guard. The
+current local graph excludes at least one ready competitor edge via
+`MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN=16`, and one cycle pool is excluded by the
+active-state guard, so no production candidate can reach quote or publish.
+
+This does not yet prove the exact historical quote result at tx block
+`47919749`, because the diagnostic reads the current Redis snapshot. Forced
+quote probes are useful shadow evidence only; they should not be treated as a
+historical replay.
+
+### Smallest Next Fix
+
+Implement the narrowest live behavior change that preserves pruning while
+preventing the triggering pools from being pruned before path generation:
+
+- changed pools bypass the time-based active guard for the current cycle when
+  their state is quote-ready;
+- dynamic multihop token adjacency keeps the normal top-16 depth-ranked edges
+  and additionally includes current changed-pool edges that fall outside that
+  base fanout;
+- searcher cycle logs include `dynamic_multihop_priority_edges` so the runtime
+  cost of this extra coverage is visible.
+
+This is not a global fanout increase and does not remove later rough quote,
+exact quote, min-profit, impact, candidate cap, or execution filters.
+
+### Verification
+
+- Local: `cargo check -p base-arb-recorder --bin competitor_searcher_pipeline_diag`.
+- Local: `bash -n ops/competitor_searcher_pipeline_diag.sh`.
+- Cloud:
+  `ops/competitor_searcher_pipeline_diag.sh --tx-hash 0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d --output /tmp/p0b-6a003d20-diag.txt`.
+- Cloud:
+  `ops/competitor_searcher_pipeline_diag.sh --tx-hash 0x117417c777e2f26d57c1cec10fc8fdd3f331e9a19fe4c3e1e88ad9e7a3eb44b5 --output /tmp/p0b-117417-diag.txt`.
+- After deploy, searcher cycle logs should show
+  `dynamic_multihop_priority_edges`; fresh competitor diagnostics should not
+  stop at `path_generation` solely because a current changed pool is outside
+  the base top-16 fanout or stale by wall-clock age.
+
+### Regression Guard
+
+Every future `covered_no_opportunity_near_block` or
+`recognized_anchor_cycle_but_no_opportunity` report entry should be run through
+`ops/competitor_searcher_pipeline_diag.sh`. A usable report must include
+`path_generated`, quote skip reason if any, rough quote, exact probe stages,
+min-profit result, impact result, quote-model edge result, and whether a
+candidate would be publish-eligible if the path had been generated.
 
 ## 2026-06-24 MinProfitNotMet Root Cause Split
 

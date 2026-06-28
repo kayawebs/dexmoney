@@ -103,6 +103,7 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_quote_dropped: u64,
     pub dynamic_multihop_rough_profit_below_min: u64,
     pub dynamic_multihop_candidate_cap_hit: u64,
+    pub dynamic_multihop_priority_edges: u64,
     pub best_profit_before_impact: U256,
     pub best_profit_rejected_by_impact: U256,
     pub best_profit_rejected_by_model_edge: U256,
@@ -221,6 +222,7 @@ impl SearchStats {
         self.dynamic_multihop_rough_profit_below_min +=
             other.dynamic_multihop_rough_profit_below_min;
         self.dynamic_multihop_candidate_cap_hit += other.dynamic_multihop_candidate_cap_hit;
+        self.dynamic_multihop_priority_edges += other.dynamic_multihop_priority_edges;
         self.best_profit_before_impact = self
             .best_profit_before_impact
             .max(other.best_profit_before_impact);
@@ -1024,6 +1026,8 @@ impl SearchEngine {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         let mut segment_cache = SegmentPathCache::default();
+        stats.dynamic_multihop_priority_edges =
+            graph.priority_edges_beyond_base_fanout(changed_pools) as u64;
         for anchor in &self.anchor_configs {
             for changed_pool in changed_pools {
                 let Some(changed_edges) = graph.pool_edges(*changed_pool) else {
@@ -1037,6 +1041,7 @@ impl SearchEngine {
                         anchor,
                         changed_edge,
                         3,
+                        changed_pools,
                         &mut segment_cache,
                         &mut stats,
                     );
@@ -1047,6 +1052,7 @@ impl SearchEngine {
                         anchor,
                         changed_edge,
                         4,
+                        changed_pools,
                         &mut segment_cache,
                         &mut stats,
                     );
@@ -1521,8 +1527,6 @@ impl GraphSnapshot {
         for edges in edges_by_token.values_mut() {
             edges
                 .sort_by_key(|edge| std::cmp::Reverse(pool_depth_score(&states[edge.state_index])));
-            edges.truncate(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN);
-            edges.sort_by_key(|edge| (edge.token_out, edge.pool()));
         }
         Self {
             pool_states: states,
@@ -1535,12 +1539,43 @@ impl GraphSnapshot {
         &self.pool_states[edge.state_index]
     }
 
-    fn edges_from_token(&self, token: Address) -> Option<&[OwnedPoolEdge]> {
-        self.edges_by_token.get(&token).map(Vec::as_slice)
+    fn candidate_edges_from_token(
+        &self,
+        token: Address,
+        priority_pools: &HashSet<Address>,
+    ) -> Vec<OwnedPoolEdge> {
+        let Some(edges) = self.edges_by_token.get(&token) else {
+            return Vec::new();
+        };
+        let mut out = edges
+            .iter()
+            .take(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
+            .copied()
+            .collect::<Vec<_>>();
+        for edge in edges.iter().skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN) {
+            if priority_pools.contains(&edge.pool()) {
+                out.push(*edge);
+            }
+        }
+        out.sort_by_key(|edge| (edge.token_out, edge.pool()));
+        out
     }
 
     fn pool_edges(&self, pool: Address) -> Option<&[OwnedPoolEdge]> {
         self.pool_to_edges.get(&pool).map(Vec::as_slice)
+    }
+
+    fn priority_edges_beyond_base_fanout(&self, priority_pools: &HashSet<Address>) -> usize {
+        self.edges_by_token
+            .values()
+            .map(|edges| {
+                edges
+                    .iter()
+                    .skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
+                    .filter(|edge| priority_pools.contains(&edge.pool()))
+                    .count()
+            })
+            .sum()
     }
 }
 
@@ -1591,6 +1626,7 @@ fn add_dynamic_cycles_for_changed_edge(
     anchor: &AnchorSearchConfig,
     changed_edge: &OwnedPoolEdge,
     cycle_len: usize,
+    priority_pools: &HashSet<Address>,
     segment_cache: &mut SegmentPathCache,
     stats: &mut SearchStats,
 ) {
@@ -1598,12 +1634,24 @@ fn add_dynamic_cycles_for_changed_edge(
     for changed_position in 0..cycle_len {
         let prefix_len = changed_position;
         let suffix_len = cycle_len - changed_position - 1;
-        let prefixes = segment_cache.get(graph, anchor.token, changed_edge.token_in, prefix_len);
+        let prefixes = segment_cache.get(
+            graph,
+            anchor.token,
+            changed_edge.token_in,
+            prefix_len,
+            priority_pools,
+        );
         if prefixes.is_empty() {
             stats.dynamic_multihop_prefix_empty += 1;
             continue;
         }
-        let suffixes = segment_cache.get(graph, changed_edge.token_out, anchor.token, suffix_len);
+        let suffixes = segment_cache.get(
+            graph,
+            changed_edge.token_out,
+            anchor.token,
+            suffix_len,
+            priority_pools,
+        );
         if suffixes.is_empty() {
             stats.dynamic_multihop_suffix_empty += 1;
             continue;
@@ -1656,6 +1704,7 @@ impl SegmentPathCache {
         start: Address,
         end: Address,
         edge_count: usize,
+        priority_pools: &HashSet<Address>,
     ) -> Arc<Vec<Vec<OwnedPoolEdge>>> {
         let key = SegmentPathKey {
             start,
@@ -1664,7 +1713,15 @@ impl SegmentPathCache {
         };
         self.paths
             .entry(key)
-            .or_insert_with(|| Arc::new(edge_paths_between(graph, start, end, edge_count)))
+            .or_insert_with(|| {
+                Arc::new(edge_paths_between(
+                    graph,
+                    start,
+                    end,
+                    edge_count,
+                    priority_pools,
+                ))
+            })
             .clone()
     }
 }
@@ -2015,6 +2072,7 @@ fn edge_paths_between(
     start: Address,
     end: Address,
     edge_count: usize,
+    priority_pools: &HashSet<Address>,
 ) -> Vec<Vec<OwnedPoolEdge>> {
     if edge_count == 0 {
         return if start == end {
@@ -2025,7 +2083,15 @@ fn edge_paths_between(
     }
     let mut out = Vec::new();
     let mut current = Vec::with_capacity(edge_count);
-    edge_paths_between_inner(graph, start, end, edge_count, &mut current, &mut out);
+    edge_paths_between_inner(
+        graph,
+        start,
+        end,
+        edge_count,
+        priority_pools,
+        &mut current,
+        &mut out,
+    );
     out
 }
 
@@ -2034,6 +2100,7 @@ fn edge_paths_between_inner(
     current_token: Address,
     end: Address,
     remaining_edges: usize,
+    priority_pools: &HashSet<Address>,
     current: &mut Vec<OwnedPoolEdge>,
     out: &mut Vec<Vec<OwnedPoolEdge>>,
 ) {
@@ -2046,10 +2113,11 @@ fn edge_paths_between_inner(
         }
         return;
     }
-    let Some(edges) = graph.edges_from_token(current_token) else {
+    let edges = graph.candidate_edges_from_token(current_token, priority_pools);
+    if edges.is_empty() {
         return;
     };
-    for edge in edges {
+    for edge in &edges {
         if out.len() >= MAX_DYNAMIC_SEGMENT_PATHS {
             return;
         }
@@ -2059,12 +2127,13 @@ fn edge_paths_between_inner(
         {
             continue;
         }
-        current.push(edge.clone());
+        current.push(*edge);
         edge_paths_between_inner(
             graph,
             edge.token_out,
             end,
             remaining_edges - 1,
+            priority_pools,
             current,
             out,
         );

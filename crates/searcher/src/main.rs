@@ -157,6 +157,8 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_rough_profit_below_min,
                 dynamic_multihop_candidate_cap_hit =
                     aggregate.search.dynamic_multihop_candidate_cap_hit,
+                dynamic_multihop_priority_edges =
+                    aggregate.search.dynamic_multihop_priority_edges,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
                 risk_price_impact_rejected = aggregate.risk_price_impact_rejected,
@@ -509,7 +511,11 @@ where
             Some(state) => {
                 let topology = PoolTopology::from(&state);
                 let was_active = runtime.active_pool_addresses.contains(&pool);
-                if is_pool_state_active(&state, now, max_pool_state_age_ms, settings) {
+                let quote_ready = is_pool_state_quote_ready(&state, settings);
+                if quote_ready
+                    && (!state.is_stale(now, max_pool_state_age_ms)
+                        || changed_pools.contains(&pool))
+                {
                     runtime.active_pool_addresses.insert(pool);
                 } else {
                     runtime.active_pool_addresses.remove(&pool);
@@ -559,6 +565,9 @@ where
     let active_pool_refresh =
         refresh_active_pool_cache_if_due(runtime, now, max_pool_state_age_ms, settings);
     if active_pool_refresh.changed {
+        rebuild_path_index = true;
+    }
+    if force_changed_quote_ready_pools_active(runtime, &changed_pools, settings) {
         rebuild_path_index = true;
     }
     if runtime.active_pool_addresses.is_empty() {
@@ -771,6 +780,24 @@ fn refresh_active_pool_cache_if_due(
     }
 }
 
+fn force_changed_quote_ready_pools_active(
+    runtime: &mut SearchRuntime,
+    changed_pools: &HashSet<Address>,
+    settings: &Settings,
+) -> bool {
+    let mut changed = false;
+    for pool in changed_pools {
+        let Some(state) = runtime.pool_states.get(pool) else {
+            continue;
+        };
+        if is_pool_state_quote_ready(state, settings) && runtime.active_pool_addresses.insert(*pool)
+        {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn active_pool_sweep_interval(max_pool_state_age_ms: i64) -> Duration {
     let max_age_ms = max_pool_state_age_ms.max(1) as u64;
     let sweep_ms = (max_age_ms / 10).clamp(ACTIVE_POOL_SWEEP_MIN_MS, ACTIVE_POOL_SWEEP_MAX_MS);
@@ -786,6 +813,10 @@ fn is_pool_state_active(
     if state.is_stale(now, max_pool_state_age_ms) {
         return false;
     }
+    is_pool_state_quote_ready(state, settings)
+}
+
+fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
     match state.variant {
         PoolVariant::AerodromeVolatile => {
             if !is_supported_factory(
