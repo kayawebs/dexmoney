@@ -15,52 +15,69 @@ instead of patching from chat memory.
 
 Latest evidence:
 
-- Report: `reports/competitor-gap-20260628T045424Z`.
-- Local bot activity in that report: `0` opportunities, `0` simulations, `0`
-  transactions in the last 30m; only `16` opportunities and `2` transactions in
-  2h.
-- Competitor samples in the same window: `covered_no_opportunity_near_block=2`,
-  `tick_scan_zero=1`; pool gaps: `covered_no_opportunity_near_block=9`,
-  `observed_only_not_imported=1`, `tick_scan_zero=2`.
-- Important samples:
-  - `0xef5e229441ef8759c86e95a430c4b1001c914c22b21c00ced2950f5a6e0212c0`:
-    recognized anchor cycle, but no local opportunity near the block.
-  - `0xe4a03fc4f06710d1a8847c05f409e5b667a0f9335e6e5782867ff90b2624fd55`:
-    covered V3/V4 path, but no local opportunity near the block.
-  - V4 pool `0x9a8e11510fbfbb6d2b2f405e5b59202036f0a80c` is imported but
-    reported as `tick_scan_zero`.
-  - V4 pool `0x3c2828d64180af222763d3e78df47d8cc5454942` is observed-only with a
-    nonzero hook, so it is not executable by current safe V4 rules.
-- Balancer V3 global readiness remains a separate blocker: `137` enabled pools,
-  `0` model coverage, `0` quote coverage in the report.
+- Competitor report: `reports/competitor-gap-20260628T054124Z`.
+- Searcher quality report: `reports/searcher-quality-20260628T054645Z`.
+- Competitor samples in the latest report: all `3` sampled profit txs are
+  `covered_no_opportunity_near_block`.
+- Searcher gap split: `recognized_anchor_cycle_but_no_opportunity=1`,
+  `recognized_swaps_do_not_form_anchor_cycle=2`.
+- Important competitor samples:
+  - `0x3b5761584aaaaa15247c9896ca3c85c5f8eef819a96fdc9e103cb02b2f42c2df`:
+    two ready V3-style USDC/cbBTC pools, recognized anchor cycle, no local
+    opportunity near the block.
+  - `0x66687b5961276b98d948ae751e41eb87ffe510a0e90e4cdc1fc1035e89118c4a`:
+    Uniswap V3 + Balancer V3 flow; Balancer pool
+    `0x6cf6f5adc2a3de26972340a827d2369ff56e82d0` remains
+    `balancer_v3_quote_unvalidated`.
+  - `0xa800c486733586e35dadf7aef5cded7fd8e6a3a72b191e98cf4bf39832850e5b`:
+    Aerodrome + V4 flow; V4 pool
+    `0xed93844bad1e39b1d7298a37f636d8169bc6523e` is static/zero-hook but
+    `tick_scan_zero`.
+- Impact shadow from the searcher-quality report: `price_impact_rejected=1044`,
+  shadow pass counts would be `650` at 100 bps, `974` at 150 bps, `978` at
+  300 bps, and `1030` at 500 bps; max shadow profit was `21,389` at 100 bps,
+  `41,778` at 150 bps, `56,941` at 300 bps, and `848,466` at 500 bps.
+- The same searcher-quality report produced only `6` opportunities and `14`
+  emitted candidates, so impact50 is a material opportunity-scarcity suspect,
+  but it is not yet proven to explain the competitor near-block misses.
 
 Priority order:
 
 - [ ] P0: Explain `covered_no_opportunity_near_block` and
   `recognized_anchor_cycle_but_no_opportunity` for the latest competitor
   samples:
-  - Start from `0xef5e229441ef8759c86e95a430c4b1001c914c22b21c00ced2950f5a6e0212c0`
-    and `0xe4a03fc4f06710d1a8847c05f409e5b667a0f9335e6e5782867ff90b2624fd55`.
+  - Start from `0x3b5761584aaaaa15247c9896ca3c85c5f8eef819a96fdc9e103cb02b2f42c2df`.
   - For each competitor pool/path, prove whether our searcher rejected it due
     to path generation, quote skip, impact guard, min profit, anchor amount, hot
     pool selection, trust/execution filter, or missing Redis state.
   - Produce a durable diagnostic that maps one competitor tx to the exact local
     rejection stage.
-- [ ] P1: Fix V4 readiness gaps that directly appear in competitor samples:
+- [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
+  opportunities:
+  - Replay and/or simulate top `price_impact_rejected` samples from
+    `reports/searcher-quality-20260628T054645Z.txt`.
+  - Use the shadow data to compare 100/150/300/500 bps, but do not raise the
+    live threshold until samples show successful simulation and acceptable
+    revert risk.
+  - Check whether the competitor P0 sample would have been rejected by impact;
+    if yes, impact tuning becomes the first fix. If no, keep it as a separate
+    opportunity-volume optimization.
+- [ ] P2: Close Balancer V3 readiness gaps:
+  - Ensure enabled Balancer V3 pools have `pool_model_coverage` and
+    `pool_quote_coverage` rows; current reports still show competitor-used
+    Balancer pools as `balancer_v3_quote_unvalidated`.
+  - Persist live Balancer state needed by local quote, not just observation rows.
+  - Fix missing token decimals/rates/model inputs before promoting pools into
+    hot search.
+- [ ] P3: Fix V4 readiness gaps that directly appear in competitor samples:
   - Investigate why imported pool
-    `0x9a8e11510fbfbb6d2b2f405e5b59202036f0a80c` remains `tick_scan_zero`
+    `0xed93844bad1e39b1d7298a37f636d8169bc6523e` remains `tick_scan_zero`
     despite V4 tick backfill/repair.
   - Decide whether nonzero-hook pool
     `0x3c2828d64180af222763d3e78df47d8cc5454942` is safely supportable; if not,
     classify it explicitly as unsupported so reports do not imply accidental
     coverage debt.
-- [ ] P2: Close Balancer V3 readiness gaps:
-  - Ensure enabled Balancer V3 pools have `pool_model_coverage` and
-    `pool_quote_coverage` rows; current report shows `0/137`.
-  - Persist live Balancer state needed by local quote, not just observation rows.
-  - Fix missing token decimals/rates/model inputs before promoting pools into
-    hot search.
-- [ ] P3: Deep-dive Balancer V3 + V3-style flash-cycle routes:
+- [ ] P4: Deep-dive Balancer V3 + V3-style flash-cycle routes:
   - Example tx:
     `0x641b0d4f32c1d75ded37045df1fbfcd8f209a2c00456884dd3988d3d24dc8887`.
   - This shape borrows/receives USDC from a V3 pool, swaps most USDC through
@@ -75,15 +92,10 @@ Priority order:
   - Compare each used pool against local states: discovered, imported,
     quoteable, hot Redis, trusted executable, and recently path-generated.
   - Produce top missed pool/protocol/path families over 30m, 2h, and 12h.
-- [ ] P4: Make competitor reporting scalable enough for the 30m loop:
+- [ ] P5: Make competitor reporting scalable enough for the 30m loop:
   - A 5000-block report with opportunity lookup was still running after 6m.
   - Split fast triage reports from deep reports, or optimize the opportunity
     lookup query path before relying on full-window automation.
-- [ ] P5: Track impact-threshold opportunity loss with shadow metrics before
-  tuning:
-  - Compare current 50 bps guard against 100/150/300/500 bps shadow pass counts.
-  - Only raise the live threshold after replay/simulation shows the extra paths
-    are structurally valid rather than stale or overly optimistic.
 - [ ] P6: Reduce V3-style `TickRangeExhausted`:
   - Keep searcher hot path RPC-free; it should only enqueue `ticks:repair`.
   - Watch whether queued repair reduces repeated exhausted pools.
