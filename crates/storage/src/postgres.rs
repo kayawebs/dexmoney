@@ -394,6 +394,71 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn get_pool_ticks_current_many(
+        &self,
+        pools: &[Address],
+    ) -> Result<std::collections::HashMap<Address, Vec<TickState>>> {
+        if pools.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut pool_addresses = pools
+            .iter()
+            .map(|pool| format!("{pool:#x}"))
+            .collect::<Vec<_>>();
+        pool_addresses.sort();
+        pool_addresses.dedup();
+
+        #[derive(sqlx::FromRow)]
+        struct PoolTickCurrentRow {
+            chain_id: i64,
+            pool_address: String,
+            tick: i32,
+            liquidity_net: String,
+            liquidity_gross: String,
+            block_number: i64,
+            updated_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<PoolTickCurrentRow> = sqlx::query_as(
+            r#"
+            SELECT chain_id, pool_address, tick, liquidity_net, liquidity_gross,
+                   block_number, updated_at
+            FROM pool_ticks_current
+            WHERE lower(pool_address) = ANY($1)
+            ORDER BY lower(pool_address), tick
+            "#,
+        )
+        .bind(
+            pool_addresses
+                .iter()
+                .map(|address| address.to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = std::collections::HashMap::<Address, Vec<TickState>>::new();
+        for row in rows {
+            let pool_address = row.pool_address.parse::<Address>()?;
+            let chain_id = u64::try_from(row.chain_id)?;
+            let block_number = u64::try_from(row.block_number)?;
+            let liquidity_net = row.liquidity_net.parse::<i128>()?;
+            let liquidity_gross = U256::from_str_radix(&row.liquidity_gross, 10)?;
+            out.entry(pool_address).or_default().push(TickState {
+                pool_id: base_arb_common::types::PoolId {
+                    chain_id,
+                    address: pool_address,
+                },
+                tick: row.tick,
+                liquidity_net,
+                liquidity_gross,
+                block_number,
+                updated_at: row.updated_at,
+            });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_pool_tick_coverage(
         &self,
