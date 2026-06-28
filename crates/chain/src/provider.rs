@@ -2,7 +2,7 @@ use crate::events::DexEvent;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use base_arb_common::config::Settings;
-use base_arb_common::constants::PANCAKE_V3_FACTORY;
+use base_arb_common::constants::{PANCAKE_V3_FACTORY, UNISWAP_V2_FACTORY};
 use base_arb_common::types::{
     DexKind, DiscoveredPool, PoolId, PoolRegistryEntry, PoolState, PoolVariant, TickState,
 };
@@ -496,6 +496,14 @@ impl ChainProvider {
         match variant {
             PoolVariant::AerodromeVolatile => {
                 let stable = self.fetch_pool_stable(pool).await.unwrap_or(false);
+                if is_uniswap_v2_factory(factory) {
+                    let expected = self.fetch_v2_pair(factory, token0, token1).await?;
+                    if expected != pool {
+                        anyhow::bail!(
+                            "trusted V2 factory canonical pair mismatch: factory={factory:#x} tokens={token0:#x}/{token1:#x} expected_pair={expected:#x} observed_pool={pool:#x}"
+                        );
+                    }
+                }
                 let mut state = self.fetch_aerodrome_pool_state(pool).await?;
                 state.factory_address = Some(factory);
                 state.stable = Some(stable);
@@ -783,6 +791,22 @@ impl ChainProvider {
     pub async fn get_transaction_by_hash(&self, tx_hash: B256) -> Result<Option<Value>> {
         self.rpc_optional("eth_getTransactionByHash", json!([format!("{tx_hash:#x}")]))
             .await
+    }
+
+    async fn fetch_v2_pair(
+        &self,
+        factory: Address,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<Address> {
+        let raw = self
+            .eth_call(
+                factory,
+                &encode_get_pair(token_a, token_b),
+                "V2 factory getPair(address,address)",
+            )
+            .await?;
+        decode_single_address(&raw).context("V2 factory getPair returned non-address")
     }
 
     pub async fn get_logs_raw(&self, params: Value) -> Result<Vec<Value>> {
@@ -2468,6 +2492,20 @@ fn encode_get_pool_bool(token_a: Address, token_b: Address, stable: bool) -> Str
         encode_address_word(token_b),
         encode_bool_word(stable),
     )
+}
+
+fn encode_get_pair(token_a: Address, token_b: Address) -> String {
+    format!(
+        "0xe6a43905{}{}",
+        encode_address_word(token_a),
+        encode_address_word(token_b),
+    )
+}
+
+fn is_uniswap_v2_factory(factory: Address) -> bool {
+    UNISWAP_V2_FACTORY
+        .parse::<Address>()
+        .is_ok_and(|expected| expected == factory)
 }
 
 fn encode_get_fee(pool: Address, stable: bool) -> String {

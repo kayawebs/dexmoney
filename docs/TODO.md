@@ -56,6 +56,14 @@ Latest evidence:
   propagated a factory trust/calldata error as a process-level error. This
   blocks all simulations/submissions even though the bad candidate should be
   skipped individually.
+- After deploying the new Hub with DirectV2 support, execution-manager resumed
+  simulation but the live failure bucket became dominated by
+  `Executor revert: PoolMismatch`. Representative pool
+  `0x0a55ebff7663e364101eae168ef471068b44576c` is V2-style and locally enabled
+  with factory `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`, but onchain
+  `getPair(USDC,WETH)` returns canonical pair
+  `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C`. Hub is correct; local pool
+  classification/import accepted a non-canonical DirectV2 pool.
 - Important competitor samples:
   - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
     ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
@@ -211,6 +219,16 @@ Priority order:
   - Verification after deploy: execution-manager should stop crash-looping;
     batch summaries should continue after DirectV2/factory rejects; DB should
     show `executor preflight rejected: ...` instead of a service restart.
+- [ ] P0f: Remove non-canonical DirectV2 pools from executable data:
+  - Code fix implemented locally: `resolve_pool_for_trusted_factory` now checks
+    `UNISWAP_V2_FACTORY.getPair(token0, token1) == pool` before importing a
+    DirectV2-style pool as executable.
+  - Diagnostic/cleanup script added locally:
+    `ops/direct_v2_canonical_diag.sh`.
+  - First target:
+    `ops/direct_v2_canonical_diag.sh --pool 0x0a55ebff7663e364101eae168ef471068b44576c --apply`.
+  - After deploy/cleanup/restart, recent simulation failures should no longer
+    be dominated by `PoolMismatch` for the `aero-classic-44576c` path.
 - [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from

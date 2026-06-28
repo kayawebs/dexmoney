@@ -8,13 +8,123 @@ This file is the durable memory for important production issues. Use
 Work these in priority order. Do not skip directly to fixes unless the Evidence
 section already proves the root cause.
 
-1. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
-2. `2026-06-24 MinProfitNotMet Root Cause Split`
-3. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
-4. `2026-06-24 Submitted Transaction Revert Rate`
-5. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
-6. `2026-06-24 Balancer V3 Readiness`
-7. `2026-06-24 Health Monitor Coverage`
+1. `2026-06-28 DirectV2 Non-Canonical PoolMismatch`
+2. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
+3. `2026-06-24 MinProfitNotMet Root Cause Split`
+4. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
+5. `2026-06-24 Submitted Transaction Revert Rate`
+6. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
+7. `2026-06-24 Balancer V3 Readiness`
+8. `2026-06-24 Health Monitor Coverage`
+
+## 2026-06-28 DirectV2 Non-Canonical PoolMismatch
+
+Status: Fixed In Code; cleanup/deploy pending
+Category: safety
+
+### Symptom
+
+After deploying the new `ExecutorHub` with DirectV2 support, execution-manager
+started simulating fresh candidates again, but the last 10m failure bucket was
+dominated by `Executor revert: PoolMismatch`:
+
+- `opportunities_10m=474`;
+- `simulations_10m=139`;
+- `transactions_10m=2`;
+- `PoolMismatch=111`.
+
+Representative opportunity:
+`b58e7fa0-1b3c-4789-bae0-e045def45c08`, block `47924308`,
+path
+`WETH-000006/USDC-a02913-a02913-000006-aero-classic-44576c-aero-slipstream-59dc59`.
+
+### Impact
+
+The Hub is correctly refusing unsafe execution, so funds are protected. The
+runtime impact is severe: searcher and execution-manager spend hot-path work on
+candidates that can never pass the contract guard.
+
+### Hypotheses
+
+- The DirectV2 pool is canonical for its configured factory, but the Hub
+  validation is wrong.
+- The DirectV2 pool is not canonical for its configured factory, and local
+  discovery/import accepted a bad pool/factory pair.
+- The candidate path factory address is missing or rewritten incorrectly between
+  searcher and execution-manager.
+
+### Evidence
+
+The failing first step was:
+
+- pool `0x0a55ebff7663e364101eae168ef471068b44576c`;
+- factory `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`;
+- token0 WETH `0x4200000000000000000000000000000000000006`;
+- token1 USDC `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`;
+- local DB variant `AerodromeVolatile`, `stable=false`.
+
+Onchain factory proof:
+
+```bash
+cast call 0x8909dc15e40173ff4699343b6eb8132c65e18ec6 \
+  "getPair(address,address)(address)" \
+  0x833589fcd6edb6e08f4c7c32d4f71b54bda02913 \
+  0x4200000000000000000000000000000000000006
+```
+
+returned canonical pair:
+`0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C`, not
+`0x0a55ebff7663e364101eae168ef471068b44576c`.
+
+The observed pool itself is a V2-style contract with matching tokens/reserves,
+but it is not the factory canonical pair for that token pair. Hub
+`PoolMismatch` is therefore the expected safety outcome.
+
+### Decision
+
+Root cause: local pool classification/import allowed an enabled DirectV2-style
+pool whose configured trusted factory does not return it from
+`getPair(token0, token1)`.
+
+This must be rejected at data ingress and cleaned from current runtime state.
+Do not relax Hub `PoolMismatch`.
+
+### Fix
+
+- `ChainProvider::resolve_pool_for_trusted_factory` now verifies
+  `UNISWAP_V2_FACTORY.getPair(token0, token1) == observed_pool` before treating
+  a DirectV2/AerodromeVolatile pool as executable.
+- Added `ops/direct_v2_canonical_diag.sh` to scan enabled DirectV2 pools,
+  prove canonical status with onchain `getPair`, and optionally disable
+  mismatched pools plus remove their Redis pool state.
+
+### Verification
+
+Required before closing:
+
+```bash
+cargo check -p base-arb-chain
+bash -n ops/direct_v2_canonical_diag.sh
+ops/direct_v2_canonical_diag.sh --pool 0x0a55ebff7663e364101eae168ef471068b44576c
+ops/direct_v2_canonical_diag.sh --pool 0x0a55ebff7663e364101eae168ef471068b44576c --apply
+```
+
+After deploy and cleanup, execution-manager simulation failures should no
+longer be dominated by `PoolMismatch` for
+`0x0a55ebff7663e364101eae168ef471068b44576c`.
+
+### Regression Guard
+
+Use `ops/direct_v2_canonical_diag.sh` whenever enabling DirectV2 pools or when
+`PoolMismatch` clusters by an AerodromeVolatile/DirectV2 path. Future trusted
+factory imports must fail closed when canonical factory proof is unavailable or
+does not match the observed pool.
+
+### Follow-up
+
+The single `UniswapV2: K` failure observed in the same window is separate and
+should be investigated only after the non-canonical pool set is removed from
+the hot path.
 
 ## 2026-06-28 Competitor Ready Anchor Cycle No Opportunity
 
