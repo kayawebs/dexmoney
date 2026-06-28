@@ -156,6 +156,24 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   `candidates_emitted=45`, and `opportunities_created=19`. This is still an
   optimization target, but it restores multi-cycle throughput compared with the
   previous single-cycle `path_build_ms=107,016`.
+- New execution-layer blocker after searcher throughput recovered:
+  execution-manager crash-looped while processing a candidate containing
+  factory `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`, with fatal error
+  `Aerodrome Classic factory ... is not trusted; configured factory is
+  0x420dd381b31aef6683db6b902084cb0ffece40da`. This is a candidate-level
+  executability issue, not a process-level invariant violation. A single
+  untrusted or temporarily unsupported pool must not stop all simulations and
+  submissions.
+- Smallest execution fix: `live_approval_preflight` now validates candidate
+  calldata, approval derivation, and executor selection as preflight checks. If
+  any of these fail, execution-manager enqueues a synthetic failed simulation
+  with the full reason and skips only that candidate under
+  `preflight_unencodable`; it no longer returns the error to the main loop.
+- Verification needed after deploying execution-manager: the container should
+  stop crash-looping, `execution candidate batch summary` should continue to
+  print, and rejected DirectV2/factory candidates should appear as simulation
+  failures with `executor preflight rejected: ...` instead of killing the
+  process.
 
 ### Regression Guard
 

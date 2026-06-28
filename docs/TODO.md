@@ -50,6 +50,12 @@ Latest evidence:
   `changed_pools≈1,200`, `dynamic_multihop_priority_edges>1,100`, and only one
   cycle per minute-plus. This is now part of P0 because stale searcher output
   cannot compete even if coverage is broader.
+- After the reachability memo fix restored searcher throughput, execution-manager
+  was observed crash-looping on a candidate with factory
+  `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`, because approval preflight
+  propagated a factory trust/calldata error as a process-level error. This
+  blocks all simulations/submissions even though the bad candidate should be
+  skipped individually.
 - Important competitor samples:
   - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
     ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
@@ -195,6 +201,16 @@ Priority order:
   - Add shadow metrics before changing live behavior: count opportunities that
     would pass using adaptive sizing, best adaptive amount, extra quote cost,
     and whether the selected amount is executable with current inventory.
+- [ ] P0e: Keep execution-manager alive on candidate-level preflight rejects:
+  - Code fix implemented locally: `live_approval_preflight` records unencodable
+    or unsupported candidates as failed synthetic simulations and returns
+    `preflight_unencodable` instead of crashing the process.
+  - This does not make untrusted pools executable. It preserves the existing
+    calldata/factory checks and only scopes their failure to the offending
+    candidate.
+  - Verification after deploy: execution-manager should stop crash-looping;
+    batch summaries should continue after DirectV2/factory rejects; DB should
+    show `executor preflight rejected: ...` instead of a service restart.
 - [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from

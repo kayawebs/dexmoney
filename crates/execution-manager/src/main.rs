@@ -816,7 +816,47 @@ where
         return Ok(None);
     }
 
-    let approvals = simulator::required_token_approvals(candidate, settings)?;
+    let preflight_calldata = match simulator::build_live_execution_calldata(settings, candidate) {
+        Ok(calldata) => calldata,
+        Err(err) => {
+            let reason = format!("executor preflight rejected: {err:#}");
+            warn!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                reason = %reason,
+                "candidate skipped before approval preflight because it cannot be encoded"
+            );
+            enqueue_preflight_failure_simulation(
+                simulation_recorder,
+                candidate,
+                current_block,
+                reason,
+                Vec::new(),
+            );
+            return Ok(Some(CandidateAction::Skipped("preflight_unencodable")));
+        }
+    };
+
+    let approvals = match simulator::required_token_approvals(candidate, settings) {
+        Ok(approvals) => approvals,
+        Err(err) => {
+            let reason = format!("executor approval preflight rejected: {err:#}");
+            warn!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                reason = %reason,
+                "candidate skipped before approval preflight because approvals cannot be derived"
+            );
+            enqueue_preflight_failure_simulation(
+                simulation_recorder,
+                candidate,
+                current_block,
+                reason,
+                preflight_calldata,
+            );
+            return Ok(Some(CandidateAction::Skipped("preflight_unencodable")));
+        }
+    };
     let approval_count = approvals.len();
     let missing_approvals = tx_manager::missing_approvals_cached(
         provider,
@@ -863,12 +903,30 @@ where
         return Ok(Some(CandidateAction::Skipped("admin_pending_approval")));
     }
 
-    let executor = simulator::executor_for_candidate(settings, candidate)?;
+    let executor = match simulator::executor_for_candidate(settings, candidate) {
+        Ok(executor) => executor,
+        Err(err) => {
+            let reason = format!("executor selection preflight rejected: {err:#}");
+            warn!(
+                candidate_id = %candidate.id,
+                path = %candidate.path.name,
+                reason = %reason,
+                "candidate skipped before approval preflight because executor cannot be selected"
+            );
+            enqueue_preflight_failure_simulation(
+                simulation_recorder,
+                candidate,
+                current_block,
+                reason,
+                preflight_calldata,
+            );
+            return Ok(Some(CandidateAction::Skipped("preflight_unencodable")));
+        }
+    };
     let nonce = provider
         .get_transaction_count(fund_wallet.address(), true)
         .await?;
     let approval = missing_approvals[0];
-    let calldata = simulator::build_live_execution_calldata(settings, candidate)?;
     let synthetic_simulation = SimulationResult {
         id: uuid::Uuid::new_v4(),
         opportunity_id: candidate.id,
@@ -888,7 +946,7 @@ where
         gas_cost_expected: None,
         net_simulated_profit: None,
         revert_reason: Some("lazy approval preflight; simulation skipped".to_string()),
-        calldata: calldata.clone(),
+        calldata: preflight_calldata.clone(),
     };
     let simulation_record_queue_dropped =
         simulation_recorder.enqueue(vec![synthetic_simulation.clone()]);
@@ -946,6 +1004,44 @@ where
                 .await?;
             Ok(Some(CandidateAction::Simulated))
         }
+    }
+}
+
+fn enqueue_preflight_failure_simulation(
+    simulation_recorder: &SimulationRecordQueue,
+    candidate: &Candidate,
+    current_block: u64,
+    reason: String,
+    calldata: Vec<u8>,
+) {
+    let simulation = SimulationResult {
+        id: uuid::Uuid::new_v4(),
+        opportunity_id: candidate.id,
+        success: false,
+        path_name: Some(candidate.path.name.clone()),
+        token_in: Some(candidate.token_in),
+        amount_in: Some(candidate.amount_in),
+        expected_profit: Some(candidate.expected_profit),
+        min_profit: Some(candidate.min_profit),
+        simulated_profit: U256::ZERO,
+        gas_estimate: None,
+        block_number: Some(current_block),
+        base_fee_per_gas: None,
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        gas_cost_cap: None,
+        gas_cost_expected: None,
+        net_simulated_profit: None,
+        revert_reason: Some(reason),
+        calldata,
+    };
+    let dropped = simulation_recorder.enqueue(vec![simulation]);
+    if dropped > 0 {
+        warn!(
+            candidate_id = %candidate.id,
+            simulation_record_queue_dropped = dropped,
+            "preflight failure simulation record dropped"
+        );
     }
 }
 
