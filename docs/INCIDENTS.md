@@ -120,6 +120,22 @@ Expected result: the same pool should move away from
 `balancer_v3_quote_unvalidated`. If it becomes a stable/multi-token/model gap,
 that is a real protocol support task rather than a missing coverage task.
 
+Runtime result on 2026-06-28 11:00Z:
+
+- Deployed commit `694d6a3` to `/home/ubuntu/dexmoney`.
+- Ran `ops/repair_competitor_balancer_v3.sh --report-dir reports/competitor-gap-20260628T103106Z --limit 20 --apply`.
+- Pool `0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7` classified as
+  `family=weighted`, `status=weighted_multi_token_unsupported`.
+- Router quote validation wrote query failures for both tested directions:
+  `cbBTC -> WETH` and `WETH -> cbBTC`.
+- Follow-up report `reports/competitor-gap-20260628T110019Z` no longer sampled
+  that Balancer pool in the 100-block window. Its flow probe did verify the new
+  singleton classification path: `0x498581...2b2b` is now reported as
+  `uniswap_v4_pool_manager` instead of a generic router/unknown contract.
+
+Conclusion: the representative Balancer gap is now classified as a real
+multi-token Balancer support gap, not a missing coverage-row issue.
+
 ### Regression Guard
 
 Keep competitor reports read-only. Use the repair script only when a report

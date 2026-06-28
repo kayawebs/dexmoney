@@ -259,6 +259,14 @@ Priority order:
     `pool_quote_coverage` ready rows for competitor-used Balancer pools, plus a
     local quote that agrees with Balancer router query for the sampled
     direction.
+  - Runtime result on 2026-06-28 11:00Z: coverage repair was applied for
+    `0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7`; classification is
+    `weighted_multi_token_unsupported`, and router quote validation failed in
+    both tested directions. This specific gap is no longer "unvalidated"; it is
+    a real unsupported multi-token Balancer model/execution question.
+  - Next subproblem: decide whether to implement Balancer weighted multi-token
+    exact-in quote/execution support, or explicitly keep these pools out of hot
+    search until the competitor data proves enough profit density.
   - Verification: next competitor report should no longer classify
     `0x7b4c...fdb7` as `balancer_v3_quote_unvalidated`; if it remains missed,
     the gap should move downstream to path generation, amount sizing, or
