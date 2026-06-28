@@ -17,6 +17,7 @@ struct Args {
     limit: i64,
     max_age_hours: i64,
     word_radius: i32,
+    queued_word_radius: i32,
     gaps_only: bool,
     pools: HashSet<Address>,
     loop_enabled: bool,
@@ -39,12 +40,13 @@ async fn main() -> Result<()> {
 
     if args.loop_enabled {
         println!(
-            "== V3-style Tick Repair Daemon == mode={} interval_secs={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
+            "== V3-style Tick Repair Daemon == mode={} interval_secs={} limit={} max_age_hours={} word_radius={} queued_word_radius={} force={} gaps_only={}",
             if args.apply { "apply" } else { "dry-run" },
             args.interval_secs,
             args.limit,
             args.max_age_hours,
             args.word_radius,
+            args.queued_word_radius,
             args.force,
             args.gaps_only,
         );
@@ -74,7 +76,7 @@ async fn run_repair_once(
     let pools = load_repair_pools(postgres, args, &queued_repair_pools).await?;
     println!("== V3-style Tick Repair ==");
     println!(
-        "mode={} pass={} pools={} queued={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
+        "mode={} pass={} pools={} queued={} limit={} max_age_hours={} word_radius={} queued_word_radius={} force={} gaps_only={}",
         if args.apply { "apply" } else { "dry-run" },
         pass.map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string()),
@@ -83,6 +85,7 @@ async fn run_repair_once(
         args.limit,
         args.max_age_hours,
         args.word_radius,
+        args.queued_word_radius,
         args.force,
         args.gaps_only,
     );
@@ -98,6 +101,11 @@ async fn run_repair_once(
         checked += 1;
         let address = pool.state.pool_id.address;
         let force_refresh = args.force || queued_repair_set.contains(&address);
+        let repair_word_radius = if queued_repair_set.contains(&address) {
+            args.queued_word_radius
+        } else {
+            args.word_radius
+        };
         let existing_ticks = redis.get_pool_ticks(address).await?;
         if !force_refresh && !existing_ticks.is_empty() {
             persisted_existing += 1;
@@ -137,7 +145,7 @@ async fn run_repair_once(
         }
 
         match provider
-            .fetch_initialized_ticks_around_state(&pool.state, args.word_radius)
+            .fetch_initialized_ticks_around_state(&pool.state, repair_word_radius)
             .await
         {
             Ok(ticks) => {
@@ -163,7 +171,7 @@ async fn run_repair_once(
                                 0,
                                 Some(pool.state.block_number),
                                 "v3_tick_repair",
-                                Some(args.word_radius),
+                                Some(repair_word_radius),
                                 None,
                                 None,
                             )
@@ -196,7 +204,7 @@ async fn run_repair_once(
                             ticks.len(),
                             Some(pool.state.block_number),
                             "v3_tick_repair",
-                            Some(args.word_radius),
+                            Some(repair_word_radius),
                             None,
                             None,
                         )
@@ -227,7 +235,7 @@ async fn run_repair_once(
                             0,
                             Some(pool.state.block_number),
                             "v3_tick_repair",
-                            Some(args.word_radius),
+                            Some(repair_word_radius),
                             None,
                             None,
                         )
@@ -263,6 +271,7 @@ fn parse_args() -> Result<Args> {
         limit: 100,
         max_age_hours: 24,
         word_radius: 8,
+        queued_word_radius: 256,
         gaps_only: false,
         pools: HashSet::new(),
         loop_enabled: false,
@@ -296,6 +305,13 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("invalid --word-radius")?;
             }
+            "--queued-word-radius" => {
+                args.queued_word_radius = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--queued-word-radius requires a value"))?
+                    .parse()
+                    .context("invalid --queued-word-radius")?;
+            }
             "--interval-secs" => {
                 args.interval_secs = iter
                     .next()
@@ -327,6 +343,9 @@ fn parse_args() -> Result<Args> {
     if args.word_radius < 0 {
         anyhow::bail!("--word-radius must be non-negative");
     }
+    if args.queued_word_radius < args.word_radius {
+        anyhow::bail!("--queued-word-radius must be greater than or equal to --word-radius");
+    }
     if args.loop_enabled && args.interval_secs == 0 {
         anyhow::bail!("--interval-secs must be positive");
     }
@@ -335,7 +354,7 @@ fn parse_args() -> Result<Args> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: repair_v3_ticks [--apply] [--force] [--gaps-only] [--loop] [--interval-secs 30] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
+        "Usage: repair_v3_ticks [--apply] [--force] [--gaps-only] [--loop] [--interval-secs 30] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--queued-word-radius 256] [--pool 0x...]"
     );
 }
 

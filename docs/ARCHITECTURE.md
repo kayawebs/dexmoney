@@ -194,7 +194,7 @@ If multiple processes need the same expensive data, one process must own the fet
 ## Tick Coverage Strategy
 
 - V3-style pools (`UniswapV3`, `PancakeV3`, `AerodromeSlipstream`) are repaired by targeted hot-pool backfill, not by chain-wide full tick scans. Candidate pools come from recent activity, opportunities, competitor usage, and coverage gaps.
-- `v3-tick-repair` is the low-priority daemon for V3-style tick persistence. It prioritizes real coverage gaps, persists already-hot Redis ticks into `pool_ticks_current`, and only calls RPC for hot pools with no cached initialized ticks. `ops/v3_tick_repair.sh` remains the manual entrypoint for one-off repairs.
+- `v3-tick-repair` is the low-priority daemon for V3-style tick persistence. It consumes the Redis `ticks:repair` queue produced by the searcher when a V3-style quote exhausts the known tick range, then refreshes that pool with a wider queued radius. When the queue is empty it only checks explicit `pool_tick_coverage` gaps; it must not scan all pools/states on every loop.
 - `ops/reconcile_tick_coverage.sh` backfills `pool_tick_coverage` from existing `pool_ticks_current` rows. Run it after historical or repaired tick loads if diagnostics show tick rows present but coverage still missing.
 - Uniswap V4 uses PoolManager log hydration into Postgres because PoolId state is manager-scoped; it cannot use the V3 pool `ticks(int24)` repair path. `v4-tick-repair` runs a recent-window PoolManager scan loop with block overlap, writes `pool_ticks_current`/`pool_tick_coverage`, and syncs Redis for promoted hot pools.
 - Health and diagnostics must treat `pool_tick_coverage` as the readiness source. A missing `ticks:index:<pool>` means "not in Redis hot cache", not necessarily "tick data missing".
