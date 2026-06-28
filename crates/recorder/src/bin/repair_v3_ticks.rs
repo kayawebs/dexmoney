@@ -70,6 +70,7 @@ async fn run_repair_once(
     pass: Option<u64>,
 ) -> Result<()> {
     let queued_repair_pools = redis.drain_tick_repair_pools(args.limit as usize).await?;
+    let queued_repair_set = queued_repair_pools.iter().copied().collect::<HashSet<_>>();
     let pools = load_repair_pools(postgres, args, &queued_repair_pools).await?;
     println!("== V3-style Tick Repair ==");
     println!(
@@ -96,8 +97,9 @@ async fn run_repair_once(
     for pool in pools {
         checked += 1;
         let address = pool.state.pool_id.address;
+        let force_refresh = args.force || queued_repair_set.contains(&address);
         let existing_ticks = redis.get_pool_ticks(address).await?;
-        if !args.force && !existing_ticks.is_empty() {
+        if !force_refresh && !existing_ticks.is_empty() {
             persisted_existing += 1;
             ticks_written += existing_ticks.len();
             if args.apply {
