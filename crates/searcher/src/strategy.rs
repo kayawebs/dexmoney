@@ -84,6 +84,7 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_missing_decimals: u64,
     pub dynamic_multihop_rough_stable_quote_failed: u64,
     pub dynamic_multihop_rough_v2_quote_failed: u64,
+    pub dynamic_multihop_rough_balancer_quote_failed: u64,
     pub dynamic_multihop_rough_missing_v3_state: u64,
     pub dynamic_multihop_rough_v3_spot_quote_failed: u64,
     pub dynamic_multihop_rough_v3_spot_overflow: u64,
@@ -177,6 +178,8 @@ impl SearchStats {
         self.dynamic_multihop_rough_stable_quote_failed +=
             other.dynamic_multihop_rough_stable_quote_failed;
         self.dynamic_multihop_rough_v2_quote_failed += other.dynamic_multihop_rough_v2_quote_failed;
+        self.dynamic_multihop_rough_balancer_quote_failed +=
+            other.dynamic_multihop_rough_balancer_quote_failed;
         self.dynamic_multihop_rough_missing_v3_state +=
             other.dynamic_multihop_rough_missing_v3_state;
         self.dynamic_multihop_rough_v3_spot_quote_failed +=
@@ -1675,6 +1678,7 @@ pub enum RoughQuoteFailure {
     MissingDecimals,
     StableQuoteFailed,
     V2QuoteFailed,
+    BalancerQuoteFailed,
     MissingV3State,
     V3SpotQuoteFailed,
     V3SpotOverflow,
@@ -1700,6 +1704,9 @@ impl SearchStats {
             }
             RoughQuoteFailure::V2QuoteFailed => {
                 self.dynamic_multihop_rough_v2_quote_failed += 1;
+            }
+            RoughQuoteFailure::BalancerQuoteFailed => {
+                self.dynamic_multihop_rough_balancer_quote_failed += 1;
             }
             RoughQuoteFailure::MissingV3State => {
                 self.dynamic_multihop_rough_missing_v3_state += 1;
@@ -1801,7 +1808,12 @@ fn rough_quote_edge_upper_bound(
         | PoolVariant::UniswapV4 => spot_quote_exact_in(state, edge.token_in, amount_in)
             .map_err(classify_v3_spot_quote_failure),
         PoolVariant::BalancerV3 => {
-            decimal_normalized_optimistic_quote(state, edge.token_in, edge.token_out, amount_in)
+            if state.balancer_model.as_deref() == Some("weighted") {
+                quote_balancer_weighted_exact_in(state, edge.token_in, edge.token_out, amount_in)
+                    .map_err(|_| RoughQuoteFailure::BalancerQuoteFailed)
+            } else {
+                decimal_normalized_optimistic_quote(state, edge.token_in, edge.token_out, amount_in)
+            }
         }
     }
 }
@@ -2735,6 +2747,13 @@ fn canonical_token_pair(a: Address, b: Address) -> (Address, Address) {
 }
 
 fn is_supported_pool(state: &PoolState) -> bool {
+    if state.token0 == Address::ZERO
+        || state.token1 == Address::ZERO
+        || state.token0 == state.token1
+    {
+        return false;
+    }
+
     match state.variant {
         PoolVariant::AerodromeVolatile => {
             if state.stable.unwrap_or(false)
@@ -2765,7 +2784,7 @@ fn is_supported_pool(state: &PoolState) -> bool {
                 _ => false,
             }
         }
-        PoolVariant::BalancerV3 => state.token0 != Address::ZERO && state.token1 != Address::ZERO,
+        PoolVariant::BalancerV3 => true,
     }
 }
 
@@ -2800,7 +2819,8 @@ mod tests {
 
     use super::{
         anchor_search_configs, demo_pool_states, expand_max_amounts, is_supported_config_pool,
-        pair_config_index, quote_balancer_weighted_exact_in, SearchEngine, SearchPath,
+        is_supported_pool, pair_config_index, quote_balancer_weighted_exact_in,
+        rough_quote_edge_upper_bound, OwnedPoolEdge, SearchEngine, SearchPath,
     };
 
     #[test]
@@ -2863,6 +2883,59 @@ mod tests {
 
         assert!(out > U256::from(40_000_000_000_000_000u64));
         assert!(out < U256::from(50_000_000_000_000_000u64));
+    }
+
+    #[test]
+    fn rough_quote_uses_balancer_model_without_token_decimals() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let weth = address!("4200000000000000000000000000000000000006");
+        let one_18 = U256::from(1_000_000_000_000_000_000u128);
+        let state = PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: address!("9999999999999999999999999999999999999999"),
+            },
+            dex: DexKind::Balancer,
+            variant: PoolVariant::BalancerV3,
+            factory_address: None,
+            token0: usdc,
+            token1: weth,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps: 10,
+            fee_pips: None,
+            pool_key_fee_pips: None,
+            hooks_address: None,
+            stable: None,
+            reserve0: Some(U256::from(100u64) * one_18),
+            reserve1: Some(one_18),
+            balancer_model: Some("weighted".to_string()),
+            balancer_weight0: Some(one_18 / U256::from(2u64)),
+            balancer_weight1: Some(one_18 / U256::from(2u64)),
+            balancer_scaling_factor0: Some(U256::from(1_000_000_000_000u64)),
+            balancer_scaling_factor1: Some(U256::from(1u64)),
+            balancer_token_rate0: Some(one_18),
+            balancer_token_rate1: Some(one_18),
+            balancer_swap_fee_percentage: Some(U256::from(1_000_000_000_000_000u64)),
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            tick_spacing: None,
+            block_number: 1,
+            valid_through_block: 1,
+            updated_at: Utc::now(),
+        };
+        let edge = OwnedPoolEdge {
+            state_index: 0,
+            pool: state.pool_id.address,
+            token_in: usdc,
+            token_out: weth,
+        };
+
+        let out = rough_quote_edge_upper_bound(&edge, &state, U256::from(5_000_000u64))
+            .expect("weighted model should not require token decimals");
+
+        assert!(out > U256::ZERO);
     }
 
     #[tokio::test]
@@ -2940,6 +3013,22 @@ mod tests {
         pool_states[classic].token0_decimals = Some(6);
         pool_states[classic].token1_decimals = Some(18);
         assert!(is_supported_config_pool(&pool_states[classic], &config));
+    }
+
+    #[test]
+    fn supported_pool_filter_rejects_invalid_token_edges() {
+        let mut pool_states =
+            demo_pool_states(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
+        let state = pool_states
+            .iter_mut()
+            .find(|state| state.variant == PoolVariant::AerodromeVolatile)
+            .unwrap();
+
+        state.token0 = Address::ZERO;
+        assert!(!is_supported_pool(state));
+
+        state.token0 = state.token1;
+        assert!(!is_supported_pool(state));
     }
 
     #[test]

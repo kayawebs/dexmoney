@@ -1380,6 +1380,79 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS factory_address TEXT"#,
         r#"CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
             ON dex_events (pool_address, block_number DESC, event_type)"#,
+        r#"CREATE TABLE IF NOT EXISTS pool_states (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chain_id BIGINT NOT NULL DEFAULT 8453,
+            pool_address TEXT NOT NULL,
+            dex TEXT NOT NULL,
+            variant TEXT,
+            factory_address TEXT,
+            token0 TEXT NOT NULL,
+            token1 TEXT NOT NULL,
+            token0_decimals BIGINT,
+            token1_decimals BIGINT,
+            fee BIGINT,
+            fee_pips BIGINT,
+            pool_key_fee_pips BIGINT,
+            hooks_address TEXT,
+            stable BOOLEAN,
+            reserve0 TEXT,
+            reserve1 TEXT,
+            balancer_model TEXT,
+            balancer_weight0 TEXT,
+            balancer_weight1 TEXT,
+            balancer_scaling_factor0 TEXT,
+            balancer_scaling_factor1 TEXT,
+            balancer_token_rate0 TEXT,
+            balancer_token_rate1 TEXT,
+            balancer_swap_fee_percentage TEXT,
+            sqrt_price_x96 TEXT,
+            liquidity TEXT,
+            tick BIGINT,
+            tick_spacing BIGINT,
+            block_number BIGINT NOT NULL,
+            valid_through_block BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL,
+            source TEXT NOT NULL DEFAULT 'unknown'
+        )"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS chain_id BIGINT NOT NULL DEFAULT 8453"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS variant TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS factory_address TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS token0_decimals BIGINT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS token1_decimals BIGINT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS fee_pips BIGINT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS pool_key_fee_pips BIGINT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS hooks_address TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS stable BOOLEAN"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_model TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_weight0 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_weight1 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_scaling_factor0 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_scaling_factor1 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_token_rate0 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_token_rate1 TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS balancer_swap_fee_percentage TEXT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS tick_spacing BIGINT"#,
+        r#"ALTER TABLE pool_states
+            ADD COLUMN IF NOT EXISTS valid_through_block BIGINT NOT NULL DEFAULT 0"#,
         r#"ALTER TABLE pool_states
             ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown'"#,
         r#"CREATE INDEX IF NOT EXISTS pool_states_pool_block_idx
@@ -1969,66 +2042,134 @@ impl RecorderStore for PostgresStore {
         if pool_states.is_empty() {
             return Ok(());
         }
+        struct PoolStateRecordRow {
+            id: uuid::Uuid,
+            chain_id: i64,
+            pool_address: String,
+            dex: String,
+            variant: String,
+            factory_address: Option<String>,
+            token0: String,
+            token1: String,
+            token0_decimals: Option<i64>,
+            token1_decimals: Option<i64>,
+            fee: i64,
+            fee_pips: Option<i64>,
+            pool_key_fee_pips: Option<i64>,
+            hooks_address: Option<String>,
+            stable: Option<bool>,
+            reserve0: Option<String>,
+            reserve1: Option<String>,
+            balancer_model: Option<String>,
+            balancer_weight0: Option<String>,
+            balancer_weight1: Option<String>,
+            balancer_scaling_factor0: Option<String>,
+            balancer_scaling_factor1: Option<String>,
+            balancer_token_rate0: Option<String>,
+            balancer_token_rate1: Option<String>,
+            balancer_swap_fee_percentage: Option<String>,
+            sqrt_price_x96: Option<String>,
+            liquidity: Option<String>,
+            tick: Option<i64>,
+            tick_spacing: Option<i64>,
+            block_number: i64,
+            valid_through_block: i64,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            source: String,
+        }
+
         let mut rows = Vec::with_capacity(pool_states.len());
         for pool_state in pool_states {
-            rows.push((
-                uuid::Uuid::new_v4(),
-                address_to_string(pool_state.pool_id.address),
-                dex_to_string(pool_state.dex),
-                address_to_string(pool_state.token0),
-                address_to_string(pool_state.token1),
-                i64::from(pool_state.fee_bps),
-                pool_state.reserve0.map(|v| v.to_string()),
-                pool_state.reserve1.map(|v| v.to_string()),
-                pool_state.sqrt_price_x96.map(|v| v.to_string()),
-                pool_state.liquidity.map(|v| v.to_string()),
-                pool_state.tick.map(i64::from),
-                i64::try_from(pool_state.block_number)?,
-                pool_state.updated_at,
-            ));
+            rows.push(PoolStateRecordRow {
+                id: uuid::Uuid::new_v4(),
+                chain_id: i64::try_from(pool_state.pool_id.chain_id)?,
+                pool_address: address_to_string(pool_state.pool_id.address),
+                dex: dex_to_string(pool_state.dex).to_string(),
+                variant: variant_to_string(pool_state.variant).to_string(),
+                factory_address: pool_state.factory_address.map(address_to_string),
+                token0: address_to_string(pool_state.token0),
+                token1: address_to_string(pool_state.token1),
+                token0_decimals: pool_state.token0_decimals.map(i64::from),
+                token1_decimals: pool_state.token1_decimals.map(i64::from),
+                fee: i64::from(pool_state.fee_bps),
+                fee_pips: pool_state.fee_pips.map(i64::from),
+                pool_key_fee_pips: pool_state.pool_key_fee_pips.map(i64::from),
+                hooks_address: pool_state.hooks_address.map(address_to_string),
+                stable: pool_state.stable,
+                reserve0: pool_state.reserve0.map(|v| v.to_string()),
+                reserve1: pool_state.reserve1.map(|v| v.to_string()),
+                balancer_model: pool_state.balancer_model,
+                balancer_weight0: pool_state.balancer_weight0.map(|v| v.to_string()),
+                balancer_weight1: pool_state.balancer_weight1.map(|v| v.to_string()),
+                balancer_scaling_factor0: pool_state
+                    .balancer_scaling_factor0
+                    .map(|v| v.to_string()),
+                balancer_scaling_factor1: pool_state
+                    .balancer_scaling_factor1
+                    .map(|v| v.to_string()),
+                balancer_token_rate0: pool_state.balancer_token_rate0.map(|v| v.to_string()),
+                balancer_token_rate1: pool_state.balancer_token_rate1.map(|v| v.to_string()),
+                balancer_swap_fee_percentage: pool_state
+                    .balancer_swap_fee_percentage
+                    .map(|v| v.to_string()),
+                sqrt_price_x96: pool_state.sqrt_price_x96.map(|v| v.to_string()),
+                liquidity: pool_state.liquidity.map(|v| v.to_string()),
+                tick: pool_state.tick.map(i64::from),
+                tick_spacing: pool_state.tick_spacing.map(i64::from),
+                block_number: i64::try_from(pool_state.block_number)?,
+                valid_through_block: i64::try_from(pool_state.valid_through_block)?,
+                updated_at: pool_state.updated_at,
+                source: source.to_string(),
+            });
         }
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO pool_states (
-                id, pool_address, dex, token0, token1, fee, reserve0, reserve1,
-                sqrt_price_x96, liquidity, tick, block_number, updated_at, source
+                id, chain_id, pool_address, dex, variant, factory_address, token0, token1,
+                token0_decimals, token1_decimals, fee, fee_pips, pool_key_fee_pips,
+                hooks_address, stable, reserve0, reserve1, balancer_model, balancer_weight0,
+                balancer_weight1, balancer_scaling_factor0, balancer_scaling_factor1,
+                balancer_token_rate0, balancer_token_rate1, balancer_swap_fee_percentage,
+                sqrt_price_x96, liquidity, tick, tick_spacing, block_number,
+                valid_through_block, updated_at, source
             )
             "#,
         );
-        query.push_values(
-            rows,
-            |mut row,
-             (
-                id,
-                pool_address,
-                dex,
-                token0,
-                token1,
-                fee,
-                reserve0,
-                reserve1,
-                sqrt_price_x96,
-                liquidity,
-                tick,
-                block_number,
-                updated_at,
-            )| {
-                row.push_bind(id)
-                    .push_bind(pool_address)
-                    .push_bind(dex)
-                    .push_bind(token0)
-                    .push_bind(token1)
-                    .push_bind(fee)
-                    .push_bind(reserve0)
-                    .push_bind(reserve1)
-                    .push_bind(sqrt_price_x96)
-                    .push_bind(liquidity)
-                    .push_bind(tick)
-                    .push_bind(block_number)
-                    .push_bind(updated_at)
-                    .push_bind(source);
-            },
-        );
+        query.push_values(rows, |mut row, record| {
+            row.push_bind(record.id)
+                .push_bind(record.chain_id)
+                .push_bind(record.pool_address)
+                .push_bind(record.dex)
+                .push_bind(record.variant)
+                .push_bind(record.factory_address)
+                .push_bind(record.token0)
+                .push_bind(record.token1)
+                .push_bind(record.token0_decimals)
+                .push_bind(record.token1_decimals)
+                .push_bind(record.fee)
+                .push_bind(record.fee_pips)
+                .push_bind(record.pool_key_fee_pips)
+                .push_bind(record.hooks_address)
+                .push_bind(record.stable)
+                .push_bind(record.reserve0)
+                .push_bind(record.reserve1)
+                .push_bind(record.balancer_model)
+                .push_bind(record.balancer_weight0)
+                .push_bind(record.balancer_weight1)
+                .push_bind(record.balancer_scaling_factor0)
+                .push_bind(record.balancer_scaling_factor1)
+                .push_bind(record.balancer_token_rate0)
+                .push_bind(record.balancer_token_rate1)
+                .push_bind(record.balancer_swap_fee_percentage)
+                .push_bind(record.sqrt_price_x96)
+                .push_bind(record.liquidity)
+                .push_bind(record.tick)
+                .push_bind(record.tick_spacing)
+                .push_bind(record.block_number)
+                .push_bind(record.valid_through_block)
+                .push_bind(record.updated_at)
+                .push_bind(record.source);
+        });
         query.build().execute(&self.pool).await?;
         Ok(())
     }
