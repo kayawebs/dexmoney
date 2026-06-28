@@ -14,9 +14,10 @@ use base_arb_common::types::{
     Candidate, DexKind, PoolState, PoolVariant, TickState, TokenPairSearchConfig,
 };
 use base_arb_storage::{
-    postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore,
-    PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
-    TickRepairStore, TickStateStore,
+    postgres::{FactoryRegistryRecord, PostgresStore},
+    redis::RedisStore,
+    CandidateStore, CurrentBlockStore, PoolChangeStore, PoolStateStore, RecorderStore,
+    TickChangeStore, TickRepairStore, TickStateStore,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -374,7 +375,100 @@ struct SearchRuntime {
     last_active_pool_sweep: Option<Instant>,
     path_index: Option<strategy::PathIndex>,
     graph_snapshot: Option<strategy::GraphSnapshot>,
+    trusted_factories: TrustedFactorySet,
     bootstrapped: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TrustedFactorySet {
+    aerodrome_volatile: HashSet<Address>,
+    aerodrome_slipstream: HashSet<Address>,
+    uniswap_v3: HashSet<Address>,
+    pancake_v3: HashSet<Address>,
+}
+
+impl TrustedFactorySet {
+    fn from_settings_and_registry(
+        settings: &Settings,
+        registry: &[FactoryRegistryRecord],
+    ) -> Self {
+        let mut set = Self::default();
+        set.insert_optional(PoolVariant::AerodromeVolatile, settings.aerodrome_pool_factory);
+        set.insert_optional(
+            PoolVariant::AerodromeSlipstream,
+            settings.aerodrome_slipstream_factory,
+        );
+        set.insert_optional(PoolVariant::UniswapV3, settings.uniswap_v3_factory);
+        set.insert_optional(PoolVariant::PancakeV3, settings.pancake_v3_factory);
+        set.insert_constant(PoolVariant::AerodromeVolatile, AERODROME_CLASSIC_FACTORY);
+        set.insert_constant(PoolVariant::AerodromeVolatile, UNISWAP_V2_FACTORY);
+        for factory in AERODROME_SLIPSTREAM_FACTORIES {
+            set.insert_constant(PoolVariant::AerodromeSlipstream, factory);
+        }
+        set.insert_constant(PoolVariant::UniswapV3, UNISWAP_V3_FACTORY);
+        set.insert_constant(PoolVariant::PancakeV3, PANCAKE_V3_FACTORY);
+
+        for row in registry {
+            let Ok(address) = row.factory_address.parse::<Address>() else {
+                continue;
+            };
+            let Some(variant) = parse_pool_variant(&row.variant) else {
+                continue;
+            };
+            set.insert(variant, address);
+        }
+        set
+    }
+
+    fn len(&self) -> usize {
+        self.aerodrome_volatile.len()
+            + self.aerodrome_slipstream.len()
+            + self.uniswap_v3.len()
+            + self.pancake_v3.len()
+    }
+
+    fn supports(&self, state: &PoolState) -> bool {
+        let Some(factory) = state.factory_address else {
+            return false;
+        };
+        match state.variant {
+            PoolVariant::AerodromeVolatile => self.aerodrome_volatile.contains(&factory),
+            PoolVariant::AerodromeSlipstream => self.aerodrome_slipstream.contains(&factory),
+            PoolVariant::UniswapV3 => self.uniswap_v3.contains(&factory),
+            PoolVariant::PancakeV3 => self.pancake_v3.contains(&factory),
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
+        }
+    }
+
+    fn insert_optional(&mut self, variant: PoolVariant, address: Option<Address>) {
+        if let Some(address) = address {
+            self.insert(variant, address);
+        }
+    }
+
+    fn insert_constant(&mut self, variant: PoolVariant, address: &str) {
+        if let Ok(address) = address.parse::<Address>() {
+            self.insert(variant, address);
+        }
+    }
+
+    fn insert(&mut self, variant: PoolVariant, address: Address) {
+        match variant {
+            PoolVariant::AerodromeVolatile => {
+                self.aerodrome_volatile.insert(address);
+            }
+            PoolVariant::AerodromeSlipstream => {
+                self.aerodrome_slipstream.insert(address);
+            }
+            PoolVariant::UniswapV3 => {
+                self.uniswap_v3.insert(address);
+            }
+            PoolVariant::PancakeV3 => {
+                self.pancake_v3.insert(address);
+            }
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,11 +498,11 @@ impl From<&PoolState> for PoolTopology {
     }
 }
 
-async fn run_search_cycle<P, C, R>(
+async fn run_search_cycle<P, C>(
     runtime: &mut SearchRuntime,
     pool_store: &P,
     candidate_store: &C,
-    config_store: &R,
+    config_store: &PostgresStore,
     opportunity_recorder: &OpportunityRecordQueue,
     settings: &Settings,
     candidate_ttl_ms: i64,
@@ -424,7 +518,6 @@ where
         + TickRepairStore
         + TickStateStore,
     C: CandidateStore,
-    R: PairSearchConfigStore,
 {
     let cycle_started = Instant::now();
     if !runtime.bootstrapped {
@@ -472,6 +565,22 @@ where
     let mut config_changed = false;
     if runtime.engine.is_none() || config_refresh_due {
         let pair_configs = config_store.enabled_pair_search_configs().await?;
+        let trusted_factory_rows = config_store
+            .trusted_factory_registry(settings.chain_id)
+            .await?;
+        let trusted_factories =
+            TrustedFactorySet::from_settings_and_registry(settings, &trusted_factory_rows);
+        if runtime.trusted_factories != trusted_factories {
+            runtime.trusted_factories = trusted_factories;
+            runtime.path_index = None;
+            runtime.graph_snapshot = None;
+            runtime.last_active_pool_sweep = None;
+            config_changed = true;
+            info!(
+                trusted_factories = runtime.trusted_factories.len(),
+                "searcher trusted factory registry refreshed"
+            );
+        }
         if runtime.engine.is_none() || runtime.pair_configs != pair_configs {
             runtime.engine = Some(strategy::engine_from_settings(
                 settings,
@@ -513,7 +622,8 @@ where
             Some(state) => {
                 let topology = PoolTopology::from(&state);
                 let was_active = runtime.active_pool_addresses.contains(&pool);
-                let quote_ready = is_pool_state_quote_ready(&state, settings);
+                let quote_ready =
+                    is_pool_state_quote_ready(&state, settings, &runtime.trusted_factories);
                 if quote_ready
                     && (!state.is_stale(now, max_pool_state_age_ms)
                         || changed_pools.contains(&pool))
@@ -725,9 +835,12 @@ fn active_pool_addresses<'a>(
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> HashSet<Address> {
     pool_states
-        .filter(|state| is_pool_state_active(state, now, max_pool_state_age_ms, settings))
+        .filter(|state| {
+            is_pool_state_active(state, now, max_pool_state_age_ms, settings, trusted_factories)
+        })
         .map(|state| state.pool_id.address)
         .collect()
 }
@@ -772,6 +885,7 @@ fn refresh_active_pool_cache_if_due(
         now,
         max_pool_state_age_ms,
         settings,
+        &runtime.trusted_factories,
     );
     let changed = active_pool_addresses != runtime.active_pool_addresses;
     runtime.active_pool_addresses = active_pool_addresses;
@@ -792,7 +906,8 @@ fn force_changed_quote_ready_pools_active(
         let Some(state) = runtime.pool_states.get(pool) else {
             continue;
         };
-        if is_pool_state_quote_ready(state, settings) && runtime.active_pool_addresses.insert(*pool)
+        if is_pool_state_quote_ready(state, settings, &runtime.trusted_factories)
+            && runtime.active_pool_addresses.insert(*pool)
         {
             changed = true;
         }
@@ -811,31 +926,28 @@ fn is_pool_state_active(
     now: DateTime<Utc>,
     max_pool_state_age_ms: i64,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> bool {
     if state.is_stale(now, max_pool_state_age_ms) {
         return false;
     }
-    is_pool_state_quote_ready(state, settings)
+    is_pool_state_quote_ready(state, settings, trusted_factories)
 }
 
-fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
+fn is_pool_state_quote_ready(
+    state: &PoolState,
+    settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
+) -> bool {
     match state.variant {
         PoolVariant::AerodromeVolatile => {
-            if !is_supported_factory(
-                state,
-                settings.aerodrome_pool_factory,
-                &[AERODROME_CLASSIC_FACTORY, UNISWAP_V2_FACTORY],
-            ) {
+            if !is_supported_factory(state, trusted_factories) {
                 return false;
             }
             is_nonzero_u256(state.reserve0) && is_nonzero_u256(state.reserve1)
         }
         PoolVariant::AerodromeSlipstream => {
-            if !is_supported_factory(
-                state,
-                settings.aerodrome_slipstream_factory,
-                &AERODROME_SLIPSTREAM_FACTORIES,
-            ) {
+            if !is_supported_factory(state, trusted_factories) {
                 return false;
             }
             state.sqrt_price_x96.is_some()
@@ -843,7 +955,7 @@ fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
                 && state.tick.is_some()
         }
         PoolVariant::UniswapV3 => {
-            if !is_supported_factory(state, settings.uniswap_v3_factory, &[UNISWAP_V3_FACTORY]) {
+            if !is_supported_factory(state, trusted_factories) {
                 return false;
             }
             state.sqrt_price_x96.is_some()
@@ -851,7 +963,7 @@ fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
                 && state.tick.is_some()
         }
         PoolVariant::PancakeV3 => {
-            if !is_supported_factory(state, settings.pancake_v3_factory, &[PANCAKE_V3_FACTORY]) {
+            if !is_supported_factory(state, trusted_factories) {
                 return false;
             }
             state.sqrt_price_x96.is_some()
@@ -876,18 +988,21 @@ fn is_pool_state_quote_ready(state: &PoolState, settings: &Settings) -> bool {
 
 fn is_supported_factory(
     state: &PoolState,
-    configured: Option<Address>,
-    fallback_supported: &[&str],
+    trusted_factories: &TrustedFactorySet,
 ) -> bool {
-    let Some(factory) = state.factory_address else {
-        return false;
-    };
-    if configured == Some(factory) {
-        return true;
+    trusted_factories.supports(state)
+}
+
+fn parse_pool_variant(value: &str) -> Option<PoolVariant> {
+    match value {
+        "AerodromeVolatile" => Some(PoolVariant::AerodromeVolatile),
+        "AerodromeSlipstream" => Some(PoolVariant::AerodromeSlipstream),
+        "UniswapV3" => Some(PoolVariant::UniswapV3),
+        "PancakeV3" => Some(PoolVariant::PancakeV3),
+        "UniswapV4" => Some(PoolVariant::UniswapV4),
+        "BalancerV3" => Some(PoolVariant::BalancerV3),
+        _ => None,
     }
-    fallback_supported
-        .iter()
-        .any(|expected| address_eq_str(factory, expected))
 }
 
 fn is_supported_manager(state: &PoolState, configured: Option<Address>) -> bool {
@@ -895,13 +1010,6 @@ fn is_supported_manager(state: &PoolState, configured: Option<Address>) -> bool 
         return false;
     };
     configured == Some(factory)
-}
-
-fn address_eq_str(address: Address, expected: &str) -> bool {
-    expected
-        .parse::<Address>()
-        .map(|expected| address == expected)
-        .unwrap_or(false)
 }
 
 fn is_nonzero_u256(value: Option<U256>) -> bool {

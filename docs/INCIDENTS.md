@@ -1341,3 +1341,70 @@ Keep the rolling competitor report as the first diagnostic for opportunity
 scarcity. A future `covered_no_opportunity_near_block` must be mapped to one of
 path generation, quote skip, impact guard, min profit, amount config, or
 unsupported flow before changing hot-path search logic.
+
+## 2026-06-28 - Trusted Factory Registry Not Used By Searcher
+
+### Symptom
+
+Competitor report `competitor-gap-20260628T231709Z` classified tx
+`0xb981459fc52aac252e81675ad5f10ef1936bddfd1e439761135cfc42c751b13c` as
+`recognized_anchor_cycle_but_no_opportunity`. The reconstructed cycles used
+supported local variants with pool state and tick data present, but production
+path generation returned `path_generated=no`.
+
+### Evidence
+
+- Diagnostic before the fix stopped at `root_stage=path_generation`.
+- SQL showed the excluded pools were not missing data:
+  - `0x62046274558e152f0e318d12666a9da93ccd2cc8`:
+    `AerodromeVolatile`, nonzero reserves, factory
+    `0xed8db60acc29e14bc867a497d94ca6e3ceb5ec04`,
+    `factory_registry.trusted=true`, `enabled=true`.
+  - `0x1131db5977242a03ebead1acd18f80a9a29e5922`:
+    `UniswapV3`, nonzero liquidity/tick/sqrt price, `262` ticks, factory
+    `0xf8f2eb4940cfe7d13603dddd87f123820fc061ef`,
+    `factory_registry.trusted=true`, `enabled=true`.
+- The searcher `is_pool_state_quote_ready` path only accepted a single
+  configured factory plus hardcoded fallbacks. It did not read the trusted
+  factory registry, while market-data and discovery already did.
+
+### Root Cause
+
+`pools.enabled=true` and `factory_registry.trusted=true` were not sufficient for
+searcher path generation. Searcher had a separate factory allowlist embedded in
+settings/constants, so trusted fork factories discovered from competitor/global
+swap flow could be stored and updated but still excluded by the active-state
+guard.
+
+### Fix
+
+- Searcher now refreshes trusted factories from `factory_registry` together
+  with pair configs and uses that set in `is_pool_state_quote_ready`.
+- The diagnostic tool now reads the same trusted factory registry, so
+  competitor path-generation reports match production eligibility.
+- Unknown or untrusted factories are still excluded; this is not a global
+  factory bypass.
+
+### Verification
+
+On the cloud node, after syncing the updated diagnostic, rerunning the sample
+showed:
+
+```text
+trusted_factories: 178
+production_path_generated: yes
+production_path_generation_reason: all cycle edges are present in dynamic graph fanout
+```
+
+Current-state exact probes for the same tx still rejected at min profit, so
+this verification only proves the path-generation fix. It does not prove the
+historical quote at the competitor block.
+
+### Regression Guard
+
+When a future competitor report says
+`recognized_anchor_cycle_but_no_opportunity`, first run
+`ops/competitor_searcher_pipeline_diag.sh --tx-hash <hash>`. If all pools are
+trusted and data-ready but `path_generated=no`, inspect the exact
+`path_generation_reason` before changing protocol support, amount config, or
+execution logic.

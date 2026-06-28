@@ -134,6 +134,21 @@ Latest evidence:
 - The same searcher-quality report produced only `6` opportunities and `14`
   emitted candidates, so impact50 is a material opportunity-scarcity suspect,
   but it is not yet proven to explain the competitor near-block misses.
+- 2026-06-28 23:17Z lightweight competitor report
+  `competitor-gap-20260628T231709Z` proved a path-generation miss on already
+  observed, locally state-ready, locally tick-ready, trusted-factory pools:
+  tx `0xb981459fc52aac252e81675ad5f10ef1936bddfd1e439761135cfc42c751b13c`
+  reconstructed two USDC anchor cycles using supported V3-style/classic
+  variants. Before the fix, both cycles stopped at `path_generated=no` because
+  `0x62046274558e152f0e318d12666a9da93ccd2cc8` and
+  `0x1131db5977242a03ebead1acd18f80a9a29e5922` were excluded by the
+  active-state guard. SQL showed both factories were already
+  `factory_registry.trusted=true/enabled=true`; the real bug was that searcher
+  quote-readiness only used `.env`/hardcoded factory addresses and ignored the
+  trusted factory registry. After updating the diagnostic to read
+  `factory_registry`, the same tx reports `production_path_generated=yes` for
+  both cycles. Current-state exact probes still show `min_profit_rejected`, so
+  this sample proves the path-generation bug, not historical profitability.
 
 Priority order:
 
@@ -201,6 +216,12 @@ Priority order:
     `0x6a003d20...e018d` and fresh competitor reports should no longer classify
     changed-pool-ready cycles as `root_stage=path_generation` solely because of
     top-16 fanout or time-based active guard.
+  - 2026-06-28 follow-up root cause: path generation also missed
+    trusted-factory fork pools because searcher did not load
+    `factory_registry`. This is distinct from fanout and tick coverage. The
+    narrow fix is to refresh trusted factories alongside pair configs and use
+    that set for `is_pool_state_quote_ready`; unknown/untrusted factories remain
+    excluded.
   - Follow-up P0 evidence after the fanout fix: the same sample still used
     pool `0xfa65a76655f3c0641b79e89de3f51459c3727823`, which is created by
     `0x8909dc15e40173ff4699343b6eb8132c65e18ec6`. Onchain this factory supports
