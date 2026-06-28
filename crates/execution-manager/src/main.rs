@@ -232,6 +232,20 @@ where
         if circuit_breaker.is_halted(settings) {
             anyhow::bail!("execution circuit breaker halted; no candidates were popped");
         }
+        reconcile_pending_worker_lanes(
+            eoa_store,
+            recorder,
+            provider,
+            settings,
+            runtime,
+            circuit_breaker,
+        )
+        .await?;
+        if circuit_breaker.is_halted(settings) {
+            anyhow::bail!(
+                "execution circuit breaker halted after pending lane reconciliation; no candidates were popped"
+            );
+        }
         match select_cached_ready_worker(eoa_store, runtime).await? {
             Some(wallet) => Some(wallet),
             None => {
@@ -1183,6 +1197,35 @@ where
         sync_idle_lane(&mut lane, provider).await?;
         fund_worker_lane_if_needed(&mut lane, provider, settings, runtime).await?;
         eoa_store.set_lane_state(lane.state.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_pending_worker_lanes<E, R>(
+    eoa_store: &E,
+    recorder: &R,
+    provider: &ChainProvider,
+    settings: &Settings,
+    runtime: &ExecutionRuntime,
+    circuit_breaker: &mut ExecutionCircuitBreaker,
+) -> Result<()>
+where
+    E: EoaStateStore,
+    R: RecorderStore + PendingTransactionStore,
+{
+    for worker in &runtime.worker_wallets {
+        let Some(state) = eoa_store.get_lane_state(worker.address()).await? else {
+            continue;
+        };
+        if state.status != EoaLaneStatus::Pending {
+            continue;
+        }
+        let mut lane = eoa_lane::EoaLane { state };
+        if let Some(success) =
+            handle_pending_lane(&mut lane, eoa_store, recorder, provider, worker, settings).await?
+        {
+            circuit_breaker.observe_arb_receipt(success, settings);
+        }
     }
     Ok(())
 }

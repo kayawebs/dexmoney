@@ -72,22 +72,13 @@ pub fn spot_quote_exact_in(
     if sqrt_price_x96.is_zero() {
         return Err(ArbBotError::Quote("empty sqrt_price_x96".into()));
     }
+    let price_x192 = U512::from(sqrt_price_x96)
+        .checked_mul(U512::from(sqrt_price_x96))
+        .ok_or_else(|| ArbBotError::Quote("price overflow".into()))?;
     if token_in == pool_state.token0 {
-        let price_x192 = sqrt_price_x96
-            .checked_mul(sqrt_price_x96)
-            .ok_or_else(|| ArbBotError::Quote("price overflow".into()))?;
-        amount_in
-            .checked_mul(price_x192)
-            .and_then(|value| value.checked_div(q192()))
-            .ok_or_else(|| ArbBotError::Quote("spot quote overflow".into()))
+        mul_div_u512(amount_in, price_x192, U512::from(q192()))
     } else if token_in == pool_state.token1 {
-        let price_x192 = sqrt_price_x96
-            .checked_mul(sqrt_price_x96)
-            .ok_or_else(|| ArbBotError::Quote("price overflow".into()))?;
-        amount_in
-            .checked_mul(q192())
-            .and_then(|value| value.checked_div(price_x192))
-            .ok_or_else(|| ArbBotError::Quote("spot quote overflow".into()))
+        mul_div_u512(amount_in, U512::from(q192()), price_x192)
     } else {
         Err(ArbBotError::Quote("token_in not in pool".into()))
     }
@@ -490,6 +481,16 @@ fn mul_div(a: U256, b: U256, denominator: U256) -> Result<U256> {
     u512_to_u256((U512::from(a) * U512::from(b)) / U512::from(denominator))
 }
 
+fn mul_div_u512(a: U256, b: U512, denominator: U512) -> Result<U256> {
+    if denominator.is_zero() {
+        return Err(ArbBotError::Quote("division by zero".into()));
+    }
+    let numerator = U512::from(a)
+        .checked_mul(b)
+        .ok_or_else(|| ArbBotError::Quote("spot quote overflow".into()))?;
+    u512_to_u256(numerator / denominator)
+}
+
 fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Result<U256> {
     if denominator.is_zero() {
         return Err(ArbBotError::Quote("division by zero".into()));
@@ -810,5 +811,52 @@ mod tests {
         assert_eq!(diagnostics.ticks_used, 3);
         assert_eq!(diagnostics.crossed_ticks, 2);
         assert!(!diagnostics.tick_range_exhausted);
+    }
+
+    #[test]
+    fn spot_quote_handles_high_tick_without_u256_price_overflow() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let sapien = address!("c729777d0470F30612B1564Fd96E8Dd26f5814E3");
+        let state = PoolState {
+            pool_id: PoolId {
+                chain_id: 8453,
+                address: address!("3e7931b43e955b6aFCd800E25170DC9b89556ad8"),
+            },
+            dex: DexKind::UniswapV3,
+            variant: PoolVariant::UniswapV3,
+            factory_address: Some(address!("33128a8fC17869897dcE68Ed026d694621f6FDfD")),
+            token0: usdc,
+            token1: sapien,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps: 100,
+            fee_pips: Some(10_000),
+            pool_key_fee_pips: None,
+            hooks_address: None,
+            stable: None,
+            reserve0: None,
+            reserve1: None,
+            balancer_model: None,
+            balancer_weight0: None,
+            balancer_weight1: None,
+            balancer_scaling_factor0: None,
+            balancer_scaling_factor1: None,
+            balancer_token_rate0: None,
+            balancer_token_rate1: None,
+            balancer_swap_fee_percentage: None,
+            sqrt_price_x96: Some(
+                U256::from_str_radix("435304320653430368601368673715936847", 10).unwrap(),
+            ),
+            liquidity: Some(U256::from(24_839_845_858_375u64)),
+            tick: Some(310_400),
+            tick_spacing: Some(200),
+            block_number: 47_910_731,
+            valid_through_block: 47_910_731,
+            updated_at: Utc::now(),
+        };
+
+        let quote = spot_quote_exact_in(&state, usdc, U256::from(1_358_126u64)).unwrap();
+
+        assert!(quote > U256::ZERO);
     }
 }
