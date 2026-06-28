@@ -60,6 +60,57 @@ services:
       - --interval-ms
       - "${V4_METADATA_HYDRATOR_INTERVAL_MS:-30000}"
 
+  v3-tick-repair:
+    <<: *app-common
+    container_name: dexmoney-v3-tick-repair
+    image: dexmoney-v3-tick-repair:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_PACKAGE: base-arb-recorder
+        APP_BIN: repair_v3_ticks
+    command:
+      - app
+      - --loop
+      - --apply
+      - --gaps-only
+      - --limit
+      - "${V3_TICK_REPAIR_LIMIT:-100}"
+      - --max-age-hours
+      - "${V3_TICK_REPAIR_MAX_AGE_HOURS:-2}"
+      - --word-radius
+      - "${V3_TICK_REPAIR_WORD_RADIUS:-64}"
+      - --interval-secs
+      - "${V3_TICK_REPAIR_INTERVAL_SECS:-30}"
+
+  v4-tick-repair:
+    <<: *app-common
+    container_name: dexmoney-v4-tick-repair
+    image: dexmoney-v4-tick-repair:${DEXMONEY_IMAGE_TAG:-latest}
+    build:
+      context: .
+      args:
+        APP_PACKAGE: base-arb-recorder
+        APP_BIN: hydrate_uniswap_v4_ticks
+    command:
+      - app
+      - --loop
+      - --manager-scan
+      - --apply
+      - --refresh-existing
+      - --limit
+      - "${V4_TICK_REPAIR_LIMIT:-1000}"
+      - --max-lookback-blocks
+      - "${V4_TICK_REPAIR_INITIAL_LOOKBACK_BLOCKS:-5000}"
+      - --chunk-blocks
+      - "${V4_TICK_REPAIR_CHUNK_BLOCKS:-1000}"
+      - --flush-pool-batch-size
+      - "${V4_TICK_REPAIR_FLUSH_POOL_BATCH_SIZE:-256}"
+      - --loop-overlap-blocks
+      - "${V4_TICK_REPAIR_LOOP_OVERLAP_BLOCKS:-20}"
+      - --interval-ms
+      - "${V4_TICK_REPAIR_INTERVAL_MS:-30000}"
+
   searcher:
     <<: *app-common
     container_name: dexmoney-searcher

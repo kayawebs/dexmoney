@@ -172,11 +172,12 @@ Protocol support is only complete when all layers work together:
 
 Current protocol priorities:
 
-- V3-style pools: keep targeted hot-pool tick repair and durable coverage
+- V3-style pools: keep the `v3-tick-repair` hot-pool daemon and durable coverage
   reconciliation working. Do not do full chain-wide V3 tick scans unless a
   measured gap justifies it.
 - Uniswap V4: maintain full PoolManager metadata/tick coverage in Postgres, then
-  promote only supported static-fee/safe-hook quoteable pools to Redis.
+  use the `v4-tick-repair` incremental PoolManager scan for hot tick freshness
+  and promote only supported static-fee/safe-hook quoteable pools to Redis.
 - Balancer V3: expand local math coverage beyond the current weighted-pool path
   only when competitor gap reports show material missed profit.
 - New protocols: prefer adapter expansion behind the stable Hub entrypoint; avoid

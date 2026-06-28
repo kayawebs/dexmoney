@@ -101,6 +101,14 @@ async fn main() -> Result<()> {
                     aggregate.search.quote_skipped_tick_range_exhausted,
                 quote_skipped_error = aggregate.search.quote_skipped_error,
                 price_impact_rejected = aggregate.search.price_impact_rejected,
+                price_impact_shadow_pass_100_bps =
+                    aggregate.search.price_impact_shadow_pass_100_bps,
+                price_impact_shadow_pass_150_bps =
+                    aggregate.search.price_impact_shadow_pass_150_bps,
+                price_impact_shadow_pass_300_bps =
+                    aggregate.search.price_impact_shadow_pass_300_bps,
+                price_impact_shadow_pass_500_bps =
+                    aggregate.search.price_impact_shadow_pass_500_bps,
                 quote_model_edge_rejected = aggregate.search.quote_model_edge_rejected,
                 min_profit_rejected = aggregate.search.min_profit_rejected,
                 candidates_emitted = aggregate.search.candidates_emitted,
@@ -157,6 +165,10 @@ async fn main() -> Result<()> {
                 opportunities_created = aggregate.opportunities_created,
                 best_profit_before_impact = %aggregate.search.best_profit_before_impact,
                 best_profit_rejected_by_impact = %aggregate.search.best_profit_rejected_by_impact,
+                best_profit_shadow_pass_100_bps = %aggregate.search.best_profit_shadow_pass_100_bps,
+                best_profit_shadow_pass_150_bps = %aggregate.search.best_profit_shadow_pass_150_bps,
+                best_profit_shadow_pass_300_bps = %aggregate.search.best_profit_shadow_pass_300_bps,
+                best_profit_shadow_pass_500_bps = %aggregate.search.best_profit_shadow_pass_500_bps,
                 best_profit_rejected_by_model_edge = %aggregate.search.best_profit_rejected_by_model_edge,
                 best_profit_after_impact = %aggregate.search.best_profit,
                 top_min_profit_rejected = %aggregate.search.top_min_profit_rejected_summary(),

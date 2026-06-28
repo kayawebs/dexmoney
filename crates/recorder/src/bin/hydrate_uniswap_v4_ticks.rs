@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, env, str::FromStr, time::Instant};
+use std::{
+    collections::BTreeMap,
+    env,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
@@ -34,6 +39,9 @@ struct Cli {
     sync_redis: bool,
     refresh_existing: bool,
     flush_pool_batch_size: usize,
+    loop_enabled: bool,
+    interval_ms: u64,
+    loop_overlap_blocks: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -79,14 +87,67 @@ async fn main() -> Result<()> {
     ensure_registry_schema(&store.pool).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
+
+    if cli.loop_enabled {
+        println!(
+            "== Uniswap V4 Tick Hydration Daemon == mode={} interval_ms={} overlap_blocks={} limit={} chunk_blocks={} sync_redis={}",
+            if cli.apply { "apply" } else { "dry-run" },
+            cli.interval_ms,
+            cli.loop_overlap_blocks,
+            cli.limit,
+            cli.chunk_blocks,
+            cli.sync_redis,
+        );
+        let mut pass = 0u64;
+        let mut last_to_block: Option<u64> = None;
+        loop {
+            pass = pass.saturating_add(1);
+            let latest_block = match provider.get_block_number().await {
+                Ok(block) => block,
+                Err(err) => {
+                    eprintln!("v4 tick hydration latest block failed pass={pass} error={err:#}");
+                    tokio::time::sleep(Duration::from_millis(cli.interval_ms)).await;
+                    continue;
+                }
+            };
+            let mut pass_cli = cli.clone();
+            pass_cli.to_block = Some(latest_block);
+            if let Some(last_to) = last_to_block {
+                pass_cli.from_block = Some(last_to.saturating_sub(cli.loop_overlap_blocks));
+                pass_cli.max_lookback_blocks = None;
+            }
+            match run_hydration_once(&settings, &store, &redis, &provider, &pass_cli, Some(pass))
+                .await
+            {
+                Ok(_) => last_to_block = Some(latest_block),
+                Err(err) => eprintln!("v4 tick hydration pass failed pass={pass} error={err:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(cli.interval_ms)).await;
+        }
+    }
+
+    run_hydration_once(&settings, &store, &redis, &provider, &cli, None).await?;
+    Ok(())
+}
+
+async fn run_hydration_once(
+    settings: &Settings,
+    store: &PostgresStore,
+    redis: &RedisStore,
+    provider: &ChainProvider,
+    cli: &Cli,
+    pass: Option<u64>,
+) -> Result<Summary> {
     let latest_block = provider.get_block_number().await?;
     let to_block = cli.to_block.unwrap_or(latest_block);
 
     let pools = fetch_quoteable_v4_pools(&store, settings.chain_id, cli.limit).await?;
     println!("== Uniswap V4 Tick Hydration ==");
     println!(
-        "mode={} pools={} to_block={} chunk_blocks={} sync_redis={}",
+        "mode={} pass={} pools={} to_block={} chunk_blocks={} sync_redis={}",
         if cli.apply { "apply" } else { "dry-run" },
+        pass.map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         pools.len(),
         to_block,
         cli.chunk_blocks,
@@ -189,7 +250,7 @@ async fn main() -> Result<()> {
         "invalid_logs={} negative_gross_ticks={}",
         summary.invalid_logs, summary.negative_gross_ticks
     );
-    Ok(())
+    Ok(summary)
 }
 
 async fn fetch_quoteable_v4_pools(
@@ -898,6 +959,9 @@ where
         sync_redis: true,
         refresh_existing: false,
         flush_pool_batch_size: DEFAULT_MANAGER_SCAN_FLUSH_POOL_BATCH_SIZE,
+        loop_enabled: false,
+        interval_ms: 30_000,
+        loop_overlap_blocks: 20,
     };
 
     while let Some(arg) = args.next() {
@@ -913,6 +977,11 @@ where
             "--apply" => cli.apply = true,
             "--no-redis" => cli.sync_redis = false,
             "--refresh-existing" => cli.refresh_existing = true,
+            "--loop" => cli.loop_enabled = true,
+            "--interval-ms" => cli.interval_ms = parse_next(&mut args, "--interval-ms")?,
+            "--loop-overlap-blocks" => {
+                cli.loop_overlap_blocks = parse_next(&mut args, "--loop-overlap-blocks")?
+            }
             "--flush-pool-batch-size" => {
                 cli.flush_pool_batch_size = parse_next(&mut args, "--flush-pool-batch-size")?
             }
@@ -928,6 +997,9 @@ where
     }
     if cli.flush_pool_batch_size == 0 {
         anyhow::bail!("--flush-pool-batch-size must be > 0");
+    }
+    if cli.loop_enabled && cli.interval_ms == 0 {
+        anyhow::bail!("--interval-ms must be > 0");
     }
     Ok(cli)
 }
@@ -946,7 +1018,7 @@ where
 
 fn print_help() {
     println!(
-        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--flush-pool-batch-size 256] [--refresh-existing] [--apply] [--no-redis]\n\nUse --limit 0 to select all quoteable V4 pools. With --apply, ticks are written to Postgres pool_ticks_current and, unless --no-redis is set, synced to Redis for search."
+        "Usage: hydrate_uniswap_v4_ticks [--from-block N] [--to-block N] [--max-lookback-blocks N] [--limit 200] [--chunk-blocks 10000] [--manager-scan] [--flush-pool-batch-size 256] [--refresh-existing] [--loop] [--interval-ms 30000] [--loop-overlap-blocks 20] [--apply] [--no-redis]\n\nUse --limit 0 to select all quoteable V4 pools. With --apply, ticks are written to Postgres pool_ticks_current and, unless --no-redis is set, synced to Redis for search. In --loop mode, the first pass uses the configured range/lookback; later passes scan incrementally from the previous to_block minus the overlap."
     );
 }
 

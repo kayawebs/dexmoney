@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::env;
+use std::{collections::HashSet, env, time::Duration};
 
 use alloy_primitives::{Address, U256};
 use anyhow::{anyhow, Context, Result};
@@ -20,6 +19,8 @@ struct Args {
     word_radius: i32,
     gaps_only: bool,
     pools: HashSet<Address>,
+    loop_enabled: bool,
+    interval_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -36,16 +37,51 @@ async fn main() -> Result<()> {
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
 
-    let pools = load_repair_pools(&postgres, &args).await?;
+    if args.loop_enabled {
+        println!(
+            "== V3-style Tick Repair Daemon == mode={} interval_secs={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
+            if args.apply { "apply" } else { "dry-run" },
+            args.interval_secs,
+            args.limit,
+            args.max_age_hours,
+            args.word_radius,
+            args.force,
+            args.gaps_only,
+        );
+        let mut pass = 0u64;
+        loop {
+            pass = pass.saturating_add(1);
+            if let Err(err) = run_repair_once(&provider, &postgres, &redis, &args, Some(pass)).await
+            {
+                eprintln!("repair pass failed pass={pass} error={err:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(args.interval_secs)).await;
+        }
+    }
+
+    run_repair_once(&provider, &postgres, &redis, &args, None).await
+}
+
+async fn run_repair_once(
+    provider: &ChainProvider,
+    postgres: &PostgresStore,
+    redis: &RedisStore,
+    args: &Args,
+    pass: Option<u64>,
+) -> Result<()> {
+    let pools = load_repair_pools(postgres, args).await?;
     println!("== V3-style Tick Repair ==");
     println!(
-        "mode={} pools={} limit={} max_age_hours={} word_radius={} force={}",
+        "mode={} pass={} pools={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
         if args.apply { "apply" } else { "dry-run" },
+        pass.map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         pools.len(),
         args.limit,
         args.max_age_hours,
         args.word_radius,
-        args.force
+        args.force,
+        args.gaps_only,
     );
 
     let mut checked = 0usize;
@@ -225,6 +261,8 @@ fn parse_args() -> Result<Args> {
         word_radius: 8,
         gaps_only: false,
         pools: HashSet::new(),
+        loop_enabled: false,
+        interval_secs: 30,
     };
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -232,6 +270,7 @@ fn parse_args() -> Result<Args> {
             "--apply" => args.apply = true,
             "--force" => args.force = true,
             "--gaps-only" => args.gaps_only = true,
+            "--loop" => args.loop_enabled = true,
             "--limit" => {
                 args.limit = iter
                     .next()
@@ -252,6 +291,13 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow!("--word-radius requires a value"))?
                     .parse()
                     .context("invalid --word-radius")?;
+            }
+            "--interval-secs" => {
+                args.interval_secs = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--interval-secs requires a value"))?
+                    .parse()
+                    .context("invalid --interval-secs")?;
             }
             "--pool" => {
                 let pool = iter
@@ -277,12 +323,15 @@ fn parse_args() -> Result<Args> {
     if args.word_radius < 0 {
         anyhow::bail!("--word-radius must be non-negative");
     }
+    if args.loop_enabled && args.interval_secs == 0 {
+        anyhow::bail!("--interval-secs must be positive");
+    }
     Ok(args)
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: repair_v3_ticks [--apply] [--force] [--gaps-only] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
+        "Usage: repair_v3_ticks [--apply] [--force] [--gaps-only] [--loop] [--interval-secs 30] [--limit 100] [--max-age-hours 24] [--word-radius 8] [--pool 0x...]"
     );
 }
 

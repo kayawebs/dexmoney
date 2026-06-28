@@ -116,7 +116,7 @@ section "2. searcher key counters"
   echo
   echo "summary field extracts:"
   grep "searcher cycle summary" "$SEARCHER_LOG" \
-    | grep -oE "latest_chain_block=[0-9]+|latest_pool_state_block=[0-9]+|quote_attempts=[0-9]+|quote_successes=[0-9]+|quote_skipped_missing_ticks=[0-9]+|quote_skipped_tick_range_exhausted=[0-9]+|quote_skipped_error=[0-9]+|price_impact_rejected=[0-9]+|quote_model_edge_rejected=[0-9]+|min_profit_rejected=[0-9]+|candidates_emitted=[0-9]+|opportunities_created=[0-9]+|best_profit_before_impact=[0-9]+|best_profit_rejected_by_impact=[0-9]+|best_profit_after_impact=[0-9]+" \
+    | grep -oE "latest_chain_block=[0-9]+|latest_pool_state_block=[0-9]+|quote_attempts=[0-9]+|quote_successes=[0-9]+|quote_skipped_missing_ticks=[0-9]+|quote_skipped_tick_range_exhausted=[0-9]+|quote_skipped_error=[0-9]+|price_impact_rejected=[0-9]+|price_impact_shadow_pass_100_bps=[0-9]+|price_impact_shadow_pass_150_bps=[0-9]+|price_impact_shadow_pass_300_bps=[0-9]+|price_impact_shadow_pass_500_bps=[0-9]+|quote_model_edge_rejected=[0-9]+|min_profit_rejected=[0-9]+|candidates_emitted=[0-9]+|opportunities_created=[0-9]+|best_profit_before_impact=[0-9]+|best_profit_rejected_by_impact=[0-9]+|best_profit_shadow_pass_100_bps=[0-9]+|best_profit_shadow_pass_150_bps=[0-9]+|best_profit_shadow_pass_300_bps=[0-9]+|best_profit_shadow_pass_500_bps=[0-9]+|best_profit_after_impact=[0-9]+" \
     | sort | uniq -c || true
 } >>"$OUT_FILE" 2>&1
 
@@ -213,6 +213,12 @@ fi
 
 section "5. price-impact rejected samples from logs"
 {
+  echo "shadow threshold counters:"
+  grep "searcher cycle summary" "$SEARCHER_LOG" \
+    | grep -oE "price_impact_shadow_pass_100_bps=[0-9]+|price_impact_shadow_pass_150_bps=[0-9]+|price_impact_shadow_pass_300_bps=[0-9]+|price_impact_shadow_pass_500_bps=[0-9]+|best_profit_shadow_pass_100_bps=[0-9]+|best_profit_shadow_pass_150_bps=[0-9]+|best_profit_shadow_pass_300_bps=[0-9]+|best_profit_shadow_pass_500_bps=[0-9]+" \
+    | sort | uniq -c || true
+  echo
+  echo "top rejected samples:"
   grep "top_price_impact_rejected=" "$SEARCHER_LOG" || true
   echo
   echo "compact:"

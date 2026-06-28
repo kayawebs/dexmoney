@@ -25,6 +25,7 @@ const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 const TOP_REJECTED_SAMPLES: usize = 5;
 const TOP_QUOTE_SKIP_SAMPLES: usize = 8;
 const TOP_ROUGH_QUOTE_FAILURE_SAMPLES: usize = 8;
+const IMPACT_SHADOW_THRESHOLDS_BPS: [u64; 4] = [100, 150, 300, 500];
 const MAX_AMOUNT_TIER_DENOMINATOR: u64 = 1_000_000;
 const MAX_AMOUNT_TIER_NUMERATORS: &[u64] = &[
     100,       // 0.01%
@@ -68,6 +69,14 @@ pub struct SearchStats {
     pub quote_skipped_tick_range_exhausted: u64,
     pub quote_skipped_error: u64,
     pub price_impact_rejected: u64,
+    pub price_impact_shadow_pass_100_bps: u64,
+    pub price_impact_shadow_pass_150_bps: u64,
+    pub price_impact_shadow_pass_300_bps: u64,
+    pub price_impact_shadow_pass_500_bps: u64,
+    pub best_profit_shadow_pass_100_bps: U256,
+    pub best_profit_shadow_pass_150_bps: U256,
+    pub best_profit_shadow_pass_300_bps: U256,
+    pub best_profit_shadow_pass_500_bps: U256,
     pub quote_model_edge_rejected: u64,
     pub min_profit_rejected: u64,
     pub candidates_emitted: u64,
@@ -160,6 +169,22 @@ impl SearchStats {
         self.quote_skipped_tick_range_exhausted += other.quote_skipped_tick_range_exhausted;
         self.quote_skipped_error += other.quote_skipped_error;
         self.price_impact_rejected += other.price_impact_rejected;
+        self.price_impact_shadow_pass_100_bps += other.price_impact_shadow_pass_100_bps;
+        self.price_impact_shadow_pass_150_bps += other.price_impact_shadow_pass_150_bps;
+        self.price_impact_shadow_pass_300_bps += other.price_impact_shadow_pass_300_bps;
+        self.price_impact_shadow_pass_500_bps += other.price_impact_shadow_pass_500_bps;
+        self.best_profit_shadow_pass_100_bps = self
+            .best_profit_shadow_pass_100_bps
+            .max(other.best_profit_shadow_pass_100_bps);
+        self.best_profit_shadow_pass_150_bps = self
+            .best_profit_shadow_pass_150_bps
+            .max(other.best_profit_shadow_pass_150_bps);
+        self.best_profit_shadow_pass_300_bps = self
+            .best_profit_shadow_pass_300_bps
+            .max(other.best_profit_shadow_pass_300_bps);
+        self.best_profit_shadow_pass_500_bps = self
+            .best_profit_shadow_pass_500_bps
+            .max(other.best_profit_shadow_pass_500_bps);
         self.quote_model_edge_rejected += other.quote_model_edge_rejected;
         self.min_profit_rejected += other.min_profit_rejected;
         self.candidates_emitted += other.candidates_emitted;
@@ -305,6 +330,7 @@ impl SearchStats {
         self.price_impact_rejected += 1;
         self.best_profit_rejected_by_impact =
             self.best_profit_rejected_by_impact.max(expected_profit);
+        self.record_price_impact_shadow(price_impact_bps, expected_profit, max_price_impact_bps);
         self.record_price_impact_rejected_sample(PriceImpactRejectedSample {
             path_name: path.name.clone(),
             token_in: path
@@ -319,6 +345,42 @@ impl SearchStats {
             step_count: path.steps.len(),
             modes: diagnostics.modes.join("+"),
         });
+    }
+
+    fn record_price_impact_shadow(
+        &mut self,
+        price_impact_bps: u64,
+        expected_profit: U256,
+        current_max_price_impact_bps: u64,
+    ) {
+        for threshold in IMPACT_SHADOW_THRESHOLDS_BPS {
+            if threshold <= current_max_price_impact_bps || price_impact_bps > threshold {
+                continue;
+            }
+            match threshold {
+                100 => {
+                    self.price_impact_shadow_pass_100_bps += 1;
+                    self.best_profit_shadow_pass_100_bps =
+                        self.best_profit_shadow_pass_100_bps.max(expected_profit);
+                }
+                150 => {
+                    self.price_impact_shadow_pass_150_bps += 1;
+                    self.best_profit_shadow_pass_150_bps =
+                        self.best_profit_shadow_pass_150_bps.max(expected_profit);
+                }
+                300 => {
+                    self.price_impact_shadow_pass_300_bps += 1;
+                    self.best_profit_shadow_pass_300_bps =
+                        self.best_profit_shadow_pass_300_bps.max(expected_profit);
+                }
+                500 => {
+                    self.price_impact_shadow_pass_500_bps += 1;
+                    self.best_profit_shadow_pass_500_bps =
+                        self.best_profit_shadow_pass_500_bps.max(expected_profit);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn record_price_impact_rejected_sample(&mut self, sample: PriceImpactRejectedSample) {
@@ -2868,6 +2930,31 @@ mod tests {
         assert_eq!(amounts.last().copied(), Some(max));
         assert!(amounts.contains(&U256::from(400_000_000_000_000u64)));
         assert_eq!(amounts.len(), 9);
+    }
+
+    #[test]
+    fn price_impact_shadow_counts_only_higher_threshold_passes() {
+        let mut stats = super::SearchStats::default();
+
+        stats.record_price_impact_shadow(80, U256::from(10_000u64), 50);
+        assert_eq!(stats.price_impact_shadow_pass_100_bps, 1);
+        assert_eq!(stats.price_impact_shadow_pass_150_bps, 1);
+        assert_eq!(stats.price_impact_shadow_pass_300_bps, 1);
+        assert_eq!(stats.price_impact_shadow_pass_500_bps, 1);
+        assert_eq!(stats.best_profit_shadow_pass_100_bps, U256::from(10_000u64));
+
+        stats.record_price_impact_shadow(120, U256::from(20_000u64), 50);
+        assert_eq!(stats.price_impact_shadow_pass_100_bps, 1);
+        assert_eq!(stats.price_impact_shadow_pass_150_bps, 2);
+        assert_eq!(stats.price_impact_shadow_pass_300_bps, 2);
+        assert_eq!(stats.price_impact_shadow_pass_500_bps, 2);
+        assert_eq!(stats.best_profit_shadow_pass_150_bps, U256::from(20_000u64));
+
+        stats.record_price_impact_shadow(120, U256::from(30_000u64), 150);
+        assert_eq!(stats.price_impact_shadow_pass_150_bps, 2);
+        assert_eq!(stats.price_impact_shadow_pass_300_bps, 3);
+        assert_eq!(stats.price_impact_shadow_pass_500_bps, 3);
+        assert_eq!(stats.best_profit_shadow_pass_300_bps, U256::from(30_000u64));
     }
 
     #[test]
