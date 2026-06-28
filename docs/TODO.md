@@ -15,6 +15,40 @@ instead of patching from chat memory.
 
 Latest evidence:
 
+- 2026-06-28 10:31Z controlled check after the new Hub/DirectV2 cleanup:
+  - Current runtime is producing some USDC-only candidates, but still far below
+    the target competitor. In a fixed 35m DB window there were `36`
+    opportunities, `35` simulations, `5` transaction records, and only `1`
+    opportunity without any simulation. Execution was popping fresh candidates
+    with `expired=0` and `stale_by_block=0`, so this is not an executor backlog
+    or worker-speed problem.
+  - Current configured capital remains USDC-only:
+    `token_search_defaults(all,multihop)` both use
+    `0x833589fcd6edb6e08f4c7c32d4f71b54bdA02913`,
+    `search_amounts=45,270,872`, `min_profit=5,000`, and there are no enabled
+    pair-level amount overrides.
+  - Recent local failures are concentrated, not random:
+    `MinProfitNotMet=15` on
+    `cycle4-a02913-pancake-v3-6f9830-aero-classic-727823-aero-classic-42bf6a-aero-slipstream-39a1be`,
+    `UniswapV2: K=10` on
+    `cycle4-a02913-aero-slipstream-da9813-aero-slipstream-19ed42-aero-classic-2dd69c-aero-classic-20f072`,
+    plus small `router/no-revert-data` and lazy-approval buckets.
+  - The newest lightweight competitor report
+    `competitor-gap-20260628T103106Z` sampled 3 competitor profit txs. The
+    sampled profits were WETH-side and/or used Balancer/router-vault flows; no
+    sampled tx was a directly comparable `USDC <=45U` local anchor-cycle miss.
+    Therefore the latest report does not prove a 45U USDC funding miss, but it
+    does prove ongoing coverage/model gaps:
+    `balancer_v3_quote_unvalidated=2`,
+    `covered_no_opportunity_near_block=1`,
+    `recognized_swaps_do_not_form_anchor_cycle=2`, and one V4
+    `tick_scan_zero`.
+  - Latest searcher cycle summaries still show the hot path is current
+    (`latest_chain_block == latest_pool_state_block`) but candidates are often
+    not emitted: recent cycles had tens of thousands of quote successes,
+    `opportunities_created=0`, large `min_profit_rejected`, and
+    `price_impact_rejected` with shadow-pass counts at 100/150/300/500 bps.
+    This is a searcher economics/threshold/model issue, not executor capacity.
 - Competitor reports:
   - `reports/competitor-gap-20260628T061104Z`
     (`/private/tmp/competitor-gap-20260628T061104Z.tgz` locally).
@@ -206,7 +240,43 @@ Priority order:
       local opportunity generation.
   - Do not add hot-path search complexity until this flow class is proven common
     and profitable enough.
-- [ ] P0d: Replace fixed amount-grid search with adaptive sizing:
+- [ ] P0d: Close Balancer V3 readiness gaps used by the competitor:
+  - Latest lightweight report `competitor-gap-20260628T103106Z` classified
+    `2/3` sampled competitor txs as `balancer_v3_quote_unvalidated`.
+    Representative pool:
+    `0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7`
+    (`WETH/cbBTC`, Vault `0xba1333333333a1ba1108e8412f11850a5c319ba9`)
+    is observed but still lacks quote/model readiness.
+  - Remote runtime has `BALANCER_V3_VAULT`, `BALANCER_V3_ROUTER`, and
+    `BALANCER_V3_ADAPTER` configured, but no
+    `SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED`; the code default is `false`.
+    Do not solve this by enabling per-candidate RPC quote in the hot path unless
+    a bounded benchmark proves it is safe. Prefer local model/state coverage.
+  - This is not solved by adding more USDC. The sampled competitor profits were
+    WETH-side and involved Balancer/router-vault flow, so matching them requires
+    protocol/model coverage plus WETH inventory/config.
+  - Required evidence before hot-path promotion: `pool_model_coverage` and
+    `pool_quote_coverage` ready rows for competitor-used Balancer pools, plus a
+    local quote that agrees with Balancer router query for the sampled
+    direction.
+  - Verification: next competitor report should no longer classify
+    `0x7b4c...fdb7` as `balancer_v3_quote_unvalidated`; if it remains missed,
+    the gap should move downstream to path generation, amount sizing, or
+    execution.
+- [ ] P0e: Model or explicitly exclude competitor router/vault flow classes:
+  - Latest report `competitor-gap-20260628T103106Z` had
+    `recognized_swaps_do_not_form_anchor_cycle=2` with unrecognized
+    counterparties:
+    `0x238a358808379702088667322f80ac48bad5e6c4`,
+    `0x498581ff718922c3f8e6a244956af099b2652b2b`, and
+    `0xba1333333333a1ba1108e8412f11850a5c319ba9`.
+  - Do not force these into standard anchor-cycle search. First decode emitted
+    topics and transfer adjacency to determine whether each is a Balancer
+    Vault, Uniswap V4 PoolManager, exact-output router, flash repayment shape,
+    or out-of-scope external protocol.
+  - Verification: reports should bucket these flows by explicit class rather
+    than generic `recognized_swaps_do_not_form_anchor_cycle`.
+- [ ] P0f: Replace fixed amount-grid search with adaptive sizing:
   - Current search uses a small discrete set derived from configured max amount,
     e.g. fractions of `45,270,872` raw USDC. This can miss the local optimum,
     especially on single-peak AMM profit curves.
@@ -220,7 +290,7 @@ Priority order:
   - Add shadow metrics before changing live behavior: count opportunities that
     would pass using adaptive sizing, best adaptive amount, extra quote cost,
     and whether the selected amount is executable with current inventory.
-- [ ] P0e: Keep execution-manager alive on candidate-level preflight rejects:
+- [ ] P0g: Keep execution-manager alive on candidate-level preflight rejects:
   - Code fix implemented locally: `live_approval_preflight` records unencodable
     or unsupported candidates as failed synthetic simulations and returns
     `preflight_unencodable` instead of crashing the process.
@@ -230,7 +300,7 @@ Priority order:
   - Verification after deploy: execution-manager should stop crash-looping;
     batch summaries should continue after DirectV2/factory rejects; DB should
     record the offending candidate failure instead of restarting the process.
-- [ ] P0f: Remove non-canonical DirectV2 pools from executable data:
+- [ ] P0h: Remove non-canonical DirectV2 pools from executable data:
   - Code fix committed and deployed: trusted DirectV2/AerodromeVolatile imports
     now verify `getPair(token0, token1)` for the known DirectV2 factory before
     accepting a pool as executable.
@@ -239,7 +309,7 @@ Priority order:
     removed and searcher/execution-manager restarted.
   - Current evidence: a fresh 3-minute simulation window after cleanup had
     `PoolMismatch=0`. Keep watching wider windows before closing.
-- [ ] P0g: Submitted simulation-success transactions revert because of
+- [ ] P1c: Submitted simulation-success transactions revert because of
   same-block competition:
   - Sample:
     `0x3a033b28adf3267a667243d9aaa2a85427a4afca80201b52cd55df803a85d1dc`.
@@ -251,7 +321,7 @@ Priority order:
     allowance/balance, or unknown.
   - Next fix direction: fee policy / private route / latency and nonce
     readiness. Do not change quote math based on this sample.
-- [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
+- [ ] P1a: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from
     `reports/searcher-quality-20260628T054645Z.txt`.
@@ -264,13 +334,18 @@ Priority order:
   - Check whether the competitor P0 sample would have been rejected by impact;
     if yes, impact tuning becomes the first fix. If no, keep it as a separate
     opportunity-volume optimization.
-- [ ] P2: Close Balancer V3 readiness gaps:
-  - Ensure enabled Balancer V3 pools have `pool_model_coverage` and
-    `pool_quote_coverage` rows; current reports still show competitor-used
-    Balancer pools as `balancer_v3_quote_unvalidated`.
-  - Persist live Balancer state needed by local quote, not just observation rows.
-  - Fix missing token decimals/rates/model inputs before promoting pools into
-    hot search.
+- [ ] P1b: Diagnose current USDC-45 local simulation failures:
+  - In the 2026-06-28 09:57..10:32 UTC fixed window, opportunities were
+    USDC-only and within the configured `45,270,872` raw cap, so these failures
+    are not a funding-limit issue.
+  - `MinProfitNotMet=15` is concentrated on
+    `cycle4-a02913-pancake-v3-6f9830-aero-classic-727823-aero-classic-42bf6a-aero-slipstream-39a1be`.
+  - `UniswapV2: K=10` is concentrated on
+    `cycle4-a02913-aero-slipstream-da9813-aero-slipstream-19ed42-aero-classic-2dd69c-aero-classic-20f072`.
+  - Next evidence: compare local step outputs/reserves against onchain
+    `eth_call`/replay for the two representative opportunity ids and classify
+    as stale state, fee/model mismatch, fee-on-transfer token, same-block race,
+    or unsupported token behavior. Do not patch by guessing.
 - [ ] P3: Fix V4 readiness gaps that directly appear in competitor samples:
   - Investigate why imported pool
     `0xed93844bad1e39b1d7298a37f636d8169bc6523e` remains `tick_scan_zero`

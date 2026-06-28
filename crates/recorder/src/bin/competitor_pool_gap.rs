@@ -548,22 +548,27 @@ fn classify_pool_gap(row: &PoolCoverage, include_opportunity_lookup: bool) -> St
         return "v4_hook_pool_currently_unsupported".into();
     }
     if row.variant.as_deref() == Some("BalancerV3") {
+        match row.model_status.as_deref() {
+            Some("weighted_inputs_ready") => {}
+            Some("stable_inputs_ready") if row.balancer_runtime_ready => {}
+            Some("stable_inputs_ready") => return "balancer_v3_stable_local_math_missing".into(),
+            Some("weighted_multi_token_unsupported") => {
+                return "balancer_v3_weighted_multi_token_unsupported".into();
+            }
+            Some("weighted_input_mismatch") => return "balancer_v3_weighted_input_mismatch".into(),
+            Some("unsupported_pool_type") => return "balancer_v3_unsupported_pool_type".into(),
+            Some("classification_failed") => {
+                return "balancer_v3_model_classification_failed".into()
+            }
+            Some(status) => return format!("balancer_v3_model_{status}"),
+            None => return "balancer_v3_model_unclassified".into(),
+        }
         if row.quote_ready_count == 0 {
             return match row.latest_quote_status.as_deref() {
                 Some("query_failed") => "balancer_v3_quote_failed".into(),
                 Some("zero_output") => "balancer_v3_quote_zero_output".into(),
                 Some(status) => format!("balancer_v3_quote_{status}"),
                 None => "balancer_v3_quote_unvalidated".into(),
-            };
-        }
-        if !row.balancer_runtime_ready {
-            return match row.model_status.as_deref() {
-                Some("weighted_inputs_ready") | Some("stable_inputs_ready") => {
-                    "balancer_v3_local_math_missing".into()
-                }
-                Some("unsupported_pool_type") => "balancer_v3_unsupported_pool_type".into(),
-                Some(status) => format!("balancer_v3_model_{status}"),
-                None => "balancer_v3_model_unclassified".into(),
             };
         }
     }

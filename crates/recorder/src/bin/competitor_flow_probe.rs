@@ -83,6 +83,65 @@ struct RpcProfile {
     symbol: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct KnownContracts {
+    labels: BTreeMap<String, &'static str>,
+}
+
+impl KnownContracts {
+    fn from_settings(settings: &Settings) -> Self {
+        let mut labels = BTreeMap::new();
+        insert_known(&mut labels, settings.balancer_v3_vault, "balancer_v3_vault");
+        insert_known(
+            &mut labels,
+            settings.balancer_v3_router,
+            "balancer_v3_router",
+        );
+        insert_known(
+            &mut labels,
+            settings.balancer_v3_adapter,
+            "balancer_v3_adapter",
+        );
+        insert_known(
+            &mut labels,
+            settings.uniswap_v4_pool_manager,
+            "uniswap_v4_pool_manager",
+        );
+        insert_known(
+            &mut labels,
+            settings.uniswap_v4_adapter,
+            "uniswap_v4_adapter",
+        );
+        insert_known(&mut labels, settings.executor_contract, "executor_hub");
+        insert_known(
+            &mut labels,
+            settings.executor_contract_2hop,
+            "executor_2hop",
+        );
+        insert_known(
+            &mut labels,
+            settings.executor_contract_multihop,
+            "executor_multihop",
+        );
+        Self { labels }
+    }
+
+    fn classify(&self, address: Address) -> Option<&'static str> {
+        self.labels.get(&address_key(address)).copied()
+    }
+
+    fn describe(&self) -> String {
+        if self.labels.is_empty() {
+            return "-".into();
+        }
+        self.labels
+            .iter()
+            .map(|(address, label)| format!("{label}={address}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -93,6 +152,7 @@ async fn main() -> Result<()> {
     let store = PostgresStore::connect(&settings.postgres_url).await?;
     ensure_registry_schema(&store.pool).await?;
     let provider = ChainProvider::from_settings(&settings);
+    let known_contracts = KnownContracts::from_settings(&settings);
 
     let latest_block = provider.get_block_number().await?;
     let from_block = latest_block.saturating_sub(cli.lookback_blocks);
@@ -127,6 +187,7 @@ async fn main() -> Result<()> {
     writeln!(writer, "from_block: {from_block}")?;
     writeln!(writer, "to_block: {latest_block}")?;
     writeln!(writer, "collector_transfer_txs: {}", txs.len())?;
+    writeln!(writer, "known_contracts: {}", known_contracts.describe())?;
     writeln!(writer)?;
 
     let mut stats = BTreeMap::<String, CounterpartyStats>::new();
@@ -189,7 +250,8 @@ async fn main() -> Result<()> {
             .with_context(|| format!("invalid counterparty address {address}"))?;
         let db = load_db_profile(&store.pool, settings.chain_id, address).await?;
         let rpc = probe_rpc_profile(&provider, address).await;
-        let classification = classify_counterparty(&db, rpc.as_ref().ok());
+        let classification =
+            classify_counterparty(address, &known_contracts, &db, rpc.as_ref().ok());
         let action = recommended_action(classification, &db, rpc.as_ref().ok());
         writeln!(writer, "address: {:#x}", address)?;
         writeln!(writer, "classification: {classification}")?;
@@ -556,7 +618,15 @@ async fn probe_rpc_profile(provider: &ChainProvider, address: Address) -> Result
     })
 }
 
-fn classify_counterparty(db: &DbProfile, rpc: Option<&RpcProfile>) -> &'static str {
+fn classify_counterparty(
+    address: Address,
+    known_contracts: &KnownContracts,
+    db: &DbProfile,
+    rpc: Option<&RpcProfile>,
+) -> &'static str {
+    if let Some(label) = known_contracts.classify(address) {
+        return label;
+    }
     if db.pool_symbol.is_some() {
         return "known_pool";
     }
@@ -587,6 +657,19 @@ fn recommended_action(
     rpc: Option<&RpcProfile>,
 ) -> &'static str {
     match classification {
+        "balancer_v3_vault" => {
+            "balancer_v3_vault_flow; decode Vault pool id/token deltas and run Balancer model/quote coverage for the referenced pool"
+        }
+        "balancer_v3_router" => {
+            "balancer_v3_router_flow; trace Vault Swap events and map pool ids before treating as a standard pool cycle"
+        }
+        "uniswap_v4_pool_manager" => {
+            "uniswap_v4_pool_manager_flow; map PoolId through protocol_pool_observations before deciding whether the path is executable"
+        }
+        "uniswap_v4_adapter" | "balancer_v3_adapter" | "executor_hub" | "executor_2hop"
+        | "executor_multihop" => {
+            "own_infra_contract; inspect why our configured execution contract appears in competitor transfer flow"
+        }
         "known_pool" => {
             if db.pool_enabled == Some(true) {
                 "already_known_pool; if this still forms a gap, inspect swap-topic coverage or path composition"
@@ -612,6 +695,21 @@ fn recommended_action(
         "rpc_probe_failed" => "rpc_probe_failed; rerun with a smaller window or inspect RPC errors",
         _ => "unknown; inspect manually",
     }
+}
+
+fn insert_known(
+    labels: &mut BTreeMap<String, &'static str>,
+    address: Option<Address>,
+    label: &'static str,
+) {
+    let Some(address) = address else {
+        return;
+    };
+    labels.entry(address_key(address)).or_insert(label);
+}
+
+fn address_key(address: Address) -> String {
+    format!("{address:#x}").to_ascii_lowercase()
 }
 
 fn importable_pool_line(address: Address, rpc: &RpcProfile) -> String {

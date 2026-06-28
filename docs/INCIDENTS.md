@@ -11,12 +11,120 @@ section already proves the root cause.
 1. `2026-06-28 DirectV2 Non-Canonical PoolMismatch`
 2. `2026-06-28 Submitted Success Simulation Reverted After Same-Block Competition`
 3. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
-4. `2026-06-24 MinProfitNotMet Root Cause Split`
-5. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
-6. `2026-06-24 Submitted Transaction Revert Rate`
-7. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
-8. `2026-06-24 Balancer V3 Readiness`
-9. `2026-06-24 Health Monitor Coverage`
+4. `2026-06-28 Balancer And Router Vault Coverage`
+5. `2026-06-24 MinProfitNotMet Root Cause Split`
+6. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
+7. `2026-06-24 Submitted Transaction Revert Rate`
+8. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
+9. `2026-06-24 Balancer V3 Readiness`
+10. `2026-06-24 Health Monitor Coverage`
+
+## 2026-06-28 Balancer And Router Vault Coverage
+
+Status: Diagnostic and repair entry implemented locally; runtime coverage apply pending
+Category: competitor coverage / protocol readiness
+
+### Symptom
+
+The lightweight competitor report `competitor-gap-20260628T103106Z` sampled
+three competitor profit transactions. None was a directly comparable
+`USDC <=45U` anchor-cycle miss, but two involved Balancer/router-vault style
+flows that the local reports could not classify precisely:
+
+- `balancer_v3_quote_unvalidated=2`;
+- `recognized_swaps_do_not_form_anchor_cycle=2`;
+- repeated unknown counterparties included Balancer Vault
+  `0xba1333333333a1ba1108e8412f11850a5c319ba9` and Uniswap V4 PoolManager
+  `0x498581ff718922c3f8e6a244956af099b2652b2b`.
+
+Representative Balancer pool:
+`0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7`
+(`WETH/cbBTC`, Vault `0xba1333333333a1ba1108e8412f11850a5c319ba9`) was
+observed and imported but had no model/quote coverage rows in the report.
+
+### Hypotheses
+
+- The pool is usable, but `pool_model_coverage` and `pool_quote_coverage` were
+  never populated.
+- The pool is a Balancer type that the local searcher cannot model without a
+  new local math implementation or a deliberately enabled bounded router quote.
+- The competitor flow is not a standard anchor cycle; the Vault/PoolManager
+  singleton must be decoded into underlying pool ids before comparing with
+  local searcher output.
+
+### Evidence
+
+`competitor-pool-gap.txt` had a concrete Balancer row:
+
+- pool `0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7`;
+- topic `balancer_v3`;
+- gap `balancer_v3_quote_unvalidated`;
+- `quote_ready_count=0`;
+- model fields empty;
+- factory/Vault `0xba1333333333a1ba1108e8412f11850a5c319ba9`.
+
+The local runtime has `BALANCER_V3_VAULT`, `BALANCER_V3_ROUTER`, and
+`BALANCER_V3_ADAPTER` configured. `SEARCHER_BALANCER_V3_RUNTIME_QUOTE_ENABLED`
+is not configured and defaults to false, so hot-path RPC quoting should not be
+assumed as the fix.
+
+### Root Cause
+
+The current reports mixed two different gaps:
+
+- Balancer readiness gap: competitor-used Balancer pools were present but not
+  classified/validated in coverage tables.
+- Router-vault flow gap: singleton contracts were bucketed as generic
+  `contract_unknown_or_router`, which hid whether they were Balancer Vault,
+  Balancer router, Uniswap V4 PoolManager, or some unrelated protocol.
+
+### Fix
+
+- `competitor_flow_probe` now loads configured known singleton contracts from
+  settings and classifies Balancer Vault/router, Uniswap V4 PoolManager, local
+  adapters, and executor contracts explicitly.
+- `competitor_pool_gap` now classifies Balancer gaps by model readiness first:
+  weighted two-token pools can proceed to quote coverage, while stable,
+  weighted multi-token, unsupported, failed, or unclassified pools are reported
+  as explicit model gaps.
+- Added `ops/repair_competitor_balancer_v3.sh`, a repeatable repair entry that
+  extracts Balancer pools from `competitor-pool-gap.txt` and runs both model
+  classification and quote validation. It is dry-run by default and only writes
+  coverage with `--apply`.
+
+### Verification
+
+Local static checks:
+
+```bash
+cargo fmt --check
+cargo check -p base-arb-recorder --bin competitor_flow_probe --bin competitor_pool_gap
+bash -n ops/repair_competitor_balancer_v3.sh
+```
+
+The report parser extracts the expected pool from
+`/private/tmp/competitor-gap-20260628T103106Z/competitor-pool-gap.txt`:
+`0x7b4c560f33a71a9f7a500af3c4c65b46fbbafdb7`.
+
+Runtime verification after deploy:
+
+```bash
+ops/repair_competitor_balancer_v3.sh \
+  --report-dir reports/competitor-gap-20260628T103106Z \
+  --apply
+
+ops/competitor_gap_report.sh --lookback-blocks 100 --limit 3 --top 5
+```
+
+Expected result: the same pool should move away from
+`balancer_v3_quote_unvalidated`. If it becomes a stable/multi-token/model gap,
+that is a real protocol support task rather than a missing coverage task.
+
+### Regression Guard
+
+Keep competitor reports read-only. Use the repair script only when a report
+shows Balancer model/quote gaps. Future reports should never leave configured
+Vault/PoolManager singleton addresses under generic `contract_unknown_or_router`.
 
 ## 2026-06-28 DirectV2 Non-Canonical PoolMismatch
 
