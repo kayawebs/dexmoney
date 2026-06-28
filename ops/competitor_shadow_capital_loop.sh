@@ -22,7 +22,9 @@ Options:
   --limit N                  Gap report tx limit. Default: 50.
   --top N                    Gap report top rows. Default: 20.
   --tx-limit N               Max txs to pipeline-diagnose per loop. Default: 20.
-  --capital-days N           Recent days for WETH/USDC capital estimate. Default: 1.
+  --capital-lookback-blocks N
+                             Live RPC block window for WETH/USDC capital estimate. Default: 5000.
+  --capital-days N           Legacy DB capital window if live lookback is set to 0. Default: 1.
   --capital-limit N          Max capital txs to inspect. Default: 5000.
   --shadow-source max|p99|p90
                              Which competitor capital statistic to use as max tier. Default: max.
@@ -43,6 +45,7 @@ LOOKBACK_BLOCKS="${LOOKBACK_BLOCKS:-1000}"
 LIMIT="${LIMIT:-50}"
 TOP="${TOP:-20}"
 TX_LIMIT="${TX_LIMIT:-20}"
+CAPITAL_LOOKBACK_BLOCKS="${CAPITAL_LOOKBACK_BLOCKS:-5000}"
 CAPITAL_DAYS="${CAPITAL_DAYS:-1}"
 CAPITAL_LIMIT="${CAPITAL_LIMIT:-5000}"
 SHADOW_SOURCE="${SHADOW_SOURCE:-max}"
@@ -65,6 +68,8 @@ while [[ $# -gt 0 ]]; do
       TX_LIMIT="$2"; shift 2 ;;
     --capital-days)
       CAPITAL_DAYS="$2"; shift 2 ;;
+    --capital-lookback-blocks)
+      CAPITAL_LOOKBACK_BLOCKS="$2"; shift 2 ;;
     --capital-limit)
       CAPITAL_LIMIT="$2"; shift 2 ;;
     --shadow-source)
@@ -151,6 +156,7 @@ extract_report_txs() {
 
 run_once() {
   local stamp run_dir summary capital_file gap_parent gap_dir usdc_key weth_key usdc_amount weth_amount tx_count
+  local -a capital_args
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   run_dir="${OUT_DIR%/}/shadow-capital-${stamp}"
   summary="${run_dir}/shadow-summary.txt"
@@ -166,18 +172,26 @@ run_once() {
     echo "limit=${LIMIT}"
     echo "top=${TOP}"
     echo "tx_limit=${TX_LIMIT}"
+    echo "capital_lookback_blocks=${CAPITAL_LOOKBACK_BLOCKS}"
     echo "capital_days=${CAPITAL_DAYS}"
     echo "capital_limit=${CAPITAL_LIMIT}"
     echo "shadow_source=${SHADOW_SOURCE}"
     echo "run_dir=${run_dir}"
   } >"${summary}"
 
+  capital_args=(
+    --address "${ADDRESS}"
+    --limit "${CAPITAL_LIMIT}"
+    --shell
+    --output "${capital_file}"
+  )
+  if [[ "${CAPITAL_LOOKBACK_BLOCKS}" != "0" ]]; then
+    capital_args+=(--live-lookback-blocks "${CAPITAL_LOOKBACK_BLOCKS}")
+  else
+    capital_args+=(--days "${CAPITAL_DAYS}")
+  fi
   "${CARGO_BIN}" run -p base-arb-recorder --bin competitor_capital -- \
-    --address "${ADDRESS}" \
-    --days "${CAPITAL_DAYS}" \
-    --limit "${CAPITAL_LIMIT}" \
-    --shell \
-    --output "${capital_file}" >>"${summary}" 2>&1
+    "${capital_args[@]}" >>"${summary}" 2>&1
 
   usdc_key="$(capital_key USDC)"
   weth_key="$(capital_key WETH)"

@@ -10,9 +10,10 @@ use std::{
 
 use alloy_primitives::{Address, U256};
 use anyhow::{bail, Context, Result};
+use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_storage::postgres::{ensure_registry_schema, PostgresStore};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool};
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +42,7 @@ struct Cli {
     limit: i64,
     output: Option<PathBuf>,
     shell_output: bool,
+    live_lookback_blocks: Option<u64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -108,6 +110,24 @@ async fn main() -> Result<()> {
     }
 
     let settings = Settings::load()?;
+    if let Some(lookback_blocks) = cli.live_lookback_blocks {
+        let provider = ChainProvider::from_settings(&settings);
+        let to_block = provider.get_block_number().await?;
+        let from_block = to_block.saturating_sub(lookback_blocks);
+        let rows = load_live_related_transactions(&provider, &cli, from_block, to_block).await?;
+        let collector = address_to_lower(cli.address);
+        let txs = rows
+            .into_iter()
+            .filter_map(|row| analyze_tx(row, &collector).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        if cli.shell_output {
+            print_shell_exports(&cli, from_block as i64, to_block as i64, &txs);
+        } else {
+            print_report(&cli, from_block as i64, to_block as i64, &txs);
+        }
+        return Ok(());
+    }
+
     let store = PostgresStore::connect(&settings.postgres_url).await?;
     ensure_registry_schema(&store.pool).await?;
 
@@ -486,6 +506,100 @@ async fn load_related_transactions(
     Ok(rows)
 }
 
+async fn load_live_related_transactions(
+    provider: &ChainProvider,
+    cli: &Cli,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Vec<TxRow>> {
+    let txs = load_collector_txs(
+        provider,
+        cli.address,
+        from_block,
+        to_block,
+        usize::try_from(cli.limit).unwrap_or(usize::MAX),
+    )
+    .await?;
+    let mut rows = Vec::new();
+    for tx in txs {
+        let Some(receipt) = provider.get_transaction_receipt(tx.tx_hash).await? else {
+            continue;
+        };
+        let Some(transaction) = provider.get_transaction_by_hash(tx.tx_hash).await? else {
+            continue;
+        };
+        rows.push(TxRow {
+            tx_hash: format!("{:#x}", receipt.tx_hash).to_ascii_lowercase(),
+            block_number: receipt
+                .block_number
+                .unwrap_or(tx.block_number)
+                .try_into()
+                .unwrap_or(i64::MAX),
+            transaction_index: receipt
+                .raw
+                .get("transactionIndex")
+                .and_then(Value::as_str)
+                .and_then(parse_hex_i64),
+            from_address: transaction
+                .get("from")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase),
+            to_address: transaction
+                .get("to")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase),
+            gas_used: receipt.gas_used.map(|value| value.to_string()),
+            effective_gas_price: receipt.effective_gas_price.map(|value| value.to_string()),
+            receipt_json: receipt.raw,
+        });
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone)]
+struct CollectorTx {
+    tx_hash: alloy_primitives::B256,
+    block_number: u64,
+}
+
+async fn load_collector_txs(
+    provider: &ChainProvider,
+    collector: Address,
+    from_block: u64,
+    to_block: u64,
+    limit: usize,
+) -> Result<Vec<CollectorTx>> {
+    let params = json!([{
+        "fromBlock": format!("0x{from_block:x}"),
+        "toBlock": format!("0x{to_block:x}"),
+        "topics": [TRANSFER_TOPIC, null, address_topic(collector)]
+    }]);
+    let logs = provider.get_logs_raw(params).await?;
+    let mut by_tx = BTreeMap::<alloy_primitives::B256, u64>::new();
+    for log in logs {
+        let Some(tx_hash) = raw_log_tx_hash(&log) else {
+            continue;
+        };
+        let block_number = raw_log_block_number(&log).unwrap_or_default();
+        by_tx.entry(tx_hash).or_insert(block_number);
+    }
+    let mut txs = by_tx
+        .into_iter()
+        .map(|(tx_hash, block_number)| CollectorTx {
+            tx_hash,
+            block_number,
+        })
+        .collect::<Vec<_>>();
+    txs.sort_by(|left, right| {
+        right
+            .block_number
+            .cmp(&left.block_number)
+            .then_with(|| right.tx_hash.cmp(&left.tx_hash))
+    });
+    txs.truncate(limit);
+    Ok(txs)
+}
+
 fn parse_args<I>(args: I) -> Result<Cli>
 where
     I: IntoIterator<Item = String>,
@@ -497,6 +611,7 @@ where
     let mut limit = 50_000_i64;
     let mut output = None;
     let mut shell_output = false;
+    let mut live_lookback_blocks = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -546,9 +661,17 @@ where
             "--shell" => {
                 shell_output = true;
             }
+            "--live-lookback-blocks" => {
+                live_lookback_blocks = Some(
+                    iter.next()
+                        .context("missing value for --live-lookback-blocks")?
+                        .parse()
+                        .context("invalid --live-lookback-blocks")?,
+                );
+            }
             "-h" | "--help" => {
                 bail!(
-                    "Usage: cargo run -p base-arb-recorder --bin competitor_capital -- --address <collector> [--days 30] [--from-block N] [--to-block N] [--limit 50000] [--output capital.txt] [--shell]"
+                    "Usage: cargo run -p base-arb-recorder --bin competitor_capital -- --address <collector> [--days 30] [--from-block N] [--to-block N] [--limit 50000] [--output capital.txt] [--shell] [--live-lookback-blocks 5000]"
                 );
             }
             _ => bail!("unknown argument: {arg}"),
@@ -568,7 +691,30 @@ where
         limit,
         output,
         shell_output,
+        live_lookback_blocks,
     })
+}
+
+fn address_topic(address: Address) -> String {
+    format!(
+        "0x{:0>64}",
+        format!("{address:#x}").trim_start_matches("0x")
+    )
+}
+
+fn raw_log_tx_hash(log: &Value) -> Option<alloy_primitives::B256> {
+    log.get("transactionHash")?.as_str()?.parse().ok()
+}
+
+fn raw_log_block_number(log: &Value) -> Option<u64> {
+    let raw = log.get("blockNumber")?.as_str()?;
+    u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
+}
+
+fn parse_hex_i64(raw: &str) -> Option<i64> {
+    u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+        .ok()
+        .and_then(|value| value.try_into().ok())
 }
 
 fn topic_to_address(topic: &str) -> Result<String> {
