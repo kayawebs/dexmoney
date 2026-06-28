@@ -8,6 +8,11 @@ address continues to receive frequent arbitrage profits. Diagnose the local
 gap as coverage, quote, path-generation, or execution-model lag until proven
 otherwise.
 
+Use [`COMPETITOR_DRIVEN_LOOP.md`](COMPETITOR_DRIVEN_LOOP.md) to convert each
+rolling competitor report into this priority list. When a task needs code or
+configuration changes, run it through [`DEBUG_WORKFLOW.md`](DEBUG_WORKFLOW.md)
+instead of patching from chat memory.
+
 Priority order:
 
 - [ ] Build a rolling competitor profit/path gap report for the target address:

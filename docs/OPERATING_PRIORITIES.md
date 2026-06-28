@@ -9,6 +9,10 @@ must leave durable memory in [`INCIDENTS.md`](INCIDENTS.md) and local diagnostic
 reports under `reports/`. The required loop is: symptom, hypotheses, evidence,
 decision, fix, verification, regression guard.
 
+For opportunity scarcity and competitor-parity work, use
+[`COMPETITOR_DRIVEN_LOOP.md`](COMPETITOR_DRIVEN_LOOP.md) to turn rolling
+competitor reports into TODO priority changes and focused debug workflows.
+
 ## 0. Performance First
 
 The primary product is fast, accurate arbitrage attempts. Every runtime decision
