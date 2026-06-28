@@ -168,16 +168,22 @@ fn simulate_zero_for_one(
     let mut diagnostics = V3QuoteDiagnostics::default();
     let mut ticks = initialized_ticks
         .iter()
-        .filter(|tick| tick.tick < current_tick)
+        .filter(|tick| tick.tick <= current_tick)
         .collect::<Vec<_>>();
     ticks.sort_by_key(|tick| std::cmp::Reverse(tick.tick));
 
     for tick in ticks {
-        if amount_remaining.is_zero() || liquidity.is_zero() {
+        if amount_remaining.is_zero() {
             break;
         }
         diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
+        if liquidity.is_zero() {
+            sqrt_price = target_sqrt;
+            diagnostics.crossed_ticks += 1;
+            liquidity = apply_liquidity_delta(liquidity, -tick.liquidity_net)?;
+            continue;
+        }
         let step = compute_swap_step(
             sqrt_price,
             target_sqrt,
@@ -237,11 +243,17 @@ fn simulate_one_for_zero(
     ticks.sort_by_key(|tick| tick.tick);
 
     for tick in ticks {
-        if amount_remaining.is_zero() || liquidity.is_zero() {
+        if amount_remaining.is_zero() {
             break;
         }
         diagnostics.ticks_used += 1;
         let target_sqrt = sqrt_ratio_at_tick(tick.tick)?;
+        if liquidity.is_zero() {
+            sqrt_price = target_sqrt;
+            diagnostics.crossed_ticks += 1;
+            liquidity = apply_liquidity_delta(liquidity, tick.liquidity_net)?;
+            continue;
+        }
         let step = compute_swap_step(
             sqrt_price,
             target_sqrt,
@@ -708,5 +720,95 @@ mod tests {
         assert_eq!(diagnostics.ticks_used, 0);
         assert_eq!(diagnostics.crossed_ticks, 0);
         assert!(diagnostics.tick_range_exhausted);
+    }
+
+    #[test]
+    fn zero_for_one_crosses_empty_liquidity_gap() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let sapien = address!("c729777d0470F30612B1564Fd96E8Dd26f5814E3");
+        let pool_id = PoolId {
+            chain_id: 8453,
+            address: address!("3e7931b43e955b6aFCd800E25170DC9b89556ad8"),
+        };
+        let state = PoolState {
+            pool_id: pool_id.clone(),
+            dex: DexKind::UniswapV3,
+            variant: PoolVariant::UniswapV3,
+            factory_address: Some(address!("33128a8fC17869897dcE68Ed026d694621f6FDfD")),
+            token0: usdc,
+            token1: sapien,
+            token0_decimals: None,
+            token1_decimals: None,
+            fee_bps: 100,
+            fee_pips: Some(10_000),
+            pool_key_fee_pips: None,
+            hooks_address: None,
+            stable: None,
+            reserve0: None,
+            reserve1: None,
+            balancer_model: None,
+            balancer_weight0: None,
+            balancer_weight1: None,
+            balancer_scaling_factor0: None,
+            balancer_scaling_factor1: None,
+            balancer_token_rate0: None,
+            balancer_token_rate1: None,
+            balancer_swap_fee_percentage: None,
+            sqrt_price_x96: Some(
+                U256::from_str_radix("435304320653430368601368673715936847", 10).unwrap(),
+            ),
+            liquidity: Some(U256::from(24_839_845_858_375u64)),
+            tick: Some(310_400),
+            tick_spacing: Some(200),
+            block_number: 47_910_731,
+            valid_through_block: 47_910_731,
+            updated_at: Utc::now(),
+        };
+        let ticks = vec![
+            TickState {
+                pool_id: pool_id.clone(),
+                tick: 272_800,
+                liquidity_net: 6_234_462_154_408_162,
+                liquidity_gross: U256::from(6_234_462_154_408_162u64),
+                block_number: 47_910_731,
+                updated_at: Utc::now(),
+            },
+            TickState {
+                pool_id: pool_id.clone(),
+                tick: 295_800,
+                liquidity_net: -6_234_462_154_408_162,
+                liquidity_gross: U256::from(6_234_462_154_408_162u64),
+                block_number: 47_910_731,
+                updated_at: Utc::now(),
+            },
+            TickState {
+                pool_id: pool_id.clone(),
+                tick: 310_400,
+                liquidity_net: 24_839_845_858_375,
+                liquidity_gross: U256::from(24_839_845_858_375u64),
+                block_number: 47_910_731,
+                updated_at: Utc::now(),
+            },
+            TickState {
+                pool_id,
+                tick: 315_400,
+                liquidity_net: -24_839_845_858_375,
+                liquidity_gross: U256::from(24_839_845_858_375u64),
+                block_number: 47_910_731,
+                updated_at: Utc::now(),
+            },
+        ];
+
+        let (quote, diagnostics) =
+            quote_exact_in_with_ticks_diagnostics(&state, &ticks, usdc, U256::from(1_358_126u64))
+                .unwrap();
+
+        assert_eq!(
+            quote.amount_out,
+            U256::from_str_radix("9421396908990250283", 10).unwrap()
+        );
+        assert_eq!(diagnostics.ticks_used, 3);
+        assert_eq!(diagnostics.crossed_ticks, 2);
+        assert!(!diagnostics.tick_range_exhausted);
     }
 }
