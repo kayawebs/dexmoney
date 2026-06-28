@@ -91,6 +91,7 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_unsupported_pool: u64,
     pub dynamic_multihop_rough_zero_output: u64,
     pub dynamic_multihop_rough_quote_included: u64,
+    pub dynamic_multihop_rough_quote_dropped: u64,
     pub dynamic_multihop_rough_profit_below_min: u64,
     pub dynamic_multihop_candidate_cap_hit: u64,
     pub best_profit_before_impact: U256,
@@ -190,6 +191,7 @@ impl SearchStats {
             other.dynamic_multihop_rough_unsupported_pool;
         self.dynamic_multihop_rough_zero_output += other.dynamic_multihop_rough_zero_output;
         self.dynamic_multihop_rough_quote_included += other.dynamic_multihop_rough_quote_included;
+        self.dynamic_multihop_rough_quote_dropped += other.dynamic_multihop_rough_quote_dropped;
         self.dynamic_multihop_rough_profit_below_min +=
             other.dynamic_multihop_rough_profit_below_min;
         self.dynamic_multihop_candidate_cap_hit += other.dynamic_multihop_candidate_cap_hit;
@@ -1586,6 +1588,7 @@ fn score_dynamic_multihop_path(
     let mut best_score_bps = U256::ZERO;
     let mut best_profit = U256::ZERO;
     let mut quote_failure: Option<RoughQuoteFailure> = None;
+    let mut quote_failure_variant: Option<PoolVariant> = None;
     let mut quote_failure_sample: Option<RoughQuoteFailureSample> = None;
     let mut below_min = false;
     'amounts: for amount_in in anchor.amount_sizes.iter().copied() {
@@ -1599,6 +1602,7 @@ fn score_dynamic_multihop_path(
                 Ok(next_amount) => next_amount,
                 Err(reason) => {
                     quote_failure.get_or_insert(reason);
+                    quote_failure_variant.get_or_insert(state.variant);
                     quote_failure_sample.get_or_insert_with(|| RoughQuoteFailureSample {
                         reason,
                         anchor: anchor.token,
@@ -1615,6 +1619,7 @@ fn score_dynamic_multihop_path(
             };
             if next_amount.is_zero() {
                 quote_failure.get_or_insert(RoughQuoteFailure::ZeroOutput);
+                quote_failure_variant.get_or_insert(state.variant);
                 quote_failure_sample.get_or_insert_with(|| RoughQuoteFailureSample {
                     reason: RoughQuoteFailure::ZeroOutput,
                     anchor: anchor.token,
@@ -1653,12 +1658,15 @@ fn score_dynamic_multihop_path(
             if let Some(sample) = quote_failure_sample {
                 stats.record_rough_quote_failure_sample(sample);
             }
-            stats.dynamic_multihop_rough_quote_included += 1;
-            return Some(ScoredDynamicPath {
-                path: build_dynamic_multihop_search_path(graph, anchor, edges),
-                score_bps: U256::from(1u64),
-                estimated_profit: U256::ZERO,
-            });
+            if should_include_rough_quote_failure(reason, quote_failure_variant) {
+                stats.dynamic_multihop_rough_quote_included += 1;
+                return Some(ScoredDynamicPath {
+                    path: build_dynamic_multihop_search_path(graph, anchor, edges),
+                    score_bps: U256::from(1u64),
+                    estimated_profit: U256::ZERO,
+                });
+            }
+            stats.dynamic_multihop_rough_quote_dropped += 1;
         } else if below_min {
             stats.dynamic_multihop_rough_profit_below_min += 1;
         }
@@ -1669,6 +1677,30 @@ fn score_dynamic_multihop_path(
         score_bps: best_score_bps,
         estimated_profit: best_profit,
     })
+}
+
+fn should_include_rough_quote_failure(
+    reason: RoughQuoteFailure,
+    variant: Option<PoolVariant>,
+) -> bool {
+    match reason {
+        // V3-style rough scoring uses a spot-only approximation. Exact quote may
+        // still recover with initialized ticks, so keep these paths eligible.
+        RoughQuoteFailure::V3SpotQuoteFailed | RoughQuoteFailure::V3SpotOverflow => true,
+        // Balancer runtime query can recover when the local metadata is not rich
+        // enough for rough scoring.
+        RoughQuoteFailure::MissingDecimals => variant == Some(PoolVariant::BalancerV3),
+        // These failures are deterministic for the exact quote path too, or
+        // indicate a graph/data bug. Dropping avoids wasting the hot quote loop.
+        RoughQuoteFailure::MissingReserves
+        | RoughQuoteFailure::TokenMismatch
+        | RoughQuoteFailure::StableQuoteFailed
+        | RoughQuoteFailure::V2QuoteFailed
+        | RoughQuoteFailure::BalancerQuoteFailed
+        | RoughQuoteFailure::MissingV3State
+        | RoughQuoteFailure::UnsupportedPool
+        | RoughQuoteFailure::ZeroOutput => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2820,7 +2852,8 @@ mod tests {
     use super::{
         anchor_search_configs, demo_pool_states, expand_max_amounts, is_supported_config_pool,
         is_supported_pool, pair_config_index, quote_balancer_weighted_exact_in,
-        rough_quote_edge_upper_bound, OwnedPoolEdge, SearchEngine, SearchPath,
+        rough_quote_edge_upper_bound, should_include_rough_quote_failure, OwnedPoolEdge,
+        RoughQuoteFailure, SearchEngine, SearchPath,
     };
 
     #[test]
@@ -3029,6 +3062,30 @@ mod tests {
 
         state.token0 = state.token1;
         assert!(!is_supported_pool(state));
+    }
+
+    #[test]
+    fn rough_quote_failure_policy_drops_deterministic_failures() {
+        assert!(!should_include_rough_quote_failure(
+            RoughQuoteFailure::ZeroOutput,
+            Some(PoolVariant::UniswapV4),
+        ));
+        assert!(!should_include_rough_quote_failure(
+            RoughQuoteFailure::StableQuoteFailed,
+            Some(PoolVariant::AerodromeVolatile),
+        ));
+        assert!(should_include_rough_quote_failure(
+            RoughQuoteFailure::V3SpotQuoteFailed,
+            Some(PoolVariant::UniswapV4),
+        ));
+        assert!(should_include_rough_quote_failure(
+            RoughQuoteFailure::MissingDecimals,
+            Some(PoolVariant::BalancerV3),
+        ));
+        assert!(!should_include_rough_quote_failure(
+            RoughQuoteFailure::MissingDecimals,
+            Some(PoolVariant::AerodromeVolatile),
+        ));
     }
 
     #[test]
