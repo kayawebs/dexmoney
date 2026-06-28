@@ -1,5 +1,50 @@
 # TODO
 
+## Current: Competitor Opportunity Gap
+
+Target competitor: `0x0629da86af5a4ae1ba5e1589b13702558d0fb056`.
+Do not treat low local opportunity count as a market-wide dry spell while this
+address continues to receive frequent arbitrage profits. Diagnose the local
+gap as coverage, quote, path-generation, or execution-model lag until proven
+otherwise.
+
+Priority order:
+
+- [ ] Build a rolling competitor profit/path gap report for the target address:
+  - Decode profitable transactions into pool sequence, token flow, protocol
+    variants, profit token, and profit amount.
+  - Compare each used pool against local states: discovered, imported,
+    quoteable, hot Redis, trusted executable, and recently path-generated.
+  - Produce top missed pool/protocol/path families over 30m, 2h, and 12h.
+- [ ] Deep-dive Balancer V3 + V3-style flash-cycle routes:
+  - Example tx:
+    `0x641b0d4f32c1d75ded37045df1fbfcd8f209a2c00456884dd3988d3d24dc8887`.
+  - This shape borrows/receives USDC from a V3 pool, swaps most USDC through
+    Balancer V3, repays the V3 pool with the output token, and keeps USDC
+    residue as profit.
+  - Determine whether own-funds forward-cycle search is sufficient to detect
+    the same economics, or whether a dedicated flash/exact-output route model
+    is required.
+- [ ] Close Balancer V3 readiness gaps:
+  - Ensure competitor-used Balancer pools have `pool_model_coverage` and
+    `pool_quote_coverage` rows.
+  - Persist live Balancer state needed by local quote, not just observation rows.
+  - Fix missing token decimals/rates/model inputs before promoting pools into
+    hot search.
+- [ ] Track impact-threshold opportunity loss with shadow metrics before tuning:
+  - Compare current 50 bps guard against 100/150/300/500 bps shadow pass counts.
+  - Only raise the live threshold after replay/simulation shows the extra paths
+    are structurally valid rather than stale or overly optimistic.
+- [ ] Reduce V3-style `TickRangeExhausted`:
+  - Keep searcher hot path RPC-free; it should only enqueue `ticks:repair`.
+  - Watch whether queued repair reduces repeated exhausted pools.
+  - If repeated exhaustion persists, add per-pool repeated-failure counters and
+    widen queued repair radius adaptively.
+- [ ] Re-check MinProfitNotMet after opportunity flow recovers:
+  - Use fresh samples only.
+  - Split by protocol combo and distinguish state-race failures from local quote
+    model optimism.
+
 ## Current: Aerodrome Quote Correctness
 
 - [x] Decode all known quote-state pool events for the supported pool variants:
