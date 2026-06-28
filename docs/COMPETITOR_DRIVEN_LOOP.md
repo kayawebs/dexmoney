@@ -12,10 +12,11 @@ evidence, then a focused fix agent works one problem through the debug workflow.
 
 ## Recurring Report
 
-Run the competitor gap report every 30 minutes from the local machine:
+Run the lightweight competitor gap report every 30 minutes from the local
+machine:
 
 ```bash
-bash ops/remote/competitor-gap-report.sh --lookback-blocks 5000 --limit 200 --top 50
+bash ops/remote/competitor-gap-report.sh --lookback-blocks 100 --limit 3 --top 5
 ```
 
 The wrapper runs the heavy analysis on `ssh base` and copies the report archive
@@ -31,8 +32,18 @@ Default target competitor:
 0x0629da86af5a4ae1ba5e1589b13702558d0fb056
 ```
 
-The report is read-only diagnostics. It must not restart services, change
-runtime config, deploy contracts, or mutate chain state.
+The recurring report is read-only diagnostics. It must not restart services,
+change runtime config, deploy contracts, or mutate chain state.
+
+Use wider reports only as manual deep dives after a specific hypothesis is
+chosen:
+
+```bash
+bash ops/remote/competitor-gap-report.sh --lookback-blocks 5000 --limit 200 --top 50
+```
+
+If the wide report takes longer than a few minutes, treat that as a reporting
+scalability issue rather than blocking the 30m triage loop.
 
 ## Main-Agent Triage
 
