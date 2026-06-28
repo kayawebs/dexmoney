@@ -234,8 +234,12 @@ async fn run_diag(
         .collect::<BTreeSet<Address>>();
 
     let mut coverages = Vec::new();
+    let mut uncovered_swap_pools = Vec::new();
     for (pool, topic0) in &pool_logs {
-        coverages.push(load_pool_coverage(pg, settings.chain_id, tx_block, *pool, topic0).await?);
+        match load_pool_coverage(pg, settings.chain_id, tx_block, *pool, topic0).await? {
+            Some(coverage) => coverages.push(coverage),
+            None => uncovered_swap_pools.push((*pool, topic0.clone())),
+        }
     }
     let priority_pools = coverages
         .iter()
@@ -294,8 +298,9 @@ async fn run_diag(
     writeln!(writer, "topic_summary: {}", receipt_topic_summary(&receipt))?;
     writeln!(
         writer,
-        "recognized_swap_pools: {} recognized_anchor_cycles: {}",
+        "recognized_swap_pools: {} uncovered_swap_pools: {} recognized_anchor_cycles: {}",
         coverages.len(),
+        uncovered_swap_pools.len(),
         cycles.len()
     )?;
     writeln!(writer)?;
@@ -307,6 +312,14 @@ async fn run_diag(
     writeln!(writer)?;
 
     writeln!(writer, "== Pools ==")?;
+    for (pool, topic0) in &uncovered_swap_pools {
+        writeln!(
+            writer,
+            "uncovered_pool={:#x} topic={} reason=missing_pool_metadata_or_unsupported_protocol",
+            pool,
+            topic_family(topic0)
+        )?;
+    }
     for coverage in &coverages {
         let redis_state = redis.get_pool_state(coverage.pool).await?;
         let ticks = redis
@@ -1661,7 +1674,7 @@ async fn load_pool_coverage(
     block_number: u64,
     pool_address: Address,
     topic0: &str,
-) -> Result<PoolCoverage> {
+) -> Result<Option<PoolCoverage>> {
     let pool_text = format!("{pool_address:#x}").to_ascii_lowercase();
     let row = sqlx::query(
         r#"
@@ -1716,15 +1729,19 @@ async fn load_pool_coverage(
     .fetch_one(pool)
     .await?;
 
-    let token0: String = row.try_get("token0")?;
-    let token1: String = row.try_get("token1")?;
-    let dex: String = row.try_get("dex")?;
-    let variant: String = row.try_get("variant")?;
+    let token0: Option<String> = row.try_get("token0")?;
+    let token1: Option<String> = row.try_get("token1")?;
+    let dex: Option<String> = row.try_get("dex")?;
+    let variant: Option<String> = row.try_get("variant")?;
+    let (Some(token0), Some(token1), Some(dex), Some(variant)) = (token0, token1, dex, variant)
+    else {
+        return Ok(None);
+    };
     let fee_pips: Option<i64> = row.try_get("fee_pips")?;
     let fee_bps: Option<i64> = row.try_get("fee_bps")?;
     let tick_spacing: Option<i64> = row.try_get("tick_spacing")?;
     let latest_state_block: Option<i64> = row.try_get("latest_state_block")?;
-    Ok(PoolCoverage {
+    Ok(Some(PoolCoverage {
         pool: pool_address,
         topic0: topic0.to_string(),
         token0: Address::from_str(&token0).context("invalid token0")?,
@@ -1750,7 +1767,7 @@ async fn load_pool_coverage(
         latest_state_block: latest_state_block.map(|value| value as u64),
         latest_state_source: row.try_get("latest_state_source")?,
         opportunities_near_block: row.try_get("opportunities_near_block")?,
-    })
+    }))
 }
 
 fn receipt_swap_logs(receipt: &TxReceipt) -> Vec<(Address, String)> {
