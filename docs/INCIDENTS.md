@@ -150,6 +150,12 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   `current_token` can reach `end_token` in the remaining number of edges under
   the same bounded candidate-edge graph. This prunes impossible branches without
   dropping any reachable path.
+- Runtime verification after deploying the reachability memo fix:
+  `cycles=128` in one summary window, `changed_pool_scans=23`,
+  `changed_pools=2,566`, `path_build_ms=15,453` total, `max_cycle_ms=6,072`,
+  `candidates_emitted=45`, and `opportunities_created=19`. This is still an
+  optimization target, but it restores multi-cycle throughput compared with the
+  previous single-cycle `path_build_ms=107,016`.
 
 ### Regression Guard
 
