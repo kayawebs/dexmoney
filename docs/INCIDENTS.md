@@ -746,3 +746,89 @@ Sealed summaries should include:
 During catch-up, `catchup_lag_blocks` should monotonically decrease. Searcher
 should see `chain:current_block` lag until market-data has actually processed
 the missing blocks.
+
+## 2026-06-28: Post-Recovery Opportunity Scarcity
+
+Status: Fixed In Code
+Category: coverage | observability
+
+### Symptom
+
+After node recovery and bot restart, the last 30m had `0` opportunities, `0`
+simulations, and `0` transactions, even though the watched competitor continued
+to receive profitable arbitrage transfers. Searcher was not stalled: cycle logs
+showed current chain and pool-state blocks, tens of thousands of quote attempts,
+and `opportunities_created=0`.
+
+### Impact
+
+The bot could not submit any arbitrage attempts. This is a P0 because it is an
+opportunity-production outage, not an execution-manager outage.
+
+### Hypotheses
+
+- Same-block competitor-discovered V3/V4 pools are imported too late or without
+  initialized ticks, so searcher cannot quote them before the opportunity is
+  gone.
+- Ready competitor anchor cycles are being rejected by local amount/min-profit
+  settings or impact guard rather than missing pool coverage.
+- Some competitor flows are not anchor cycles and need separate classification
+  before adding search complexity.
+
+### Evidence
+
+- Competitor report `reports/competitor-gap-20260628T061104Z` sampled three
+  competitor profit txs: two `covered_no_opportunity_near_block` and one
+  `tick_scan_zero`.
+- The report showed `pool_gap_counts`: `covered_no_opportunity_near_block=5`,
+  `tick_scan_zero=3`.
+- Tx `0x7395b8f98e215feddceeab9ee229a18b4c29a88bb37a7c2e2a49adbc8a478a03`
+  included same-block V3/V4 pools classified as `tick_scan_zero`.
+- Tx `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`
+  used a ready USDC -> cbBTC -> WETH -> USDC cycle, but competitor flow moved
+  `457,242,224` raw USDC while local configured max was `45,270,872` raw.
+- Searcher logs showed most successful quotes rejected by `min_profit_rejected`;
+  some above-min candidates were rejected by `MAX_PRICE_IMPACT_BPS=50`.
+
+### Decision
+
+This is at least two issues. The same-block `tick_scan_zero` path is a real
+coverage bug: importing a trusted pool wrote registry rows but did not
+immediately publish the discovered state or trigger tick warmup. The ready-cycle
+case needs better diagnostics before changing amount/min-profit/impact config.
+
+### Fix
+
+- `market-data` now immediately publishes the `DiscoveredPool.state` after a
+  trusted pool import and asynchronously starts initialized tick warmup for that
+  pool. This avoids waiting for registry reload or later state refresh before
+  searcher can see the pool.
+- `competitor_live_compare` now reports anchor-token pool-to-pool flow and its
+  ratio to configured max amounts even when the competitor profit token is not
+  an anchor token.
+- `docs/TODO.md` was split into P0a/P0b/P0c so same-block tick readiness,
+  ready-cycle rejection, and non-cycle competitor flows are tracked separately.
+
+### Verification
+
+After deployment, run:
+
+```bash
+bash ops/remote/competitor-gap-report.sh --lookback-blocks 100 --limit 3 --top 5
+```
+
+Expected:
+
+- Same-block trusted V3/V4 pools should no longer remain `tick_scan_zero`
+  unless the pool is explicitly unsupported or RPC tick lookup failed.
+- `anchor_input_guess` should include `pool_to_pool_anchor_max_raw` and
+  `observed_to_configured_bps` for ready anchor cycles.
+- Searcher should create opportunities again when either a newly imported pool
+  is quoteable or a ready path passes amount/min-profit/impact filters.
+
+### Regression Guard
+
+Keep the rolling competitor report as the first diagnostic for opportunity
+scarcity. A future `covered_no_opportunity_near_block` must be mapped to one of
+path generation, quote skip, impact guard, min profit, amount config, or
+unsupported flow before changing hot-path search logic.

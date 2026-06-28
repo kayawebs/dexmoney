@@ -750,6 +750,7 @@ fn tx_diagnostics(
         anchor_input_guesses: anchor_input_guesses(
             receipt,
             collector,
+            coverages,
             anchor_tokens,
             anchor_configs,
         ),
@@ -1038,6 +1039,7 @@ fn unrecognized_transfer_counterparties(
 fn anchor_input_guesses(
     receipt: &TxReceipt,
     collector: Address,
+    coverages: &[PoolCoverage],
     anchor_tokens: &BTreeSet<String>,
     anchor_configs: &BTreeMap<String, AnchorAmountConfig>,
 ) -> Vec<String> {
@@ -1087,10 +1089,93 @@ fn anchor_input_guesses(
         *profit_by_token.entry(token).or_default() += amount;
     }
 
-    if executor_addresses.is_empty() {
+    if !executor_addresses.is_empty() {
+        for log in receipt
+            .raw
+            .get("logs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(topic0) = raw_log_topic0(log) else {
+                continue;
+            };
+            if topic0 != ERC20_TRANSFER_TOPIC {
+                continue;
+            }
+            let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+                continue;
+            };
+            if topics.len() < 3 {
+                continue;
+            }
+            let Some(from) = topics[1].as_str().and_then(topic_address) else {
+                continue;
+            };
+            let Some(to) = topics[2].as_str().and_then(topic_address) else {
+                continue;
+            };
+            if !executor_addresses.contains(&from) || to == collector_address {
+                continue;
+            }
+            let token = log
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_ascii_lowercase();
+            if !anchor_tokens.contains(&token) {
+                continue;
+            }
+            let amount = parse_hex_u256(log.get("data").and_then(Value::as_str).unwrap_or("0x0"));
+            *input_by_token.entry(token).or_default() += amount;
+        }
+    }
+
+    let tokens = input_by_token
+        .keys()
+        .chain(profit_by_token.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    for token in tokens {
+        let input = input_by_token.get(&token).copied().unwrap_or_default();
+        let profit = profit_by_token.get(&token).copied().unwrap_or_default();
+        let config = anchor_configs.get(&token).cloned().unwrap_or_default();
+        let configured_amounts = configured_amounts(&config);
+        let configured_min_profit = configured_min_profit(&config);
+        out.push(format!(
+            "token={} input_raw={} profit_raw={} configured_multihop_amounts={} configured_multihop_min_profit={}",
+            short_addr(&token),
+            input,
+            profit,
+            configured_amounts,
+            configured_min_profit
+        ));
+    }
+    out.extend(anchor_pool_flow_guesses(
+        receipt,
+        coverages,
+        anchor_tokens,
+        anchor_configs,
+    ));
+    out
+}
+
+fn anchor_pool_flow_guesses(
+    receipt: &TxReceipt,
+    coverages: &[PoolCoverage],
+    anchor_tokens: &BTreeSet<String>,
+    anchor_configs: &BTreeMap<String, AnchorAmountConfig>,
+) -> Vec<String> {
+    let recognized_pools = coverages
+        .iter()
+        .map(|coverage| coverage.pool.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if recognized_pools.len() < 2 {
         return Vec::new();
     }
 
+    let mut max_pool_to_pool_by_token = BTreeMap::<String, U256>::new();
     for log in receipt
         .raw
         .get("logs")
@@ -1102,6 +1187,14 @@ fn anchor_input_guesses(
             continue;
         };
         if topic0 != ERC20_TRANSFER_TOPIC {
+            continue;
+        }
+        let token = log
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_ascii_lowercase();
+        if !anchor_tokens.contains(&token) {
             continue;
         }
         let Some(topics) = log.get("topics").and_then(Value::as_array) else {
@@ -1116,51 +1209,69 @@ fn anchor_input_guesses(
         let Some(to) = topics[2].as_str().and_then(topic_address) else {
             continue;
         };
-        if !executor_addresses.contains(&from) || to == collector_address {
-            continue;
-        }
-        let token = log
-            .get("address")
-            .and_then(Value::as_str)
-            .unwrap_or("-")
-            .to_ascii_lowercase();
-        if !anchor_tokens.contains(&token) {
+        if !recognized_pools.contains(&from) || !recognized_pools.contains(&to) {
             continue;
         }
         let amount = parse_hex_u256(log.get("data").and_then(Value::as_str).unwrap_or("0x0"));
-        *input_by_token.entry(token).or_default() += amount;
+        let current = max_pool_to_pool_by_token.entry(token).or_default();
+        if amount > *current {
+            *current = amount;
+        }
     }
 
-    let tokens = input_by_token
-        .keys()
-        .chain(profit_by_token.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
     let mut out = Vec::new();
-    for token in tokens {
-        let input = input_by_token.get(&token).copied().unwrap_or_default();
-        let profit = profit_by_token.get(&token).copied().unwrap_or_default();
+    for (token, amount) in max_pool_to_pool_by_token {
         let config = anchor_configs.get(&token).cloned().unwrap_or_default();
-        let configured_amounts = config
-            .multihop_amounts
-            .as_deref()
-            .or(config.all_amounts.as_deref())
-            .unwrap_or("-");
-        let configured_min_profit = config
-            .multihop_min_profit
-            .as_deref()
-            .or(config.all_min_profit.as_deref())
-            .unwrap_or("-");
+        let configured_max = configured_max_raw(&config);
+        let configured_amounts = configured_amounts(&config);
+        let configured_min_profit = configured_min_profit(&config);
+        let observed_to_configured_bps = configured_max
+            .filter(|max| !max.is_zero())
+            .map(|max| (amount.saturating_mul(U256::from(10_000u64)) / max).to_string())
+            .unwrap_or_else(|| "-".into());
         out.push(format!(
-            "token={} input_raw={} profit_raw={} configured_multihop_amounts={} configured_multihop_min_profit={}",
+            "token={} pool_to_pool_anchor_max_raw={} configured_multihop_amounts={} configured_multihop_min_profit={} observed_to_configured_bps={}",
             short_addr(&token),
-            input,
-            profit,
+            amount,
             configured_amounts,
-            configured_min_profit
+            configured_min_profit,
+            observed_to_configured_bps
         ));
     }
     out
+}
+
+fn configured_amounts(config: &AnchorAmountConfig) -> &str {
+    config
+        .multihop_amounts
+        .as_deref()
+        .or(config.all_amounts.as_deref())
+        .unwrap_or("-")
+}
+
+fn configured_min_profit(config: &AnchorAmountConfig) -> &str {
+    config
+        .multihop_min_profit
+        .as_deref()
+        .or(config.all_min_profit.as_deref())
+        .unwrap_or("-")
+}
+
+fn configured_max_raw(config: &AnchorAmountConfig) -> Option<U256> {
+    let mut max_value = None;
+    for raw in configured_amounts(config).split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "-" {
+            continue;
+        }
+        let Ok(value) = U256::from_str_radix(raw, 10) else {
+            continue;
+        };
+        if max_value.map(|max| value > max).unwrap_or(true) {
+            max_value = Some(value);
+        }
+    }
+    max_value
 }
 
 fn write_tx(

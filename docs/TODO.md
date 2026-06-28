@@ -15,24 +15,39 @@ instead of patching from chat memory.
 
 Latest evidence:
 
-- Competitor report: `reports/competitor-gap-20260628T054124Z`.
+- Competitor report: `reports/competitor-gap-20260628T061104Z`
+  (`/private/tmp/competitor-gap-20260628T061104Z.tgz` locally).
 - Searcher quality report: `reports/searcher-quality-20260628T054645Z`.
-- Competitor samples in the latest report: all `3` sampled profit txs are
-  `covered_no_opportunity_near_block`.
-- Searcher gap split: `recognized_anchor_cycle_but_no_opportunity=1`,
+- Current runtime status: in the latest 30m, Postgres had `0` opportunities,
+  `0` simulations, and `0` transactions, while searcher logs still showed
+  active same-block processing with `latest_chain_block == latest_pool_state_block`.
+  Recent cycles had tens of thousands of `quote_attempts` and `quote_successes`,
+  but `opportunities_created=0`.
+- Current direct blocker split: most successful quotes are rejected by
+  `min_profit_rejected`; a smaller set of above-min candidates is rejected by
+  `MAX_PRICE_IMPACT_BPS=50`. One recent cycle showed
+  `quote_successes=62,854`, `min_profit_rejected=62,854`,
+  `opportunities_created=0`; another showed `price_impact_rejected=22`,
+  all passing the 100/150/300/500 bps shadow thresholds.
+- Competitor samples in the latest report: `2` sampled profit txs are
+  `covered_no_opportunity_near_block`, and `1` is `tick_scan_zero`.
+- Pool gap split: `covered_no_opportunity_near_block=5`, `tick_scan_zero=3`.
+- Searcher gap split from live compare: `recognized_anchor_cycle_but_no_opportunity=1`,
   `recognized_swaps_do_not_form_anchor_cycle=2`.
 - Important competitor samples:
-  - `0x3b5761584aaaaa15247c9896ca3c85c5f8eef819a96fdc9e103cb02b2f42c2df`:
-    two ready V3-style USDC/cbBTC pools, recognized anchor cycle, no local
-    opportunity near the block.
-  - `0x66687b5961276b98d948ae751e41eb87ffe510a0e90e4cdc1fc1035e89118c4a`:
-    Uniswap V3 + Balancer V3 flow; Balancer pool
-    `0x6cf6f5adc2a3de26972340a827d2369ff56e82d0` remains
-    `balancer_v3_quote_unvalidated`.
-  - `0xa800c486733586e35dadf7aef5cded7fd8e6a3a72b191e98cf4bf39832850e5b`:
-    Aerodrome + V4 flow; V4 pool
-    `0xed93844bad1e39b1d7298a37f636d8169bc6523e` is static/zero-hook but
-    `tick_scan_zero`.
+  - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
+    ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
+    local opportunity near the block. Competitor transfer flow shows
+    `457,242,224` raw USDC moving into the first pool, while current configured
+    USDC max is `45,270,872` raw; the report previously printed
+    `anchor_input_guess=-`, so diagnostics did not expose the scale mismatch.
+  - `0x7395b8f98e215feddceeab9ee229a18b4c29a88bb37a7c2e2a49adbc8a478a03`:
+    V4 + V3 + Pancake path; three pools in the sample are `tick_scan_zero`,
+    including same-block competitor-discovered V3 and older V4 pools.
+  - `0x1e3f6bcff4d92108769b623117423dee7bc2dd60f5d5284854db00c6eabcc62f`:
+    only one recognized swap pool and two unrecognized counterparties, likely a
+    non-cycle or external-protocol flow that our anchor-cycle search does not
+    model yet.
 - Impact shadow from the searcher-quality report: `price_impact_rejected=1044`,
   shadow pass counts would be `650` at 100 bps, `974` at 150 bps, `978` at
   300 bps, and `1030` at 500 bps; max shadow profit was `21,389` at 100 bps,
@@ -43,19 +58,40 @@ Latest evidence:
 
 Priority order:
 
-- [ ] P0: Explain `covered_no_opportunity_near_block` and
-  `recognized_anchor_cycle_but_no_opportunity` for the latest competitor
-  samples:
-  - Start from `0x3b5761584aaaaa15247c9896ca3c85c5f8eef819a96fdc9e103cb02b2f42c2df`.
-  - For each competitor pool/path, prove whether our searcher rejected it due
-    to path generation, quote skip, impact guard, min profit, anchor amount, hot
-    pool selection, trust/execution filter, or missing Redis state.
-  - Produce a durable diagnostic that maps one competitor tx to the exact local
-    rejection stage.
+- [ ] P0a: Make same-block competitor-discovered V3/V4 pools quoteable quickly:
+  - Start from tx
+    `0x7395b8f98e215feddceeab9ee229a18b4c29a88bb37a7c2e2a49adbc8a478a03`.
+  - Prove why `0x104efd7b51f74cc8d1bbe9991a5e0c94e397e5eb` and the V4 pools
+    in that tx remain `tick_scan_zero` at report time.
+  - Fix the live import path so newly imported V3-style/V4 pools get immediate
+    minimal tick coverage around current tick without blocking market-data.
+  - Verification: next competitor report should not classify same-block
+    executable pools as `tick_scan_zero` unless they are explicitly unsupported.
+- [ ] P0b: Explain ready anchor-cycle no-opportunity by exact local rejection:
+  - Start from tx
+    `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`.
+  - Compare competitor observed anchor flow (`457,242,224` raw USDC) with our
+    configured USDC max (`45,270,872` raw) and min profit (`5,000` raw).
+  - Prove whether our no-opportunity result is caused by configured amount,
+    min profit, impact guard, path generation, or exact quote disagreement.
+  - A report enhancement has been added locally so `anchor_input_guess` includes
+    pool-to-pool anchor token flow and configured max ratio, even when the
+    competitor profit token is not an anchor token.
+- [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
+  search logic:
+  - Start from tx
+    `0x1e3f6bcff4d92108769b623117423dee7bc2dd60f5d5284854db00c6eabcc62f`.
+  - Identify the two unrecognized counterparties and decide whether the path is
+    a router/vault/exact-output shape, a flash repayment shape, or out of scope.
+  - Do not add hot-path search complexity until this flow class is proven common
+    and profitable enough.
 - [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from
     `reports/searcher-quality-20260628T054645Z.txt`.
+  - Also replay the current top impact samples, e.g.
+    `cycle3-a02913-aero-slipstream-6258a8-aero-classic-18b2ff-aero-classic-892aa7`,
+    which showed profits above current min but `impact_bps=100`.
   - Use the shadow data to compare 100/150/300/500 bps, but do not raise the
     live threshold until samples show successful simulation and acceptable
     revert risk.

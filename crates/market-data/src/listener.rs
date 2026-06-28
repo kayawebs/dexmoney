@@ -2270,6 +2270,15 @@ where
                 1,
             )
             .await?;
+        let imported_state = discovered.state.clone();
+        self.publish_selected_states_with_block(
+            std::slice::from_ref(&imported_state),
+            &HashSet::from([pool]),
+            discovery_source,
+            Some(block_number),
+        )
+        .await?;
+        self.spawn_initialized_tick_warmup(vec![imported_state], "live_pool_discovery_import");
         info!(
             pool = %pool,
             factory = %factory,
