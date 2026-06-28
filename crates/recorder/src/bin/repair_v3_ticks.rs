@@ -355,7 +355,7 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
             updated_at
           FROM pool_states
           WHERE updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
-          ORDER BY lower(pool_address), updated_at DESC
+          ORDER BY lower(pool_address), block_number DESC, updated_at DESC
         )
         SELECT
           p.chain_id,
