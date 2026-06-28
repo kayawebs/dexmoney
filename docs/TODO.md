@@ -15,8 +15,12 @@ instead of patching from chat memory.
 
 Latest evidence:
 
-- Competitor report: `reports/competitor-gap-20260628T061104Z`
-  (`/private/tmp/competitor-gap-20260628T061104Z.tgz` locally).
+- Competitor reports:
+  - `reports/competitor-gap-20260628T061104Z`
+    (`/private/tmp/competitor-gap-20260628T061104Z.tgz` locally).
+  - `reports/competitor-gap-20260628T064024Z`
+    (`/private/tmp/competitor-gap-20260628T064024Z.tgz` locally), after
+    deploying `c4ae103`.
 - Searcher quality report: `reports/searcher-quality-20260628T054645Z`.
 - Current runtime status: in the latest 30m, Postgres had `0` opportunities,
   `0` simulations, and `0` transactions, while searcher logs still showed
@@ -34,6 +38,13 @@ Latest evidence:
 - Pool gap split: `covered_no_opportunity_near_block=5`, `tick_scan_zero=3`.
 - Searcher gap split from live compare: `recognized_anchor_cycle_but_no_opportunity=1`,
   `recognized_swaps_do_not_form_anchor_cycle=2`.
+- Post-`c4ae103` competitor report still shows local opportunity scarcity:
+  `covered_no_opportunity_near_block=4`, `recognized_anchor_cycle_but_no_opportunity=4`,
+  and `recognized_swaps_do_not_form_anchor_cycle=1`.
+- Post-`c4ae103` searcher logs confirm the hot path is active and current, but
+  `opportunities_created=0`: recent cycles had `quote_successes=31,344`,
+  `min_profit_rejected=31,336`, `price_impact_rejected=8`, and no emitted
+  candidates.
 - Important competitor samples:
   - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
     ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
@@ -41,6 +52,10 @@ Latest evidence:
     `457,242,224` raw USDC moving into the first pool, while current configured
     USDC max is `45,270,872` raw; the report previously printed
     `anchor_input_guess=-`, so diagnostics did not expose the scale mismatch.
+  - `0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d`:
+    ready 4-hop USDC anchor cycle. Competitor input was only `11,496,168` raw
+    USDC, below the current configured max `45,270,872`, with profit
+    `17,803` raw USDC; therefore amount cap alone cannot explain P0b.
   - `0x7395b8f98e215feddceeab9ee229a18b4c29a88bb37a7c2e2a49adbc8a478a03`:
     V4 + V3 + Pancake path; three pools in the sample are `tick_scan_zero`,
     including same-block competitor-discovered V3 and older V4 pools.
@@ -59,6 +74,12 @@ Latest evidence:
 Priority order:
 
 - [ ] P0a: Make same-block competitor-discovered V3/V4 pools quoteable quickly:
+  - Code fix committed and deployed as `c4ae103`: trusted pool import now
+    immediately publishes `DiscoveredPool.state` and starts async initialized
+    tick warmup via `live_pool_discovery_import`.
+  - Runtime verification after deploy: pool-discovery logs show imported pools
+    followed by `initialized tick warmup started/complete`, with
+    `lag_blocks=0`.
   - Start from tx
     `0x7395b8f98e215feddceeab9ee229a18b4c29a88bb37a7c2e2a49adbc8a478a03`.
   - Prove why `0x104efd7b51f74cc8d1bbe9991a5e0c94e397e5eb` and the V4 pools
@@ -72,19 +93,51 @@ Priority order:
     `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`.
   - Compare competitor observed anchor flow (`457,242,224` raw USDC) with our
     configured USDC max (`45,270,872` raw) and min profit (`5,000` raw).
+  - Do not treat amount cap as the only cause: tx
+    `0x6a003d20b0657ff6e1bb63a46e008af4f51e3eeb5f05e79605b8962add8e018d`
+    used only `11,496,168` raw USDC and still had no local opportunity.
   - Prove whether our no-opportunity result is caused by configured amount,
     min profit, impact guard, path generation, or exact quote disagreement.
   - A report enhancement has been added locally so `anchor_input_guess` includes
     pool-to-pool anchor token flow and configured max ratio, even when the
     competitor profit token is not an anchor token.
+  - Next durable tool needed: given a competitor tx, reconstruct each recognized
+    anchor cycle and print the exact local searcher stage result:
+    path-generated, quote-skipped reason, rough-quote result, min-profit result,
+    impact result, and candidate publish result.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx
     `0x1e3f6bcff4d92108769b623117423dee7bc2dd60f5d5284854db00c6eabcc62f`.
   - Identify the two unrecognized counterparties and decide whether the path is
     a router/vault/exact-output shape, a flash repayment shape, or out of scope.
+  - Keep a structured list in every competitor report for unsupported flow
+    classes: `recognized_swaps_do_not_form_anchor_cycle`, `observed_only_not_imported`,
+    `classified_observed_only_not_imported`, nonzero V4 hook, Balancer V3
+    quote-unvalidated, and unrecognized transfer counterparty.
+  - Latest examples to retain:
+    - `0x481b42ed7341480c4c5e70dfba0fa9eea1288892b2565b23d65ad3a30057f172`:
+      V4 plus external counterparties including the V4 PoolManager; one V4 pool
+      is `observed_only_not_imported` with nonzero hook.
+    - `0x305f690cfbd271cdee231eebf4db29583fab792cb16f13722a064685d9350be1`:
+      profit in WETH while the anchor cycle touches USDC, currently missed by
+      local opportunity generation.
   - Do not add hot-path search complexity until this flow class is proven common
     and profitable enough.
+- [ ] P0d: Replace fixed amount-grid search with adaptive sizing:
+  - Current search uses a small discrete set derived from configured max amount,
+    e.g. fractions of `45,270,872` raw USDC. This can miss the local optimum,
+    especially on single-peak AMM profit curves.
+  - Keep hot path cheap: first run coarse monotonic/geometric probes, then only
+    for candidates near or above min profit run a local ternary/golden-section
+    or bracketed integer search around the best region.
+  - Do not spend compute on obviously uneconomic tiny inputs. Derive a per-token
+    minimum from configured min profit, rough gas target, and observed output
+    slope; amounts unable to clear the configured min profit should be skipped
+    before full route quote.
+  - Add shadow metrics before changing live behavior: count opportunities that
+    would pass using adaptive sizing, best adaptive amount, extra quote cost,
+    and whether the selected amount is executable with current inventory.
 - [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from
