@@ -121,6 +121,24 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   `UNISWAP_V2_FACTORY` as `DirectV2`, including `ExecutorHub` strict
   validation through `getPair`. This part is not live until a new Hub is
   deployed and configured.
+- Post-deploy searcher logs showed the first fanout/active fix restored some
+  opportunities, but introduced a hot-path performance regression. Recent
+  cycles had `changed_pools=1204..1224`, `path_build_ms=66,403..95,581`,
+  `dynamic_multihop_invalid_cycle=189,246..227,190`, and only
+  `opportunities_created=1` per cycle. `dynamic_multihop_priority_edges`
+  exceeded `1,100`, so every token segment expansion received all changed-pool
+  priority edges during backlog processing.
+- Root cause: the narrow coverage fix made the priority set global to the whole
+  cycle. That preserves coverage, but turns `MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN`
+  into `top16 + all changed edges` for hot tokens such as USDC/WETH, causing
+  path generation to enumerate huge invalid prefix/suffix combinations before
+  rough quote.
+- Smallest performance fix: bound the extra priority set per token. The
+  triggering changed edge is still inserted explicitly, but only the first
+  `32` beyond-top16 changed priority edges per token are injected into segment
+  expansion. Searcher logs now include
+  `dynamic_multihop_priority_edges_dropped`, and the competitor pipeline
+  diagnostic mirrors the same bounded priority rule.
 
 ### Regression Guard
 

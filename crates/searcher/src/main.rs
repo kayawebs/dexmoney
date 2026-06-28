@@ -159,6 +159,8 @@ async fn main() -> Result<()> {
                     aggregate.search.dynamic_multihop_candidate_cap_hit,
                 dynamic_multihop_priority_edges =
                     aggregate.search.dynamic_multihop_priority_edges,
+                dynamic_multihop_priority_edges_dropped =
+                    aggregate.search.dynamic_multihop_priority_edges_dropped,
                 risk_rejected = aggregate.risk_rejected,
                 risk_expected_profit_rejected = aggregate.risk_expected_profit_rejected,
                 risk_price_impact_rejected = aggregate.risk_price_impact_rejected,

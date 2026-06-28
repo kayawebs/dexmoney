@@ -45,6 +45,11 @@ Latest evidence:
   `opportunities_created=0`: recent cycles had `quote_successes=31,344`,
   `min_profit_rejected=31,336`, `price_impact_rejected=8`, and no emitted
   candidates.
+- After deploying the fanout/active-guard fix, opportunity creation resumed but
+  searcher throughput regressed badly: recent cycles had `path_build_ms=66s..96s`,
+  `changed_pools≈1,200`, `dynamic_multihop_priority_edges>1,100`, and only one
+  cycle per minute-plus. This is now part of P0 because stale searcher output
+  cannot compete even if coverage is broader.
 - Important competitor samples:
   - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
     ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
@@ -144,6 +149,15 @@ Priority order:
     `getPool(tokenA,tokenB,stable)`. Minimal code support has been added for
     known `UNISWAP_V2_FACTORY` as DirectV2/getPair; this requires deploying a
     new `ExecutorHub` before live execution can use these paths.
+  - P0 performance regression after the coverage fix: global changed-pool
+    priority made dynamic path generation effectively `top16 + all changed
+    edges` for hot tokens. Minimal fix: keep every changed edge as an explicit
+    trigger, but bound extra beyond-top16 priority edges to `32` per token and
+    log `dynamic_multihop_priority_edges_dropped`.
+  - Verification for the bounded-priority fix: after deploying searcher,
+    `path_build_ms` should drop from 60-90s back to low seconds or better under
+    comparable backlog, while fresh competitor diagnostics should not return to
+    `path_generation` solely because a changed pool was outside top16.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx

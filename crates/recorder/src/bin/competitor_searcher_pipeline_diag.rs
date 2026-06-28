@@ -46,6 +46,7 @@ const AERODROME_CLASSIC_SWAP_TOPIC: &str =
 const UNISWAP_V4_SWAP_TOPIC: &str =
     "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
+const MAX_DYNAMIC_PRIORITY_EDGES_PER_TOKEN: usize = 32;
 const MAX_AMOUNT_TIER_DENOMINATOR: u64 = 1_000_000;
 const MAX_AMOUNT_TIER_NUMERATORS: &[u64] = &[
     100, 300, 1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000,
@@ -172,6 +173,8 @@ struct ExactProbeResult {
 struct GraphSnapshot {
     edges_by_token: HashMap<Address, Vec<GraphEdge>>,
     priority_edges_beyond_base_fanout: usize,
+    priority_edges_selected: usize,
+    priority_edges_dropped: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,11 +277,13 @@ async fn run_diag(
     )?;
     writeln!(
         writer,
-        "redis_pool_states: {} active_pool_states: {} priority_pools: {} priority_edges_beyond_base_fanout: {}",
+        "redis_pool_states: {} active_pool_states: {} priority_pools: {} priority_edges_beyond_base_fanout: {} priority_edges_selected: {} priority_edges_dropped: {}",
         redis_states.len(),
         active_states.len(),
         priority_pools.len(),
-        graph.priority_edges_beyond_base_fanout
+        graph.priority_edges_beyond_base_fanout,
+        graph.priority_edges_selected,
+        graph.priority_edges_dropped
     )?;
     writeln!(writer, "topic_summary: {}", receipt_topic_summary(&receipt))?;
     writeln!(
@@ -1121,6 +1126,8 @@ impl GraphSnapshot {
             }
         }
         let mut priority_edges_beyond_base_fanout = 0usize;
+        let mut priority_edges_selected = 0usize;
+        let mut priority_edges_dropped = 0usize;
         let edges_by_token = edges_by_token
             .into_iter()
             .map(|(token, mut edges)| {
@@ -1141,13 +1148,20 @@ impl GraphSnapshot {
                     .take(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
                     .map(|(edge, _)| *edge)
                     .collect::<Vec<_>>();
-                selected.extend(
-                    edges
-                        .iter()
-                        .skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
-                        .filter(|(edge, _)| priority_pools.contains(&edge.pool))
-                        .map(|(edge, _)| *edge),
-                );
+                let mut token_priority_selected = 0usize;
+                for (edge, _) in edges
+                    .iter()
+                    .skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
+                    .filter(|(edge, _)| priority_pools.contains(&edge.pool))
+                {
+                    if token_priority_selected < MAX_DYNAMIC_PRIORITY_EDGES_PER_TOKEN {
+                        selected.push(*edge);
+                        priority_edges_selected += 1;
+                        token_priority_selected += 1;
+                    } else {
+                        priority_edges_dropped += 1;
+                    }
+                }
                 selected.sort_by_key(|edge| (edge.token_out, edge.pool));
                 (token, selected)
             })
@@ -1155,6 +1169,8 @@ impl GraphSnapshot {
         Self {
             edges_by_token,
             priority_edges_beyond_base_fanout,
+            priority_edges_selected,
+            priority_edges_dropped,
         }
     }
 }

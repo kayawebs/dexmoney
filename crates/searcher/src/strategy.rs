@@ -21,6 +21,7 @@ const MAX_FOUR_POOL_CYCLE_PATHS_PER_ANCHOR: usize = 2_000;
 const MAX_DYNAMIC_MULTIHOP_PATHS_PER_SCAN: usize = 5_000;
 const MAX_DYNAMIC_MULTIHOP_CANDIDATES_PER_SCAN: usize = 20_000;
 const MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN: usize = 16;
+const MAX_DYNAMIC_PRIORITY_EDGES_PER_TOKEN: usize = 32;
 const MAX_DYNAMIC_SEGMENT_PATHS: usize = 256;
 const TOP_REJECTED_SAMPLES: usize = 5;
 const TOP_QUOTE_SKIP_SAMPLES: usize = 8;
@@ -104,6 +105,7 @@ pub struct SearchStats {
     pub dynamic_multihop_rough_profit_below_min: u64,
     pub dynamic_multihop_candidate_cap_hit: u64,
     pub dynamic_multihop_priority_edges: u64,
+    pub dynamic_multihop_priority_edges_dropped: u64,
     pub best_profit_before_impact: U256,
     pub best_profit_rejected_by_impact: U256,
     pub best_profit_rejected_by_model_edge: U256,
@@ -223,6 +225,8 @@ impl SearchStats {
             other.dynamic_multihop_rough_profit_below_min;
         self.dynamic_multihop_candidate_cap_hit += other.dynamic_multihop_candidate_cap_hit;
         self.dynamic_multihop_priority_edges += other.dynamic_multihop_priority_edges;
+        self.dynamic_multihop_priority_edges_dropped +=
+            other.dynamic_multihop_priority_edges_dropped;
         self.best_profit_before_impact = self
             .best_profit_before_impact
             .max(other.best_profit_before_impact);
@@ -1026,8 +1030,9 @@ impl SearchEngine {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         let mut segment_cache = SegmentPathCache::default();
-        stats.dynamic_multihop_priority_edges =
-            graph.priority_edges_beyond_base_fanout(changed_pools) as u64;
+        let priority = graph.bounded_priority_pools(changed_pools);
+        stats.dynamic_multihop_priority_edges = priority.selected_edges as u64;
+        stats.dynamic_multihop_priority_edges_dropped = priority.dropped_edges as u64;
         for anchor in &self.anchor_configs {
             for changed_pool in changed_pools {
                 let Some(changed_edges) = graph.pool_edges(*changed_pool) else {
@@ -1041,7 +1046,7 @@ impl SearchEngine {
                         anchor,
                         changed_edge,
                         3,
-                        changed_pools,
+                        &priority.pools,
                         &mut segment_cache,
                         &mut stats,
                     );
@@ -1052,7 +1057,7 @@ impl SearchEngine {
                         anchor,
                         changed_edge,
                         4,
-                        changed_pools,
+                        &priority.pools,
                         &mut segment_cache,
                         &mut stats,
                     );
@@ -1496,6 +1501,12 @@ pub(crate) struct GraphSnapshot {
     pool_to_edges: HashMap<Address, Vec<OwnedPoolEdge>>,
 }
 
+struct BoundedPriorityPools {
+    pools: HashSet<Address>,
+    selected_edges: usize,
+    dropped_edges: usize,
+}
+
 impl GraphSnapshot {
     fn new(pool_states: Vec<PoolState>) -> Self {
         let mut states = Vec::new();
@@ -1565,17 +1576,31 @@ impl GraphSnapshot {
         self.pool_to_edges.get(&pool).map(Vec::as_slice)
     }
 
-    fn priority_edges_beyond_base_fanout(&self, priority_pools: &HashSet<Address>) -> usize {
-        self.edges_by_token
-            .values()
-            .map(|edges| {
-                edges
-                    .iter()
-                    .skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
-                    .filter(|edge| priority_pools.contains(&edge.pool()))
-                    .count()
-            })
-            .sum()
+    fn bounded_priority_pools(&self, priority_pools: &HashSet<Address>) -> BoundedPriorityPools {
+        let mut pools = HashSet::new();
+        let mut selected_edges = 0usize;
+        let mut dropped_edges = 0usize;
+        for edges in self.edges_by_token.values() {
+            let mut token_selected = 0usize;
+            for edge in edges
+                .iter()
+                .skip(MAX_DYNAMIC_EDGE_FANOUT_PER_TOKEN)
+                .filter(|edge| priority_pools.contains(&edge.pool()))
+            {
+                if token_selected < MAX_DYNAMIC_PRIORITY_EDGES_PER_TOKEN {
+                    pools.insert(edge.pool());
+                    selected_edges += 1;
+                    token_selected += 1;
+                } else {
+                    dropped_edges += 1;
+                }
+            }
+        }
+        BoundedPriorityPools {
+            pools,
+            selected_edges,
+            dropped_edges,
+        }
     }
 }
 
