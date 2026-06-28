@@ -178,7 +178,7 @@ call_failed=0
 
 while IFS='|' read -r pool token0 token1 factory dex variant enabled; do
   checked=$((checked + 1))
-  if [[ "$enabled" != "true" ]]; then
+  if [[ "$enabled" != "true" && ! ( "$APPLY" -eq 1 && -n "$POOL" ) ]]; then
     printf "%-44s %-44s %-9s %s\n" "$pool" "-" "SKIP" "pool is not enabled"
     continue
   fi
