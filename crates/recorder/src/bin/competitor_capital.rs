@@ -40,6 +40,7 @@ struct Cli {
     to_block: Option<i64>,
     limit: i64,
     output: Option<PathBuf>,
+    shell_output: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -118,8 +119,53 @@ async fn main() -> Result<()> {
         .filter_map(|row| analyze_tx(row, &collector).transpose())
         .collect::<Result<Vec<_>>>()?;
 
-    print_report(&cli, from_block, to_block, &txs);
+    if cli.shell_output {
+        print_shell_exports(&cli, from_block, to_block, &txs);
+    } else {
+        print_report(&cli, from_block, to_block, &txs);
+    }
     Ok(())
+}
+
+fn print_shell_exports(cli: &Cli, from_block: i64, to_block: i64, txs: &[TxCapital]) {
+    println!("SHADOW_SCOPE_ADDRESS={}", address_to_lower(cli.address));
+    println!("SHADOW_SCOPE_FROM_BLOCK={from_block}");
+    println!("SHADOW_SCOPE_TO_BLOCK={to_block}");
+    println!("SHADOW_SCOPE_TXS={}", txs.len());
+    for token in TOKENS {
+        let flows = txs
+            .iter()
+            .flat_map(|tx| tx.token_flows.iter())
+            .filter(|flow| flow.token.address == token.address)
+            .filter(|flow| {
+                flow.profit_to_collector_raw > U256::ZERO
+                    && flow.executor_out_non_collector_raw > U256::ZERO
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let raw_values = flows
+            .iter()
+            .map(|flow| flow.executor_max_out_non_collector_raw)
+            .collect::<Vec<_>>();
+        let prefix = format!("SHADOW_{}", token.symbol);
+        println!("{}_TXS={}", prefix, flows.len());
+        println!(
+            "{}_P50_RAW={}",
+            prefix,
+            percentile_u256(raw_values.clone(), 0.50)
+        );
+        println!(
+            "{}_P90_RAW={}",
+            prefix,
+            percentile_u256(raw_values.clone(), 0.90)
+        );
+        println!(
+            "{}_P99_RAW={}",
+            prefix,
+            percentile_u256(raw_values.clone(), 0.99)
+        );
+        println!("{}_MAX_RAW={}", prefix, max_u256(raw_values));
+    }
 }
 
 fn print_report(cli: &Cli, from_block: i64, to_block: i64, txs: &[TxCapital]) {
@@ -450,6 +496,7 @@ where
     let mut to_block = None;
     let mut limit = 50_000_i64;
     let mut output = None;
+    let mut shell_output = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -496,9 +543,12 @@ where
                     iter.next().context("missing value for --output")?,
                 ));
             }
+            "--shell" => {
+                shell_output = true;
+            }
             "-h" | "--help" => {
                 bail!(
-                    "Usage: cargo run -p base-arb-recorder --bin competitor_capital -- --address <collector> [--days 30] [--from-block N] [--to-block N] [--limit 50000] [--output capital.txt]"
+                    "Usage: cargo run -p base-arb-recorder --bin competitor_capital -- --address <collector> [--days 30] [--from-block N] [--to-block N] [--limit 50000] [--output capital.txt] [--shell]"
                 );
             }
             _ => bail!("unknown argument: {arg}"),
@@ -517,6 +567,7 @@ where
         to_block,
         limit,
         output,
+        shell_output,
     })
 }
 
@@ -558,6 +609,19 @@ fn max_value(values: Vec<f64>) -> f64 {
     values
         .into_iter()
         .fold(0.0, |acc, value| if value > acc { value } else { acc })
+}
+
+fn percentile_u256(mut values: Vec<U256>, p: f64) -> U256 {
+    if values.is_empty() {
+        return U256::ZERO;
+    }
+    values.sort();
+    let idx = ((values.len().saturating_sub(1) as f64) * p).round() as usize;
+    values[idx.min(values.len() - 1)]
+}
+
+fn max_u256(values: Vec<U256>) -> U256 {
+    values.into_iter().max().unwrap_or(U256::ZERO)
 }
 
 fn set_report_output(path: &Path) -> Result<()> {

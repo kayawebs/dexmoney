@@ -18,6 +18,8 @@ Options are passed through to competitor_searcher_pipeline_diag:
   --max-price-impact-bps N     Override local impact guard for shadow checks.
   --max-pool-state-age-ms N    Override pool active-state age guard.
   --min-expected-profit N      Override min expected profit in raw anchor units.
+  --shadow-token-amount T:A    Add exact non-production shadow amount, e.g. USDC:45000000.
+  --shadow-token-max T:A       Add tiered non-production shadow amounts up to raw max.
 EOF
 }
 

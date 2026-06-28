@@ -60,6 +60,7 @@ struct Cli {
     max_price_impact_bps: u64,
     max_pool_state_age_ms: i64,
     min_expected_profit: U256,
+    shadow_token_amounts: HashMap<Address, Vec<U256>>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +278,11 @@ async fn run_diag(
     )?;
     writeln!(
         writer,
+        "shadow_token_amounts: {}",
+        display_shadow_token_amounts(&cli.shadow_token_amounts)
+    )?;
+    writeln!(
+        writer,
         "redis_pool_states: {} active_pool_states: {} priority_pools: {} priority_edges_beyond_base_fanout: {} priority_edges_selected: {} priority_edges_dropped: {}",
         redis_states.len(),
         active_states.len(),
@@ -438,6 +444,21 @@ async fn diagnose_cycle(
             });
         }
     }
+    if let Some(shadow_amounts) = cli.shadow_token_amounts.get(&cycle.anchor) {
+        for shadow_amount in shadow_amounts {
+            if shadow_amount.is_zero() {
+                continue;
+            }
+            if probes.iter().any(|probe| probe.amount == *shadow_amount) {
+                continue;
+            }
+            probes.push(AmountProbe {
+                amount: *shadow_amount,
+                source: "shadow_capital_tier",
+                production_grid: false,
+            });
+        }
+    }
     probes.sort_by(|left, right| {
         left.production_grid
             .cmp(&right.production_grid)
@@ -493,6 +514,18 @@ async fn diagnose_cycle(
         "observed_anchor_input_shadow: {}",
         observed_anchor_input
             .map(|amount| amount.to_string())
+            .unwrap_or_else(|| "-".into())
+    )?;
+    writeln!(
+        writer,
+        "shadow_configured_amounts_for_anchor: {}",
+        cli.shadow_token_amounts
+            .get(&cycle.anchor)
+            .map(|amounts| amounts
+                .iter()
+                .map(U256::to_string)
+                .collect::<Vec<_>>()
+                .join(","))
             .unwrap_or_else(|| "-".into())
     )?;
 
@@ -1033,6 +1066,12 @@ fn summarize_cycle(path_generated: bool, rough: &str, results: &[ExactProbeResul
     if !path_generated {
         return "path_generation_rejected".into();
     }
+    if results
+        .iter()
+        .any(|result| result.stage == "shadow_would_publish_if_amount_were_in_grid")
+    {
+        return "shadow_amount_would_publish_not_in_live_grid".into();
+    }
     if rough.starts_with("dropped_rough") {
         if results
             .iter()
@@ -1053,6 +1092,13 @@ fn summarize_cycle(path_generated: bool, rough: &str, results: &[ExactProbeResul
         .any(|result| result.stage == "candidate_publish_eligible")
     {
         return "candidate_publish_eligible_current_state".into();
+    }
+    let production_results = results
+        .iter()
+        .filter(|result| result.production_grid)
+        .collect::<Vec<_>>();
+    if production_results.is_empty() && !results.is_empty() {
+        return "shadow_only_no_live_amount_grid".into();
     }
     if results
         .iter()
@@ -1090,6 +1136,11 @@ fn decide_root_stage(summaries: &[String]) -> &'static str {
         .any(|summary| summary.contains("rough_quote"))
     {
         "rough_quote_or_dynamic_path_pruning"
+    } else if summaries
+        .iter()
+        .any(|summary| summary.contains("shadow_amount"))
+    {
+        "amount_grid_or_capital_config"
     } else if summaries
         .iter()
         .all(|summary| summary.contains("min_profit"))
@@ -2141,6 +2192,7 @@ where
     let mut max_price_impact_bps = settings.max_price_impact_bps;
     let mut max_pool_state_age_ms = settings.max_pool_state_age_ms;
     let mut min_expected_profit = usdc_to_units(settings.min_expected_profit_usdc);
+    let mut shadow_token_amounts: HashMap<Address, Vec<U256>> = HashMap::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2189,12 +2241,38 @@ where
                 )
                 .context("invalid --min-expected-profit")?;
             }
+            "--shadow-token-amount" => {
+                let raw = args
+                    .next()
+                    .context("--shadow-token-amount requires TOKEN:RAW_AMOUNT")?;
+                let (token, amount) = parse_shadow_token_amount(&raw, settings)
+                    .with_context(|| format!("invalid --shadow-token-amount {raw}"))?;
+                if !amount.is_zero() {
+                    shadow_token_amounts.entry(token).or_default().push(amount);
+                }
+            }
+            "--shadow-token-max" => {
+                let raw = args
+                    .next()
+                    .context("--shadow-token-max requires TOKEN:RAW_MAX_AMOUNT")?;
+                let (token, amount) = parse_shadow_token_amount(&raw, settings)
+                    .with_context(|| format!("invalid --shadow-token-max {raw}"))?;
+                let expanded = expand_max_amounts(&[amount]);
+                shadow_token_amounts
+                    .entry(token)
+                    .or_default()
+                    .extend(expanded);
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
             }
             other => bail!("unknown argument: {other}"),
         }
+    }
+    for amounts in shadow_token_amounts.values_mut() {
+        amounts.sort();
+        amounts.dedup();
     }
     Ok(Cli {
         tx_hash: tx_hash.context("--tx-hash or --report-entry is required")?,
@@ -2203,13 +2281,31 @@ where
         max_price_impact_bps,
         max_pool_state_age_ms,
         min_expected_profit,
+        shadow_token_amounts,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: cargo run -p base-arb-recorder --bin competitor_searcher_pipeline_diag -- --tx-hash <0x...> [--output /tmp/report.txt]"
+        "Usage: cargo run -p base-arb-recorder --bin competitor_searcher_pipeline_diag -- --tx-hash <0x...> [--output /tmp/report.txt] [--shadow-token-max USDC:<raw>] [--shadow-token-max WETH:<raw>]"
     );
+}
+
+fn parse_shadow_token_amount(raw: &str, settings: &Settings) -> Result<(Address, U256)> {
+    let (token_raw, amount_raw) = raw.split_once(':').context("expected TOKEN:RAW_AMOUNT")?;
+    let token = parse_token_alias(token_raw, settings)?;
+    let amount = U256::from_str_radix(amount_raw, 10).context("invalid raw amount")?;
+    Ok((token, amount))
+}
+
+fn parse_token_alias(raw: &str, settings: &Settings) -> Result<Address> {
+    if raw.eq_ignore_ascii_case("USDC") {
+        return Ok(settings.usdc_address);
+    }
+    if raw.eq_ignore_ascii_case("WETH") {
+        return Ok(settings.weth_address);
+    }
+    Address::from_str(raw).context("invalid token alias/address")
 }
 
 fn extract_tx_hash(raw: &str) -> Option<String> {
@@ -2327,6 +2423,27 @@ fn short_hex(value: impl AsRef<str>) -> String {
         return value.to_string();
     }
     format!("0x{}..{}", &raw[..6], &raw[raw.len() - 6..])
+}
+
+fn display_shadow_token_amounts(amounts_by_token: &HashMap<Address, Vec<U256>>) -> String {
+    if amounts_by_token.is_empty() {
+        return "-".into();
+    }
+    let mut rows = amounts_by_token
+        .iter()
+        .map(|(token, amounts)| {
+            format!(
+                "{token:#x}:{}",
+                amounts
+                    .iter()
+                    .map(U256::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.join(" | ")
 }
 
 fn display_opt_u64(value: Option<u64>) -> String {
