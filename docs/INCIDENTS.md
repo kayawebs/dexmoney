@@ -9,13 +9,14 @@ Work these in priority order. Do not skip directly to fixes unless the Evidence
 section already proves the root cause.
 
 1. `2026-06-28 DirectV2 Non-Canonical PoolMismatch`
-2. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
-3. `2026-06-24 MinProfitNotMet Root Cause Split`
-4. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
-5. `2026-06-24 Submitted Transaction Revert Rate`
-6. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
-7. `2026-06-24 Balancer V3 Readiness`
-8. `2026-06-24 Health Monitor Coverage`
+2. `2026-06-28 Submitted Success Simulation Reverted After Same-Block Competition`
+3. `2026-06-28 Competitor Ready Anchor Cycle No Opportunity`
+4. `2026-06-24 MinProfitNotMet Root Cause Split`
+5. `2026-06-24 Uniswap V4 Adapter NoOutput Verification`
+6. `2026-06-24 Submitted Transaction Revert Rate`
+7. `2026-06-24 Competitor Pool And Protocol Coverage Gap`
+8. `2026-06-24 Balancer V3 Readiness`
+9. `2026-06-24 Health Monitor Coverage`
 
 ## 2026-06-28 DirectV2 Non-Canonical PoolMismatch
 
@@ -125,6 +126,79 @@ does not match the observed pool.
 The single `UniswapV2: K` failure observed in the same window is separate and
 should be investigated only after the non-canonical pool set is removed from
 the hot path.
+
+## 2026-06-28 Submitted Success Simulation Reverted After Same-Block Competition
+
+Status: Root cause proven for sample; fix pending
+Category: execution competitiveness
+
+### Symptom
+
+After deploying the canonical DirectV2 guard and cleaning stale Redis pool
+state, the fresh simulation bucket no longer showed `PoolMismatch`. In a
+3-minute window, two simulations succeeded and one transaction was submitted:
+
+- opportunity `bd3aab0b-12c0-44d0-9b4d-e70148c5510c`;
+- tx `0x3a033b28adf3267a667243d9aaa2a85427a4afca80201b52cd55df803a85d1dc`;
+- path `cycle3-a02913-aero-slipstream-39a1be-aero-slipstream-0ce10c-aero-slipstream-59dc59`;
+- expected profit `26,999` raw USDC, min profit `5,000` raw USDC;
+- simulation succeeded at `2026-06-28 09:36:10.047551+00`;
+- transaction was included in block `47925012` with status `0`.
+
+### Evidence
+
+Receipt:
+
+- our tx index: `135`;
+- `effectiveGasPrice=9,300,000`;
+- `gasUsed=544,208`;
+- no logs emitted because the transaction reverted.
+
+The three path pools were:
+
+- `0x6b0f53cbd9272d8117e9535fe25371dedf39a1be`;
+- `0xf579b16f9b1a4acc872d34a8141fbbd36c0ce10c`;
+- `0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59`.
+
+Same block `47925012` contained earlier successful swaps touching the same
+pools:
+
+- tx `0xb5c9593cbace54813c52eceac1a39d25a409491154c0fb47c2943826c4c51c95`,
+  index `1`, touched all three path pools and paid effective gas price
+  `144,796,229`;
+- tx `0x799302e90d9286c815940fb824153dd07a8ff86a1fde1bb00c015bad381b4754`,
+  index `50`, touched the first path pool.
+
+`cast run` of our transaction on the local archive node succeeds and emits
+`Executed(... profit=40684)`, which means the calldata and Hub execution path
+are not inherently broken. The failure is explained by block-order state
+movement: the opportunity was consumed or changed before our tx at index `135`.
+
+### Root Cause
+
+For this sample, the submitted revert is an execution competitiveness issue:
+the bot found a real executable opportunity, but sent or priced it such that it
+landed behind earlier transactions touching the same pools in the same block.
+
+Do not classify this sample as a local quote math bug, DirectV2 canonicality
+bug, or Hub safety bug.
+
+### Next Fix Candidates
+
+- Measure `simulation_time -> submit_time -> included_block/index` for every
+  submitted tx and correlate reverted txs with earlier same-block pool touches.
+- Improve transaction inclusion priority for high-confidence opportunities:
+  fee policy, private/builder route if available, and worker nonce readiness.
+- Consider route-level contention heuristics: if a pool was just touched in the
+  included block before us, record the failure as `same_block_competed` for
+  analytics instead of lumping it into generic `transaction reverted`.
+
+### Regression Guard
+
+Add a submitted-tx diagnostic that, given a tx hash, prints path pools,
+inclusion index, earlier same-block logs for those pools, competing tx gas
+price, and whether isolated `cast run` succeeds. This should be a first-line
+tool before changing quote math for submitted reverts.
 
 ## 2026-06-28 Competitor Ready Anchor Cycle No Opportunity
 

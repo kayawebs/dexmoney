@@ -64,6 +64,17 @@ Latest evidence:
   `getPair(USDC,WETH)` returns canonical pair
   `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C`. Hub is correct; local pool
   classification/import accepted a non-canonical DirectV2 pool.
+- After deploying the DirectV2 canonical guard and cleaning stale runtime state,
+  a fresh 3-minute window showed `PoolMismatch=0` and two successful
+  simulations. One submitted transaction
+  `0x3a033b28adf3267a667243d9aaa2a85427a4afca80201b52cd55df803a85d1dc`
+  still reverted. This is not the DirectV2 issue: it was a 3-hop Aerodrome
+  Slipstream path whose three pools were already touched earlier in the same
+  included block by tx
+  `0xb5c9593cbace54813c52eceac1a39d25a409491154c0fb47c2943826c4c51c95`
+  at transaction index `1`; our tx landed at index `135`. Isolated `cast run`
+  succeeds and emits profit, so this sample belongs to execution
+  competitiveness / same-block ordering, not quote math.
 - Important competitor samples:
   - `0x0cfd9a658d8e670194aa8277cb53a406f01b7c7a112a86058ddf13b04655517d`:
     ready USDC/cbBTC -> cbBTC/WETH -> WETH/USDC V3-style anchor cycle, but no
@@ -218,17 +229,28 @@ Priority order:
     candidate.
   - Verification after deploy: execution-manager should stop crash-looping;
     batch summaries should continue after DirectV2/factory rejects; DB should
-    show `executor preflight rejected: ...` instead of a service restart.
+    record the offending candidate failure instead of restarting the process.
 - [ ] P0f: Remove non-canonical DirectV2 pools from executable data:
-  - Code fix implemented locally: `resolve_pool_for_trusted_factory` now checks
-    `UNISWAP_V2_FACTORY.getPair(token0, token1) == pool` before importing a
-    DirectV2-style pool as executable.
-  - Diagnostic/cleanup script added locally:
-    `ops/direct_v2_canonical_diag.sh`.
-  - First target:
-    `ops/direct_v2_canonical_diag.sh --pool 0x0a55ebff7663e364101eae168ef471068b44576c --apply`.
-  - After deploy/cleanup/restart, recent simulation failures should no longer
-    be dominated by `PoolMismatch` for the `aero-classic-44576c` path.
+  - Code fix committed and deployed: trusted DirectV2/AerodromeVolatile imports
+    now verify `getPair(token0, token1)` for the known DirectV2 factory before
+    accepting a pool as executable.
+  - Runtime cleanup executed for representative non-canonical pool
+    `0x0a55ebff7663e364101eae168ef471068b44576c`; Redis stale pool keys were
+    removed and searcher/execution-manager restarted.
+  - Current evidence: a fresh 3-minute simulation window after cleanup had
+    `PoolMismatch=0`. Keep watching wider windows before closing.
+- [ ] P0g: Submitted simulation-success transactions revert because of
+  same-block competition:
+  - Sample:
+    `0x3a033b28adf3267a667243d9aaa2a85427a4afca80201b52cd55df803a85d1dc`.
+  - Root cause for sample: our tx landed at index `135` in block `47925012`;
+    a successful competitor tx at index `1` touched all three path pools with
+    much higher effective gas price (`144,796,229` vs our `9,300,000`).
+  - Next diagnostic: build a submitted-tx competition report that classifies
+    submitted reverts into same-block competed, calldata/model failure,
+    allowance/balance, or unknown.
+  - Next fix direction: fee policy / private route / latency and nonce
+    readiness. Do not change quote math based on this sample.
 - [ ] P1: Validate whether `MAX_PRICE_IMPACT_BPS=50` is blocking real
   opportunities:
   - Replay and/or simulate top `price_impact_rejected` samples from
