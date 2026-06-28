@@ -139,6 +139,17 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   expansion. Searcher logs now include
   `dynamic_multihop_priority_edges_dropped`, and the competitor pipeline
   diagnostic mirrors the same bounded priority rule.
+- First runtime verification showed bounded priority alone was insufficient:
+  `dynamic_multihop_priority_edges` fell to `196` and
+  `dynamic_multihop_priority_edges_dropped=961`, but `path_build_ms` still rose
+  to `107,016` with `dynamic_multihop_invalid_cycle=238,505`. The remaining
+  hot cost is segment path recursion exploring token branches that cannot
+  possibly reach the target token within the remaining edge count.
+- Second performance fix: `SegmentPathCache` now includes reachability memoing.
+  Before recursively expanding a prefix/suffix segment, searcher checks whether
+  `current_token` can reach `end_token` in the remaining number of edges under
+  the same bounded candidate-edge graph. This prunes impossible branches without
+  dropping any reachable path.
 
 ### Regression Guard
 

@@ -1717,9 +1717,17 @@ struct SegmentPathKey {
     edge_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ReachabilityKey {
+    start: Address,
+    end: Address,
+    edge_count: usize,
+}
+
 #[derive(Default)]
 struct SegmentPathCache {
     paths: HashMap<SegmentPathKey, Arc<Vec<Vec<OwnedPoolEdge>>>>,
+    reachable: HashMap<ReachabilityKey, bool>,
 }
 
 impl SegmentPathCache {
@@ -1736,18 +1744,49 @@ impl SegmentPathCache {
             end,
             edge_count,
         };
-        self.paths
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(edge_paths_between(
-                    graph,
-                    start,
-                    end,
-                    edge_count,
-                    priority_pools,
-                ))
-            })
-            .clone()
+        if let Some(paths) = self.paths.get(&key) {
+            return paths.clone();
+        }
+        let paths = Arc::new(edge_paths_between(
+            graph,
+            start,
+            end,
+            edge_count,
+            priority_pools,
+            self,
+        ));
+        self.paths.insert(key, paths.clone());
+        paths
+    }
+
+    fn can_reach(
+        &mut self,
+        graph: &GraphSnapshot,
+        start: Address,
+        end: Address,
+        edge_count: usize,
+        priority_pools: &HashSet<Address>,
+    ) -> bool {
+        let key = ReachabilityKey {
+            start,
+            end,
+            edge_count,
+        };
+        if let Some(reachable) = self.reachable.get(&key) {
+            return *reachable;
+        }
+        let reachable = if edge_count == 0 {
+            start == end
+        } else {
+            graph
+                .candidate_edges_from_token(start, priority_pools)
+                .iter()
+                .any(|edge| {
+                    self.can_reach(graph, edge.token_out, end, edge_count - 1, priority_pools)
+                })
+        };
+        self.reachable.insert(key, reachable);
+        reachable
     }
 }
 
@@ -2098,6 +2137,7 @@ fn edge_paths_between(
     end: Address,
     edge_count: usize,
     priority_pools: &HashSet<Address>,
+    cache: &mut SegmentPathCache,
 ) -> Vec<Vec<OwnedPoolEdge>> {
     if edge_count == 0 {
         return if start == end {
@@ -2105,6 +2145,9 @@ fn edge_paths_between(
         } else {
             Vec::new()
         };
+    }
+    if !cache.can_reach(graph, start, end, edge_count, priority_pools) {
+        return Vec::new();
     }
     let mut out = Vec::new();
     let mut current = Vec::with_capacity(edge_count);
@@ -2114,6 +2157,7 @@ fn edge_paths_between(
         end,
         edge_count,
         priority_pools,
+        cache,
         &mut current,
         &mut out,
     );
@@ -2126,6 +2170,7 @@ fn edge_paths_between_inner(
     end: Address,
     remaining_edges: usize,
     priority_pools: &HashSet<Address>,
+    cache: &mut SegmentPathCache,
     current: &mut Vec<OwnedPoolEdge>,
     out: &mut Vec<Vec<OwnedPoolEdge>>,
 ) {
@@ -2146,6 +2191,15 @@ fn edge_paths_between_inner(
         if out.len() >= MAX_DYNAMIC_SEGMENT_PATHS {
             return;
         }
+        if !cache.can_reach(
+            graph,
+            edge.token_out,
+            end,
+            remaining_edges - 1,
+            priority_pools,
+        ) {
+            continue;
+        }
         if current
             .iter()
             .any(|existing| existing.pool() == edge.pool())
@@ -2159,6 +2213,7 @@ fn edge_paths_between_inner(
             end,
             remaining_edges - 1,
             priority_pools,
+            cache,
             current,
             out,
         );

@@ -158,6 +158,10 @@ Priority order:
     `path_build_ms` should drop from 60-90s back to low seconds or better under
     comparable backlog, while fresh competitor diagnostics should not return to
     `path_generation` solely because a changed pool was outside top16.
+  - Runtime check showed bounded priority alone was insufficient:
+    `path_build_ms=107s` with `dynamic_multihop_invalid_cycle=238k`. Follow-up
+    fix adds reachability memoing to segment path generation so impossible
+    prefix/suffix branches are not recursively expanded.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx
