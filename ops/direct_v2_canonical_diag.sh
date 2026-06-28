@@ -233,9 +233,12 @@ WHERE lower(pool_address) = lower(:'pool');
 SQL
 
     if [[ "$CLEAN_REDIS" -eq 1 && -n "$REDIS" ]]; then
-      suffix="${pool#0x}"
-      redis-cli -u "$REDIS" --raw --scan --pattern "pool_index:*$suffix" \
+      redis-cli -u "$REDIS" --raw --scan --pattern "pool_index:*" \
         | while IFS= read -r index_key; do
+            index_pool="${index_key#pool_index:}"
+            if [[ "${index_pool,,}" != "${pool,,}" ]]; then
+              continue
+            fi
             state_key="$(redis-cli -u "$REDIS" --raw GET "$index_key" 2>/dev/null || true)"
             if [[ -n "$state_key" ]]; then
               redis-cli -u "$REDIS" SREM pools:index "$state_key" >/dev/null || true
@@ -243,7 +246,12 @@ SQL
             fi
             redis-cli -u "$REDIS" DEL "$index_key" >/dev/null || true
           done
-      redis-cli -u "$REDIS" SREM pools:changed "$pool" "${pool,,}" >/dev/null || true
+      redis-cli -u "$REDIS" --raw SMEMBERS pools:changed \
+        | while IFS= read -r changed_pool; do
+            if [[ "${changed_pool,,}" == "${pool,,}" ]]; then
+              redis-cli -u "$REDIS" SREM pools:changed "$changed_pool" >/dev/null || true
+            fi
+          done
     fi
   done <"$mismatches"
 fi
