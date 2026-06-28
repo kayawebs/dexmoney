@@ -356,11 +356,6 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
           FROM pool_states
           WHERE updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
           ORDER BY lower(pool_address), updated_at DESC
-        ),
-        tick_rows AS (
-          SELECT chain_id, lower(pool_address) AS pool, count(*) AS tick_rows
-          FROM pool_ticks_current
-          GROUP BY 1, 2
         )
         SELECT
           p.chain_id,
@@ -385,9 +380,15 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
         LEFT JOIN pool_tick_coverage tc
           ON tc.chain_id = p.chain_id
          AND lower(tc.pool_address) = lower(p.pool_address)
-        LEFT JOIN tick_rows tr
-          ON tr.chain_id = p.chain_id
-         AND tr.pool = lower(p.pool_address)
+        LEFT JOIN LATERAL (
+          SELECT EXISTS (
+            SELECT 1
+            FROM pool_ticks_current pt
+            WHERE pt.chain_id = p.chain_id
+              AND lower(pt.pool_address) = lower(p.pool_address)
+            LIMIT 1
+          ) AS has_ticks
+        ) tr ON TRUE
         WHERE p.enabled
           AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
           AND ls.sqrt_price_x96 IS NOT NULL
@@ -405,13 +406,13 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
             NOT $4::BOOLEAN
             OR tc.status IS NULL
             OR tc.status = 'refresh_failed'
-            OR (tc.status = 'ready' AND COALESCE(tr.tick_rows, 0) = 0)
+            OR (tc.status = 'ready' AND NOT COALESCE(tr.has_ticks, FALSE))
           )
         ORDER BY
           CASE
             WHEN tc.status IS NULL THEN 0
             WHEN tc.status = 'refresh_failed' THEN 1
-            WHEN tc.status = 'ready' AND COALESCE(tr.tick_rows, 0) = 0 THEN 2
+            WHEN tc.status = 'ready' AND NOT COALESCE(tr.has_ticks, FALSE) THEN 2
             ELSE 3
           END,
           ls.updated_at DESC
