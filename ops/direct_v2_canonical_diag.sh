@@ -4,11 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+ENV_BASE_RPC_HTTP=""
+
 if [[ -f ".env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source ".env"
   set +a
+  ENV_BASE_RPC_HTTP="${BASE_RPC_HTTP:-}"
 fi
 
 if [[ -f ".env.docker" ]]; then
@@ -21,6 +24,11 @@ fi
 DB_URL="${POSTGRES_URL:-${DATABASE_URL:-}}"
 REDIS="${REDIS_URL:-}"
 RPC_URL="${BASE_RPC_HTTP:-}"
+if [[ "$RPC_URL" == *"node-execution-1"* && -n "$ENV_BASE_RPC_HTTP" ]]; then
+  RPC_URL="$ENV_BASE_RPC_HTTP"
+elif [[ "$RPC_URL" == *"node-execution-1"* ]]; then
+  RPC_URL="http://127.0.0.1:8545"
+fi
 CHAIN_ID="${CHAIN_ID:-8453}"
 FACTORY="${UNISWAP_V2_FACTORY:-0x8909dc15e40173ff4699343b6eb8132c65e18ec6}"
 CAST_BIN="${CAST_BIN:-cast}"
@@ -91,6 +99,15 @@ if [[ -z "$RPC_URL" ]]; then
   exit 2
 fi
 
+if ! command -v "$CAST_BIN" >/dev/null 2>&1; then
+  if [[ -x "$HOME/.foundry/bin/cast" ]]; then
+    CAST_BIN="$HOME/.foundry/bin/cast"
+  else
+    echo "cast binary not found; set CAST_BIN=/path/to/cast" >&2
+    exit 2
+  fi
+fi
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -149,6 +166,7 @@ echo "apply: $APPLY"
 echo "clean_redis: $CLEAN_REDIS"
 echo "chain_id: $CHAIN_ID"
 echo "factory: $FACTORY"
+echo "rpc_url: $RPC_URL"
 echo "targets: $(wc -l < "$targets" | tr -d ' ')"
 echo
 printf "%-44s %-44s %-9s %s\n" "pool" "canonical_pair" "status" "reason"
@@ -173,12 +191,14 @@ while IFS='|' read -r pool token0 token1 factory dex variant enabled; do
     continue
   fi
 
-  expected="$("$CAST_BIN" call "$factory" "getPair(address,address)(address)" "$token0" "$token1" --rpc-url "$RPC_URL" 2>/dev/null || true)"
+  call_error="$tmpdir/getpair-$checked.err"
+  expected="$("$CAST_BIN" call "$factory" "getPair(address,address)(address)" "$token0" "$token1" --rpc-url "$RPC_URL" 2>"$call_error" || true)"
   expected="${expected//$'\r'/}"
   expected="${expected//$'\n'/}"
   if [[ ! "$expected" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     call_failed=$((call_failed + 1))
-    printf "%-44s %-44s %-9s %s\n" "$pool" "-" "ERROR" "getPair call failed"
+    error_text="$(tr '\n' ' ' <"$call_error" | cut -c1-180)"
+    printf "%-44s %-44s %-9s %s\n" "$pool" "-" "ERROR" "getPair call failed: $error_text"
     continue
   fi
 
