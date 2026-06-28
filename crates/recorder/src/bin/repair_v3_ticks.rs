@@ -343,20 +343,6 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
         .collect::<Vec<_>>();
     let rows = sqlx::query(
         r#"
-        WITH latest_state AS (
-          SELECT DISTINCT ON (lower(pool_address))
-            pool_address,
-            reserve0,
-            reserve1,
-            sqrt_price_x96,
-            liquidity,
-            tick,
-            block_number,
-            updated_at
-          FROM pool_states
-          WHERE updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
-          ORDER BY lower(pool_address), block_number DESC, updated_at DESC
-        )
         SELECT
           p.chain_id,
           p.pool_address,
@@ -376,7 +362,21 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
           ls.block_number,
           ls.updated_at
         FROM pools p
-        JOIN latest_state ls ON lower(ls.pool_address) = lower(p.pool_address)
+        JOIN LATERAL (
+          SELECT
+            reserve0,
+            reserve1,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            block_number,
+            updated_at
+          FROM pool_states ps
+          WHERE lower(ps.pool_address) = lower(p.pool_address)
+            AND ps.updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
+          ORDER BY ps.block_number DESC, ps.updated_at DESC
+          LIMIT 1
+        ) ls ON TRUE
         LEFT JOIN pool_tick_coverage tc
           ON tc.chain_id = p.chain_id
          AND lower(tc.pool_address) = lower(p.pool_address)
