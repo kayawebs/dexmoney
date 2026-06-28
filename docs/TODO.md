@@ -221,6 +221,30 @@ Priority order:
     `path_build_ms=107s` with `dynamic_multihop_invalid_cycle=238k`. Follow-up
     fix adds reachability memoing to segment path generation so impossible
     prefix/suffix branches are not recursively expanded.
+  - Overnight shadow-capital reports initially overstated `path_generation`
+    failures because the diagnostic treated WETH shadow amounts as probe
+    amounts only, not as shadow search anchors. Diagnostic fix now distinguishes
+    production anchors from shadow-only anchors. Representative tx
+    `0x1541a8938cf3b97b7555ac52628da7f5a41ba8c40d4a514a8e33705c34a92e54`
+    now reconstructs two WETH cycles with
+    `anchor_config_source=shadow_only`, `production_path_generated=no`, and
+    exact probes failing at `MissingTicks` rather than path generation.
+  - The representative `MissingTicks` pool
+    `0xfdc5d1271760af0e6146147850ddfc6844a43a10` is an enabled UniswapV3 pool
+    with current pool state, but `pool_tick_coverage` was `zero_ticks`.
+    Runtime `v3-tick-repair` logs showed `queued=20..60` while only
+    `pools=4..6` were actually repaired each pass. Root cause: queued repair
+    pools were drained from Redis and then filtered by `max_age_hours=2` on
+    `pool_states.updated_at`. That violates the project invariant that a pool
+    with no recent event can still have an accurate current state.
+  - Minimal tick repair fix: explicit/queued repair pools now load the latest
+    pool state regardless of `max_age_hours`; the hot background gap scan still
+    keeps the age filter. Logs now include `queued_selected` and
+    `queued_unselected` to catch future queue-drain-without-repair regressions.
+  - Next evidence: rerun shadow-capital triage with the fixed diagnostic before
+    making another live path-generation change. Reclassify misses into:
+    production anchor missing, true graph fanout/active guard, missing ticks,
+    rough-quote pruning, amount grid, and unsupported non-cycle flow.
 - [ ] P0c: Classify competitor non-cycle/external-protocol flows before changing
   search logic:
   - Start from tx
@@ -381,6 +405,19 @@ Priority order:
   - A 5000-block report with opportunity lookup was still running after 6m.
   - Split fast triage reports from deep reports, or optimize the opportunity
     lookup query path before relying on full-window automation.
+- [ ] P5b: Stop duplicate lazy-approval raw transaction submissions:
+  - Overnight transaction stats showed `Dropped=56`, but `54/56` were not
+    onchain arbitrage failures. They were local records with reason
+    `rpc eth_sendRawTransaction failed: code=-32000 message=already known`.
+  - These rows came from repeated fund/admin approval submission attempts using
+    the same nonce/raw transaction. The same approval command should not be
+    emitted repeatedly once the node already knows it.
+  - This is lower priority than P0 opportunity coverage because it mainly
+    pollutes transaction stats and wastes admin-submit work, but it should be
+    fixed in execution-manager pending-approval tracking.
+  - Verification: repeated approval preflight should produce at most one
+    pending/admin approval record per `(token, spender, nonce)` and zero
+    `already known` dropped rows in a fresh 2h window.
 - [ ] P6: Reduce V3-style `TickRangeExhausted`:
   - Keep searcher hot path RPC-free; it should only enqueue `ticks:repair`.
   - Watch whether queued repair reduces repeated exhausted pools.

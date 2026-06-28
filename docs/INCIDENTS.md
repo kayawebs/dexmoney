@@ -482,6 +482,38 @@ exact quote, min-profit, impact, candidate cap, or execution filters.
   print, and rejected DirectV2/factory candidates should appear as simulation
   failures with `executor preflight rejected: ...` instead of killing the
   process.
+- Overnight shadow-capital diagnostics initially showed
+  `root_stage=path_generation` for most competitor samples, but the diagnostic
+  was under-modeling shadow capital. `--shadow-token-max WETH:<amount>` added
+  quote probe amounts but did not add WETH to the effective anchor set used for
+  path reconstruction. Representative tx
+  `0x1541a8938cf3b97b7555ac52628da7f5a41ba8c40d4a514a8e33705c34a92e54`
+  was therefore falsely reported as `recognized_anchor_cycles=0` even though
+  the local ready pools form a WETH cycle:
+  `WETH -> NFTWIZ -> KOBI -> TOSHI -> WETH`.
+- Diagnostic fix: `competitor_searcher_pipeline_diag` now separates
+  production anchors from shadow anchors. It prints
+  `production_path_generated`, `production_path_generation_reason`, and
+  `anchor_config_source`, and treats shadow-only amount grids as
+  `production_grid=false`.
+- Verification on the representative tx after the diagnostic fix:
+  `recognized_anchor_cycles=2`, `anchor_config_source=shadow_only`,
+  `production_path_generated=no` with reason
+  `missing multihop anchor search config`, and exact probes now fail at
+  `MissingTicks` for pool `0xfdc5d1271760af0e6146147850ddfc6844a43a10`.
+  This proves at least part of the apparent P0 path-generation gap is actually
+  WETH funding/config plus tick coverage, not graph fanout.
+- Tick repair root cause: the representative pool was enabled, had current
+  UniswapV3 state, and had `pool_tick_coverage.status=zero_ticks`. Runtime
+  repair logs repeatedly showed `queued=20..60` but only `pools=4..6` selected
+  per pass. Queued pools were drained from Redis before SQL selection, then
+  filtered out by `pool_states.updated_at >= now() - max_age_hours`. With the
+  daemon default `max_age_hours=2`, a pool with no recent event but accurate
+  current state could be dropped from repair without being fixed.
+- Tick repair fix: explicit and queued repair pools now load the latest
+  available pool state without the age filter; only the background gap scan
+  remains hot-age limited. Repair logs include `queued_selected` and
+  `queued_unselected` so future queue loss is visible immediately.
 
 ### Regression Guard
 

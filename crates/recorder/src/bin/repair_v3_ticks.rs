@@ -74,14 +74,20 @@ async fn run_repair_once(
     let queued_repair_pools = redis.drain_tick_repair_pools(args.limit as usize).await?;
     let queued_repair_set = queued_repair_pools.iter().copied().collect::<HashSet<_>>();
     let pools = load_repair_pools(postgres, args, &queued_repair_pools).await?;
+    let queued_selected = pools
+        .iter()
+        .filter(|pool| queued_repair_set.contains(&pool.state.pool_id.address))
+        .count();
     println!("== V3-style Tick Repair ==");
     println!(
-        "mode={} pass={} pools={} queued={} limit={} max_age_hours={} word_radius={} queued_word_radius={} force={} gaps_only={}",
+        "mode={} pass={} pools={} queued={} queued_selected={} queued_unselected={} limit={} max_age_hours={} word_radius={} queued_word_radius={} force={} gaps_only={}",
         if args.apply { "apply" } else { "dry-run" },
         pass.map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string()),
         pools.len(),
         queued_repair_pools.len(),
+        queued_selected,
+        queued_repair_pools.len().saturating_sub(queued_selected),
         args.limit,
         args.max_age_hours,
         args.word_radius,
@@ -375,7 +381,7 @@ async fn load_repair_pools(
             r#"
             WITH wanted AS (
               SELECT lower(pool_address) AS pool_address
-              FROM unnest($3::TEXT[]) AS filter(pool_address)
+              FROM unnest($2::TEXT[]) AS filter(pool_address)
             )
             SELECT
               p.chain_id,
@@ -409,7 +415,6 @@ async fn load_repair_pools(
                 updated_at
               FROM pool_states ps
               WHERE lower(ps.pool_address) = lower(p.pool_address)
-                AND ps.updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
               ORDER BY ps.block_number DESC, ps.updated_at DESC
               LIMIT 1
             ) ls ON TRUE
@@ -423,7 +428,6 @@ async fn load_repair_pools(
             "#,
         )
         .bind(args.limit)
-        .bind(args.max_age_hours)
         .bind(&pool_filter)
         .fetch_all(&postgres.pool)
         .await?

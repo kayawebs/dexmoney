@@ -227,8 +227,10 @@ async fn run_diag(
         .context("transaction receipt missing block_number")?;
     let pool_logs = dedupe_swap_pools(receipt_swap_logs(&receipt));
     let pair_configs = load_enabled_pair_search_configs(pg).await?;
-    let anchor_configs = anchor_search_configs(&pair_configs);
-    let anchor_tokens = anchor_configs
+    let production_anchor_configs = anchor_search_configs(&pair_configs);
+    let effective_anchor_configs =
+        anchor_configs_with_shadow_amounts(&production_anchor_configs, cli);
+    let anchor_tokens = effective_anchor_configs
         .keys()
         .copied()
         .collect::<BTreeSet<Address>>();
@@ -372,7 +374,8 @@ async fn run_diag(
             &receipt,
             &coverages,
             &pair_configs,
-            &anchor_configs,
+            &production_anchor_configs,
+            &effective_anchor_configs,
             &observed_anchor_amounts,
             redis,
             &graph,
@@ -407,7 +410,8 @@ async fn diagnose_cycle(
     receipt: &TxReceipt,
     coverages: &[PoolCoverage],
     pair_configs: &[TokenPairSearchConfig],
-    anchor_configs: &HashMap<Address, AnchorConfig>,
+    production_anchor_configs: &HashMap<Address, AnchorConfig>,
+    effective_anchor_configs: &HashMap<Address, AnchorConfig>,
     observed_anchor_amounts: &BTreeMap<Address, U256>,
     redis: &RedisStore,
     graph: &GraphSnapshot,
@@ -433,9 +437,26 @@ async fn diagnose_cycle(
             .get(edge.coverage_index)
             .is_some_and(|coverage| coverage.topic0 != ERC20_TRANSFER_TOPIC)
     });
-    let path_generated =
-        path_generated_status(cycle, pair_configs, anchor_configs, graph, active_pools);
-    let amount_config = amount_config_for_cycle(cycle, pair_configs, anchor_configs);
+    let path_generated = path_generated_status(
+        cycle,
+        pair_configs,
+        effective_anchor_configs,
+        graph,
+        active_pools,
+    );
+    let production_path_generated = path_generated_status(
+        cycle,
+        pair_configs,
+        production_anchor_configs,
+        graph,
+        active_pools,
+    );
+    let amount_config = amount_config_for_cycle(
+        cycle,
+        pair_configs,
+        production_anchor_configs,
+        effective_anchor_configs,
+    );
     let observed_anchor_input = observed_cycle_anchor_input(receipt, cycle)
         .or_else(|| observed_anchor_amounts.get(&cycle.anchor).copied());
     let mut probes = amount_config
@@ -444,8 +465,8 @@ async fn diagnose_cycle(
         .copied()
         .map(|amount| AmountProbe {
             amount,
-            source: "configured_grid",
-            production_grid: true,
+            source: amount_config.source,
+            production_grid: amount_config.production_grid,
         })
         .collect::<Vec<_>>();
     if let Some(observed_amount) = observed_anchor_input {
@@ -505,6 +526,31 @@ async fn diagnose_cycle(
         }
     )?;
     writeln!(writer, "path_generation_reason: {}", path_generated.reason)?;
+    writeln!(
+        writer,
+        "production_path_generated: {}",
+        if production_path_generated.generated {
+            "yes"
+        } else {
+            "no"
+        }
+    )?;
+    writeln!(
+        writer,
+        "production_path_generation_reason: {}",
+        production_path_generated.reason
+    )?;
+    writeln!(
+        writer,
+        "anchor_config_source: {}",
+        if production_anchor_configs.contains_key(&cycle.anchor) {
+            "production"
+        } else if cli.shadow_token_amounts.contains_key(&cycle.anchor) {
+            "shadow_only"
+        } else {
+            "missing"
+        }
+    )?;
     writeln!(writer, "all_redis_states_present: {all_states_present}")?;
     writeln!(writer, "all_pools_active_now: {all_active}")?;
     writeln!(
@@ -637,6 +683,11 @@ fn path_generated_status(
             false
         };
         if !has_amounts {
+            if anchor_configs.contains_key(&cycle.anchor) {
+                return PathGeneratedStatus::yes(
+                    "two-hop pair path exists with shadow anchor search config",
+                );
+            }
             return PathGeneratedStatus::no("two-hop pair config has no search amounts for anchor");
         }
         return PathGeneratedStatus::yes("two-hop pair path exists in static path index");
@@ -702,12 +753,15 @@ impl PathGeneratedStatus {
 struct AmountConfig {
     amounts: Vec<U256>,
     min_profit: U256,
+    production_grid: bool,
+    source: &'static str,
 }
 
 fn amount_config_for_cycle(
     cycle: &AnchorCycle,
     pair_configs: &[TokenPairSearchConfig],
-    anchor_configs: &HashMap<Address, AnchorConfig>,
+    production_anchor_configs: &HashMap<Address, AnchorConfig>,
+    effective_anchor_configs: &HashMap<Address, AnchorConfig>,
 ) -> AmountConfig {
     if cycle.edges.len() == 2 {
         if let Some(config) = pair_configs.iter().find(|config| {
@@ -716,28 +770,46 @@ fn amount_config_for_cycle(
                     && config.token0 == cycle.edges[0].token_out)
         }) {
             if cycle.anchor == config.token0 {
-                return AmountConfig {
-                    amounts: expand_max_amounts(&config.token0_search_amounts),
-                    min_profit: config.token0_min_profit,
-                };
+                let amounts = expand_max_amounts(&config.token0_search_amounts);
+                if !amounts.is_empty() {
+                    return AmountConfig {
+                        amounts,
+                        min_profit: config.token0_min_profit,
+                        production_grid: true,
+                        source: "configured_grid",
+                    };
+                }
             }
             if cycle.anchor == config.token1 {
-                return AmountConfig {
-                    amounts: expand_max_amounts(&config.token1_search_amounts),
-                    min_profit: config.token1_min_profit,
-                };
+                let amounts = expand_max_amounts(&config.token1_search_amounts);
+                if !amounts.is_empty() {
+                    return AmountConfig {
+                        amounts,
+                        min_profit: config.token1_min_profit,
+                        production_grid: true,
+                        source: "configured_grid",
+                    };
+                }
             }
         }
     }
-    anchor_configs
+    effective_anchor_configs
         .get(&cycle.anchor)
         .map(|config| AmountConfig {
             amounts: config.amount_sizes.clone(),
             min_profit: config.min_profit,
+            production_grid: production_anchor_configs.contains_key(&cycle.anchor),
+            source: if production_anchor_configs.contains_key(&cycle.anchor) {
+                "configured_grid"
+            } else {
+                "shadow_anchor_grid"
+            },
         })
         .unwrap_or_else(|| AmountConfig {
             amounts: Vec::new(),
             min_profit: U256::ZERO,
+            production_grid: false,
+            source: "missing_amount_grid",
         })
 }
 
@@ -1260,6 +1332,33 @@ fn anchor_search_configs(configs: &[TokenPairSearchConfig]) -> HashMap<Address, 
         }
     }
     by_token
+}
+
+fn anchor_configs_with_shadow_amounts(
+    production: &HashMap<Address, AnchorConfig>,
+    cli: &Cli,
+) -> HashMap<Address, AnchorConfig> {
+    let mut out = production.clone();
+    for (token, amounts) in &cli.shadow_token_amounts {
+        if amounts.is_empty() {
+            continue;
+        }
+        out.entry(*token)
+            .and_modify(|config| {
+                for amount in amounts {
+                    if !amount.is_zero() && !config.amount_sizes.contains(amount) {
+                        config.amount_sizes.push(*amount);
+                    }
+                }
+                config.amount_sizes.sort();
+                config.min_profit = config.min_profit.min(cli.min_expected_profit);
+            })
+            .or_insert_with(|| AnchorConfig {
+                amount_sizes: amounts.clone(),
+                min_profit: cli.min_expected_profit,
+            });
+    }
+    out
 }
 
 fn merge_anchor_config(
