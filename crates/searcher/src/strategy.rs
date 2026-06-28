@@ -111,6 +111,7 @@ pub struct SearchStats {
     pub top_price_impact_rejected: Vec<PriceImpactRejectedSample>,
     pub top_quote_skipped: Vec<QuoteSkipSample>,
     pub top_rough_quote_failures: Vec<RoughQuoteFailureSample>,
+    pub tick_repair_pools: HashSet<Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +243,8 @@ impl SearchStats {
         for sample in &other.top_rough_quote_failures {
             self.record_rough_quote_failure_sample(sample.clone());
         }
+        self.tick_repair_pools
+            .extend(other.tick_repair_pools.iter().copied());
     }
 
     fn record_quote_skip(&mut self, reason: QuoteSkipReason) {
@@ -270,6 +273,18 @@ impl SearchStats {
             amount_in,
             message,
         });
+    }
+
+    fn record_quote_skip_with_sample_and_repair_pools(
+        &mut self,
+        reason: QuoteSkipReason,
+        path_name: String,
+        amount_in: U256,
+        message: String,
+        repair_pools: &[Address],
+    ) {
+        self.record_quote_skip_with_sample(reason, path_name, amount_in, message);
+        self.tick_repair_pools.extend(repair_pools.iter().copied());
     }
 
     fn record_quote_skip_sample(&mut self, sample: QuoteSkipSample) {
@@ -499,6 +514,7 @@ pub enum QuoteSkipReason {
 pub struct QuoteSkip {
     reason: QuoteSkipReason,
     message: String,
+    repair_pools: Vec<Address>,
 }
 
 impl QuoteSkip {
@@ -506,6 +522,31 @@ impl QuoteSkip {
         Self {
             reason,
             message: message.into(),
+            repair_pools: Vec::new(),
+        }
+    }
+
+    fn with_repair_pool(
+        reason: QuoteSkipReason,
+        message: impl Into<String>,
+        pool: Address,
+    ) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+            repair_pools: vec![pool],
+        }
+    }
+
+    fn with_repair_pools(
+        reason: QuoteSkipReason,
+        message: impl Into<String>,
+        repair_pools: Vec<Address>,
+    ) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+            repair_pools,
         }
     }
 
@@ -704,11 +745,12 @@ impl SearchEngine {
                         continue;
                     }
                     Err(err) => {
-                        stats.record_quote_skip_with_sample(
+                        stats.record_quote_skip_with_sample_and_repair_pools(
                             err.reason,
                             search_path.path.name.clone(),
                             *amount_in,
                             err.message.clone(),
+                            &err.repair_pools,
                         );
                         debug!(
                             path = %search_path.path.name,
@@ -876,14 +918,15 @@ impl SearchEngine {
                     continue;
                 }
                 Err(err) => {
-                    stats.record_quote_skip_with_sample(
+                    stats.record_quote_skip_with_sample_and_repair_pools(
                         err.reason,
                         search_path.path.name.clone(),
                         *amount_in,
                         err.message.clone(),
+                        &err.repair_pools,
                     );
                     debug!(
-                        path = %search_path.path.name,
+                    path = %search_path.path.name,
                         amount_in = %amount_in,
                         reason = ?err.reason,
                         error = %err.message,
@@ -2282,12 +2325,13 @@ async fn quote_path(
                     .unwrap_or_default();
                 tick_count = pool_ticks.len() as u32;
                 if pool_ticks.is_empty() {
-                    return Err(QuoteSkip::new(
+                    return Err(QuoteSkip::with_repair_pool(
                         QuoteSkipReason::MissingTicks,
                         format!(
                             "initialized tick data missing for {:#x}",
                             pool_state.pool_id.address
                         ),
+                        pool_state.pool_id.address,
                     ));
                 } else {
                     let (quote, v3_diagnostics) = quote_exact_in_with_ticks_diagnostics(
@@ -2414,12 +2458,23 @@ async fn quote_path(
             crossed_ticks = diagnostics.crossed_ticks,
             "quote skipped: V3 quote exhausted known tick range"
         );
-        return Err(QuoteSkip::new(
+        return Err(QuoteSkip::with_repair_pools(
             QuoteSkipReason::TickRangeExhausted,
             "V3 quote exhausted known tick range",
+            tick_repair_pools_from_diagnostics(&diagnostics),
         ));
     }
     Ok(Some((amount, max_impact, diagnostics)))
+}
+
+fn tick_repair_pools_from_diagnostics(diagnostics: &QuoteDiagnostics) -> Vec<Address> {
+    let mut seen = HashSet::new();
+    diagnostics
+        .steps
+        .iter()
+        .filter(|step| step.tick_range_exhausted && is_v3_style_variant(step.variant))
+        .filter_map(|step| seen.insert(step.pool).then_some(step.pool))
+        .collect()
 }
 
 fn candidate_block_number_from_diagnostics(diagnostics: &QuoteDiagnostics) -> u64 {
@@ -2907,7 +2962,8 @@ fn short_token(token: Address) -> String {
 mod tests {
     use alloy_primitives::{address, Address, U256};
     use base_arb_common::types::{
-        DexKind, PoolId, PoolState, PoolVariant, TickState, TokenPairSearchConfig,
+        DexKind, PoolId, PoolState, PoolVariant, QuoteDiagnostics, QuoteStepDiagnostics, TickState,
+        TokenPairSearchConfig,
     };
     use chrono::Utc;
 
@@ -2955,6 +3011,64 @@ mod tests {
         assert_eq!(stats.price_impact_shadow_pass_300_bps, 3);
         assert_eq!(stats.price_impact_shadow_pass_500_bps, 3);
         assert_eq!(stats.best_profit_shadow_pass_300_bps, U256::from(30_000u64));
+    }
+
+    #[test]
+    fn tick_range_exhausted_steps_are_queued_for_repair_once() {
+        let pool_a = address!("1111111111111111111111111111111111111111");
+        let pool_b = address!("2222222222222222222222222222222222222222");
+        let diagnostics = QuoteDiagnostics {
+            modes: Vec::new(),
+            ticks_used: 0,
+            crossed_ticks: 0,
+            tick_range_exhausted: true,
+            v3_pools_without_ticks: 0,
+            steps: vec![
+                quote_step_for_repair_test(pool_a, PoolVariant::UniswapV3, true),
+                quote_step_for_repair_test(pool_a, PoolVariant::UniswapV3, true),
+                quote_step_for_repair_test(pool_b, PoolVariant::AerodromeVolatile, true),
+                quote_step_for_repair_test(pool_b, PoolVariant::PancakeV3, false),
+            ],
+        };
+
+        assert_eq!(
+            super::tick_repair_pools_from_diagnostics(&diagnostics),
+            vec![pool_a]
+        );
+    }
+
+    fn quote_step_for_repair_test(
+        pool: Address,
+        variant: PoolVariant,
+        tick_range_exhausted: bool,
+    ) -> QuoteStepDiagnostics {
+        QuoteStepDiagnostics {
+            step_no: 1,
+            mode: String::new(),
+            pool,
+            variant,
+            source_block: 1,
+            valid_through_block: 1,
+            state_updated_at: Utc::now(),
+            token_in: Address::ZERO,
+            token_out: Address::ZERO,
+            amount_in: U256::ZERO,
+            amount_out_raw: U256::ZERO,
+            amount_out: U256::ZERO,
+            fee_bps: 0,
+            fee_pips: None,
+            stable: None,
+            tick_spacing: Some(1),
+            sqrt_price_x96: None,
+            liquidity: None,
+            tick: None,
+            reserve0: None,
+            reserve1: None,
+            tick_count: 0,
+            ticks_used: 0,
+            crossed_ticks: 0,
+            tick_range_exhausted,
+        }
     }
 
     #[test]

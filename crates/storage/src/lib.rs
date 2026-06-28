@@ -46,6 +46,12 @@ pub trait TickChangeStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait TickRepairStore: Send + Sync {
+    async fn mark_tick_repair_pools(&self, pools: Vec<Address>) -> anyhow::Result<()>;
+    async fn drain_tick_repair_pools(&self, limit: usize) -> anyhow::Result<Vec<Address>>;
+}
+
+#[async_trait]
 pub trait CurrentBlockStore: Send + Sync {
     async fn set_current_block(&self, block_number: u64) -> anyhow::Result<()>;
     async fn get_current_block(&self) -> anyhow::Result<Option<u64>>;
@@ -292,6 +298,29 @@ impl TickChangeStore for InMemoryStores {
         let mut changed = self.tick_changed_pools.lock().await;
         let mut out = Vec::with_capacity(changed.len());
         while let Some(pool) = changed.pop_front() {
+            out.push(pool);
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl TickRepairStore for InMemoryStores {
+    async fn mark_tick_repair_pools(&self, pools: Vec<Address>) -> anyhow::Result<()> {
+        let mut changed = self.tick_changed_pools.lock().await;
+        for pool in pools {
+            changed.push_back(pool);
+        }
+        Ok(())
+    }
+
+    async fn drain_tick_repair_pools(&self, limit: usize) -> anyhow::Result<Vec<Address>> {
+        let mut changed = self.tick_changed_pools.lock().await;
+        let mut out = Vec::with_capacity(limit.min(changed.len()));
+        while out.len() < limit {
+            let Some(pool) = changed.pop_front() else {
+                break;
+            };
             out.push(pool);
         }
         Ok(out)

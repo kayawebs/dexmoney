@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     CandidateStore, CurrentBlockStore, EoaStateStore, FailureStore, PoolChangeStore,
-    PoolRuntimeStore, PoolStateStore, TickChangeStore, TickStateStore,
+    PoolRuntimeStore, PoolStateStore, TickChangeStore, TickRepairStore, TickStateStore,
 };
 use base_arb_common::types::{Candidate, EoaLaneState, PoolState, TickState};
 
@@ -79,6 +79,10 @@ pub fn changed_pools_key() -> &'static str {
 
 pub fn changed_tick_pools_key() -> &'static str {
     "ticks:changed"
+}
+
+pub fn tick_repair_pools_key() -> &'static str {
+    "ticks:repair"
 }
 
 pub fn current_block_key() -> &'static str {
@@ -314,6 +318,39 @@ impl TickChangeStore for RedisStore {
         let values: Vec<String> = redis::cmd("SPOP")
             .arg(changed_tick_pools_key())
             .arg(100_000usize)
+            .query_async(&mut manager)
+            .await?;
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        values
+            .into_iter()
+            .map(|value| value.parse().map_err(Into::into))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl TickRepairStore for RedisStore {
+    async fn mark_tick_repair_pools(&self, pools: Vec<Address>) -> Result<()> {
+        if pools.is_empty() {
+            return Ok(());
+        }
+        let mut manager = self.manager.clone();
+        let mut pipe = redis::pipe();
+        queue_sadd_addresses(&mut pipe, tick_repair_pools_key(), &pools);
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
+    }
+
+    async fn drain_tick_repair_pools(&self, limit: usize) -> Result<Vec<Address>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut manager = self.manager.clone();
+        let values: Vec<String> = redis::cmd("SPOP")
+            .arg(tick_repair_pools_key())
+            .arg(limit)
             .query_async(&mut manager)
             .await?;
         if values.is_empty() {

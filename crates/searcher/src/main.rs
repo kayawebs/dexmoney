@@ -16,7 +16,7 @@ use base_arb_common::types::{
 use base_arb_storage::{
     postgres::PostgresStore, redis::RedisStore, CandidateStore, CurrentBlockStore,
     PairSearchConfigStore, PoolChangeStore, PoolStateStore, RecorderStore, TickChangeStore,
-    TickStateStore,
+    TickRepairStore, TickStateStore,
 };
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
                 candidates_coalesced = aggregate.candidates_coalesced,
                 inactive_pool_filtered_paths = aggregate.inactive_pool_filtered_paths,
                 tick_missing_filtered_paths = aggregate.tick_missing_filtered_paths,
+                tick_repair_queued_pools = aggregate.tick_repair_queued_pools,
                 opportunity_record_queue_dropped = aggregate.opportunity_record_queue_dropped,
                 dynamic_multihop_paths = aggregate.search.dynamic_multihop_paths,
                 dynamic_multihop_anchors = aggregate.search.dynamic_multihop_anchors,
@@ -217,6 +218,7 @@ struct SearchCycleStats {
     candidates_coalesced: u64,
     inactive_pool_filtered_paths: u64,
     tick_missing_filtered_paths: u64,
+    tick_repair_queued_pools: u64,
     opportunity_record_queue_dropped: u64,
     opportunities_created: u64,
 }
@@ -257,6 +259,7 @@ impl SearchCycleStats {
         self.candidates_coalesced += other.candidates_coalesced;
         self.inactive_pool_filtered_paths += other.inactive_pool_filtered_paths;
         self.tick_missing_filtered_paths += other.tick_missing_filtered_paths;
+        self.tick_repair_queued_pools += other.tick_repair_queued_pools;
         self.opportunity_record_queue_dropped += other.opportunity_record_queue_dropped;
         self.opportunities_created += other.opportunities_created;
     }
@@ -410,7 +413,12 @@ async fn run_search_cycle<P, C, R>(
     min_expected_profit_usdc: f64,
 ) -> Result<SearchCycleStats>
 where
-    P: PoolStateStore + PoolChangeStore + CurrentBlockStore + TickChangeStore + TickStateStore,
+    P: PoolStateStore
+        + PoolChangeStore
+        + CurrentBlockStore
+        + TickChangeStore
+        + TickRepairStore
+        + TickStateStore,
     C: CandidateStore,
     R: PairSearchConfigStore,
 {
@@ -660,6 +668,7 @@ where
         if path_batch.len() >= SEARCHER_PUBLISH_BATCH_PATHS {
             quote_and_publish_path_batch(
                 candidate_store,
+                pool_store,
                 opportunity_recorder,
                 &mut cycle_stats,
                 engine,
@@ -678,6 +687,7 @@ where
     if !path_batch.is_empty() {
         quote_and_publish_path_batch(
             candidate_store,
+            pool_store,
             opportunity_recorder,
             &mut cycle_stats,
             engine,
@@ -989,8 +999,9 @@ where
     Ok(())
 }
 
-async fn quote_and_publish_path_batch<C>(
+async fn quote_and_publish_path_batch<C, T>(
     candidate_store: &C,
+    tick_repair_store: &T,
     opportunity_recorder: &OpportunityRecordQueue,
     cycle_stats: &mut SearchCycleStats,
     engine: &strategy::SearchEngine,
@@ -1004,6 +1015,7 @@ async fn quote_and_publish_path_batch<C>(
 ) -> Result<()>
 where
     C: CandidateStore,
+    T: TickRepairStore,
 {
     let quote_started = Instant::now();
     let (candidates, mut search_stats) = engine
@@ -1011,7 +1023,18 @@ where
         .await?;
     cycle_stats.quote_ms += quote_started.elapsed().as_millis() as u64;
     search_stats.total_paths = 0;
+    let tick_repair_pools = search_stats
+        .tick_repair_pools
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    cycle_stats.tick_repair_queued_pools += tick_repair_pools.len() as u64;
     cycle_stats.search.merge(&search_stats);
+    if !tick_repair_pools.is_empty() {
+        tick_repair_store
+            .mark_tick_repair_pools(tick_repair_pools)
+            .await?;
+    }
     let publish_started = Instant::now();
     publish_candidates(
         candidate_store,

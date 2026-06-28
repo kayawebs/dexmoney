@@ -6,7 +6,7 @@ use base_arb_chain::provider::ChainProvider;
 use base_arb_common::config::Settings;
 use base_arb_common::types::{DexKind, PoolId, PoolState, PoolVariant};
 use base_arb_storage::postgres::PostgresStore;
-use base_arb_storage::{redis::RedisStore, TickChangeStore, TickStateStore};
+use base_arb_storage::{redis::RedisStore, TickChangeStore, TickRepairStore, TickStateStore};
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 
@@ -69,14 +69,16 @@ async fn run_repair_once(
     args: &Args,
     pass: Option<u64>,
 ) -> Result<()> {
-    let pools = load_repair_pools(postgres, args).await?;
+    let queued_repair_pools = redis.drain_tick_repair_pools(args.limit as usize).await?;
+    let pools = load_repair_pools(postgres, args, &queued_repair_pools).await?;
     println!("== V3-style Tick Repair ==");
     println!(
-        "mode={} pass={} pools={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
+        "mode={} pass={} pools={} queued={} limit={} max_age_hours={} word_radius={} force={} gaps_only={}",
         if args.apply { "apply" } else { "dry-run" },
         pass.map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string()),
         pools.len(),
+        queued_repair_pools.len(),
         args.limit,
         args.max_age_hours,
         args.word_radius,
@@ -335,14 +337,152 @@ fn print_usage() {
     );
 }
 
-async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<RepairPool>> {
-    let pool_filter = args
-        .pools
+async fn load_repair_pools(
+    postgres: &PostgresStore,
+    args: &Args,
+    queued_repair_pools: &[Address],
+) -> Result<Vec<RepairPool>> {
+    let mut selected_pools = args.pools.clone();
+    selected_pools.extend(queued_repair_pools.iter().copied());
+    let pool_filter = selected_pools
         .iter()
         .map(|pool| format!("{pool:#x}"))
         .collect::<Vec<_>>();
-    let rows = sqlx::query(
-        r#"
+
+    let rows = if !pool_filter.is_empty() {
+        sqlx::query(
+            r#"
+            WITH wanted AS (
+              SELECT lower(pool_address) AS pool_address
+              FROM unnest($3::TEXT[]) AS filter(pool_address)
+            )
+            SELECT
+              p.chain_id,
+              p.pool_address,
+              p.dex,
+              p.variant,
+              p.factory_address,
+              p.token0,
+              p.token1,
+              p.fee_bps,
+              p.tick_spacing,
+              p.stable,
+              ls.reserve0,
+              ls.reserve1,
+              ls.sqrt_price_x96,
+              ls.liquidity,
+              ls.tick,
+              ls.block_number,
+              ls.updated_at
+            FROM wanted w
+            JOIN pools p
+              ON lower(p.pool_address) = w.pool_address
+            JOIN LATERAL (
+              SELECT
+                reserve0,
+                reserve1,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+                block_number,
+                updated_at
+              FROM pool_states ps
+              WHERE lower(ps.pool_address) = lower(p.pool_address)
+                AND ps.updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
+              ORDER BY ps.block_number DESC, ps.updated_at DESC
+              LIMIT 1
+            ) ls ON TRUE
+            WHERE p.enabled
+              AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
+              AND ls.sqrt_price_x96 IS NOT NULL
+              AND ls.liquidity IS NOT NULL
+              AND ls.tick IS NOT NULL
+            ORDER BY ls.updated_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(args.limit)
+        .bind(args.max_age_hours)
+        .bind(&pool_filter)
+        .fetch_all(&postgres.pool)
+        .await?
+    } else if args.gaps_only {
+        sqlx::query(
+            r#"
+            WITH candidates AS (
+              SELECT
+                tc.chain_id,
+                tc.pool_address,
+                tc.status,
+                tc.updated_at
+              FROM pool_tick_coverage tc
+              WHERE tc.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
+                AND (
+                  tc.status IN ('refresh_failed', 'zero_ticks')
+                  OR (tc.status = 'ready' AND tc.tick_count = 0)
+                )
+              ORDER BY
+                CASE
+                  WHEN tc.status = 'refresh_failed' THEN 0
+                  WHEN tc.status = 'zero_ticks' THEN 1
+                  WHEN tc.status = 'ready' AND tc.tick_count = 0 THEN 2
+                  ELSE 3
+                END,
+                tc.updated_at DESC
+              LIMIT $1
+            )
+            SELECT
+              p.chain_id,
+              p.pool_address,
+              p.dex,
+              p.variant,
+              p.factory_address,
+              p.token0,
+              p.token1,
+              p.fee_bps,
+              p.tick_spacing,
+              p.stable,
+              ls.reserve0,
+              ls.reserve1,
+              ls.sqrt_price_x96,
+              ls.liquidity,
+              ls.tick,
+              ls.block_number,
+              ls.updated_at
+            FROM candidates c
+            JOIN pools p
+              ON p.chain_id = c.chain_id
+             AND lower(p.pool_address) = lower(c.pool_address)
+            JOIN LATERAL (
+              SELECT
+                reserve0,
+                reserve1,
+                sqrt_price_x96,
+                liquidity,
+                tick,
+                block_number,
+                updated_at
+              FROM pool_states ps
+              WHERE lower(ps.pool_address) = lower(p.pool_address)
+                AND ps.updated_at >= NOW() - ($2::BIGINT * INTERVAL '1 hour')
+              ORDER BY ps.block_number DESC, ps.updated_at DESC
+              LIMIT 1
+            ) ls ON TRUE
+            WHERE p.enabled
+              AND p.variant IN ('AerodromeSlipstream', 'UniswapV3', 'PancakeV3')
+              AND ls.sqrt_price_x96 IS NOT NULL
+              AND ls.liquidity IS NOT NULL
+              AND ls.tick IS NOT NULL
+            ORDER BY c.updated_at DESC
+            "#,
+        )
+        .bind(args.limit)
+        .bind(args.max_age_hours)
+        .fetch_all(&postgres.pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
         SELECT
           p.chain_id,
           p.pool_address,
@@ -418,13 +558,14 @@ async fn load_repair_pools(postgres: &PostgresStore, args: &Args) -> Result<Vec<
           ls.updated_at DESC
         LIMIT $1
         "#,
-    )
-    .bind(args.limit)
-    .bind(args.max_age_hours)
-    .bind(&pool_filter)
-    .bind(args.gaps_only)
-    .fetch_all(&postgres.pool)
-    .await?;
+        )
+        .bind(args.limit)
+        .bind(args.max_age_hours)
+        .bind(&pool_filter)
+        .bind(args.gaps_only)
+        .fetch_all(&postgres.pool)
+        .await?
+    };
 
     rows.into_iter()
         .map(|row| {

@@ -1376,6 +1376,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pools (enabled, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pools_pair_idx
             ON pools (token_pair_id, enabled)"#,
+        r#"CREATE INDEX IF NOT EXISTS pools_chain_lower_pool_idx
+            ON pools (chain_id, lower(pool_address))"#,
         r#"ALTER TABLE pools
             ADD COLUMN IF NOT EXISTS factory_address TEXT"#,
         r#"CREATE INDEX IF NOT EXISTS dex_events_pool_block_type_idx
@@ -1735,6 +1737,8 @@ pub async fn ensure_registry_schema(pool: &PgPool) -> Result<()> {
             ON pool_tick_coverage (chain_id, status, updated_at DESC)"#,
         r#"CREATE INDEX IF NOT EXISTS pool_tick_coverage_variant_idx
             ON pool_tick_coverage (chain_id, variant, tick_count, updated_at DESC)"#,
+        r#"CREATE INDEX IF NOT EXISTS pool_tick_coverage_pool_lower_idx
+            ON pool_tick_coverage (chain_id, lower(pool_address))"#,
         r#"CREATE TABLE IF NOT EXISTS pool_quote_coverage (
             chain_id BIGINT NOT NULL,
             pool_address TEXT NOT NULL,
