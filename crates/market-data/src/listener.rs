@@ -626,6 +626,7 @@ where
 
             let fee_started = Instant::now();
             let mut fee_refreshed_pools = HashSet::new();
+            let mut fee_refresh_failed_pools = HashSet::new();
             let mut fee_refresh_jobs = Vec::new();
             for (pool, block_number) in classic_fee_refreshes {
                 let Some(index) = state_index_by_pool.get(&pool).copied() else {
@@ -740,20 +741,21 @@ where
                         );
                     }
                     Err(err) => {
-                        changed_pools.remove(&pool);
-                        validation_snapshots.retain(|(_, address), _| *address != pool);
+                        fee_refresh_failed_pools.insert(pool);
                         match outcome.job.kind {
                             FeeRefreshKind::Classic { .. } => warn!(
                                 pool = %pool,
                                 block_number,
+                                retained_fee_bps = state.fee_bps,
                                 error = %err,
-                                "Classic state update withheld because factory fee refresh failed"
+                                "Classic fee refresh failed; retaining previous fee and publishing updated reserves"
                             ),
                             FeeRefreshKind::Slipstream => warn!(
                                 pool = %pool,
                                 block_number,
+                                retained_fee_pips = ?state.fee_pips,
                                 error = %err,
-                                "Slipstream state update withheld because dynamic fee refresh failed"
+                                "Slipstream dynamic fee refresh failed; retaining previous fee and publishing updated state"
                             ),
                         }
                     }
@@ -816,6 +818,7 @@ where
                 events = events.len(),
                 changed_pools = changed_pools.len(),
                 fee_refreshed_pools = fee_refreshed_pools.len(),
+                fee_refresh_failed_pools = fee_refresh_failed_pools.len(),
                 protocol_observed,
                 v4_promoted = v4_promote_stats.promoted,
                 balancer_promoted = balancer_promote_stats.promoted,

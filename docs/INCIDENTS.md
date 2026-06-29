@@ -817,6 +817,26 @@ doctor architecture but currently report `unsupported_deep_check` until their
 protocol-specific step analyzers are added. Add health-monitor alerts for
 `MinProfitNotMet` spikes by protocol after the buckets are stable.
 
+2026-06-29 live `UniswapV2: K` split:
+
+- Sample simulation `2d44b0e0-189e-41d5-b682-922cfca92ca0`, opportunity
+  `39f9d641-ba15-447c-93ce-69207df952df`, path
+  `cycle4-a02913-aero-slipstream-39a1be-aero-classic-42bf6a-aero-classic-727823-pancake-v3-6f9830`.
+- Doctor verdict: `classic_state_stale_by_opportunity_block`.
+- The first V3-style step and second classic step matched onchain state and
+  local formula at source block `47959508`.
+- The third classic step used source block `47959505`, while the same pool
+  `0xfa65a76655f3c0641b79e89de3f51459c3727823` had `Sync/Swap` logs in block
+  `47959508`. Onchain reserves at `47959508` differed from the recorded
+  snapshot by 4 bps.
+- `market-data` logs showed the exact failure mode:
+  `Classic state update withheld because factory fee refresh failed` for that
+  pool. The listener had already applied the reserve event, then removed the
+  pool from `changed_pools` because fee refresh failed.
+- Fix: sealed-block fee refresh failure no longer withholds state publication.
+  The updated reserves/state are published with the previous fee retained, and
+  block summaries now include `fee_refresh_failed_pools`.
+
 ## 2026-06-24 Uniswap V4 Adapter NoOutput Verification
 
 Status: Fixed In Code
