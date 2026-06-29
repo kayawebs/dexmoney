@@ -79,6 +79,8 @@ async fn main() -> Result<()> {
                 tick_cache_hits = aggregate.tick_cache_hits,
                 tick_cache_misses = aggregate.tick_cache_misses,
                 tick_cache_refreshes = aggregate.tick_cache_refreshes,
+                tick_pg_fallback_pools = aggregate.tick_pg_fallback_pools,
+                tick_pg_fallback_ticks = aggregate.tick_pg_fallback_ticks,
                 path_index_rebuild_ms = aggregate.path_index_rebuild_ms,
                 path_build_ms = aggregate.path_build_ms,
                 quote_ms = aggregate.quote_ms,
@@ -202,6 +204,8 @@ struct SearchCycleStats {
     tick_cache_hits: u64,
     tick_cache_misses: u64,
     tick_cache_refreshes: u64,
+    tick_pg_fallback_pools: u64,
+    tick_pg_fallback_ticks: u64,
     path_index_rebuild_ms: u64,
     path_build_ms: u64,
     quote_ms: u64,
@@ -241,6 +245,8 @@ impl SearchCycleStats {
         self.tick_cache_hits += other.tick_cache_hits;
         self.tick_cache_misses += other.tick_cache_misses;
         self.tick_cache_refreshes += other.tick_cache_refreshes;
+        self.tick_pg_fallback_pools += other.tick_pg_fallback_pools;
+        self.tick_pg_fallback_ticks += other.tick_pg_fallback_ticks;
         self.path_index_rebuild_ms += other.path_index_rebuild_ms;
         self.path_build_ms += other.path_build_ms;
         self.quote_ms += other.quote_ms;
@@ -388,12 +394,12 @@ struct TrustedFactorySet {
 }
 
 impl TrustedFactorySet {
-    fn from_settings_and_registry(
-        settings: &Settings,
-        registry: &[FactoryRegistryRecord],
-    ) -> Self {
+    fn from_settings_and_registry(settings: &Settings, registry: &[FactoryRegistryRecord]) -> Self {
         let mut set = Self::default();
-        set.insert_optional(PoolVariant::AerodromeVolatile, settings.aerodrome_pool_factory);
+        set.insert_optional(
+            PoolVariant::AerodromeVolatile,
+            settings.aerodrome_pool_factory,
+        );
         set.insert_optional(
             PoolVariant::AerodromeSlipstream,
             settings.aerodrome_slipstream_factory,
@@ -761,6 +767,7 @@ where
         &mut runtime.tick_states,
         &mut runtime.tick_states_loaded_at,
         pool_store,
+        config_store,
         &tick_changed_pools,
         &mut refreshed_tick_pools,
         &selected_paths.path_pools,
@@ -770,6 +777,8 @@ where
     cycle_stats.tick_cache_hits += tick_load_stats.cache_hits;
     cycle_stats.tick_cache_misses += tick_load_stats.cache_misses;
     cycle_stats.tick_cache_refreshes += tick_load_stats.cache_refreshes;
+    cycle_stats.tick_pg_fallback_pools += tick_load_stats.tick_pg_fallback_pools;
+    cycle_stats.tick_pg_fallback_ticks += tick_load_stats.tick_pg_fallback_ticks;
 
     let missing_tick_pools = missing_tick_pools_for_paths(
         &runtime.pool_states,
@@ -839,7 +848,13 @@ fn active_pool_addresses<'a>(
 ) -> HashSet<Address> {
     pool_states
         .filter(|state| {
-            is_pool_state_active(state, now, max_pool_state_age_ms, settings, trusted_factories)
+            is_pool_state_active(
+                state,
+                now,
+                max_pool_state_age_ms,
+                settings,
+                trusted_factories,
+            )
         })
         .map(|state| state.pool_id.address)
         .collect()
@@ -986,10 +1001,7 @@ fn is_pool_state_quote_ready(
     }
 }
 
-fn is_supported_factory(
-    state: &PoolState,
-    trusted_factories: &TrustedFactorySet,
-) -> bool {
+fn is_supported_factory(state: &PoolState, trusted_factories: &TrustedFactorySet) -> bool {
     trusted_factories.supports(state)
 }
 
@@ -1021,6 +1033,8 @@ struct TickLoadStats {
     cache_hits: u64,
     cache_misses: u64,
     cache_refreshes: u64,
+    tick_pg_fallback_pools: u64,
+    tick_pg_fallback_ticks: u64,
 }
 
 async fn load_tick_states_for_pools<P>(
@@ -1028,6 +1042,7 @@ async fn load_tick_states_for_pools<P>(
     tick_states: &mut HashMap<Address, Vec<TickState>>,
     tick_states_loaded_at: &mut HashMap<Address, Instant>,
     pool_store: &P,
+    fallback_tick_store: &PostgresStore,
     tick_changed_pools: &HashSet<Address>,
     refreshed_tick_pools: &mut HashSet<Address>,
     path_pools: &HashSet<Address>,
@@ -1067,7 +1082,26 @@ where
     }
 
     if !pools_to_refresh.is_empty() {
-        let loaded = pool_store.get_pool_ticks_many(&pools_to_refresh).await?;
+        let mut loaded = pool_store.get_pool_ticks_many(&pools_to_refresh).await?;
+        let missing_from_hot_cache = pools_to_refresh
+            .iter()
+            .copied()
+            .filter(|pool| loaded.get(pool).is_none_or(Vec::is_empty))
+            .collect::<Vec<_>>();
+        if !missing_from_hot_cache.is_empty() {
+            let fallback_loaded = fallback_tick_store
+                .get_pool_ticks_current_many(&missing_from_hot_cache)
+                .await?;
+            for (pool, ticks) in fallback_loaded {
+                if ticks.is_empty() {
+                    continue;
+                }
+                stats.tick_pg_fallback_pools += 1;
+                stats.tick_pg_fallback_ticks += ticks.len() as u64;
+                pool_store.replace_pool_ticks(pool, ticks.clone()).await?;
+                loaded.insert(pool, ticks);
+            }
+        }
         let loaded_at = Instant::now();
         for pool in pools_to_refresh {
             tick_states.insert(pool, loaded.get(&pool).cloned().unwrap_or_default());
