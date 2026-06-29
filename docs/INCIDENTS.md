@@ -775,6 +775,11 @@ Still open:
 
 - Next split is per-step local quote vs onchain execution diff for recent
   failed samples, plus event-coverage/drift checks for the involved pools.
+- `UniswapV2: K` failures are part of the same split family but need a separate
+  branch: first prove whether Aerodrome/DirectV2 classic reserves and fees match
+  onchain at the recorded source block, then compare local formula with the
+  pool's own `getAmountOut`. If both match, the remaining likely branches are
+  token transfer behavior or same-block ordering, not tick coverage.
 - Run `ops/minprofit_proof_batch.sh` first. If the dominant bucket is
   `local_quote_missing_uniswap_v4` or `local_quote_missing_balancer_v3`, the
   immediate fix is diagnostic/model coverage for that protocol before any
@@ -791,8 +796,22 @@ a smaller proven cause using per-step replay evidence.
 
 ### Regression Guard
 
-Pending. Candidate guards include replay tests for representative routes and a
-health-monitor alert for `MinProfitNotMet` spikes by protocol.
+`doctor/arb_doctor.sh` now calls the recorder `arb_doctor` state-diff engine
+and writes `state-diff.txt`. This is the default opportunity-level guard before
+new one-off SQL:
+
+- recorded quote snapshot vs onchain state at the recorded source block;
+- Redis current state/tick presence;
+- Postgres tick coverage;
+- classic/V2 formula recomputation from the recorded snapshot;
+- classic/V2 formula recomputation from onchain source state;
+- classic pool `getAmountOut` comparison at the same block.
+
+Current deep coverage is complete for Aerodrome/DirectV2-style classic pools
+and state/tick evidence for V3-style pools. V4 and Balancer remain in the same
+doctor architecture but currently report `unsupported_deep_check` until their
+protocol-specific step analyzers are added. Add health-monitor alerts for
+`MinProfitNotMet` spikes by protocol after the buckets are stable.
 
 ## 2026-06-24 Uniswap V4 Adapter NoOutput Verification
 

@@ -46,6 +46,9 @@ The output directory contains:
 - `db-context.txt`: opportunity, simulation, transaction, path, pool, and protocol rows;
 - `replay.txt` / `replay.log`: historical replay result;
 - `validate.txt` / `validate.log`: route-level state and quote checks.
+- `state-diff.txt` / `state-diff.log`: per-step recorded/local/onchain
+  state diff and protocol quote checks. This is the first place to inspect
+  quote-model, reserve drift, fee, and tick-readiness problems.
 
 ## Verdict Buckets
 
@@ -59,6 +62,11 @@ Initial buckets:
 - `approval_config`
 - `capital_config`
 - `intervening_or_state_change_suspected`
+- `classic_state_drift`
+- `classic_formula_mismatch`
+- `classic_pool_formula_mismatch`
+- `classic_k_not_state_or_formula`
+- `v3_state_or_tick_needs_review`
 - `route_quote_completed_needs_review`
 - `unknown_needs_manual_review`
 

@@ -123,6 +123,8 @@ REPLAY_TXT="$OUT_DIR/replay.txt"
 REPLAY_LOG="$OUT_DIR/replay.log"
 VALIDATE_TXT="$OUT_DIR/validate.txt"
 VALIDATE_LOG="$OUT_DIR/validate.log"
+STATE_DIFF_TXT="$OUT_DIR/state-diff.txt"
+STATE_DIFF_LOG="$OUT_DIR/state-diff.log"
 
 write_header() {
   {
@@ -329,6 +331,14 @@ run_validate() {
   fi
 }
 
+run_state_diff() {
+  if ! cargo run -p base-arb-recorder --bin arb_doctor -- \
+    --opportunity-id "$OPPORTUNITY_ID" \
+    --out "$STATE_DIFF_TXT" >"$STATE_DIFF_LOG" 2>&1; then
+    return 1
+  fi
+}
+
 extract_field() {
   local file="$1"
   local key="$2"
@@ -349,6 +359,14 @@ classify_verdict() {
 
   if grep -q "factory_check: MISMATCH" "$validate" 2>/dev/null; then
     echo "factory_or_pool_identity_mismatch"
+  elif grep -qi "verdict=classic_state_drift" "$STATE_DIFF_TXT" 2>/dev/null; then
+    echo "classic_state_drift"
+  elif grep -qi "verdict=classic_formula_mismatch" "$STATE_DIFF_TXT" 2>/dev/null; then
+    echo "classic_formula_mismatch"
+  elif grep -qi "verdict=classic_pool_formula_mismatch" "$STATE_DIFF_TXT" 2>/dev/null; then
+    echo "classic_pool_formula_mismatch"
+  elif grep -qi "verdict=classic_k_not_state_or_formula" "$STATE_DIFF_TXT" 2>/dev/null; then
+    echo "classic_k_not_state_or_formula"
   elif grep -qi "PoolMismatch" "$replay" "$replay_log" "$validate" "$validate_log" 2>/dev/null; then
     echo "pool_mismatch"
   elif grep -qi "InsufficientAllowance" "$replay" "$replay_log" "$validate" "$validate_log" 2>/dev/null; then
@@ -375,6 +393,7 @@ classify_verdict() {
 write_final_report() {
   local replay_status="$1"
   local validate_status="$2"
+  local state_diff_status="$3"
   local verdict
   verdict="$(classify_verdict "$REPLAY_TXT" "$VALIDATE_TXT" "$REPLAY_LOG" "$VALIDATE_LOG")"
   local replay_classification
@@ -387,6 +406,7 @@ write_final_report() {
     echo "verdict: $verdict"
     echo "replay_status: $replay_status"
     echo "validate_status: $validate_status"
+    echo "state_diff_status: $state_diff_status"
     echo "replay_classification: ${replay_classification:-unknown}"
     echo "zero_min_result: ${zero_min:-unknown}"
     echo
@@ -404,6 +424,18 @@ write_final_report() {
         ;;
       factory_or_pool_identity_mismatch|pool_mismatch)
         echo "Do not execute this path. Fix pool identity/factory trust/classification before reenabling."
+        ;;
+      classic_state_drift)
+        echo "Fix market-data reserve/fee state for the affected V2/classic pool, then rerun state-diff."
+        ;;
+      classic_formula_mismatch)
+        echo "Fix local classic quote math/fee/direction; recorded quote differs from formula on the recorded snapshot."
+        ;;
+      classic_pool_formula_mismatch)
+        echo "Fix protocol-specific classic formula/fee source; local formula differs from pool getAmountOut at the same block."
+        ;;
+      classic_k_not_state_or_formula)
+        echo "State and formula did not explain UniswapV2: K. Investigate token transfer behavior or same-block ordering."
         ;;
       approval_config)
         echo "Fix hub allowance or auto-approval path; this is not a quote model issue."
@@ -425,6 +457,8 @@ write_final_report() {
     echo "replay_log: $REPLAY_LOG"
     echo "validate: $VALIDATE_TXT"
     echo "validate_log: $VALIDATE_LOG"
+    echo "state_diff: $STATE_DIFF_TXT"
+    echo "state_diff_log: $STATE_DIFF_LOG"
   } >>"$REPORT"
 }
 
@@ -453,6 +487,15 @@ if ! run_validate; then
   validate_status="failed"
 fi
 
-write_final_report "$replay_status" "$validate_status"
+state_diff_status="ok"
+{
+  echo "state_diff: $STATE_DIFF_TXT"
+  echo
+} >>"$REPORT"
+if ! run_state_diff; then
+  state_diff_status="failed"
+fi
+
+write_final_report "$replay_status" "$validate_status" "$state_diff_status"
 
 cat "$REPORT"
