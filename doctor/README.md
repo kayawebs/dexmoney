@@ -63,6 +63,7 @@ Initial buckets:
 - `capital_config`
 - `intervening_or_state_change_suspected`
 - `classic_state_drift`
+- `classic_state_stale_by_opportunity_block`
 - `classic_formula_mismatch`
 - `classic_pool_formula_mismatch`
 - `classic_k_not_state_or_formula`

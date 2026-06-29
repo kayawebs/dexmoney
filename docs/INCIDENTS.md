@@ -806,6 +806,10 @@ new one-off SQL:
 - classic/V2 formula recomputation from the recorded snapshot;
 - classic/V2 formula recomputation from onchain source state;
 - classic pool `getAmountOut` comparison at the same block.
+- `recorded_vs_onchain_opportunity` classification, which only flags stale
+  state when the chain state actually changed by the opportunity block. This
+  preserves the project rule that an old no-event pool block is not a problem
+  by itself.
 
 Current deep coverage is complete for Aerodrome/DirectV2-style classic pools
 and state/tick evidence for V3-style pools. V4 and Balancer remain in the same

@@ -361,6 +361,8 @@ classify_verdict() {
     echo "factory_or_pool_identity_mismatch"
   elif grep -qi "verdict=classic_state_drift" "$STATE_DIFF_TXT" 2>/dev/null; then
     echo "classic_state_drift"
+  elif grep -qi "verdict=classic_state_stale_by_opportunity_block" "$STATE_DIFF_TXT" 2>/dev/null; then
+    echo "classic_state_stale_by_opportunity_block"
   elif grep -qi "verdict=classic_formula_mismatch" "$STATE_DIFF_TXT" 2>/dev/null; then
     echo "classic_formula_mismatch"
   elif grep -qi "verdict=classic_pool_formula_mismatch" "$STATE_DIFF_TXT" 2>/dev/null; then
@@ -427,6 +429,9 @@ write_final_report() {
         ;;
       classic_state_drift)
         echo "Fix market-data reserve/fee state for the affected V2/classic pool, then rerun state-diff."
+        ;;
+      classic_state_stale_by_opportunity_block)
+        echo "Fix searcher/market-data freshness: the opportunity used an older classic pool snapshot even though onchain reserves had changed by the opportunity block."
         ;;
       classic_formula_mismatch)
         echo "Fix local classic quote math/fee/direction; recorded quote differs from formula on the recorded snapshot."

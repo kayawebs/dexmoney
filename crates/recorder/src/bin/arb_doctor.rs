@@ -25,6 +25,7 @@ enum Verdict {
     MissingRecordedDiagnostics,
     HistoricalStateFetchFailed,
     ClassicStateDrift,
+    ClassicStateStaleByOpportunityBlock,
     ClassicFormulaMismatch,
     ClassicPoolFormulaMismatch,
     ClassicKNotStateOrFormula,
@@ -39,6 +40,9 @@ impl Verdict {
             Self::MissingRecordedDiagnostics => "missing_recorded_quote_diagnostics",
             Self::HistoricalStateFetchFailed => "historical_state_fetch_failed",
             Self::ClassicStateDrift => "classic_state_drift",
+            Self::ClassicStateStaleByOpportunityBlock => {
+                "classic_state_stale_by_opportunity_block"
+            }
             Self::ClassicFormulaMismatch => "classic_formula_mismatch",
             Self::ClassicPoolFormulaMismatch => "classic_pool_formula_mismatch",
             Self::ClassicKNotStateOrFormula => "classic_k_not_state_or_formula",
@@ -275,6 +279,7 @@ async fn analyze_step(
         }
     };
 
+    let mut opportunity_state = None;
     if case.opportunity_block >= 0 && case.opportunity_block as u64 != source_block {
         let opportunity_block = case.opportunity_block as u64;
         match provider.get_block_hash(opportunity_block).await {
@@ -282,7 +287,10 @@ async fn analyze_step(
                 .fetch_pool_state_from_registry_at_block_hash(&entry, &hash, opportunity_block)
                 .await
             {
-                Ok(state) => write_state_line(report, "onchain_opportunity_state", &state)?,
+                Ok(state) => {
+                    write_state_line(report, "onchain_opportunity_state", &state)?;
+                    opportunity_state = Some(state);
+                }
                 Err(err) => writeln!(
                     report,
                     "onchain_opportunity_state=failed block={} hash={} error={err:#}",
@@ -301,7 +309,24 @@ async fn analyze_step(
         return Ok(Verdict::HistoricalStateFetchFailed);
     };
 
-    let state_verdict = compare_recorded_to_onchain(report, recorded, &source_state)?;
+    let state_verdict = compare_recorded_to_onchain(
+        report,
+        "recorded_vs_onchain_source",
+        recorded,
+        &source_state,
+        Verdict::ClassicStateDrift,
+    )?;
+    let opportunity_verdict = if let Some(opportunity_state) = opportunity_state.as_ref() {
+        compare_recorded_to_onchain(
+            report,
+            "recorded_vs_onchain_opportunity",
+            recorded,
+            opportunity_state,
+            Verdict::ClassicStateStaleByOpportunityBlock,
+        )?
+    } else {
+        Verdict::Clean
+    };
     let quote_verdict = quote_check(
         report,
         step,
@@ -316,7 +341,7 @@ async fn analyze_step(
         Verdict::HistoricalStateFetchFailed
     });
 
-    Ok(state_verdict.max(quote_verdict))
+    Ok(state_verdict.max(opportunity_verdict).max(quote_verdict))
 }
 
 fn write_recorded_snapshot(report: &mut String, recorded: &QuoteStepDiagnostics) -> Result<()> {
@@ -366,8 +391,10 @@ fn write_state_line(report: &mut String, label: &str, state: &PoolState) -> Resu
 
 fn compare_recorded_to_onchain(
     report: &mut String,
+    label: &str,
     recorded: &QuoteStepDiagnostics,
     onchain: &PoolState,
+    classic_drift_verdict: Verdict,
 ) -> Result<Verdict> {
     let mut verdict = Verdict::Clean;
     let reserve0_diff = diff_bps_opt(recorded.reserve0, onchain.reserve0);
@@ -381,7 +408,7 @@ fn compare_recorded_to_onchain(
 
     writeln!(
         report,
-        "recorded_vs_onchain_source=reserve0_diff_bps:{} reserve1_diff_bps:{} sqrt_diff_bps:{} liquidity_diff_bps:{} tick_diff:{} fee_bps_recorded:{} fee_bps_onchain:{} fee_pips_recorded:{:?} fee_pips_onchain:{:?}",
+        "{label}=reserve0_diff_bps:{} reserve1_diff_bps:{} sqrt_diff_bps:{} liquidity_diff_bps:{} tick_diff:{} fee_bps_recorded:{} fee_bps_onchain:{} fee_pips_recorded:{:?} fee_pips_onchain:{:?}",
         fmt_opt_u256(reserve0_diff),
         fmt_opt_u256(reserve1_diff),
         fmt_opt_u256(sqrt_diff),
@@ -400,7 +427,7 @@ fn compare_recorded_to_onchain(
             || reserve1_diff.is_some_and(|value| !value.is_zero())
             || recorded.fee_bps != onchain.fee_bps
         {
-            verdict = Verdict::ClassicStateDrift;
+            verdict = classic_drift_verdict;
         }
     } else if sqrt_diff.is_some_and(|value| !value.is_zero())
         || liquidity_diff.is_some_and(|value| !value.is_zero())
@@ -543,7 +570,10 @@ fn refine_path_verdict(verdict: Verdict, case: &CaseRow) -> Verdict {
         .simulation_revert_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("UniswapV2: K"))
-        && matches!(verdict, Verdict::Clean | Verdict::V3StateOrTickNeedsReview)
+        && matches!(
+            verdict,
+            Verdict::Clean | Verdict::V3StateOrTickNeedsReview
+        )
     {
         return Verdict::ClassicKNotStateOrFormula;
     }
@@ -554,6 +584,9 @@ fn next_action(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::ClassicStateDrift => {
             "fix market-data classic reserve/fee state maintenance or drift refresh for the affected pool"
+        }
+        Verdict::ClassicStateStaleByOpportunityBlock => {
+            "fix searcher/market-data freshness: this opportunity used an older classic pool snapshot even though onchain reserves had changed by the opportunity block"
         }
         Verdict::ClassicFormulaMismatch => {
             "fix local classic quote math/fee/direction; recorded searcher quote differs from current formula on the recorded snapshot"
