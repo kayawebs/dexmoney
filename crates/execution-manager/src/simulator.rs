@@ -7,9 +7,120 @@ use base_arb_common::constants::{
     PANCAKE_V3_FACTORY, PANCAKE_V3_ROUTER, UNISWAP_V2_FACTORY, UNISWAP_V3_FACTORY,
 };
 use base_arb_common::types::{Candidate, DexKind, PoolVariant, SimulationResult};
+use base_arb_storage::postgres::FactoryRegistryRecord;
 use chrono::Utc;
+use std::collections::HashSet;
 
 const EXECUTOR_DEADLINE_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedFactorySet {
+    aerodrome_volatile: HashSet<Address>,
+    aerodrome_slipstream: HashSet<Address>,
+    uniswap_v3: HashSet<Address>,
+    pancake_v3: HashSet<Address>,
+}
+
+impl TrustedFactorySet {
+    pub fn from_settings_and_registry(
+        settings: &Settings,
+        registry: &[FactoryRegistryRecord],
+    ) -> Self {
+        let mut set = Self::default();
+        set.insert_optional(
+            PoolVariant::AerodromeVolatile,
+            settings.aerodrome_pool_factory,
+        );
+        set.insert_optional(
+            PoolVariant::AerodromeSlipstream,
+            settings.aerodrome_slipstream_factory,
+        );
+        set.insert_optional(PoolVariant::UniswapV3, settings.uniswap_v3_factory);
+        set.insert_optional(PoolVariant::PancakeV3, settings.pancake_v3_factory);
+        set.insert_constant(PoolVariant::AerodromeVolatile, AERODROME_CLASSIC_FACTORY);
+        set.insert_constant(PoolVariant::AerodromeVolatile, UNISWAP_V2_FACTORY);
+        for factory in AERODROME_SLIPSTREAM_FACTORIES {
+            set.insert_constant(PoolVariant::AerodromeSlipstream, factory);
+        }
+        set.insert_constant(PoolVariant::UniswapV3, UNISWAP_V3_FACTORY);
+        set.insert_constant(PoolVariant::PancakeV3, PANCAKE_V3_FACTORY);
+
+        for row in registry {
+            if !row.trusted || !row.enabled {
+                continue;
+            }
+            let Ok(address) = row.factory_address.parse::<Address>() else {
+                continue;
+            };
+            let Some(variant) = parse_pool_variant(&row.variant) else {
+                continue;
+            };
+            set.insert(variant, address);
+        }
+        set
+    }
+
+    pub fn len(&self) -> usize {
+        self.aerodrome_volatile.len()
+            + self.aerodrome_slipstream.len()
+            + self.uniswap_v3.len()
+            + self.pancake_v3.len()
+    }
+
+    pub fn insert(&mut self, variant: PoolVariant, address: Address) {
+        match variant {
+            PoolVariant::AerodromeVolatile => {
+                self.aerodrome_volatile.insert(address);
+            }
+            PoolVariant::AerodromeSlipstream => {
+                self.aerodrome_slipstream.insert(address);
+            }
+            PoolVariant::UniswapV3 => {
+                self.uniswap_v3.insert(address);
+            }
+            PoolVariant::PancakeV3 => {
+                self.pancake_v3.insert(address);
+            }
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => {}
+        }
+    }
+
+    fn insert_optional(&mut self, variant: PoolVariant, address: Option<Address>) {
+        if let Some(address) = address {
+            self.insert(variant, address);
+        }
+    }
+
+    fn insert_constant(&mut self, variant: PoolVariant, address: &str) {
+        if let Ok(address) = address.parse::<Address>() {
+            self.insert(variant, address);
+        }
+    }
+
+    fn contains(&self, variant: PoolVariant, factory: Address) -> bool {
+        match variant {
+            PoolVariant::AerodromeVolatile => self.aerodrome_volatile.contains(&factory),
+            PoolVariant::AerodromeSlipstream => self.aerodrome_slipstream.contains(&factory),
+            PoolVariant::UniswapV3 => self.uniswap_v3.contains(&factory),
+            PoolVariant::PancakeV3 => self.pancake_v3.contains(&factory),
+            PoolVariant::UniswapV4 | PoolVariant::BalancerV3 => false,
+        }
+    }
+}
+
+fn parse_pool_variant(value: &str) -> Option<PoolVariant> {
+    match value {
+        "AerodromeVolatile" | "aero-classic" | "aerodrome-volatile" => {
+            Some(PoolVariant::AerodromeVolatile)
+        }
+        "AerodromeSlipstream" | "aero-slipstream" | "aerodrome-slipstream" => {
+            Some(PoolVariant::AerodromeSlipstream)
+        }
+        "UniswapV3" | "uni-v3" | "uniswap-v3" => Some(PoolVariant::UniswapV3),
+        "PancakeV3" | "pancake-v3" => Some(PoolVariant::PancakeV3),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApprovalRequirement {
@@ -35,6 +146,7 @@ impl SimulationContext {
 pub async fn simulate(
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
@@ -43,6 +155,7 @@ pub async fn simulate(
     match simulate_inner(
         provider,
         settings,
+        trusted_factories,
         operator,
         candidate,
         min_simulated_profit_usdc,
@@ -53,8 +166,13 @@ pub async fn simulate(
         Ok(result) => result,
         Err(err) => {
             let raw_error = format!("{err:#}");
-            let calldata = build_simulation_calldata(settings, candidate, candidate.min_profit)
-                .unwrap_or_default();
+            let calldata = build_simulation_calldata(
+                settings,
+                trusted_factories,
+                candidate,
+                candidate.min_profit,
+            )
+            .unwrap_or_default();
             SimulationResult {
                 id: uuid::Uuid::new_v4(),
                 opportunity_id: candidate.id,
@@ -83,6 +201,7 @@ pub async fn simulate(
 async fn simulate_inner(
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     operator: Address,
     candidate: &Candidate,
     min_simulated_profit_usdc: f64,
@@ -98,8 +217,9 @@ async fn simulate_inner(
         anyhow::bail!("profit below simulated threshold");
     }
 
-    let executor = executor_for_candidate(settings, candidate)?;
-    let calldata = build_simulation_calldata(settings, candidate, min_profit_units)?;
+    let executor = executor_for_candidate(settings, trusted_factories, candidate)?;
+    let calldata =
+        build_simulation_calldata(settings, trusted_factories, candidate, min_profit_units)?;
     let data = format!("0x{}", hex::encode(&calldata));
 
     let raw_result = provider
@@ -158,22 +278,28 @@ async fn simulate_inner(
 
 fn build_simulation_calldata(
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     candidate: &Candidate,
     min_profit: U256,
 ) -> Result<Vec<u8>> {
     let deadline = U256::from((Utc::now().timestamp() + EXECUTOR_DEADLINE_SECS) as u64);
-    build_execute_calldata(candidate, min_profit, deadline, settings)
+    build_execute_calldata(candidate, min_profit, deadline, settings, trusted_factories)
 }
 
 pub fn build_live_execution_calldata(
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     candidate: &Candidate,
 ) -> Result<Vec<u8>> {
-    build_simulation_calldata(settings, candidate, candidate.min_profit)
+    build_simulation_calldata(settings, trusted_factories, candidate, candidate.min_profit)
 }
 
-pub fn executor_for_candidate(settings: &Settings, candidate: &Candidate) -> Result<Address> {
-    let requires_hub = candidate_requires_direct_execution(candidate, settings);
+pub fn executor_for_candidate(
+    settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
+    candidate: &Candidate,
+) -> Result<Address> {
+    let requires_hub = candidate_requires_direct_execution(candidate, settings, trusted_factories);
     let selected = if requires_hub {
         settings
             .executor_contract_multihop
@@ -241,6 +367,7 @@ pub fn build_execute_calldata(
     min_profit: U256,
     deadline: U256,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> Result<Vec<u8>> {
     let selector = &keccak256(
         b"executeWithOwnFunds(address,uint256,(uint8,address,address,address,address,uint24,bool,address,bytes)[],uint256,uint256)",
@@ -252,17 +379,18 @@ pub fn build_execute_calldata(
     out.extend(encode_u256(U256::from(160u64)));
     out.extend(encode_u256(min_profit));
     out.extend(encode_u256(deadline));
-    out.extend(encode_steps(candidate, settings)?);
+    out.extend(encode_steps(candidate, settings, trusted_factories)?);
     Ok(out)
 }
 
 pub fn required_token_approvals(
     candidate: &Candidate,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> Result<Vec<ApprovalRequirement>> {
     let mut approvals = Vec::new();
     for step in &candidate.path.steps {
-        if !step_execution_kind(step, settings)?.needs_router_approval() {
+        if !step_execution_kind(step, settings, trusted_factories)?.needs_router_approval() {
             continue;
         }
         let spender = router_for_step(step.dex, step.variant, settings)
@@ -277,9 +405,13 @@ pub fn required_token_approvals(
     Ok(approvals)
 }
 
-fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
+fn encode_steps(
+    candidate: &Candidate,
+    settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
+) -> Result<Vec<u8>> {
     encode_swap_steps(candidate.path.steps.iter(), |step| {
-        let execution_kind = step_execution_kind(step, settings)?;
+        let execution_kind = step_execution_kind(step, settings, trusted_factories)?;
         let router = if execution_kind.is_direct() {
             Address::ZERO
         } else {
@@ -294,7 +426,7 @@ fn encode_steps(candidate: &Candidate, settings: &Settings) -> Result<Vec<u8>> {
             token_out: step.token_out,
             fee: router_fee_for_step(step.dex, step.variant, step.fee_bps, step.tick_spacing)?,
             stable: classic_stable_flag(step),
-            factory: factory_for_step(step, settings)?,
+            factory: factory_for_step(step, settings, trusted_factories)?,
             data: adapter_data_for_step(step)?,
         })
     })
@@ -389,30 +521,30 @@ impl ExecutorStepKind {
     }
 }
 
-fn candidate_requires_direct_execution(candidate: &Candidate, settings: &Settings) -> bool {
-    candidate
-        .path
-        .steps
-        .iter()
-        .any(|step| step_execution_kind(step, settings).is_ok_and(|kind| kind.requires_hub()))
+fn candidate_requires_direct_execution(
+    candidate: &Candidate,
+    settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
+) -> bool {
+    candidate.path.steps.iter().any(|step| {
+        step_execution_kind(step, settings, trusted_factories).is_ok_and(|kind| kind.requires_hub())
+    })
 }
 
 fn step_execution_kind(
     step: &base_arb_common::types::SwapStep,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> Result<ExecutorStepKind> {
     match (step.dex, step.variant) {
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeVolatile)) | (DexKind::Aerodrome, None) => {
             if is_uniswap_v2_factory(step.factory_address) {
                 return Ok(ExecutorStepKind::DirectV2);
             }
-            let default_factory = settings
-                .aerodrome_pool_factory
-                .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok());
             reject_untrusted_factory(
                 step.factory_address,
-                default_factory,
-                &[],
+                trusted_factories,
+                PoolVariant::AerodromeVolatile,
                 "Aerodrome Classic",
             )?;
             Ok(ExecutorStepKind::AerodromeClassic)
@@ -420,8 +552,8 @@ fn step_execution_kind(
         (DexKind::Aerodrome, Some(PoolVariant::AerodromeSlipstream)) => {
             reject_untrusted_factory(
                 step.factory_address,
-                settings.aerodrome_slipstream_factory,
-                &AERODROME_SLIPSTREAM_FACTORIES,
+                trusted_factories,
+                PoolVariant::AerodromeSlipstream,
                 "Aerodrome Slipstream",
             )?;
             Ok(ExecutorStepKind::AerodromeSlipstream)
@@ -429,33 +561,33 @@ fn step_execution_kind(
         (DexKind::UniswapV3, Some(PoolVariant::UniswapV3)) | (DexKind::UniswapV3, None) => {
             reject_untrusted_factory(
                 step.factory_address,
-                settings.uniswap_v3_factory,
-                &[UNISWAP_V3_FACTORY],
+                trusted_factories,
+                PoolVariant::UniswapV3,
                 "Uniswap V3",
             )?;
             Ok(ExecutorStepKind::UniswapV3Router)
         }
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None) => {
-            let pancake_factory = settings
-                .pancake_v3_factory
-                .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
-            reject_untrusted_factory(step.factory_address, pancake_factory, &[], "Pancake V3")?;
+            reject_untrusted_factory(
+                step.factory_address,
+                trusted_factories,
+                PoolVariant::PancakeV3,
+                "Pancake V3",
+            )?;
             Ok(ExecutorStepKind::PancakeV3Router)
         }
         (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None) => {
-            reject_untrusted_factory(
+            reject_untrusted_exact_factory(
                 step.factory_address,
                 settings.uniswap_v4_pool_manager,
-                &[],
                 "Uniswap V4 PoolManager",
             )?;
             Ok(ExecutorStepKind::Adapter)
         }
         (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None) => {
-            reject_untrusted_factory(
+            reject_untrusted_exact_factory(
                 step.factory_address,
                 settings.balancer_v3_vault,
-                &[],
                 "Balancer V3 Vault",
             )?;
             Ok(ExecutorStepKind::Adapter)
@@ -466,20 +598,29 @@ fn step_execution_kind(
 
 fn reject_untrusted_factory(
     step_factory: Option<Address>,
-    configured_factory: Option<Address>,
-    fallback_factories: &[&str],
+    trusted_factories: &TrustedFactorySet,
+    variant: PoolVariant,
     label: &str,
 ) -> Result<()> {
     let Some(factory) = step_factory else {
         return Ok(());
     };
-    if configured_factory == Some(factory)
-        || fallback_factories.iter().any(|expected| {
-            expected
-                .parse::<Address>()
-                .is_ok_and(|expected| expected == factory)
-        })
-    {
+    if trusted_factories.contains(variant, factory) {
+        return Ok(());
+    }
+
+    anyhow::bail!("{label} factory {factory:#x} is not trusted by factory_registry/settings")
+}
+
+fn reject_untrusted_exact_factory(
+    step_factory: Option<Address>,
+    configured_factory: Option<Address>,
+    label: &str,
+) -> Result<()> {
+    let Some(factory) = step_factory else {
+        return Ok(());
+    };
+    if configured_factory == Some(factory) {
         return Ok(());
     }
 
@@ -531,6 +672,7 @@ fn classic_stable_flag(step: &base_arb_common::types::SwapStep) -> bool {
 fn factory_for_step(
     step: &base_arb_common::types::SwapStep,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
 ) -> Result<Address> {
     let dex = step.dex;
     let variant = step.variant;
@@ -545,10 +687,8 @@ fn factory_for_step(
         }
         reject_untrusted_factory(
             step.factory_address,
-            settings
-                .aerodrome_pool_factory
-                .or_else(|| AERODROME_CLASSIC_FACTORY.parse().ok()),
-            &[],
+            trusted_factories,
+            PoolVariant::AerodromeVolatile,
             "Aerodrome Classic",
         )?;
         if let Some(factory) = step.factory_address {
@@ -564,8 +704,8 @@ fn factory_for_step(
     ) {
         reject_untrusted_factory(
             step.factory_address,
-            settings.aerodrome_slipstream_factory,
-            &AERODROME_SLIPSTREAM_FACTORIES,
+            trusted_factories,
+            PoolVariant::AerodromeSlipstream,
             "Aerodrome Slipstream",
         )?;
         if let Some(factory) = step.factory_address {
@@ -582,8 +722,8 @@ fn factory_for_step(
     ) {
         reject_untrusted_factory(
             step.factory_address,
-            settings.uniswap_v3_factory,
-            &[UNISWAP_V3_FACTORY],
+            trusted_factories,
+            PoolVariant::UniswapV3,
             "Uniswap V3",
         )?;
         if let Some(factory) = step.factory_address {
@@ -598,10 +738,12 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::PancakeSwap, Some(PoolVariant::PancakeV3)) | (DexKind::PancakeSwap, None)
     ) {
-        let pancake_factory = settings
-            .pancake_v3_factory
-            .or_else(|| PANCAKE_V3_FACTORY.parse().ok());
-        reject_untrusted_factory(step.factory_address, pancake_factory, &[], "Pancake V3")?;
+        reject_untrusted_factory(
+            step.factory_address,
+            trusted_factories,
+            PoolVariant::PancakeV3,
+            "Pancake V3",
+        )?;
         if let Some(factory) = step.factory_address {
             return Ok(factory);
         }
@@ -613,10 +755,9 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::UniswapV4, Some(PoolVariant::UniswapV4)) | (DexKind::UniswapV4, None)
     ) {
-        reject_untrusted_factory(
+        reject_untrusted_exact_factory(
             step.factory_address,
             settings.uniswap_v4_pool_manager,
-            &[],
             "Uniswap V4 PoolManager",
         )?;
         settings
@@ -626,10 +767,9 @@ fn factory_for_step(
         (dex, variant),
         (DexKind::Balancer, Some(PoolVariant::BalancerV3)) | (DexKind::Balancer, None)
     ) {
-        reject_untrusted_factory(
+        reject_untrusted_exact_factory(
             step.factory_address,
             settings.balancer_v3_vault,
-            &[],
             "Balancer V3 Vault",
         )?;
         settings
@@ -837,7 +977,7 @@ mod tests {
 
     use super::{
         build_execute_calldata, decode_executor_error, decode_uint256_result,
-        executor_for_candidate, required_token_approvals, router_fee_for_step,
+        executor_for_candidate, required_token_approvals, router_fee_for_step, TrustedFactorySet,
     };
 
     fn settings() -> base_arb_common::config::Settings {
@@ -964,17 +1104,21 @@ mod tests {
             Some(address!("2222222222222222222222222222222222222222"));
         settings.executor_contract_multihop =
             Some(address!("4444444444444444444444444444444444444444"));
+        let trusted_factories = TrustedFactorySet::from_settings_and_registry(&settings, &[]);
 
         assert_eq!(
-            executor_for_candidate(&settings, &candidate_with_step_count(2)).unwrap(),
+            executor_for_candidate(&settings, &trusted_factories, &candidate_with_step_count(2))
+                .unwrap(),
             address!("2222222222222222222222222222222222222222")
         );
         assert_eq!(
-            executor_for_candidate(&settings, &candidate_with_step_count(3)).unwrap(),
+            executor_for_candidate(&settings, &trusted_factories, &candidate_with_step_count(3))
+                .unwrap(),
             address!("4444444444444444444444444444444444444444")
         );
         assert_eq!(
-            executor_for_candidate(&settings, &candidate_with_step_count(4)).unwrap(),
+            executor_for_candidate(&settings, &trusted_factories, &candidate_with_step_count(4))
+                .unwrap(),
             address!("4444444444444444444444444444444444444444")
         );
     }
@@ -994,17 +1138,50 @@ mod tests {
             Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
         candidate.path.steps[1].factory_address =
             Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        let trusted_factories = TrustedFactorySet::from_settings_and_registry(&settings, &[]);
 
-        let approvals_err = required_token_approvals(&candidate, &settings)
+        let approvals_err = required_token_approvals(&candidate, &settings, &trusted_factories)
             .expect_err("untrusted V3 factory should not build approvals")
             .to_string();
         assert!(approvals_err.contains("not trusted"), "{approvals_err}");
 
-        let calldata_err =
-            build_execute_calldata(&candidate, U256::from(5_000u64), U256::from(123), &settings)
-                .expect_err("untrusted V3 factory should not build calldata")
-                .to_string();
+        let calldata_err = build_execute_calldata(
+            &candidate,
+            U256::from(5_000u64),
+            U256::from(123),
+            &settings,
+            &trusted_factories,
+        )
+        .expect_err("untrusted V3 factory should not build calldata")
+        .to_string();
         assert!(calldata_err.contains("not trusted"), "{calldata_err}");
+    }
+
+    #[test]
+    fn registry_trusted_v3_factory_is_accepted() {
+        let mut settings = settings();
+        settings.uniswap_v3_factory = Some(address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        let mut trusted_factories = TrustedFactorySet::from_settings_and_registry(&settings, &[]);
+        trusted_factories.insert(
+            base_arb_common::types::PoolVariant::UniswapV3,
+            address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+
+        let mut candidate = candidate_with_step_count(2);
+        candidate.path.steps[0].factory_address =
+            Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        candidate.path.steps[1].factory_address =
+            Some(address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+
+        assert!(required_token_approvals(&candidate, &settings, &trusted_factories).is_ok());
+        assert!(build_execute_calldata(
+            &candidate,
+            U256::from(5_000u64),
+            U256::from(123),
+            &settings,
+            &trusted_factories,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1026,18 +1203,26 @@ mod tests {
             step.factory_address = settings.uniswap_v4_pool_manager;
             step.adapter_data = Some("0x1234".into());
         }
+        let trusted_factories = TrustedFactorySet::from_settings_and_registry(&settings, &[]);
 
         assert_eq!(
-            executor_for_candidate(&settings, &candidate).unwrap(),
+            executor_for_candidate(&settings, &trusted_factories, &candidate).unwrap(),
             address!("4444444444444444444444444444444444444444")
         );
-        assert!(required_token_approvals(&candidate, &settings)
-            .unwrap()
-            .is_empty());
+        assert!(
+            required_token_approvals(&candidate, &settings, &trusted_factories)
+                .unwrap()
+                .is_empty()
+        );
 
-        let calldata =
-            build_execute_calldata(&candidate, U256::from(5_000u64), U256::from(123), &settings)
-                .unwrap();
+        let calldata = build_execute_calldata(
+            &candidate,
+            U256::from(5_000u64),
+            U256::from(123),
+            &settings,
+            &trusted_factories,
+        )
+        .unwrap();
         let array_start = 4 + 5 * 32;
         let first_element_offset =
             U256::from_be_slice(&calldata[array_start + 32..array_start + 64]).to::<usize>();
@@ -1083,11 +1268,14 @@ mod tests {
             status: OpportunityStatus::Created,
         };
 
+        let settings = settings();
+        let trusted_factories = TrustedFactorySet::from_settings_and_registry(&settings, &[]);
         let calldata = build_execute_calldata(
             &candidate,
             U256::from(5_000u64),
             U256::from(123),
-            &settings(),
+            &settings,
+            &trusted_factories,
         )
         .unwrap();
 

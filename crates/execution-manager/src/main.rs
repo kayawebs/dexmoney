@@ -38,10 +38,14 @@ struct ExecutionRuntime {
     worker_min_balance: U256,
     worker_target_balance: U256,
     executor_contracts: Vec<Address>,
+    trusted_factories: simulator::TrustedFactorySet,
 }
 
 impl ExecutionRuntime {
-    fn from_settings(settings: &Settings) -> Result<Self> {
+    fn from_settings(
+        settings: &Settings,
+        trusted_factories: simulator::TrustedFactorySet,
+    ) -> Result<Self> {
         let fund_wallet = configured_fund_wallet(settings)?;
         let worker_wallets = configured_worker_wallets(settings, fund_wallet.as_ref())?;
         let simulation_operator = fund_wallet
@@ -70,6 +74,7 @@ impl ExecutionRuntime {
             worker_min_balance,
             worker_target_balance,
             executor_contracts: configured_executor_contracts(settings),
+            trusted_factories,
         })
     }
 }
@@ -156,7 +161,15 @@ async fn main() -> Result<()> {
     let postgres = PostgresStore::connect(&settings.postgres_url).await?;
     let redis = RedisStore::connect(&settings.redis_url).await?;
     let provider = ChainProvider::from_settings(&settings);
-    let runtime = ExecutionRuntime::from_settings(&settings)?;
+    let factory_registry = postgres.trusted_factory_registry(settings.chain_id).await?;
+    let trusted_factories =
+        simulator::TrustedFactorySet::from_settings_and_registry(&settings, &factory_registry);
+    info!(
+        registry_records = factory_registry.len(),
+        trusted_factories = trusted_factories.len(),
+        "execution trusted factory registry loaded"
+    );
+    let runtime = ExecutionRuntime::from_settings(&settings, trusted_factories)?;
     let simulation_recorder = SimulationRecordQueue::spawn(postgres.clone());
 
     if settings.execution_submit_enabled {
@@ -331,6 +344,7 @@ where
             simulation_recorder,
             provider,
             settings,
+            &runtime.trusted_factories,
             operator,
             candidates,
             min_simulated_profit_usdc,
@@ -348,6 +362,7 @@ where
         simulation_recorder,
         provider,
         settings,
+        &runtime.trusted_factories,
         operator,
         selected_wallet.as_ref(),
         runtime.fund_wallet.as_ref(),
@@ -460,6 +475,7 @@ async fn run_dry_run_simulation_batch(
     simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &simulator::TrustedFactorySet,
     operator: Address,
     candidates: Vec<Candidate>,
     min_simulated_profit_usdc: f64,
@@ -491,11 +507,13 @@ async fn run_dry_run_simulation_batch(
             spawned += 1;
             let provider = provider.clone();
             let settings = settings.clone();
+            let trusted_factories = trusted_factories.clone();
             let simulation_context = simulation_context.clone();
             join_set.spawn(async move {
                 simulator::simulate(
                     &provider,
                     &settings,
+                    &trusted_factories,
                     operator,
                     &candidate,
                     min_simulated_profit_usdc,
@@ -576,6 +594,7 @@ async fn run_live_submission_batch<E, R>(
     simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &simulator::TrustedFactorySet,
     operator: Address,
     wallet: Option<&tx_manager::ExecutionWallet>,
     fund_wallet: Option<&tx_manager::ExecutionWallet>,
@@ -624,6 +643,7 @@ where
             simulation_recorder,
             provider,
             settings,
+            trusted_factories,
             wallet,
             fund_wallet,
             &candidate,
@@ -681,11 +701,13 @@ where
             spawned += 1;
             let provider = provider.clone();
             let settings = settings.clone();
+            let trusted_factories = trusted_factories.clone();
             let simulation_context = simulation_context.clone();
             join_set.spawn(async move {
                 let simulation = simulator::simulate(
                     &provider,
                     &settings,
+                    &trusted_factories,
                     operator,
                     &candidate,
                     min_simulated_profit_usdc,
@@ -748,6 +770,7 @@ where
             recorder,
             provider,
             settings,
+            trusted_factories,
             wallet,
             circuit_breaker,
             &outcome.candidate,
@@ -802,6 +825,7 @@ async fn live_approval_preflight<E, R>(
     simulation_recorder: &SimulationRecordQueue,
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &simulator::TrustedFactorySet,
     _wallet: Option<&tx_manager::ExecutionWallet>,
     fund_wallet: Option<&tx_manager::ExecutionWallet>,
     candidate: &Candidate,
@@ -816,28 +840,33 @@ where
         return Ok(None);
     }
 
-    let preflight_calldata = match simulator::build_live_execution_calldata(settings, candidate) {
-        Ok(calldata) => calldata,
-        Err(err) => {
-            let reason = format!("executor preflight rejected: {err:#}");
-            warn!(
-                candidate_id = %candidate.id,
-                path = %candidate.path.name,
-                reason = %reason,
-                "candidate skipped before approval preflight because it cannot be encoded"
-            );
-            enqueue_preflight_failure_simulation(
-                simulation_recorder,
-                candidate,
-                current_block,
-                reason,
-                Vec::new(),
-            );
-            return Ok(Some(CandidateAction::Skipped("preflight_unencodable")));
-        }
-    };
+    let preflight_calldata =
+        match simulator::build_live_execution_calldata(settings, trusted_factories, candidate) {
+            Ok(calldata) => calldata,
+            Err(err) => {
+                let reason = format!("executor preflight rejected: {err:#}");
+                warn!(
+                    candidate_id = %candidate.id,
+                    path = %candidate.path.name,
+                    reason = %reason,
+                    "candidate skipped before approval preflight because it cannot be encoded"
+                );
+                enqueue_preflight_failure_simulation(
+                    simulation_recorder,
+                    candidate,
+                    current_block,
+                    reason,
+                    Vec::new(),
+                );
+                return Ok(Some(CandidateAction::Skipped("preflight_unencodable")));
+            }
+        };
 
-    let approvals = match simulator::required_token_approvals(candidate, settings) {
+    let approvals = match simulator::required_token_approvals(
+        candidate,
+        settings,
+        trusted_factories,
+    ) {
         Ok(approvals) => approvals,
         Err(err) => {
             let reason = format!("executor approval preflight rejected: {err:#}");
@@ -861,6 +890,7 @@ where
     let missing_approvals = tx_manager::missing_approvals_cached(
         provider,
         settings,
+        trusted_factories,
         candidate,
         &approvals,
         approved_cache,
@@ -903,7 +933,7 @@ where
         return Ok(Some(CandidateAction::Skipped("admin_pending_approval")));
     }
 
-    let executor = match simulator::executor_for_candidate(settings, candidate) {
+    let executor = match simulator::executor_for_candidate(settings, trusted_factories, candidate) {
         Ok(executor) => executor,
         Err(err) => {
             let reason = format!("executor selection preflight rejected: {err:#}");
@@ -1050,6 +1080,7 @@ async fn submit_simulated_candidate<E, R>(
     recorder: &R,
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &simulator::TrustedFactorySet,
     wallet: Option<&tx_manager::ExecutionWallet>,
     circuit_breaker: &ExecutionCircuitBreaker,
     candidate: &Candidate,
@@ -1112,8 +1143,16 @@ where
         );
         return Ok(CandidateAction::Skipped("submission_lock"));
     }
-    match tx_manager::submit_candidate(provider, wallet, settings, candidate, simulation, nonce)
-        .await
+    match tx_manager::submit_candidate(
+        provider,
+        wallet,
+        settings,
+        trusted_factories,
+        candidate,
+        simulation,
+        nonce,
+    )
+    .await
     {
         Ok(submission) => {
             lane.mark_submitted(

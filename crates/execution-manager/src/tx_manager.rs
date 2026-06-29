@@ -11,7 +11,7 @@ use ethers_core::types::{
 use ethers_signers::{LocalWallet, Signer};
 use std::collections::HashSet;
 
-use crate::simulator::{executor_for_candidate, ApprovalRequirement};
+use crate::simulator::{executor_for_candidate, ApprovalRequirement, TrustedFactorySet};
 
 const GAS_LIMIT_MULTIPLIER_BPS: u64 = 12_000;
 const UNCHECKED_ARB_FALLBACK_GAS_LIMIT: u64 = 900_000;
@@ -61,11 +61,12 @@ pub async fn submit_candidate(
     provider: &ChainProvider,
     wallet: &ExecutionWallet,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     candidate: &Candidate,
     simulation: &SimulationResult,
     nonce: u64,
 ) -> Result<Submission> {
-    let executor = executor_for_candidate(settings, candidate)?;
+    let executor = executor_for_candidate(settings, trusted_factories, candidate)?;
     if simulation.calldata.is_empty() {
         anyhow::bail!("simulation calldata is empty");
     }
@@ -258,11 +259,12 @@ async fn submit_contract_call(
 pub async fn missing_approvals_cached(
     provider: &ChainProvider,
     settings: &Settings,
+    trusted_factories: &TrustedFactorySet,
     candidate: &Candidate,
     requirements: &[ApprovalRequirement],
     approved_cache: &mut HashSet<(Address, Address, Address)>,
 ) -> Result<Vec<ApprovalRequirement>> {
-    let executor = executor_for_candidate(settings, candidate)?;
+    let executor = executor_for_candidate(settings, trusted_factories, candidate)?;
     let mut missing = Vec::new();
     for requirement in requirements.iter().copied() {
         if requirement.token == Address::ZERO || requirement.spender == Address::ZERO {
